@@ -560,7 +560,11 @@ dependencies = [
 name = "ffs-mvcc"
 version = "0.1.0"
 dependencies = [
+ "asupersync",
+ "ffs-block",
+ "ffs-error",
  "ffs-types",
+ "parking_lot",
  "serde",
  "thiserror",
 ]

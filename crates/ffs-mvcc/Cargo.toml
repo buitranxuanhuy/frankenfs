@@ -7,7 +7,11 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+asupersync = { workspace = true }
+ffs-block = { workspace = true }
+ffs-error = { workspace = true }
 ffs-types = { workspace = true }
+parking_lot = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 
