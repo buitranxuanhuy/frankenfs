@@ -6,17 +6,17 @@
 //! and errors are mapped through [`FfsError::to_errno()`].
 
 use asupersync::Cx;
-use ffs_core::{DirEntry as FfsDirEntry, FileType as FfsFileType, FsOps, InodeAttr};
+use ffs_core::{FileType as FfsFileType, FsOps, InodeAttr};
 use ffs_error::FfsError;
 use ffs_types::InodeNumber;
 use fuser::{
-    FUSE_ROOT_ID, FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyData,
+    FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr, ReplyData,
     ReplyDirectory, ReplyEntry, ReplyOpen, Request,
 };
 use std::ffi::OsStr;
 use std::os::raw::c_int;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::path::Path;
+use std::time::Duration;
 use thiserror::Error;
 use tracing::warn;
 
@@ -103,32 +103,32 @@ pub struct FrankenFuse {
 
 impl FrankenFuse {
     /// Create a new FUSE adapter wrapping the given `FsOps` implementation.
+    #[must_use]
     pub fn new(ops: Box<dyn FsOps>) -> Self {
         Self { ops }
     }
 
-    /// Helper: create a `Cx` for each FUSE request.
+    /// Create a `Cx` for a FUSE request.
     ///
     /// In the future this could inherit deadlines or tracing spans from the
     /// fuser `Request`, but for now we use a plain request context.
-    fn cx_for_request(&self) -> Cx {
+    fn cx_for_request() -> Cx {
         Cx::for_request()
     }
 
-    /// Helper: reply with an `FfsError` mapped to errno.
-    fn reply_error_attr(err: FfsError, reply: ReplyAttr) {
+    fn reply_error_attr(err: &FfsError, reply: ReplyAttr) {
         reply.error(err.to_errno());
     }
 
-    fn reply_error_entry(err: FfsError, reply: ReplyEntry) {
+    fn reply_error_entry(err: &FfsError, reply: ReplyEntry) {
         reply.error(err.to_errno());
     }
 
-    fn reply_error_data(err: FfsError, reply: ReplyData) {
+    fn reply_error_data(err: &FfsError, reply: ReplyData) {
         reply.error(err.to_errno());
     }
 
-    fn reply_error_dir(err: FfsError, reply: ReplyDirectory) {
+    fn reply_error_dir(err: &FfsError, reply: ReplyDirectory) {
         reply.error(err.to_errno());
     }
 }
@@ -141,18 +141,18 @@ impl Filesystem for FrankenFuse {
     fn destroy(&mut self) {}
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        let cx = self.cx_for_request();
+        let cx = Self::cx_for_request();
         match self.ops.getattr(&cx, InodeNumber(ino)) {
             Ok(attr) => reply.attr(&ATTR_TTL, &to_file_attr(&attr)),
             Err(e) => {
                 warn!(ino, error = %e, "getattr failed");
-                Self::reply_error_attr(e, reply);
+                Self::reply_error_attr(&e, reply);
             }
         }
     }
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let cx = self.cx_for_request();
+        let cx = Self::cx_for_request();
         match self.ops.lookup(&cx, InodeNumber(parent), name) {
             Ok(attr) => reply.entry(&ATTR_TTL, &to_file_attr(&attr), 0),
             Err(e) => {
@@ -160,7 +160,7 @@ impl Filesystem for FrankenFuse {
                 if e.to_errno() != libc::ENOENT {
                     warn!(parent, ?name, error = %e, "lookup failed");
                 }
-                Self::reply_error_entry(e, reply);
+                Self::reply_error_entry(&e, reply);
             }
         }
     }
@@ -185,14 +185,14 @@ impl Filesystem for FrankenFuse {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        let cx = self.cx_for_request();
+        let cx = Self::cx_for_request();
         // Clamp negative offsets to 0 (shouldn't happen in practice).
         let byte_offset = u64::try_from(offset).unwrap_or(0);
         match self.ops.read(&cx, InodeNumber(ino), byte_offset, size) {
             Ok(data) => reply.data(&data),
             Err(e) => {
                 warn!(ino, offset, size, error = %e, "read failed");
-                Self::reply_error_data(e, reply);
+                Self::reply_error_data(&e, reply);
             }
         }
     }
@@ -205,7 +205,7 @@ impl Filesystem for FrankenFuse {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        let cx = self.cx_for_request();
+        let cx = Self::cx_for_request();
         let fs_offset = u64::try_from(offset).unwrap_or(0);
         match self.ops.readdir(&cx, InodeNumber(ino), fs_offset) {
             Ok(entries) => {
@@ -224,7 +224,7 @@ impl Filesystem for FrankenFuse {
             }
             Err(e) => {
                 warn!(ino, offset, error = %e, "readdir failed");
-                Self::reply_error_dir(e, reply);
+                Self::reply_error_dir(&e, reply);
             }
         }
     }
@@ -232,29 +232,26 @@ impl Filesystem for FrankenFuse {
 
 // ── Mount entrypoint ────────────────────────────────────────────────────────
 
-/// Build a `fuser::Config` from our `MountOptions`.
-fn build_fuser_config(options: &MountOptions) -> fuser::Config {
-    let mut mount_options = vec![
-        fuser::MountOption::FSName("frankenfs".to_owned()),
-        fuser::MountOption::Subtype("ffs".to_owned()),
-        fuser::MountOption::DefaultPermissions,
-        fuser::MountOption::NoAtime,
+/// Build a list of `fuser::MountOption` from our `MountOptions`.
+fn build_mount_options(options: &MountOptions) -> Vec<MountOption> {
+    let mut opts = vec![
+        MountOption::FSName("frankenfs".to_owned()),
+        MountOption::Subtype("ffs".to_owned()),
+        MountOption::DefaultPermissions,
+        MountOption::NoAtime,
     ];
 
     if options.read_only {
-        mount_options.push(fuser::MountOption::RO);
+        opts.push(MountOption::RO);
     }
     if options.allow_other {
-        mount_options.push(fuser::MountOption::AllowOther);
+        opts.push(MountOption::AllowOther);
     }
     if options.auto_unmount {
-        mount_options.push(fuser::MountOption::AutoUnmount);
+        opts.push(MountOption::AutoUnmount);
     }
 
-    fuser::Config {
-        mount_options,
-        ..Default::default()
-    }
+    opts
 }
 
 /// Mount a FrankenFS filesystem at the given mountpoint (blocking).
@@ -271,9 +268,9 @@ pub fn mount(
             "mountpoint cannot be empty".to_owned(),
         ));
     }
-    let config = build_fuser_config(options);
+    let fuse_opts = build_mount_options(options);
     let fs = FrankenFuse::new(ops);
-    fuser::mount2(fs, mountpoint, &config)?;
+    fuser::mount2(fs, mountpoint, &fuse_opts)?;
     Ok(())
 }
 
@@ -291,15 +288,17 @@ pub fn mount_background(
             "mountpoint cannot be empty".to_owned(),
         ));
     }
-    let config = build_fuser_config(options);
+    let fuse_opts = build_mount_options(options);
     let fs = FrankenFuse::new(ops);
-    let session = fuser::spawn_mount2(fs, mountpoint, &config)?;
+    let session = fuser::spawn_mount2(fs, mountpoint, &fuse_opts)?;
     Ok(session)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ffs_core::DirEntry as FfsDirEntry;
+    use std::time::SystemTime;
 
     #[test]
     fn file_type_conversion_roundtrip() {
@@ -358,12 +357,11 @@ mod tests {
     }
 
     #[test]
-    fn build_config_includes_ro_when_read_only() {
+    fn build_mount_options_includes_ro_when_read_only() {
         let opts = MountOptions::default();
-        let config = build_fuser_config(&opts);
-        // Verify config was built (we can't easily inspect MountOption variants,
-        // but the function shouldn't panic).
-        assert!(!config.mount_options.is_empty());
+        let mount_opts = build_mount_options(&opts);
+        // Default includes FSName + Subtype + DefaultPermissions + NoAtime + RO + AutoUnmount = 6
+        assert!(mount_opts.len() >= 5);
     }
 
     #[test]
@@ -439,8 +437,8 @@ mod tests {
                 Ok(vec![])
             }
         }
-        let fuse = FrankenFuse::new(Box::new(StubFs));
+        let _fuse = FrankenFuse::new(Box::new(StubFs));
         // Verify the Cx creation helper works.
-        let _cx = fuse.cx_for_request();
+        let _cx = FrankenFuse::cx_for_request();
     }
 }
