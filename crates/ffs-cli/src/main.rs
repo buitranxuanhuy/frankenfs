@@ -2,7 +2,8 @@
 
 use anyhow::{Context, Result, bail};
 use asupersync::{Budget, Cx};
-use ffs_core::{FsFlavor, detect_filesystem_at_path};
+use ffs_core::{FsFlavor, FsOps, OpenFs, detect_filesystem_at_path};
+use ffs_fuse::MountOptions;
 use ftui::{Style, Theme};
 use serde::Serialize;
 use std::env;
@@ -68,6 +69,17 @@ fn run() -> Result<()> {
             let json = args.any(|arg| arg == "--json");
             inspect(Path::new(&path), json)
         }
+        "mount" => {
+            let Some(image_path) = args.next() else {
+                bail!("mount requires <image-path> <mountpoint>");
+            };
+            let Some(mountpoint) = args.next() else {
+                bail!("mount requires <image-path> <mountpoint>");
+            };
+            let remaining: Vec<String> = args.collect();
+            let allow_other = remaining.iter().any(|a| a == "--allow-other");
+            mount_cmd(Path::new(&image_path), Path::new(&mountpoint), allow_other)
+        }
         "--help" | "-h" | "help" => {
             print_usage();
             Ok(())
@@ -83,6 +95,7 @@ fn print_usage() {
     println!("ffs-cli\n");
     println!("USAGE:");
     println!("  ffs-cli inspect <image-path> [--json]");
+    println!("  ffs-cli mount <image-path> <mountpoint> [--allow-other]");
 }
 
 fn inspect(path: &Path, json: bool) -> Result<()> {
@@ -142,6 +155,41 @@ fn inspect(path: &Path, json: bool) -> Result<()> {
             }
         }
     }
+
+    Ok(())
+}
+
+fn mount_cmd(image_path: &Path, mountpoint: &Path, allow_other: bool) -> Result<()> {
+    let cx = cli_cx();
+    let open_fs = OpenFs::open(&cx, image_path)
+        .with_context(|| format!("failed to open filesystem image: {}", image_path.display()))?;
+
+    match &open_fs.flavor {
+        FsFlavor::Ext4(sb) => {
+            eprintln!(
+                "Mounting ext4 image (block_size={}, blocks={}) at {}",
+                sb.block_size,
+                sb.blocks_count,
+                mountpoint.display()
+            );
+        }
+        FsFlavor::Btrfs(sb) => {
+            bail!(
+                "btrfs mount not yet supported (image label: {:?})",
+                sb.label
+            );
+        }
+    }
+
+    let opts = MountOptions {
+        read_only: true,
+        allow_other,
+        auto_unmount: true,
+    };
+
+    let fs_ops: Box<dyn FsOps> = Box::new(open_fs);
+    ffs_fuse::mount(fs_ops, mountpoint, &opts)
+        .with_context(|| format!("FUSE mount failed at {}", mountpoint.display()))?;
 
     Ok(())
 }
