@@ -340,6 +340,14 @@ impl ArcState {
         }
     }
 
+    fn resident_len(&self) -> usize {
+        self.t1.len() + self.t2.len()
+    }
+
+    fn total_len(&self) -> usize {
+        self.t1.len() + self.t2.len() + self.b1.len() + self.b2.len()
+    }
+
     fn remove_from_list(list: &mut VecDeque<BlockNumber>, key: BlockNumber) -> bool {
         if let Some(pos) = list.iter().position(|k| *k == key) {
             let _ = list.remove(pos);
@@ -368,6 +376,13 @@ impl ArcState {
     }
 
     fn replace(&mut self, incoming: BlockNumber) {
+        // `replace()` is only meaningful when the resident set is full.
+        // Guard against accidental calls during warm-up, which would cause
+        // premature eviction and underutilize the cache.
+        if self.resident_len() < self.capacity {
+            return;
+        }
+
         let t1_len = self.t1.len();
         if t1_len >= 1
             && (t1_len > self.p
@@ -401,6 +416,18 @@ impl ArcState {
     }
 
     fn on_miss_or_ghost_hit(&mut self, key: BlockNumber) {
+        // Defensive: callers use `resident.contains_key()` to decide hit vs miss.
+        // If we ever see a "miss" for a resident key, treat it as a hit to avoid
+        // duplicating list entries.
+        if matches!(self.loc.get(&key), Some(ArcList::T1 | ArcList::T2)) {
+            debug_assert!(
+                false,
+                "ARC invariant violated: loc says resident but resident map is missing"
+            );
+            self.on_hit(key);
+            return;
+        }
+
         if matches!(self.loc.get(&key), Some(ArcList::B1)) {
             let b1_len = self.b1.len().max(1);
             let b2_len = self.b2.len().max(1);
@@ -426,7 +453,9 @@ impl ArcState {
         }
 
         // Not present in any list.
-        if self.t1.len() + self.b1.len() == self.capacity {
+        let l1_len = self.t1.len() + self.b1.len();
+        let total_len = self.total_len();
+        if l1_len == self.capacity {
             if self.t1.len() < self.capacity {
                 let _ = self.b1.pop_front().and_then(|v| self.loc.remove(&v));
                 self.replace(key);
@@ -434,14 +463,13 @@ impl ArcState {
                 let _ = self.loc.remove(&victim);
                 let _ = self.resident.remove(&victim);
             }
-        } else if (self.t1.len() + self.b1.len()) < self.capacity
-            && (self.t1.len() + self.t2.len() + self.b1.len() + self.b2.len())
-                >= self.capacity.saturating_mul(2)
-        {
-            let _ = self.b2.pop_front().and_then(|v| self.loc.remove(&v));
+        } else if l1_len < self.capacity && total_len >= self.capacity {
+            if total_len >= self.capacity.saturating_mul(2) {
+                let _ = self.b2.pop_front().and_then(|v| self.loc.remove(&v));
+            }
+            self.replace(key);
         }
 
-        self.replace(key);
         self.t1.push_back(key);
         self.loc.insert(key, ArcList::T1);
     }
@@ -526,6 +554,39 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
 mod tests {
     use super::*;
 
+    fn arc_access(state: &mut ArcState, key: BlockNumber) {
+        if state.resident.contains_key(&key) {
+            state.on_hit(key);
+        } else {
+            state.on_miss_or_ghost_hit(key);
+            state.resident.insert(key, vec![0_u8]);
+        }
+
+        // Invariants: loc is the source of truth for membership; resident contains
+        // only T1/T2 entries.
+        assert_eq!(state.resident.len(), state.t1.len() + state.t2.len());
+        assert!(state.resident.len() <= state.capacity);
+        assert!(state.total_len() <= state.capacity.saturating_mul(2));
+        assert_eq!(state.loc.len(), state.total_len());
+
+        for &k in &state.t1 {
+            assert!(matches!(state.loc.get(&k), Some(ArcList::T1)));
+            assert!(state.resident.contains_key(&k));
+        }
+        for &k in &state.t2 {
+            assert!(matches!(state.loc.get(&k), Some(ArcList::T2)));
+            assert!(state.resident.contains_key(&k));
+        }
+        for &k in &state.b1 {
+            assert!(matches!(state.loc.get(&k), Some(ArcList::B1)));
+            assert!(!state.resident.contains_key(&k));
+        }
+        for &k in &state.b2 {
+            assert!(matches!(state.loc.get(&k), Some(ArcList::B2)));
+            assert!(!state.resident.contains_key(&k));
+        }
+    }
+
     #[derive(Debug)]
     struct MemoryByteDevice {
         bytes: Mutex<Vec<u8>>,
@@ -605,5 +666,91 @@ mod tests {
         let r2 = cache.read_block(&cx, BlockNumber(1)).expect("read2");
         assert_eq!(r1.as_slice(), &[3_u8; 4096]);
         assert_eq!(r2.as_slice(), &[3_u8; 4096]);
+    }
+
+    #[test]
+    fn arc_state_warms_up_without_premature_eviction() {
+        let mut state = ArcState::new(2);
+        arc_access(&mut state, BlockNumber(1));
+        arc_access(&mut state, BlockNumber(2));
+
+        assert_eq!(state.resident.len(), 2);
+        assert!(state.resident.contains_key(&BlockNumber(1)));
+        assert!(state.resident.contains_key(&BlockNumber(2)));
+        assert_eq!(
+            state.t1,
+            VecDeque::from(vec![BlockNumber(1), BlockNumber(2)])
+        );
+        assert!(state.t2.is_empty());
+        assert!(state.b1.is_empty());
+        assert!(state.b2.is_empty());
+    }
+
+    #[test]
+    fn arc_state_ghost_hits_adjust_p_and_eviction_policy() {
+        let mut state = ArcState::new(2);
+
+        // Warm up + create a mix of recency/frequency:
+        // 1 seen twice -> T2, 2/3 seen once -> T1.
+        arc_access(&mut state, BlockNumber(1)); // miss -> T1
+        arc_access(&mut state, BlockNumber(1)); // hit  -> T2
+        arc_access(&mut state, BlockNumber(2)); // miss -> T1
+        arc_access(&mut state, BlockNumber(3)); // miss -> replaces -> B1 contains 2
+
+        assert_eq!(state.p, 0);
+        assert_eq!(state.t1, VecDeque::from(vec![BlockNumber(3)]));
+        assert_eq!(state.t2, VecDeque::from(vec![BlockNumber(1)]));
+        assert_eq!(state.b1, VecDeque::from(vec![BlockNumber(2)]));
+        assert!(state.b2.is_empty());
+
+        // Ghost hit in B1 should increase p and evict from T2 (since |T1| == p after bump).
+        arc_access(&mut state, BlockNumber(2));
+        assert_eq!(state.p, 1);
+        assert_eq!(state.t1, VecDeque::from(vec![BlockNumber(3)]));
+        assert_eq!(state.t2, VecDeque::from(vec![BlockNumber(2)]));
+        assert!(state.b1.is_empty());
+        assert_eq!(state.b2, VecDeque::from(vec![BlockNumber(1)]));
+
+        // Ghost hit in B2 should decrease p and evict from T1 (since |T1| > p).
+        arc_access(&mut state, BlockNumber(1));
+        assert_eq!(state.p, 0);
+        assert!(state.t1.is_empty());
+        assert_eq!(
+            state.t2,
+            VecDeque::from(vec![BlockNumber(2), BlockNumber(1)])
+        );
+        assert_eq!(state.b1, VecDeque::from(vec![BlockNumber(3)]));
+        assert!(state.b2.is_empty());
+    }
+
+    #[test]
+    fn arc_cache_does_not_evict_before_capacity_is_full() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 8);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+
+        // Populate underlying device; cache starts empty.
+        dev.write_block(&cx, BlockNumber(0), &[1_u8; 4096])
+            .expect("write0");
+        dev.write_block(&cx, BlockNumber(1), &[2_u8; 4096])
+            .expect("write1");
+        dev.write_block(&cx, BlockNumber(2), &[3_u8; 4096])
+            .expect("write2");
+
+        let cache = ArcCache::new(dev, 2).expect("cache");
+
+        let _ = cache.read_block(&cx, BlockNumber(0)).expect("read0");
+        let _ = cache.read_block(&cx, BlockNumber(1)).expect("read1");
+
+        let guard = cache.state.lock();
+        assert_eq!(guard.resident.len(), 2);
+        assert!(guard.resident.contains_key(&BlockNumber(0)));
+        assert!(guard.resident.contains_key(&BlockNumber(1)));
+        drop(guard);
+
+        let _ = cache.read_block(&cx, BlockNumber(2)).expect("read2");
+        let guard = cache.state.lock();
+        assert_eq!(guard.resident.len(), 2);
+        drop(guard);
     }
 }
