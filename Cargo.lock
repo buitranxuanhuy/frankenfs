@@ -382,6 +382,7 @@ dependencies = [
  "anyhow",
  "asupersync",
  "ffs-core",
+ "ffs-fuse",
  "ftui",
  "serde",
  "serde_json",
@@ -399,6 +400,7 @@ dependencies = [
  "ffs-types",
  "libc",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -613,6 +615,7 @@ dependencies = [
  "memchr",
  "smallvec",
  "unicode-segmentation",
+ "web-time",
 ]
 
 [[package]]
