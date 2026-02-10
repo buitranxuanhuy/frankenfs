@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 
 const BTRFS_HEADER_SIZE: usize = 101;
 const BTRFS_ITEM_SIZE: usize = 25;
+/// Size of a btrfs_key_ptr on disk (key:17 + blockptr:u64 + generation:u64).
+const BTRFS_KEY_PTR_SIZE: usize = 33;
+/// Maximum tree depth in btrfs (kernel enforces 8 levels, 0-7).
+const BTRFS_MAX_LEVEL: u8 = 7;
 const BTRFS_SUPER_LABEL_OFFSET: usize = 0x12B;
 const BTRFS_SUPER_LABEL_LEN: usize = 256;
 const BTRFS_SYS_CHUNK_ARRAY_OFFSET: usize = 0x32B;
@@ -414,6 +418,53 @@ impl BtrfsHeader {
             level: block[0x64],
         })
     }
+
+    /// Validate the header against the block it was parsed from.
+    ///
+    /// Checks:
+    /// - `bytenr` matches `expected_bytenr` (if provided).
+    /// - `nritems` fits within the block, considering item size (leaf vs internal).
+    /// - `level` does not exceed `BTRFS_MAX_LEVEL`.
+    pub fn validate(
+        &self,
+        block_size: usize,
+        expected_bytenr: Option<u64>,
+    ) -> Result<(), ParseError> {
+        if let Some(expected) = expected_bytenr {
+            if self.bytenr != expected {
+                return Err(ParseError::InvalidField {
+                    field: "bytenr",
+                    reason: "header bytenr does not match expected",
+                });
+            }
+        }
+
+        if self.level > BTRFS_MAX_LEVEL {
+            return Err(ParseError::InvalidField {
+                field: "level",
+                reason: "exceeds maximum tree depth",
+            });
+        }
+
+        let payload_space = block_size.saturating_sub(BTRFS_HEADER_SIZE);
+        let item_size = if self.level == 0 {
+            BTRFS_ITEM_SIZE
+        } else {
+            BTRFS_KEY_PTR_SIZE
+        };
+        let max_items = payload_space / item_size;
+        let nritems = usize::try_from(self.nritems)
+            .map_err(|_| ParseError::IntegerConversion { field: "nritems" })?;
+
+        if nritems > max_items {
+            return Err(ParseError::InvalidField {
+                field: "nritems",
+                reason: "item count exceeds block capacity",
+            });
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -421,6 +472,14 @@ pub struct BtrfsItem {
     pub key: BtrfsKey,
     pub data_offset: u32,
     pub data_size: u32,
+}
+
+/// An internal (non-leaf) node item: a key paired with a child block pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BtrfsKeyPtr {
+    pub key: BtrfsKey,
+    pub blockptr: u64,
+    pub generation: u64,
 }
 
 pub fn parse_leaf_items(block: &[u8]) -> Result<(BtrfsHeader, Vec<BtrfsItem>), ParseError> {
@@ -492,6 +551,73 @@ pub fn parse_leaf_items(block: &[u8]) -> Result<(BtrfsHeader, Vec<BtrfsItem>), P
     }
 
     Ok((header, items))
+}
+
+/// Parse a btrfs internal (non-leaf) node, returning the header and key-pointer items.
+///
+/// Internal nodes (level > 0) contain `btrfs_key_ptr` entries that point
+/// to child blocks. Each entry is 33 bytes: key (17) + blockptr (8) + generation (8).
+pub fn parse_internal_items(block: &[u8]) -> Result<(BtrfsHeader, Vec<BtrfsKeyPtr>), ParseError> {
+    let header = BtrfsHeader::parse_from_block(block)?;
+    if header.level == 0 {
+        return Err(ParseError::InvalidField {
+            field: "level",
+            reason: "expected internal node (level > 0)",
+        });
+    }
+
+    header.validate(block.len(), None)?;
+
+    let nritems = usize::try_from(header.nritems)
+        .map_err(|_| ParseError::IntegerConversion { field: "nritems" })?;
+
+    let table_bytes = nritems
+        .checked_mul(BTRFS_KEY_PTR_SIZE)
+        .ok_or(ParseError::InvalidField {
+            field: "key_ptrs",
+            reason: "overflow",
+        })?;
+    let table_end = BTRFS_HEADER_SIZE
+        .checked_add(table_bytes)
+        .ok_or(ParseError::InvalidField {
+            field: "key_ptrs",
+            reason: "overflow",
+        })?;
+
+    if block.len() < table_end {
+        return Err(ParseError::InsufficientData {
+            needed: table_end,
+            offset: BTRFS_HEADER_SIZE,
+            actual: block.len().saturating_sub(BTRFS_HEADER_SIZE),
+        });
+    }
+
+    let mut ptrs = Vec::with_capacity(nritems);
+    for idx in 0..nritems {
+        let base = BTRFS_HEADER_SIZE + idx * BTRFS_KEY_PTR_SIZE;
+        let key = BtrfsKey {
+            objectid: read_le_u64(block, base)?,
+            item_type: block[base + 8],
+            offset: read_le_u64(block, base + 9)?,
+        };
+        let blockptr = read_le_u64(block, base + 17)?;
+        let generation = read_le_u64(block, base + 25)?;
+
+        if blockptr == 0 {
+            return Err(ParseError::InvalidField {
+                field: "blockptr",
+                reason: "child block pointer is zero",
+            });
+        }
+
+        ptrs.push(BtrfsKeyPtr {
+            key,
+            blockptr,
+            generation,
+        });
+    }
+
+    Ok((header, ptrs))
 }
 
 #[cfg(test)]
@@ -711,5 +837,193 @@ mod tests {
         assert_eq!(items[0].key.objectid, 123);
         assert_eq!(items[0].key.item_type, 42);
         assert_eq!(items[0].key.offset, 999);
+    }
+
+    /// Helper: build a minimal valid block with a header (zeros except nritems + level).
+    fn make_block(size: usize, nritems: u32, level: u8) -> Vec<u8> {
+        let mut block = vec![0_u8; size];
+        block[0x60..0x64].copy_from_slice(&nritems.to_le_bytes());
+        block[0x64] = level;
+        block
+    }
+
+    #[test]
+    fn parse_internal_items_smoke() {
+        let mut block = make_block(4096, 2, 1);
+
+        // Item 0: key(256, 132, 0) → blockptr=0x4000, gen=10
+        let b0 = BTRFS_HEADER_SIZE;
+        block[b0..b0 + 8].copy_from_slice(&256_u64.to_le_bytes());
+        block[b0 + 8] = 132;
+        block[b0 + 9..b0 + 17].copy_from_slice(&0_u64.to_le_bytes());
+        block[b0 + 17..b0 + 25].copy_from_slice(&0x4000_u64.to_le_bytes());
+        block[b0 + 25..b0 + 33].copy_from_slice(&10_u64.to_le_bytes());
+
+        // Item 1: key(512, 132, 100) → blockptr=0x8000, gen=10
+        let b1 = BTRFS_HEADER_SIZE + BTRFS_KEY_PTR_SIZE;
+        block[b1..b1 + 8].copy_from_slice(&512_u64.to_le_bytes());
+        block[b1 + 8] = 132;
+        block[b1 + 9..b1 + 17].copy_from_slice(&100_u64.to_le_bytes());
+        block[b1 + 17..b1 + 25].copy_from_slice(&0x8000_u64.to_le_bytes());
+        block[b1 + 25..b1 + 33].copy_from_slice(&10_u64.to_le_bytes());
+
+        let (header, ptrs) = parse_internal_items(&block).expect("internal parse");
+        assert_eq!(header.level, 1);
+        assert_eq!(ptrs.len(), 2);
+        assert_eq!(ptrs[0].key.objectid, 256);
+        assert_eq!(ptrs[0].blockptr, 0x4000);
+        assert_eq!(ptrs[0].generation, 10);
+        assert_eq!(ptrs[1].key.objectid, 512);
+        assert_eq!(ptrs[1].blockptr, 0x8000);
+    }
+
+    #[test]
+    fn parse_internal_items_rejects_leaf() {
+        let block = make_block(4096, 0, 0);
+        let err = parse_internal_items(&block).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidField { field: "level", .. }),
+            "expected level error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_internal_items_rejects_zero_blockptr() {
+        let mut block = make_block(4096, 1, 1);
+        // key is valid but blockptr is zero
+        let b0 = BTRFS_HEADER_SIZE;
+        block[b0..b0 + 8].copy_from_slice(&256_u64.to_le_bytes());
+        block[b0 + 8] = 132;
+        // blockptr stays zero (from make_block)
+
+        let err = parse_internal_items(&block).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "blockptr",
+                    ..
+                }
+            ),
+            "expected blockptr error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn header_validate_bytenr_mismatch() {
+        let block = make_block(4096, 0, 0);
+        let header = BtrfsHeader::parse_from_block(&block).expect("parse");
+        // header.bytenr is 0, expected 0x1000
+        let err = header.validate(4096, Some(0x1000)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "bytenr",
+                    ..
+                }
+            ),
+            "expected bytenr error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn header_validate_bytenr_match() {
+        let mut block = make_block(4096, 0, 0);
+        block[0x30..0x38].copy_from_slice(&0x1_0000_u64.to_le_bytes());
+        let header = BtrfsHeader::parse_from_block(&block).expect("parse");
+        header.validate(4096, Some(0x1_0000)).expect("should match");
+    }
+
+    #[test]
+    fn header_validate_nritems_overflow_leaf() {
+        // A 4096-byte block can hold (4096-101)/25 = 159 leaf items max.
+        let block = make_block(4096, 200, 0);
+        let header = BtrfsHeader::parse_from_block(&block).expect("parse");
+        let err = header.validate(4096, None).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "nritems",
+                    ..
+                }
+            ),
+            "expected nritems error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn header_validate_nritems_overflow_internal() {
+        // A 4096-byte block can hold (4096-101)/33 = 121 internal items max.
+        let block = make_block(4096, 130, 1);
+        let header = BtrfsHeader::parse_from_block(&block).expect("parse");
+        let err = header.validate(4096, None).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "nritems",
+                    ..
+                }
+            ),
+            "expected nritems error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn header_validate_level_too_high() {
+        let block = make_block(4096, 0, 8); // max is 7
+        let header = BtrfsHeader::parse_from_block(&block).expect("parse");
+        let err = header.validate(4096, None).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidField { field: "level", .. }),
+            "expected level error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_leaf_items_rejects_out_of_bounds_data() {
+        let mut block = make_block(512, 1, 0);
+        let base = BTRFS_HEADER_SIZE;
+        block[base..base + 8].copy_from_slice(&1_u64.to_le_bytes());
+        block[base + 8] = 1;
+        // data_offset = 600, data_size = 10 — well beyond the 512-byte block
+        block[base + 17..base + 21].copy_from_slice(&600_u32.to_le_bytes());
+        block[base + 21..base + 25].copy_from_slice(&10_u32.to_le_bytes());
+
+        let err = parse_leaf_items(&block).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "item_offset",
+                    ..
+                }
+            ),
+            "expected item_offset error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_internal_items_block_too_small() {
+        // Block is too small to hold the declared items
+        let mut block = make_block(140, 2, 1);
+        // Need 101 + 2*33 = 167 bytes, but only have 140
+        // Put a valid blockptr for item 0 so we fail on size not on blockptr
+        let b0 = BTRFS_HEADER_SIZE;
+        block[b0 + 17..b0 + 25].copy_from_slice(&0x4000_u64.to_le_bytes());
+
+        let err = parse_internal_items(&block).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "nritems",
+                    ..
+                }
+            ),
+            "expected nritems error, got: {err:?}"
+        );
     }
 }
