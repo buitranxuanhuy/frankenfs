@@ -11,6 +11,8 @@ pub mod ext4;
 
 pub use btrfs::{BtrfsHeader, BtrfsItem, BtrfsKey, BtrfsSuperblock, parse_leaf_items};
 pub use ext4::{
-    Ext4Extent, Ext4ExtentHeader, Ext4ExtentIndex, Ext4GroupDesc, Ext4Inode, Ext4Superblock,
-    ExtentTree, parse_extent_tree, parse_inode_extent_tree,
+    Ext4DirEntry, Ext4DirEntryTail, Ext4Extent, Ext4ExtentHeader, Ext4ExtentIndex, Ext4FileType,
+    Ext4GroupDesc, Ext4ImageReader, Ext4Inode, Ext4Superblock, ExtentTree, lookup_in_dir_block,
+    parse_dir_block, parse_extent_tree, parse_inode_extent_tree, verify_group_desc_checksum,
+    verify_inode_checksum,
 };

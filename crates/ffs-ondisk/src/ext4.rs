@@ -622,34 +622,36 @@ pub fn verify_inode_checksum(
 
     // Extended area (when inode_size > 128)
     if is > 128 {
-        // CRC bytes from 128 up to i_checksum_hi at 0x82
-        csum = crc32c::crc32c_append(csum, &raw_inode[128..INODE_CHECKSUM_HI_OFFSET]);
+        // CRC bytes from 128 up to i_checksum_hi (0x82), but don't exceed inode_size
+        let hi_bound = INODE_CHECKSUM_HI_OFFSET.min(is);
+        csum = crc32c::crc32c_append(csum, &raw_inode[128..hi_bound]);
 
-        // Check if i_checksum_hi fits (i_extra_isize >= 4)
-        let extra_isize = if raw_inode.len() >= 0x82 {
-            read_le_u16(raw_inode, 0x80)?
-        } else {
-            0
-        };
-        let extra_end = 128 + usize::from(extra_isize);
-        if extra_end >= INODE_CHECKSUM_HI_OFFSET + 2 {
-            // Zero out checksum_hi
-            csum = crc32c::crc32c_append(csum, &[0, 0]);
-            let after_csum_hi = INODE_CHECKSUM_HI_OFFSET + 2;
-            if after_csum_hi < is {
-                csum = crc32c::crc32c_append(csum, &raw_inode[after_csum_hi..is]);
-            }
-        } else {
-            // No checksum_hi field, CRC the rest
-            if INODE_CHECKSUM_HI_OFFSET < is {
+        // Only handle checksum_hi if the inode is large enough to contain it
+        if is >= INODE_CHECKSUM_HI_OFFSET + 2 {
+            // Check if i_checksum_hi fits per i_extra_isize
+            let extra_isize = read_le_u16(raw_inode, 0x80)?;
+            let extra_end = 128 + usize::from(extra_isize);
+            if extra_end >= INODE_CHECKSUM_HI_OFFSET + 2 {
+                // Zero out checksum_hi
+                csum = crc32c::crc32c_append(csum, &[0, 0]);
+                let after_csum_hi = INODE_CHECKSUM_HI_OFFSET + 2;
+                if after_csum_hi < is {
+                    csum = crc32c::crc32c_append(csum, &raw_inode[after_csum_hi..is]);
+                }
+            } else {
+                // No checksum_hi field per extra_isize, CRC the rest
                 csum = crc32c::crc32c_append(csum, &raw_inode[INODE_CHECKSUM_HI_OFFSET..is]);
             }
+        } else if hi_bound < is {
+            // inode_size < 132: no room for checksum_hi, CRC remaining bytes
+            csum = crc32c::crc32c_append(csum, &raw_inode[hi_bound..is]);
         }
     }
 
     // Extract stored checksum (lo + hi)
     let stored_lo = u32::from(read_le_u16(raw_inode, INODE_CHECKSUM_LO_OFFSET)?);
-    let stored_hi = if is > 128 {
+    let stored_hi = if is >= INODE_CHECKSUM_HI_OFFSET + 2 {
+        // Need at least 130 bytes to read extra_isize at 0x80
         let extra_isize = read_le_u16(raw_inode, 0x80)?;
         let extra_end = 128 + usize::from(extra_isize);
         if extra_end >= INODE_CHECKSUM_HI_OFFSET + 2 {
@@ -883,44 +885,40 @@ impl Ext4Inode {
         extra & 0x3
     }
 
+    /// Reconstruct a full 34-bit timestamp from base u32 + extra epoch bits.
+    ///
+    /// The kernel sign-extends the base u32 via `(signed)le32_to_cpu(raw->xtime)`
+    /// then adds `(epoch_bits << 32)`.  We must do the same — `as i32` reinterprets
+    /// the bits as signed, and `i64::from` sign-extends to 64 bits.
+    #[allow(clippy::cast_possible_wrap)] // intentional: kernel reinterprets u32 as signed
+    fn timestamp_full(base: u32, extra: u32) -> (i64, u32) {
+        let signed_base = i64::from(base as i32); // sign-extend, matching kernel
+        let epoch = i64::from(Self::extra_epoch(extra)) << 32;
+        (signed_base + epoch, Self::extra_nsec(extra))
+    }
+
     /// Full access time as (seconds_since_epoch, nanoseconds).
     #[must_use]
     pub fn atime_full(&self) -> (i64, u32) {
-        let epoch = i64::from(Self::extra_epoch(self.atime_extra)) << 32;
-        (
-            epoch | i64::from(self.atime),
-            Self::extra_nsec(self.atime_extra),
-        )
+        Self::timestamp_full(self.atime, self.atime_extra)
     }
 
     /// Full modification time as (seconds_since_epoch, nanoseconds).
     #[must_use]
     pub fn mtime_full(&self) -> (i64, u32) {
-        let epoch = i64::from(Self::extra_epoch(self.mtime_extra)) << 32;
-        (
-            epoch | i64::from(self.mtime),
-            Self::extra_nsec(self.mtime_extra),
-        )
+        Self::timestamp_full(self.mtime, self.mtime_extra)
     }
 
     /// Full inode change time as (seconds_since_epoch, nanoseconds).
     #[must_use]
     pub fn ctime_full(&self) -> (i64, u32) {
-        let epoch = i64::from(Self::extra_epoch(self.ctime_extra)) << 32;
-        (
-            epoch | i64::from(self.ctime),
-            Self::extra_nsec(self.ctime_extra),
-        )
+        Self::timestamp_full(self.ctime, self.ctime_extra)
     }
 
     /// Full creation time as (seconds_since_epoch, nanoseconds).
     #[must_use]
     pub fn crtime_full(&self) -> (i64, u32) {
-        let epoch = i64::from(Self::extra_epoch(self.crtime_extra)) << 32;
-        (
-            epoch | i64::from(self.crtime),
-            Self::extra_nsec(self.crtime_extra),
-        )
+        Self::timestamp_full(self.crtime, self.crtime_extra)
     }
 }
 
@@ -1141,13 +1139,12 @@ pub struct Ext4DirEntryTail {
 ///
 /// For blocks > 64K the kernel encodes large values by stealing the low 2 bits:
 /// `decoded = (raw & 0xFFFC) | ((raw & 0x3) << 16)`.
-/// A raw value of 0 or 0xFFFF maps to `block_size`.
+///
+/// For standard 1K-4K blocks (FrankenFS v1 scope), rec_len is always 4-byte
+/// aligned so the low 2 bits are 0 and the formula is a no-op.
 #[must_use]
-fn rec_len_from_disk(raw: u16, block_size: u32) -> u32 {
+fn rec_len_from_disk(raw: u16, _block_size: u32) -> u32 {
     let len = u32::from(raw);
-    if len == u32::from(u16::MAX) || len == 0 {
-        return block_size;
-    }
     (len & 0xFFFC) | ((len & 0x3) << 16)
 }
 
@@ -1342,6 +1339,329 @@ impl Ext4ImageReader {
             reason: "block offset exceeds addressable range",
         })?;
         ensure_slice(image, offset, self.sb.block_size as usize)
+    }
+
+    // ── Extent mapping ───────────────────────────────────────────────────
+
+    /// Maximum extent tree depth we'll follow (ext4 kernel limit is 5).
+    const MAX_EXTENT_DEPTH: u16 = 5;
+
+    /// Resolve a logical block number to a physical block number for an inode.
+    ///
+    /// Walks the inode's extent tree.  For depth-0 (leaf) trees this is a
+    /// simple scan.  For deeper trees, the appropriate extent index blocks
+    /// are read from disk and the tree is traversed down to the leaf level.
+    ///
+    /// Returns `Ok(None)` if the logical block falls in a hole (no mapping).
+    pub fn resolve_extent(
+        &self,
+        image: &[u8],
+        inode: &Ext4Inode,
+        logical_block: u32,
+    ) -> Result<Option<u64>, ParseError> {
+        let (header, tree) = parse_inode_extent_tree(inode)?;
+        self.walk_extent_tree(image, &header, &tree, logical_block, header.depth)
+    }
+
+    /// Recursive extent tree walker with depth tracking.
+    fn walk_extent_tree(
+        &self,
+        image: &[u8],
+        _header: &Ext4ExtentHeader,
+        tree: &ExtentTree,
+        logical_block: u32,
+        remaining_depth: u16,
+    ) -> Result<Option<u64>, ParseError> {
+        if remaining_depth > Self::MAX_EXTENT_DEPTH {
+            return Err(ParseError::InvalidField {
+                field: "eh_depth",
+                reason: "extent tree depth exceeds maximum",
+            });
+        }
+
+        match tree {
+            ExtentTree::Leaf(extents) => {
+                // Scan extents for the target logical block
+                for ext in extents {
+                    let start = ext.logical_block;
+                    let len = u32::from(ext.actual_len());
+                    if logical_block >= start && logical_block < start.saturating_add(len) {
+                        let offset_within = u64::from(logical_block - start);
+                        return Ok(Some(ext.physical_start + offset_within));
+                    }
+                }
+                // Hole — no extent covers this logical block
+                Ok(None)
+            }
+            ExtentTree::Index(indexes) => {
+                if remaining_depth == 0 {
+                    return Err(ParseError::InvalidField {
+                        field: "eh_depth",
+                        reason: "extent index at depth 0",
+                    });
+                }
+                // Find the index entry whose logical_block <= target.
+                // Entries are sorted; we want the last entry where logical_block <= target.
+                let mut chosen: Option<&Ext4ExtentIndex> = None;
+                for idx in indexes {
+                    if idx.logical_block <= logical_block {
+                        chosen = Some(idx);
+                    } else {
+                        break;
+                    }
+                }
+                let Some(idx) = chosen else {
+                    return Ok(None); // target is before all index entries — hole
+                };
+
+                // Read the child extent block from disk
+                let child_block = self.read_block(image, ffs_types::BlockNumber(idx.leaf_block))?;
+                let (child_header, child_tree) = parse_extent_tree(child_block)?;
+
+                // Validate depth consistency: child depth should be one less
+                if child_header.depth + 1 != remaining_depth {
+                    return Err(ParseError::InvalidField {
+                        field: "eh_depth",
+                        reason: "child extent tree depth inconsistency",
+                    });
+                }
+
+                self.walk_extent_tree(
+                    image,
+                    &child_header,
+                    &child_tree,
+                    logical_block,
+                    remaining_depth - 1,
+                )
+            }
+        }
+    }
+
+    /// Collect all leaf extents for an inode, flattening multi-level trees.
+    ///
+    /// Returns extents sorted by logical block number.
+    pub fn collect_extents(
+        &self,
+        image: &[u8],
+        inode: &Ext4Inode,
+    ) -> Result<Vec<Ext4Extent>, ParseError> {
+        let (header, tree) = parse_inode_extent_tree(inode)?;
+        let mut result = Vec::new();
+        self.collect_extents_recursive(image, &tree, header.depth, &mut result)?;
+        Ok(result)
+    }
+
+    fn collect_extents_recursive(
+        &self,
+        image: &[u8],
+        tree: &ExtentTree,
+        remaining_depth: u16,
+        result: &mut Vec<Ext4Extent>,
+    ) -> Result<(), ParseError> {
+        if remaining_depth > Self::MAX_EXTENT_DEPTH {
+            return Err(ParseError::InvalidField {
+                field: "eh_depth",
+                reason: "extent tree depth exceeds maximum",
+            });
+        }
+
+        match tree {
+            ExtentTree::Leaf(extents) => {
+                result.extend_from_slice(extents);
+                Ok(())
+            }
+            ExtentTree::Index(indexes) => {
+                if remaining_depth == 0 {
+                    return Err(ParseError::InvalidField {
+                        field: "eh_depth",
+                        reason: "extent index at depth 0",
+                    });
+                }
+                for idx in indexes {
+                    let child_block =
+                        self.read_block(image, ffs_types::BlockNumber(idx.leaf_block))?;
+                    let (child_header, child_tree) = parse_extent_tree(child_block)?;
+                    if child_header.depth + 1 != remaining_depth {
+                        return Err(ParseError::InvalidField {
+                            field: "eh_depth",
+                            reason: "child extent tree depth inconsistency",
+                        });
+                    }
+                    self.collect_extents_recursive(
+                        image,
+                        &child_tree,
+                        remaining_depth - 1,
+                        result,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    // ── File data reading ───────────────────────────────────────────────
+
+    /// Read file data from an inode starting at `offset` into `buf`.
+    ///
+    /// Returns the number of bytes actually read (may be less than `buf.len()`
+    /// if the file is shorter or if the read extends past EOF).
+    /// Holes in the extent mapping are filled with zeroes.
+    pub fn read_inode_data(
+        &self,
+        image: &[u8],
+        inode: &Ext4Inode,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, ParseError> {
+        let file_size = inode.size;
+        if offset >= file_size {
+            return Ok(0);
+        }
+
+        let available = file_size - offset;
+        let to_read = usize::try_from(available.min(buf.len() as u64)).unwrap_or(buf.len());
+
+        let bs = u64::from(self.sb.block_size);
+        let bs_usize = self.sb.block_size as usize; // block_size ≤ 65536, always fits usize
+        let mut bytes_read = 0_usize;
+
+        while bytes_read < to_read {
+            let current_offset = offset + bytes_read as u64;
+            let logical_block =
+                u32::try_from(current_offset / bs).map_err(|_| ParseError::IntegerConversion {
+                    field: "logical_block",
+                })?;
+            // SAFETY: block_size ≤ 65536 so modulus always fits in usize
+            #[allow(clippy::cast_possible_truncation)]
+            let offset_in_block = (current_offset % bs) as usize;
+            let remaining_in_block = bs_usize - offset_in_block;
+            let chunk_size = remaining_in_block.min(to_read - bytes_read);
+
+            match self.resolve_extent(image, inode, logical_block)? {
+                Some(phys_block) => {
+                    let block_data = self.read_block(image, ffs_types::BlockNumber(phys_block))?;
+                    buf[bytes_read..bytes_read + chunk_size].copy_from_slice(
+                        &block_data[offset_in_block..offset_in_block + chunk_size],
+                    );
+                }
+                None => {
+                    // Hole — fill with zeroes
+                    buf[bytes_read..bytes_read + chunk_size].fill(0);
+                }
+            }
+
+            bytes_read += chunk_size;
+        }
+
+        Ok(bytes_read)
+    }
+
+    // ── Directory operations ────────────────────────────────────────────
+
+    /// Read all directory entries from a directory inode.
+    ///
+    /// Iterates over the inode's data blocks via extent mapping, parsing
+    /// each block for directory entries.  Returns all non-deleted entries
+    /// (excluding checksum tails).
+    pub fn read_dir(
+        &self,
+        image: &[u8],
+        inode: &Ext4Inode,
+    ) -> Result<Vec<Ext4DirEntry>, ParseError> {
+        let bs = u64::from(self.sb.block_size);
+        let num_blocks = Self::dir_logical_block_count(inode.size, bs)?;
+
+        let mut all_entries = Vec::new();
+
+        for lb in 0..num_blocks {
+            if let Some(phys) = self.resolve_extent(image, inode, lb)? {
+                let block_data = self.read_block(image, ffs_types::BlockNumber(phys))?;
+                let (entries, _tail) = parse_dir_block(block_data, self.sb.block_size)?;
+                all_entries.extend(entries);
+            }
+            // Holes in directory data are skipped (shouldn't happen in practice)
+        }
+
+        Ok(all_entries)
+    }
+
+    /// Look up a single name in a directory inode.
+    ///
+    /// Returns the matching `Ext4DirEntry` if found.
+    pub fn lookup(
+        &self,
+        image: &[u8],
+        dir_inode: &Ext4Inode,
+        name: &[u8],
+    ) -> Result<Option<Ext4DirEntry>, ParseError> {
+        let bs = u64::from(self.sb.block_size);
+        let num_blocks = Self::dir_logical_block_count(dir_inode.size, bs)?;
+
+        for lb in 0..num_blocks {
+            if let Some(phys) = self.resolve_extent(image, dir_inode, lb)? {
+                let block_data = self.read_block(image, ffs_types::BlockNumber(phys))?;
+                if let Some(entry) = lookup_in_dir_block(block_data, self.sb.block_size, name) {
+                    return Ok(Some(entry));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Compute the number of logical blocks in a directory, as a u32.
+    fn dir_logical_block_count(file_size: u64, block_size: u64) -> Result<u32, ParseError> {
+        let num = file_size.div_ceil(block_size);
+        u32::try_from(num).map_err(|_| ParseError::IntegerConversion {
+            field: "dir_block_count",
+        })
+    }
+
+    // ── Path resolution ─────────────────────────────────────────────────
+
+    /// Resolve an absolute path to an inode number and parsed inode.
+    ///
+    /// The path must start with `/`.  Each component is looked up in the
+    /// current directory.  Returns the final inode.
+    ///
+    /// Does not follow symlinks (yet).
+    pub fn resolve_path(
+        &self,
+        image: &[u8],
+        path: &str,
+    ) -> Result<(ffs_types::InodeNumber, Ext4Inode), ParseError> {
+        if !path.starts_with('/') {
+            return Err(ParseError::InvalidField {
+                field: "path",
+                reason: "path must be absolute (start with /)",
+            });
+        }
+
+        let mut current_ino = ffs_types::InodeNumber::ROOT;
+        let mut current_inode = self.read_inode(image, current_ino)?;
+
+        // Split path and process each non-empty component
+        for component in path.split('/').filter(|c| !c.is_empty()) {
+            // Current inode must be a directory
+            if (current_inode.mode & 0xF000) != 0x4000 {
+                return Err(ParseError::InvalidField {
+                    field: "path",
+                    reason: "component is not a directory",
+                });
+            }
+
+            let entry = self
+                .lookup(image, &current_inode, component.as_bytes())?
+                .ok_or(ParseError::InvalidField {
+                    field: "path",
+                    reason: "component not found",
+                })?;
+
+            current_ino = ffs_types::InodeNumber(u64::from(entry.inode));
+            current_inode = self.read_inode(image, current_ino)?;
+        }
+
+        Ok((current_ino, current_inode))
     }
 
     /// Read a directory block and parse its entries.
@@ -1681,6 +2001,34 @@ mod tests {
         assert_eq!(inode.extra_isize, 32);
     }
 
+    /// Verify timestamp sign-extension matches the kernel's behavior.
+    ///
+    /// The kernel does `(signed)le32_to_cpu(raw->atime)` which sign-extends,
+    /// then adds `(epoch_bits << 32)`. A timestamp of 0xFFFF_FFFF should be
+    /// -1 (pre-1970), not 4_294_967_295.
+    #[test]
+    fn timestamp_sign_extension() {
+        let mut raw = [0_u8; 256];
+        // Set atime to 0xFFFF_FFFF (= -1 as signed i32 = 1 second before epoch)
+        raw[0x08..0x0C].copy_from_slice(&0xFFFF_FFFF_u32.to_le_bytes());
+        // extra_isize = 32 (need extended area for atime_extra)
+        raw[0x80..0x82].copy_from_slice(&32_u16.to_le_bytes());
+        // atime_extra: epoch=0, nsec=0
+        raw[0x8C..0x90].copy_from_slice(&0_u32.to_le_bytes());
+
+        let inode = Ext4Inode::parse_from_bytes(&raw).unwrap();
+        let (sec, nsec) = inode.atime_full();
+        // Must be -1 (kernel: (signed)0xFFFFFFFF = -1), NOT 4294967295
+        assert_eq!(sec, -1);
+        assert_eq!(nsec, 0);
+
+        // With epoch=1: kernel does -1 + (1 << 32) = 4294967295
+        raw[0x8C..0x90].copy_from_slice(&1_u32.to_le_bytes()); // epoch=1, nsec=0
+        let inode = Ext4Inode::parse_from_bytes(&raw).unwrap();
+        let (sec, _) = inode.atime_full();
+        assert_eq!(sec, 4_294_967_295_i64); // -1 + 2^32
+    }
+
     #[test]
     fn inode_32bit_uid_gid() {
         let mut raw = [0_u8; 256];
@@ -1983,5 +2331,430 @@ mod tests {
         // Corrupt one byte and verify it fails
         raw[0x10] ^= 0x01;
         assert!(verify_inode_checksum(&raw, csum_seed, ino, inode_size).is_err());
+    }
+
+    // ── Extent mapping / file reading / path resolution tests ───────────
+
+    /// Build a complete synthetic ext4 image for integration testing.
+    ///
+    /// Layout (4K blocks, 1 group):
+    ///   Block 0: boot sector + superblock (at byte 1024)
+    ///   Block 1: group descriptor table
+    ///   Block 2: inode table (inodes 1-8192, 256 bytes each)
+    ///   Blocks 3+: data blocks for files/directories
+    ///
+    /// Directory structure:
+    ///   / (inode 2) → ".", "..", "subdir", "hello.txt"
+    ///   /subdir (inode 12) → ".", "..", "deep.txt"
+    ///   /hello.txt (inode 11) → "Hello, FrankenFS!\n" (18 bytes)
+    ///   /subdir/deep.txt (inode 13) → 8192 bytes of 'A' (spans 2 blocks)
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
+    fn build_test_image() -> Vec<u8> {
+        let block_size = 4096_usize;
+        let image_blocks = 64;
+        let mut image = vec![0_u8; block_size * image_blocks];
+
+        // ── Superblock at byte offset 1024 ──────────────────────────────
+        let sb_off = EXT4_SUPERBLOCK_OFFSET;
+        let mut sb = [0_u8; EXT4_SUPERBLOCK_SIZE];
+        sb[0x38..0x3A].copy_from_slice(&EXT4_SUPER_MAGIC.to_le_bytes());
+        sb[0x18..0x1C].copy_from_slice(&2_u32.to_le_bytes()); // log_block_size=2 → 4K
+        sb[0x00..0x04].copy_from_slice(&8192_u32.to_le_bytes()); // inodes_count
+        sb[0x04..0x08].copy_from_slice(&(image_blocks as u32).to_le_bytes());
+        sb[0x14..0x18].copy_from_slice(&0_u32.to_le_bytes()); // first_data_block=0
+        sb[0x20..0x24].copy_from_slice(&(image_blocks as u32).to_le_bytes());
+        sb[0x28..0x2C].copy_from_slice(&8192_u32.to_le_bytes()); // inodes_per_group
+        sb[0x58..0x5A].copy_from_slice(&256_u16.to_le_bytes()); // inode_size=256
+        sb[0x54..0x58].copy_from_slice(&11_u32.to_le_bytes()); // first_ino=11
+        image[sb_off..sb_off + EXT4_SUPERBLOCK_SIZE].copy_from_slice(&sb);
+
+        // ── Group descriptor at block 1 ─────────────────────────────────
+        let gdt_off = block_size;
+        let mut gd = [0_u8; 32];
+        gd[0x08..0x0C].copy_from_slice(&2_u32.to_le_bytes()); // inode_table at block 2
+        image[gdt_off..gdt_off + 32].copy_from_slice(&gd);
+
+        // ── Inode table at block 2 ──────────────────────────────────────
+        let itable_off = 2 * block_size;
+        let inode_size = 256_usize;
+
+        // Helper: write an inode at the given inode number
+        let write_inode = |img: &mut Vec<u8>,
+                           ino: u32,
+                           mode: u16,
+                           size: u64,
+                           links: u16,
+                           extent_block: u32,
+                           extent_len: u16| {
+            let off = itable_off + (ino as usize - 1) * inode_size;
+            // mode
+            img[off..off + 2].copy_from_slice(&mode.to_le_bytes());
+            // size_lo
+            img[off + 0x04..off + 0x08].copy_from_slice(&(size as u32).to_le_bytes());
+            // size_hi
+            img[off + 0x6C..off + 0x70].copy_from_slice(&((size >> 32) as u32).to_le_bytes());
+            // links_count
+            img[off + 0x1A..off + 0x1C].copy_from_slice(&links.to_le_bytes());
+            // flags: EXTENTS
+            img[off + 0x20..off + 0x24].copy_from_slice(&0x0008_0000_u32.to_le_bytes());
+            // generation
+            img[off + 0x64..off + 0x68].copy_from_slice(&1_u32.to_le_bytes());
+
+            // Extent header at i_block (offset 0x28)
+            let eh = off + 0x28;
+            img[eh..eh + 2].copy_from_slice(&EXT4_EXTENT_MAGIC.to_le_bytes()); // magic
+            img[eh + 2..eh + 4].copy_from_slice(&1_u16.to_le_bytes()); // entries=1
+            img[eh + 4..eh + 6].copy_from_slice(&4_u16.to_le_bytes()); // max_entries
+            img[eh + 6..eh + 8].copy_from_slice(&0_u16.to_le_bytes()); // depth=0
+
+            // Single extent entry: logical=0, len, physical=extent_block
+            let ee = eh + 12;
+            img[ee..ee + 4].copy_from_slice(&0_u32.to_le_bytes()); // logical_block=0
+            img[ee + 4..ee + 6].copy_from_slice(&extent_len.to_le_bytes());
+            img[ee + 6..ee + 8].copy_from_slice(&0_u16.to_le_bytes()); // start_hi=0
+            img[ee + 8..ee + 12].copy_from_slice(&extent_block.to_le_bytes()); // start_lo
+        };
+
+        // Root directory (inode 2): mode=dir, 1 block of dir data at block 10
+        write_inode(&mut image, 2, 0o040_755, 4096, 3, 10, 1);
+
+        // hello.txt (inode 11): regular file, 18 bytes, data at block 20
+        write_inode(&mut image, 11, 0o100_644, 18, 1, 20, 1);
+
+        // subdir (inode 12): directory, 1 block of dir data at block 30
+        write_inode(&mut image, 12, 0o040_755, 4096, 2, 30, 1);
+
+        // deep.txt (inode 13): regular file, 8192 bytes, data at blocks 40-41
+        write_inode(&mut image, 13, 0o100_644, 8192, 1, 40, 2);
+
+        // ── Root directory data at block 10 ─────────────────────────────
+        let root_blk = 10 * block_size;
+        // "." → inode 2, dir
+        write_dir_entry(&mut image, root_blk, 2, 2, b".", 12);
+        // ".." → inode 2, dir
+        write_dir_entry(&mut image, root_blk + 12, 2, 2, b"..", 12);
+        // "hello.txt" → inode 11, regular
+        write_dir_entry(&mut image, root_blk + 24, 11, 1, b"hello.txt", 24);
+        // "subdir" → inode 12, dir (rec_len fills to end of block)
+        let remaining: u16 = 4096 - 12 - 12 - 24;
+        write_dir_entry(&mut image, root_blk + 48, 12, 2, b"subdir", remaining);
+
+        // ── hello.txt data at block 20 ──────────────────────────────────
+        let hello_blk = 20 * block_size;
+        image[hello_blk..hello_blk + 18].copy_from_slice(b"Hello, FrankenFS!\n");
+
+        // ── subdir directory data at block 30 ───────────────────────────
+        let sub_blk = 30 * block_size;
+        write_dir_entry(&mut image, sub_blk, 12, 2, b".", 12);
+        write_dir_entry(&mut image, sub_blk + 12, 2, 2, b"..", 12);
+        let remaining: u16 = 4096 - 12 - 12;
+        write_dir_entry(&mut image, sub_blk + 24, 13, 1, b"deep.txt", remaining);
+
+        // ── deep.txt data at blocks 40-41 ───────────────────────────────
+        let deep_blk = 40 * block_size;
+        image[deep_blk..deep_blk + 8192].fill(b'A');
+
+        image
+    }
+
+    #[test]
+    fn extent_mapping_depth_zero() {
+        let image = build_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        // Read root inode and resolve extent for logical block 0
+        let root_inode = reader
+            .read_inode(&image, ffs_types::InodeNumber(2))
+            .unwrap();
+
+        let phys = reader.resolve_extent(&image, &root_inode, 0).unwrap();
+        assert_eq!(phys, Some(10)); // root dir data at block 10
+
+        // Non-existent logical block should be None (hole)
+        let hole = reader.resolve_extent(&image, &root_inode, 999).unwrap();
+        assert_eq!(hole, None);
+    }
+
+    #[test]
+    fn extent_mapping_multi_block_file() {
+        let image = build_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        // deep.txt (inode 13) has 2 blocks starting at physical block 40
+        let deep_inode = reader
+            .read_inode(&image, ffs_types::InodeNumber(13))
+            .unwrap();
+
+        let b0 = reader.resolve_extent(&image, &deep_inode, 0).unwrap();
+        assert_eq!(b0, Some(40));
+
+        let b1 = reader.resolve_extent(&image, &deep_inode, 1).unwrap();
+        assert_eq!(b1, Some(41));
+
+        let b2 = reader.resolve_extent(&image, &deep_inode, 2).unwrap();
+        assert_eq!(b2, None); // past the extent
+    }
+
+    #[test]
+    fn collect_extents_leaf() {
+        let image = build_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        let deep_inode = reader
+            .read_inode(&image, ffs_types::InodeNumber(13))
+            .unwrap();
+
+        let extents = reader.collect_extents(&image, &deep_inode).unwrap();
+        assert_eq!(extents.len(), 1);
+        assert_eq!(extents[0].logical_block, 0);
+        assert_eq!(extents[0].actual_len(), 2);
+        assert_eq!(extents[0].physical_start, 40);
+    }
+
+    #[test]
+    fn read_inode_data_small_file() {
+        let image = build_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        let hello_inode = reader
+            .read_inode(&image, ffs_types::InodeNumber(11))
+            .unwrap();
+        assert_eq!(hello_inode.size, 18);
+
+        let mut buf = [0_u8; 64];
+        let n = reader
+            .read_inode_data(&image, &hello_inode, 0, &mut buf)
+            .unwrap();
+        assert_eq!(n, 18);
+        assert_eq!(&buf[..18], b"Hello, FrankenFS!\n");
+    }
+
+    #[test]
+    fn read_inode_data_partial_read() {
+        let image = build_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        let hello_inode = reader
+            .read_inode(&image, ffs_types::InodeNumber(11))
+            .unwrap();
+
+        // Read from offset 7, requesting 5 bytes
+        let mut buf = [0_u8; 5];
+        let n = reader
+            .read_inode_data(&image, &hello_inode, 7, &mut buf)
+            .unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..5], b"Frank");
+    }
+
+    #[test]
+    fn read_inode_data_past_eof() {
+        let image = build_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        let hello_inode = reader
+            .read_inode(&image, ffs_types::InodeNumber(11))
+            .unwrap();
+
+        // Read past EOF
+        let mut buf = [0_u8; 10];
+        let n = reader
+            .read_inode_data(&image, &hello_inode, 100, &mut buf)
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn read_inode_data_multi_block() {
+        let image = build_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        let deep_inode = reader
+            .read_inode(&image, ffs_types::InodeNumber(13))
+            .unwrap();
+        assert_eq!(deep_inode.size, 8192);
+
+        let mut buf = vec![0_u8; 8192];
+        let n = reader
+            .read_inode_data(&image, &deep_inode, 0, &mut buf)
+            .unwrap();
+        assert_eq!(n, 8192);
+        assert!(buf.iter().all(|&b| b == b'A'));
+    }
+
+    #[test]
+    fn read_inode_data_cross_block_boundary() {
+        let image = build_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        let deep_inode = reader
+            .read_inode(&image, ffs_types::InodeNumber(13))
+            .unwrap();
+
+        // Read 100 bytes straddling the block boundary (4090..4190)
+        let mut buf = [0_u8; 100];
+        let n = reader
+            .read_inode_data(&image, &deep_inode, 4090, &mut buf)
+            .unwrap();
+        assert_eq!(n, 100);
+        assert!(buf.iter().all(|&b| b == b'A'));
+    }
+
+    #[test]
+    fn read_dir_lists_entries() {
+        let image = build_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        let root_inode = reader
+            .read_inode(&image, ffs_types::InodeNumber(2))
+            .unwrap();
+
+        let entries = reader.read_dir(&image, &root_inode).unwrap();
+        assert_eq!(entries.len(), 4); // ., .., hello.txt, subdir
+
+        let has_name = |n: &[u8]| entries.iter().any(|e| e.name == n);
+        assert!(has_name(b"."));
+        assert!(has_name(b".."));
+        assert!(has_name(b"hello.txt"));
+        assert!(has_name(b"subdir"));
+    }
+
+    #[test]
+    fn read_dir_subdir() {
+        let image = build_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        let subdir_inode = reader
+            .read_inode(&image, ffs_types::InodeNumber(12))
+            .unwrap();
+
+        let entries = reader.read_dir(&image, &subdir_inode).unwrap();
+        assert_eq!(entries.len(), 3); // ., .., deep.txt
+
+        assert!(entries.iter().any(|e| e.name == b"deep.txt"));
+    }
+
+    #[test]
+    fn lookup_finds_entry() {
+        let image = build_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        let root_inode = reader
+            .read_inode(&image, ffs_types::InodeNumber(2))
+            .unwrap();
+
+        let entry = reader.lookup(&image, &root_inode, b"hello.txt").unwrap();
+        assert!(entry.is_some());
+        assert_eq!(entry.unwrap().inode, 11);
+
+        let missing = reader.lookup(&image, &root_inode, b"nonexistent").unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn resolve_path_root() {
+        let image = build_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        let (ino, inode) = reader.resolve_path(&image, "/").unwrap();
+        assert_eq!(ino, ffs_types::InodeNumber(2));
+        assert_eq!(inode.mode, 0o040_755);
+    }
+
+    #[test]
+    fn resolve_path_single_component() {
+        let image = build_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        let (ino, inode) = reader.resolve_path(&image, "/hello.txt").unwrap();
+        assert_eq!(ino, ffs_types::InodeNumber(11));
+        assert_eq!(inode.mode, 0o100_644);
+        assert_eq!(inode.size, 18);
+    }
+
+    #[test]
+    fn resolve_path_multi_component() {
+        let image = build_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        let (ino, inode) = reader.resolve_path(&image, "/subdir/deep.txt").unwrap();
+        assert_eq!(ino, ffs_types::InodeNumber(13));
+        assert_eq!(inode.mode, 0o100_644);
+        assert_eq!(inode.size, 8192);
+    }
+
+    #[test]
+    fn resolve_path_with_trailing_slash() {
+        let image = build_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        let (ino, _) = reader.resolve_path(&image, "/subdir/").unwrap();
+        assert_eq!(ino, ffs_types::InodeNumber(12));
+    }
+
+    #[test]
+    fn resolve_path_not_found() {
+        let image = build_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        let err = reader
+            .resolve_path(&image, "/nonexistent")
+            .expect_err("should fail");
+        assert!(matches!(
+            err,
+            ParseError::InvalidField {
+                field: "path",
+                reason: "component not found"
+            }
+        ));
+    }
+
+    #[test]
+    fn resolve_path_not_directory() {
+        let image = build_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        // Trying to traverse through a file
+        let err = reader
+            .resolve_path(&image, "/hello.txt/something")
+            .expect_err("should fail");
+        assert!(matches!(
+            err,
+            ParseError::InvalidField {
+                field: "path",
+                reason: "component is not a directory"
+            }
+        ));
+    }
+
+    #[test]
+    fn resolve_path_relative_rejected() {
+        let image = build_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        let err = reader
+            .resolve_path(&image, "relative/path")
+            .expect_err("should fail");
+        assert!(matches!(
+            err,
+            ParseError::InvalidField {
+                field: "path",
+                reason: "path must be absolute (start with /)"
+            }
+        ));
+    }
+
+    /// End-to-end: resolve path, then read file data.
+    #[test]
+    fn resolve_path_and_read_file_data() {
+        let image = build_test_image();
+        let reader = Ext4ImageReader::new(&image).unwrap();
+
+        let (_, inode) = reader.resolve_path(&image, "/subdir/deep.txt").unwrap();
+
+        let mut buf = vec![0_u8; 8192];
+        let n = reader.read_inode_data(&image, &inode, 0, &mut buf).unwrap();
+        assert_eq!(n, 8192);
+        assert!(buf.iter().all(|&b| b == b'A'));
     }
 }
