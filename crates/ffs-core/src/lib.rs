@@ -569,6 +569,30 @@ impl OpenFs {
 
         Ok(None)
     }
+
+    // ── High-level file read ──────────────────────────────────────────
+
+    /// Read file data by inode number via the device.
+    ///
+    /// Reads the inode, validates it is a regular file, then reads up to
+    /// `size` bytes starting at `offset` using extent mapping. Returns
+    /// `FfsError::IsDirectory` if the inode is a directory.
+    pub fn read_file(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        offset: u64,
+        size: u32,
+    ) -> Result<Vec<u8>, FfsError> {
+        let inode = self.read_inode(cx, ino)?;
+        if inode.is_dir() {
+            return Err(FfsError::IsDirectory);
+        }
+        let mut buf = vec![0_u8; size as usize];
+        let n = self.read_file_data(cx, &inode, offset, &mut buf)?;
+        buf.truncate(n);
+        Ok(buf)
+    }
 }
 
 /// Compute the number of logical blocks in a directory, as a u32.
@@ -2747,6 +2771,41 @@ mod tests {
         let inode = fs.read_inode(&cx, InodeNumber(2)).unwrap();
         let entry = fs.lookup_name(&cx, &inode, b"missing.txt").unwrap();
         assert!(entry.is_none());
+    }
+
+    // ── High-level file read tests ────────────────────────────────────
+
+    #[test]
+    fn read_file_returns_data() {
+        let image = build_ext4_image_with_extents();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let data = fs.read_file(&cx, InodeNumber(11), 0, 100).unwrap();
+        assert_eq!(&data, b"Hello, extent!");
+    }
+
+    #[test]
+    fn read_file_partial() {
+        let image = build_ext4_image_with_extents();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let data = fs.read_file(&cx, InodeNumber(11), 7, 100).unwrap();
+        assert_eq!(&data, b"extent!");
+    }
+
+    #[test]
+    fn read_file_rejects_directory() {
+        let image = build_ext4_image_with_dir();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let err = fs.read_file(&cx, InodeNumber(2), 0, 4096).unwrap_err();
+        assert_eq!(err.to_errno(), libc::EISDIR);
     }
 
     #[test]
