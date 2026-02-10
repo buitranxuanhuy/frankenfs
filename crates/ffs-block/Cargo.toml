@@ -12,5 +12,12 @@ ffs-error = { workspace = true }
 asupersync = { workspace = true }
 parking_lot = { workspace = true }
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "arc_cache"
+harness = false
+
 [lints]
 workspace = true
