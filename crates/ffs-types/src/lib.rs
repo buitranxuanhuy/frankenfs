@@ -339,21 +339,21 @@ impl fmt::Display for BtrfsObjectId {
 // ── POSIX file mode constants ────────────────────────────────────────────────
 
 /// File type mask (upper 4 bits of mode).
-pub const S_IFMT: u16 = 0o170000;
+pub const S_IFMT: u16 = 0o170_000;
 /// Named pipe (FIFO).
-pub const S_IFIFO: u16 = 0o010000;
+pub const S_IFIFO: u16 = 0o010_000;
 /// Character device.
-pub const S_IFCHR: u16 = 0o020000;
+pub const S_IFCHR: u16 = 0o020_000;
 /// Directory.
-pub const S_IFDIR: u16 = 0o040000;
+pub const S_IFDIR: u16 = 0o040_000;
 /// Block device.
-pub const S_IFBLK: u16 = 0o060000;
+pub const S_IFBLK: u16 = 0o060_000;
 /// Regular file.
-pub const S_IFREG: u16 = 0o100000;
+pub const S_IFREG: u16 = 0o100_000;
 /// Symbolic link.
-pub const S_IFLNK: u16 = 0o120000;
+pub const S_IFLNK: u16 = 0o120_000;
 /// Socket.
-pub const S_IFSOCK: u16 = 0o140000;
+pub const S_IFSOCK: u16 = 0o140_000;
 
 // ── ext4 inode flags (i_flags) ──────────────────────────────────────────────
 
