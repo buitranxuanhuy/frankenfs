@@ -630,6 +630,35 @@ impl OpenFs {
 
         Ok((current_ino, current_inode))
     }
+
+    // ── Symlink reading ───────────────────────────────────────────────
+
+    /// Read the target of a symbolic link via the device.
+    ///
+    /// Fast symlinks (target <= 60 bytes) are stored inline in the inode's
+    /// block area. Slow symlinks read their target from data blocks via
+    /// extent mapping.
+    pub fn read_symlink(&self, cx: &Cx, inode: &Ext4Inode) -> Result<Vec<u8>, FfsError> {
+        if !inode.is_symlink() {
+            return Err(FfsError::Format("not a symlink".into()));
+        }
+        // Fast symlink: target stored inline in extent_bytes
+        if let Some(target) = inode.fast_symlink_target() {
+            return Ok(target.to_vec());
+        }
+        // Slow symlink: read from data blocks
+        let len = usize::try_from(inode.size).map_err(|_| FfsError::Corruption {
+            block: 0,
+            detail: "symlink size overflow".into(),
+        })?;
+        let mut buf = vec![0_u8; len];
+        self.read_file_data(cx, inode, 0, &mut buf)?;
+        // Trim trailing NUL
+        if let Some(pos) = buf.iter().position(|&b| b == 0) {
+            buf.truncate(pos);
+        }
+        Ok(buf)
+    }
 }
 
 /// Compute the number of logical blocks in a directory, as a u32.
@@ -1069,6 +1098,66 @@ impl FsOps for Ext4FsOps {
         self.reader
             .read_symlink(&self.image, &inode)
             .map_err(|e| parse_to_ffs_error(&e))
+    }
+}
+
+// ── FsOps for OpenFs (device-based ext4 adapter) ──────────────────────────
+
+impl FsOps for OpenFs {
+    fn getattr(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<InodeAttr> {
+        self.read_inode_attr(cx, ino)
+    }
+
+    fn lookup(&self, cx: &Cx, parent: InodeNumber, name: &OsStr) -> ffs_error::Result<InodeAttr> {
+        let parent_inode = self.read_inode(cx, parent)?;
+        if !parent_inode.is_dir() {
+            return Err(FfsError::NotDirectory);
+        }
+
+        let name_bytes = name.as_encoded_bytes();
+        let entry = self
+            .lookup_name(cx, &parent_inode, name_bytes)?
+            .ok_or_else(|| FfsError::NotFound(name.to_string_lossy().into_owned()))?;
+
+        let child_ino = InodeNumber(u64::from(entry.inode));
+        self.read_inode_attr(cx, child_ino)
+    }
+
+    fn readdir(&self, cx: &Cx, ino: InodeNumber, offset: u64) -> ffs_error::Result<Vec<DirEntry>> {
+        let inode = self.read_inode(cx, ino)?;
+        if !inode.is_dir() {
+            return Err(FfsError::NotDirectory);
+        }
+
+        let raw_entries = self.read_dir(cx, &inode)?;
+        let entries: Vec<DirEntry> = raw_entries
+            .into_iter()
+            .enumerate()
+            .filter(|(idx, _)| (*idx as u64) >= offset)
+            .map(|(idx, e)| DirEntry {
+                ino: InodeNumber(u64::from(e.inode)),
+                offset: (idx as u64) + 1,
+                kind: dir_entry_file_type(e.file_type),
+                name: e.name,
+            })
+            .collect();
+
+        Ok(entries)
+    }
+
+    fn read(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        offset: u64,
+        size: u32,
+    ) -> ffs_error::Result<Vec<u8>> {
+        self.read_file(cx, ino, offset, size)
+    }
+
+    fn readlink(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<Vec<u8>> {
+        let inode = self.read_inode(cx, ino)?;
+        self.read_symlink(cx, &inode)
     }
 }
 
@@ -2903,6 +2992,94 @@ mod tests {
 
         let err = fs.resolve_path(&cx, "hello.txt").unwrap_err();
         assert!(matches!(err, FfsError::Format(_)));
+    }
+
+    // ── FsOps for OpenFs tests ────────────────────────────────────────
+
+    #[test]
+    fn open_fs_fsops_getattr() {
+        let image = build_ext4_image_with_dir();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        // Use via dyn FsOps to verify trait impl works
+        let ops: &dyn FsOps = &fs;
+        let attr = ops.getattr(&cx, InodeNumber(2)).unwrap();
+        assert_eq!(attr.kind, FileType::Directory);
+        assert_eq!(attr.perm, 0o755);
+    }
+
+    #[test]
+    fn open_fs_fsops_lookup() {
+        let image = build_ext4_image_with_dir();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let ops: &dyn FsOps = &fs;
+        let attr = ops
+            .lookup(&cx, InodeNumber(2), OsStr::new("hello.txt"))
+            .unwrap();
+        assert_eq!(attr.ino, InodeNumber(11));
+        assert_eq!(attr.kind, FileType::RegularFile);
+    }
+
+    #[test]
+    fn open_fs_fsops_lookup_not_found() {
+        let image = build_ext4_image_with_dir();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let ops: &dyn FsOps = &fs;
+        let err = ops
+            .lookup(&cx, InodeNumber(2), OsStr::new("missing"))
+            .unwrap_err();
+        assert_eq!(err.to_errno(), libc::ENOENT);
+    }
+
+    #[test]
+    fn open_fs_fsops_readdir() {
+        let image = build_ext4_image_with_dir();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let ops: &dyn FsOps = &fs;
+        let entries = ops.readdir(&cx, InodeNumber(2), 0).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].name, b".");
+        assert_eq!(entries[2].name, b"hello.txt");
+
+        // Offset-based pagination
+        let entries = ops.readdir(&cx, InodeNumber(2), 2).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, b"hello.txt");
+    }
+
+    #[test]
+    fn open_fs_fsops_read() {
+        let image = build_ext4_image_with_extents();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let ops: &dyn FsOps = &fs;
+        let data = ops.read(&cx, InodeNumber(11), 0, 100).unwrap();
+        assert_eq!(&data, b"Hello, extent!");
+    }
+
+    #[test]
+    fn open_fs_fsops_read_directory_rejected() {
+        let image = build_ext4_image_with_dir();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let ops: &dyn FsOps = &fs;
+        let err = ops.read(&cx, InodeNumber(2), 0, 4096).unwrap_err();
+        assert_eq!(err.to_errno(), libc::EISDIR);
     }
 
     #[test]
