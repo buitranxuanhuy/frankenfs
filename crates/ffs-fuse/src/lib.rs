@@ -96,7 +96,7 @@ impl Default for MountOptions {
 ///
 /// Unimplemented operations return `ENOSYS` via fuser's default method
 /// implementations. Only `getattr`, `lookup`, `readdir`, `open`, `opendir`,
-/// and `read` are overridden.
+/// `read`, and `readlink` are overridden.
 pub struct FrankenFuse {
     ops: Box<dyn FsOps>,
 }
@@ -225,6 +225,17 @@ impl Filesystem for FrankenFuse {
             Err(e) => {
                 warn!(ino, offset, error = %e, "readdir failed");
                 Self::reply_error_dir(&e, reply);
+            }
+        }
+    }
+
+    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+        let cx = Self::cx_for_request();
+        match self.ops.readlink(&cx, InodeNumber(ino)) {
+            Ok(target) => reply.data(&target),
+            Err(e) => {
+                warn!(ino, error = %e, "readlink failed");
+                Self::reply_error_data(&e, reply);
             }
         }
     }
@@ -399,6 +410,9 @@ mod tests {
             ) -> ffs_error::Result<Vec<u8>> {
                 unreachable!()
             }
+            fn readlink(&self, _cx: &Cx, _ino: InodeNumber) -> ffs_error::Result<Vec<u8>> {
+                unreachable!()
+            }
         }
         let err = mount(Box::new(NeverCalledFs), "", &MountOptions::default()).unwrap_err();
         assert!(err.to_string().contains("empty"));
@@ -434,6 +448,9 @@ mod tests {
                 _offset: u64,
                 _size: u32,
             ) -> ffs_error::Result<Vec<u8>> {
+                Ok(vec![])
+            }
+            fn readlink(&self, _cx: &Cx, _ino: InodeNumber) -> ffs_error::Result<Vec<u8>> {
                 Ok(vec![])
             }
         }
