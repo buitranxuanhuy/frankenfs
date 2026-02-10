@@ -15,12 +15,19 @@ fn fixture_path(name: &str) -> std::path::PathBuf {
 
 #[test]
 fn ext4_and_btrfs_fixtures_conform() {
-    let ext4 =
-        validate_ext4_fixture(&fixture_path("ext4_superblock_sparse.json")).expect("ext4 fixture");
+    let ext4_sparse = validate_ext4_fixture(&fixture_path("ext4_superblock_sparse.json"))
+        .expect("ext4 sparse fixture");
+    let ext4_mkfs = validate_ext4_fixture(&fixture_path("ext4_superblock_mkfs_4096.json"))
+        .expect("ext4 mkfs fixture");
     let btrfs = validate_btrfs_fixture(&fixture_path("btrfs_superblock_sparse.json"))
         .expect("btrfs fixture");
 
-    assert_eq!(ext4.block_size, 4096);
+    assert_eq!(ext4_sparse.block_size, 4096);
+    assert_eq!(ext4_mkfs.block_size, 4096);
+    assert_eq!(ext4_mkfs.log_cluster_size, 2);
+    assert_eq!(ext4_mkfs.cluster_size, 4096);
+    assert_eq!(ext4_mkfs.blocks_per_group, ext4_mkfs.clusters_per_group);
+    assert_eq!(ext4_mkfs.volume_name, "ffs-mkfs");
     assert_eq!(btrfs.sectorsize, 4096);
 }
 
