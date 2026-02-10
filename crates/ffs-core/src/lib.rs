@@ -7,7 +7,8 @@ use ffs_block::{
 use ffs_error::FfsError;
 use ffs_mvcc::{CommitError, MvccStore, Transaction};
 use ffs_ondisk::{
-    BtrfsSuperblock, Ext4FileType, Ext4GroupDesc, Ext4ImageReader, Ext4Inode, Ext4Superblock,
+    BtrfsSuperblock, Ext4Extent, Ext4FileType, Ext4GroupDesc, Ext4ImageReader, Ext4Inode,
+    Ext4Superblock, ExtentTree, parse_extent_tree, parse_inode_extent_tree,
 };
 use ffs_types::{
     BlockNumber, ByteOffset, CommitSeq, GroupNumber, InodeNumber, ParseError, Snapshot,
@@ -314,6 +315,210 @@ impl OpenFs {
             .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
         let inode = self.read_inode(cx, ino)?;
         Ok(inode_to_attr(sb, ino, &inode))
+    }
+
+    // ── Extent mapping via device ─────────────────────────────────────
+
+    /// Maximum extent tree depth (ext4 kernel limit).
+    const MAX_EXTENT_DEPTH: u16 = 5;
+
+    /// Read a full filesystem block from the device.
+    #[allow(clippy::cast_possible_truncation)] // block_size is u32, always fits usize
+    fn read_block_vec(&self, cx: &Cx, block: BlockNumber) -> Result<Vec<u8>, FfsError> {
+        let bs = u64::from(self.block_size());
+        let offset = block
+            .0
+            .checked_mul(bs)
+            .ok_or_else(|| FfsError::Corruption {
+                block: block.0,
+                detail: "block offset overflow".into(),
+            })?;
+        let mut buf = vec![0_u8; self.block_size() as usize];
+        self.dev.read_exact_at(cx, ByteOffset(offset), &mut buf)?;
+        Ok(buf)
+    }
+
+    /// Resolve a logical file block to a physical block number via the inode's
+    /// extent tree, reading index blocks from the device as needed.
+    ///
+    /// Returns `Ok(None)` if the logical block falls in a hole (no mapping).
+    pub fn resolve_extent(
+        &self,
+        cx: &Cx,
+        inode: &Ext4Inode,
+        logical_block: u32,
+    ) -> Result<Option<u64>, FfsError> {
+        let (header, tree) = parse_inode_extent_tree(inode).map_err(|e| parse_to_ffs_error(&e))?;
+        self.walk_extent_tree(cx, &tree, logical_block, header.depth)
+    }
+
+    fn walk_extent_tree(
+        &self,
+        cx: &Cx,
+        tree: &ExtentTree,
+        logical_block: u32,
+        remaining_depth: u16,
+    ) -> Result<Option<u64>, FfsError> {
+        if remaining_depth > Self::MAX_EXTENT_DEPTH {
+            return Err(FfsError::Corruption {
+                block: 0,
+                detail: "extent tree depth exceeds maximum".into(),
+            });
+        }
+
+        match tree {
+            ExtentTree::Leaf(extents) => {
+                for ext in extents {
+                    let start = ext.logical_block;
+                    let len = u32::from(ext.actual_len());
+                    if logical_block >= start && logical_block < start.saturating_add(len) {
+                        let offset_within = u64::from(logical_block - start);
+                        return Ok(Some(ext.physical_start + offset_within));
+                    }
+                }
+                Ok(None)
+            }
+            ExtentTree::Index(indexes) => {
+                if remaining_depth == 0 {
+                    return Err(FfsError::Corruption {
+                        block: 0,
+                        detail: "extent index at depth 0".into(),
+                    });
+                }
+                let mut chosen: Option<usize> = None;
+                for (i, idx) in indexes.iter().enumerate() {
+                    if idx.logical_block <= logical_block {
+                        chosen = Some(i);
+                    } else {
+                        break;
+                    }
+                }
+                let Some(i) = chosen else {
+                    return Ok(None);
+                };
+                let idx = &indexes[i];
+
+                let child_data = self.read_block_vec(cx, BlockNumber(idx.leaf_block))?;
+                let (child_header, child_tree) =
+                    parse_extent_tree(&child_data).map_err(|e| parse_to_ffs_error(&e))?;
+
+                if child_header.depth + 1 != remaining_depth {
+                    return Err(FfsError::Corruption {
+                        block: idx.leaf_block,
+                        detail: "child extent tree depth inconsistency".into(),
+                    });
+                }
+
+                self.walk_extent_tree(cx, &child_tree, logical_block, remaining_depth - 1)
+            }
+        }
+    }
+
+    /// Collect all leaf extents for an inode, flattening multi-level trees.
+    ///
+    /// Returns extents in tree-traversal order (sorted by logical block).
+    pub fn collect_extents(&self, cx: &Cx, inode: &Ext4Inode) -> Result<Vec<Ext4Extent>, FfsError> {
+        let (header, tree) = parse_inode_extent_tree(inode).map_err(|e| parse_to_ffs_error(&e))?;
+        let mut result = Vec::new();
+        self.collect_extents_recursive(cx, &tree, header.depth, &mut result)?;
+        Ok(result)
+    }
+
+    fn collect_extents_recursive(
+        &self,
+        cx: &Cx,
+        tree: &ExtentTree,
+        remaining_depth: u16,
+        result: &mut Vec<Ext4Extent>,
+    ) -> Result<(), FfsError> {
+        if remaining_depth > Self::MAX_EXTENT_DEPTH {
+            return Err(FfsError::Corruption {
+                block: 0,
+                detail: "extent tree depth exceeds maximum".into(),
+            });
+        }
+
+        match tree {
+            ExtentTree::Leaf(extents) => {
+                result.extend_from_slice(extents);
+                Ok(())
+            }
+            ExtentTree::Index(indexes) => {
+                if remaining_depth == 0 {
+                    return Err(FfsError::Corruption {
+                        block: 0,
+                        detail: "extent index at depth 0".into(),
+                    });
+                }
+                for idx in indexes {
+                    let child_data = self.read_block_vec(cx, BlockNumber(idx.leaf_block))?;
+                    let (child_header, child_tree) =
+                        parse_extent_tree(&child_data).map_err(|e| parse_to_ffs_error(&e))?;
+                    if child_header.depth + 1 != remaining_depth {
+                        return Err(FfsError::Corruption {
+                            block: idx.leaf_block,
+                            detail: "child extent tree depth inconsistency".into(),
+                        });
+                    }
+                    self.collect_extents_recursive(cx, &child_tree, remaining_depth - 1, result)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Read file data using extent mapping via the device.
+    ///
+    /// Resolves each logical block through the extent tree and reads the
+    /// corresponding physical blocks from the device. Holes are filled
+    /// with zeroes. Returns the number of bytes actually read.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn read_file_data(
+        &self,
+        cx: &Cx,
+        inode: &Ext4Inode,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, FfsError> {
+        let file_size = inode.size;
+        if offset >= file_size {
+            return Ok(0);
+        }
+
+        let available = file_size - offset;
+        let to_read = usize::try_from(available.min(buf.len() as u64)).unwrap_or(buf.len());
+
+        let bs = u64::from(self.block_size());
+        let bs_usize = self.block_size() as usize;
+        let mut bytes_read = 0_usize;
+
+        while bytes_read < to_read {
+            let current_offset = offset + bytes_read as u64;
+            let logical_block =
+                u32::try_from(current_offset / bs).map_err(|_| FfsError::Corruption {
+                    block: 0,
+                    detail: "logical block number overflow".into(),
+                })?;
+            let offset_in_block = (current_offset % bs) as usize;
+            let remaining_in_block = bs_usize - offset_in_block;
+            let chunk_size = remaining_in_block.min(to_read - bytes_read);
+
+            match self.resolve_extent(cx, inode, logical_block)? {
+                Some(phys_block) => {
+                    let block_data = self.read_block_vec(cx, BlockNumber(phys_block))?;
+                    buf[bytes_read..bytes_read + chunk_size].copy_from_slice(
+                        &block_data[offset_in_block..offset_in_block + chunk_size],
+                    );
+                }
+                None => {
+                    buf[bytes_read..bytes_read + chunk_size].fill(0);
+                }
+            }
+
+            bytes_read += chunk_size;
+        }
+
+        Ok(bytes_read)
     }
 }
 
@@ -2122,6 +2327,227 @@ mod tests {
         assert_eq!(gd.block_bitmap, 2);
         assert_eq!(gd.inode_bitmap, 3);
         assert_eq!(gd.inode_table, 4);
+    }
+
+    // ── Device-based extent mapping tests ─────────────────────────────
+
+    /// Build an ext4 image with file inodes that have extent trees.
+    ///
+    /// Layout (4K block size, 256K image = 64 blocks):
+    /// - Block 0: superblock at offset 1024
+    /// - Block 1: group descriptor table
+    /// - Block 4+: inode table
+    /// - Block 10: data for inode #11 (leaf extent)
+    /// - Block 11: extent leaf block for inode #12 (index extent)
+    /// - Block 12: data for inode #12
+    #[allow(clippy::cast_possible_truncation)]
+    fn build_ext4_image_with_extents() -> Vec<u8> {
+        let block_size: u32 = 4096;
+        let image_size: u32 = 256 * 1024;
+        let mut image = vec![0_u8; image_size as usize];
+        let sb_off = EXT4_SUPERBLOCK_OFFSET;
+
+        // ── Superblock ──
+        image[sb_off + 0x38..sb_off + 0x3A].copy_from_slice(&EXT4_SUPER_MAGIC.to_le_bytes());
+        image[sb_off + 0x18..sb_off + 0x1C].copy_from_slice(&2_u32.to_le_bytes()); // log=2 → 4K
+        let blocks_count = image_size / block_size;
+        image[sb_off + 0x04..sb_off + 0x08].copy_from_slice(&blocks_count.to_le_bytes());
+        image[sb_off..sb_off + 0x04].copy_from_slice(&128_u32.to_le_bytes()); // inodes_count
+        image[sb_off + 0x14..sb_off + 0x18].copy_from_slice(&0_u32.to_le_bytes()); // first_data_block=0
+        image[sb_off + 0x20..sb_off + 0x24].copy_from_slice(&blocks_count.to_le_bytes());
+        image[sb_off + 0x28..sb_off + 0x2C].copy_from_slice(&128_u32.to_le_bytes());
+        image[sb_off + 0x58..sb_off + 0x5A].copy_from_slice(&256_u16.to_le_bytes()); // inode_size
+        image[sb_off + 0x4C..sb_off + 0x50].copy_from_slice(&1_u32.to_le_bytes()); // rev_level=DYNAMIC
+        let incompat: u32 = 0x0002 | 0x0040; // FILETYPE | EXTENTS
+        image[sb_off + 0x60..sb_off + 0x64].copy_from_slice(&incompat.to_le_bytes());
+        image[sb_off + 0x54..sb_off + 0x58].copy_from_slice(&11_u32.to_le_bytes()); // first_ino
+
+        // ── Group descriptor at block 1 ──
+        let gd_off: usize = 4096;
+        image[gd_off..gd_off + 4].copy_from_slice(&2_u32.to_le_bytes()); // block_bitmap
+        image[gd_off + 4..gd_off + 8].copy_from_slice(&3_u32.to_le_bytes()); // inode_bitmap
+        image[gd_off + 8..gd_off + 12].copy_from_slice(&4_u32.to_le_bytes()); // inode_table
+
+        // ── Inode #11 (index 10): regular file with leaf extent ──
+        let ino11_off: usize = 4 * 4096 + 10 * 256;
+        image[ino11_off..ino11_off + 2].copy_from_slice(&0o100_644_u16.to_le_bytes()); // S_IFREG|0644
+        image[ino11_off + 4..ino11_off + 8].copy_from_slice(&14_u32.to_le_bytes()); // size=14
+        image[ino11_off + 0x1A..ino11_off + 0x1C].copy_from_slice(&1_u16.to_le_bytes()); // links
+        image[ino11_off + 0x20..ino11_off + 0x24].copy_from_slice(&0x0008_0000_u32.to_le_bytes()); // EXT4_EXTENTS_FL
+        image[ino11_off + 0x80..ino11_off + 0x82].copy_from_slice(&32_u16.to_le_bytes()); // extra
+
+        // Extent tree (depth=0, 1 leaf extent: logical 0 → physical 10)
+        let e = ino11_off + 0x28;
+        image[e..e + 2].copy_from_slice(&0xF30A_u16.to_le_bytes()); // magic
+        image[e + 2..e + 4].copy_from_slice(&1_u16.to_le_bytes()); // entries
+        image[e + 4..e + 6].copy_from_slice(&4_u16.to_le_bytes()); // max
+        image[e + 6..e + 8].copy_from_slice(&0_u16.to_le_bytes()); // depth=0
+        image[e + 12..e + 16].copy_from_slice(&0_u32.to_le_bytes()); // logical_block=0
+        image[e + 16..e + 18].copy_from_slice(&1_u16.to_le_bytes()); // raw_len=1
+        image[e + 18..e + 20].copy_from_slice(&0_u16.to_le_bytes()); // start_hi=0
+        image[e + 20..e + 24].copy_from_slice(&10_u32.to_le_bytes()); // start_lo=10
+
+        // Data at block 10
+        let d = 10 * 4096;
+        image[d..d + 14].copy_from_slice(b"Hello, extent!");
+
+        // ── Inode #12 (index 11): regular file with index extent (depth=1) ──
+        let ino12_off: usize = 4 * 4096 + 11 * 256;
+        image[ino12_off..ino12_off + 2].copy_from_slice(&0o100_644_u16.to_le_bytes());
+        image[ino12_off + 4..ino12_off + 8].copy_from_slice(&14_u32.to_le_bytes()); // size=14
+        image[ino12_off + 0x1A..ino12_off + 0x1C].copy_from_slice(&1_u16.to_le_bytes());
+        image[ino12_off + 0x20..ino12_off + 0x24].copy_from_slice(&0x0008_0000_u32.to_le_bytes()); // EXT4_EXTENTS_FL
+        image[ino12_off + 0x80..ino12_off + 0x82].copy_from_slice(&32_u16.to_le_bytes());
+
+        // Extent tree (depth=1, 1 index entry pointing to block 11)
+        let e = ino12_off + 0x28;
+        image[e..e + 2].copy_from_slice(&0xF30A_u16.to_le_bytes()); // magic
+        image[e + 2..e + 4].copy_from_slice(&1_u16.to_le_bytes()); // entries
+        image[e + 4..e + 6].copy_from_slice(&4_u16.to_le_bytes()); // max
+        image[e + 6..e + 8].copy_from_slice(&1_u16.to_le_bytes()); // depth=1
+        image[e + 12..e + 16].copy_from_slice(&0_u32.to_le_bytes()); // logical_block=0
+        image[e + 16..e + 20].copy_from_slice(&11_u32.to_le_bytes()); // leaf_lo=11
+        image[e + 20..e + 22].copy_from_slice(&0_u16.to_le_bytes()); // leaf_hi=0
+
+        // Block 11: leaf extent block (depth=0, 1 extent: logical 0 → physical 12)
+        let l = 11 * 4096;
+        image[l..l + 2].copy_from_slice(&0xF30A_u16.to_le_bytes()); // magic
+        image[l + 2..l + 4].copy_from_slice(&1_u16.to_le_bytes()); // entries
+        image[l + 4..l + 6].copy_from_slice(&340_u16.to_le_bytes()); // max (4K block)
+        image[l + 6..l + 8].copy_from_slice(&0_u16.to_le_bytes()); // depth=0
+        image[l + 12..l + 16].copy_from_slice(&0_u32.to_le_bytes()); // logical_block=0
+        image[l + 16..l + 18].copy_from_slice(&1_u16.to_le_bytes()); // raw_len=1
+        image[l + 18..l + 20].copy_from_slice(&0_u16.to_le_bytes()); // start_hi=0
+        image[l + 20..l + 24].copy_from_slice(&12_u32.to_le_bytes()); // start_lo=12
+
+        // Data at block 12
+        let d = 12 * 4096;
+        image[d..d + 14].copy_from_slice(b"Index extent!\n");
+
+        image
+    }
+
+    #[test]
+    fn resolve_extent_leaf_only() {
+        let image = build_ext4_image_with_extents();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let inode = fs.read_inode(&cx, InodeNumber(11)).unwrap();
+        let phys = fs.resolve_extent(&cx, &inode, 0).unwrap();
+        assert_eq!(phys, Some(10));
+    }
+
+    #[test]
+    fn resolve_extent_hole() {
+        let image = build_ext4_image_with_extents();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let inode = fs.read_inode(&cx, InodeNumber(11)).unwrap();
+        // Logical block 1 is not mapped — should be a hole.
+        let phys = fs.resolve_extent(&cx, &inode, 1).unwrap();
+        assert_eq!(phys, None);
+    }
+
+    #[test]
+    fn resolve_extent_index() {
+        let image = build_ext4_image_with_extents();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let inode = fs.read_inode(&cx, InodeNumber(12)).unwrap();
+        let phys = fs.resolve_extent(&cx, &inode, 0).unwrap();
+        assert_eq!(phys, Some(12));
+    }
+
+    #[test]
+    fn collect_extents_leaf() {
+        let image = build_ext4_image_with_extents();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let inode = fs.read_inode(&cx, InodeNumber(11)).unwrap();
+        let extents = fs.collect_extents(&cx, &inode).unwrap();
+        assert_eq!(extents.len(), 1);
+        assert_eq!(extents[0].logical_block, 0);
+        assert_eq!(extents[0].physical_start, 10);
+        assert_eq!(extents[0].actual_len(), 1);
+        assert!(!extents[0].is_unwritten());
+    }
+
+    #[test]
+    fn collect_extents_index() {
+        let image = build_ext4_image_with_extents();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let inode = fs.read_inode(&cx, InodeNumber(12)).unwrap();
+        let extents = fs.collect_extents(&cx, &inode).unwrap();
+        assert_eq!(extents.len(), 1);
+        assert_eq!(extents[0].logical_block, 0);
+        assert_eq!(extents[0].physical_start, 12);
+        assert_eq!(extents[0].actual_len(), 1);
+    }
+
+    #[test]
+    fn read_file_data_leaf() {
+        let image = build_ext4_image_with_extents();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let inode = fs.read_inode(&cx, InodeNumber(11)).unwrap();
+        let mut buf = vec![0_u8; 14];
+        let n = fs.read_file_data(&cx, &inode, 0, &mut buf).unwrap();
+        assert_eq!(n, 14);
+        assert_eq!(&buf[..n], b"Hello, extent!");
+    }
+
+    #[test]
+    fn read_file_data_index() {
+        let image = build_ext4_image_with_extents();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let inode = fs.read_inode(&cx, InodeNumber(12)).unwrap();
+        let mut buf = vec![0_u8; 14];
+        let n = fs.read_file_data(&cx, &inode, 0, &mut buf).unwrap();
+        assert_eq!(n, 14);
+        assert_eq!(&buf[..n], b"Index extent!\n");
+    }
+
+    #[test]
+    fn read_file_data_partial() {
+        let image = build_ext4_image_with_extents();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let inode = fs.read_inode(&cx, InodeNumber(11)).unwrap();
+        let mut buf = vec![0_u8; 100];
+        let n = fs.read_file_data(&cx, &inode, 7, &mut buf).unwrap();
+        assert_eq!(n, 7); // 14 - 7 = 7 bytes remaining
+        assert_eq!(&buf[..n], b"extent!");
+    }
+
+    #[test]
+    fn read_file_data_past_eof() {
+        let image = build_ext4_image_with_extents();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let inode = fs.read_inode(&cx, InodeNumber(11)).unwrap();
+        let mut buf = vec![0_u8; 10];
+        let n = fs.read_file_data(&cx, &inode, 100, &mut buf).unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]
