@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result, bail};
-use ffs_ondisk::{BtrfsSuperblock, Ext4Superblock};
+use ffs_ondisk::{
+    BtrfsSuperblock, Ext4DirEntry, Ext4GroupDesc, Ext4Inode, Ext4Superblock, parse_dir_block,
+};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -26,10 +28,10 @@ impl ParityReport {
     #[must_use]
     pub fn current() -> Self {
         let domains = vec![
-            CoverageDomain::new("ext4 metadata parsing", 6, 19),
+            CoverageDomain::new("ext4 metadata parsing", 9, 19),
             CoverageDomain::new("btrfs metadata parsing", 4, 20),
             CoverageDomain::new("MVCC/COW core", 4, 14),
-            CoverageDomain::new("FUSE surface", 1, 12),
+            CoverageDomain::new("FUSE surface", 6, 12),
             CoverageDomain::new("self-healing durability policy", 2, 10),
         ];
 
@@ -121,6 +123,25 @@ pub fn validate_btrfs_fixture(path: &Path) -> Result<BtrfsSuperblock> {
         .with_context(|| format!("failed btrfs parse for fixture {}", path.display()))
 }
 
+pub fn validate_group_desc_fixture(path: &Path, desc_size: u16) -> Result<Ext4GroupDesc> {
+    let data = load_sparse_fixture(path)?;
+    Ext4GroupDesc::parse_from_bytes(&data, desc_size)
+        .with_context(|| format!("failed group desc parse for fixture {}", path.display()))
+}
+
+pub fn validate_inode_fixture(path: &Path) -> Result<Ext4Inode> {
+    let data = load_sparse_fixture(path)?;
+    Ext4Inode::parse_from_bytes(&data)
+        .with_context(|| format!("failed inode parse for fixture {}", path.display()))
+}
+
+pub fn validate_dir_block_fixture(path: &Path, block_size: u32) -> Result<Vec<Ext4DirEntry>> {
+    let data = load_sparse_fixture(path)?;
+    let (entries, _tail) = parse_dir_block(&data, block_size)
+        .with_context(|| format!("failed dir block parse for fixture {}", path.display()))?;
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,6 +170,73 @@ mod tests {
         let sb = validate_btrfs_fixture(&path).expect("btrfs fixture parse");
         assert_eq!(sb.magic, ffs_types::BTRFS_MAGIC);
         assert_eq!(sb.label, "ffs-lab");
+    }
+
+    #[test]
+    fn ext4_group_desc_32byte_fixture_parses() {
+        let path = fixture_path("ext4_group_desc_32byte.json");
+        let gd = validate_group_desc_fixture(&path, 32).expect("group desc 32 parse");
+        assert_eq!(gd.block_bitmap, 5);
+        assert_eq!(gd.inode_bitmap, 6);
+        assert_eq!(gd.inode_table, 7);
+        assert_eq!(gd.free_blocks_count, 200);
+        assert_eq!(gd.free_inodes_count, 1000);
+        assert_eq!(gd.used_dirs_count, 3);
+        assert_eq!(gd.itable_unused, 500);
+        assert_eq!(gd.flags, 4);
+        assert_eq!(gd.checksum, 0xCDAB);
+    }
+
+    #[test]
+    fn ext4_group_desc_64byte_fixture_parses() {
+        let path = fixture_path("ext4_group_desc_64byte.json");
+        let gd = validate_group_desc_fixture(&path, 64).expect("group desc 64 parse");
+        // Low 32 bits = 5, high 32 bits = 1 → 0x1_0000_0005
+        assert_eq!(gd.block_bitmap, 0x1_0000_0005);
+        assert_eq!(gd.inode_bitmap, 0x2_0000_0006);
+        assert_eq!(gd.inode_table, 0x3_0000_0007);
+        // Low 16 bits = 200 (0xC8), high 16 bits = 10 (0x0A) → 0x000A_00C8
+        assert_eq!(gd.free_blocks_count, 0x000A_00C8);
+        assert_eq!(gd.free_inodes_count, 0x0014_03E8);
+        assert_eq!(gd.used_dirs_count, 0x0005_0003);
+        assert_eq!(gd.itable_unused, 0x0064_01F4);
+    }
+
+    #[test]
+    fn ext4_inode_regular_file_fixture_parses() {
+        let path = fixture_path("ext4_inode_regular_file.json");
+        let inode = validate_inode_fixture(&path).expect("regular file inode parse");
+        assert_eq!(inode.mode, 0o10_0644);
+        assert_eq!(inode.uid, 1000);
+        assert_eq!(inode.size, 1024);
+        assert_eq!(inode.links_count, 1);
+        assert_eq!(inode.blocks, 8);
+        assert_eq!(inode.flags, 0x0008_0000); // EXTENTS_FL
+        assert_eq!(inode.generation, 42);
+        assert_eq!(inode.extent_bytes.len(), 60);
+    }
+
+    #[test]
+    fn ext4_inode_directory_fixture_parses() {
+        let path = fixture_path("ext4_inode_directory.json");
+        let inode = validate_inode_fixture(&path).expect("directory inode parse");
+        assert_eq!(inode.mode, 0o4_0755);
+        assert_eq!(inode.size, 4096);
+        assert_eq!(inode.links_count, 2);
+        assert_eq!(inode.flags, 0x0008_0000); // EXTENTS_FL
+    }
+
+    #[test]
+    fn ext4_dir_block_fixture_parses() {
+        let path = fixture_path("ext4_dir_block.json");
+        let entries = validate_dir_block_fixture(&path, 4096).expect("dir block parse");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].name_str(), ".");
+        assert_eq!(entries[0].inode, 2);
+        assert_eq!(entries[1].name_str(), "..");
+        assert_eq!(entries[1].inode, 2);
+        assert_eq!(entries[2].name_str(), "hello.txt");
+        assert_eq!(entries[2].inode, 11);
     }
 
     #[test]
