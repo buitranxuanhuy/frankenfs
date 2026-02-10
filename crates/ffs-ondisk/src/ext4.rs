@@ -31,6 +31,20 @@ impl Ext4CompatFeatures {
     pub const STABLE_INODES: Self = Self(0x0800);
     pub const ORPHAN_FILE: Self = Self(0x1000);
 
+    /// All known compat flags for iteration.
+    const KNOWN: &[(u32, &'static str)] = &[
+        (0x0001, "DIR_PREALLOC"),
+        (0x0002, "IMAGIC_INODES"),
+        (0x0004, "HAS_JOURNAL"),
+        (0x0008, "EXT_ATTR"),
+        (0x0010, "RESIZE_INODE"),
+        (0x0020, "DIR_INDEX"),
+        (0x0200, "SPARSE_SUPER2"),
+        (0x0400, "FAST_COMMIT"),
+        (0x0800, "STABLE_INODES"),
+        (0x1000, "ORPHAN_FILE"),
+    ];
+
     #[must_use]
     pub fn bits(self) -> u32 {
         self.0
@@ -39,6 +53,25 @@ impl Ext4CompatFeatures {
     #[must_use]
     pub fn contains(self, flag: Self) -> bool {
         (self.0 & flag.0) != 0
+    }
+
+    /// Return names of all set flags. Unknown bits are included as hex.
+    #[must_use]
+    pub fn describe(self) -> Vec<&'static str> {
+        describe_flags(self.0, Self::KNOWN)
+    }
+
+    /// Return the raw unknown bits (not covered by any named constant).
+    #[must_use]
+    pub fn unknown_bits(self) -> u32 {
+        let known_mask: u32 = Self::KNOWN.iter().map(|(bit, _)| bit).fold(0, |a, b| a | b);
+        self.0 & !known_mask
+    }
+}
+
+impl std::fmt::Display for Ext4CompatFeatures {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        format_flags(f, self.0, Self::KNOWN)
     }
 }
 
@@ -93,6 +126,26 @@ impl Ext4IncompatFeatures {
             | Self::CASEFOLD.0,
     );
 
+    /// All known incompat flags for iteration.
+    const KNOWN: &[(u32, &'static str)] = &[
+        (0x0001, "COMPRESSION"),
+        (0x0002, "FILETYPE"),
+        (0x0004, "RECOVER"),
+        (0x0008, "JOURNAL_DEV"),
+        (0x0010, "META_BG"),
+        (0x0040, "EXTENTS"),
+        (0x0080, "64BIT"),
+        (0x0100, "MMP"),
+        (0x0200, "FLEX_BG"),
+        (0x0400, "EA_INODE"),
+        (0x1000, "DIRDATA"),
+        (0x2000, "CSUM_SEED"),
+        (0x4000, "LARGEDIR"),
+        (0x8000, "INLINE_DATA"),
+        (0x1_0000, "ENCRYPT"),
+        (0x2_0000, "CASEFOLD"),
+    ];
+
     #[must_use]
     pub fn bits(self) -> u32 {
         self.0
@@ -101,6 +154,38 @@ impl Ext4IncompatFeatures {
     #[must_use]
     pub fn contains(self, flag: Self) -> bool {
         (self.0 & flag.0) != 0
+    }
+
+    /// Return names of all set flags. Unknown bits are included as hex.
+    #[must_use]
+    pub fn describe(self) -> Vec<&'static str> {
+        describe_flags(self.0, Self::KNOWN)
+    }
+
+    /// Return the raw unknown bits (not covered by any named constant).
+    #[must_use]
+    pub fn unknown_bits(self) -> u32 {
+        let known_mask: u32 = Self::KNOWN.iter().map(|(bit, _)| bit).fold(0, |a, b| a | b);
+        self.0 & !known_mask
+    }
+
+    /// Describe which REJECTED_V1 flags are present in this value.
+    #[must_use]
+    pub fn describe_rejected_v1(self) -> Vec<&'static str> {
+        describe_flags(self.0 & Self::REJECTED_V1.0, Self::KNOWN)
+    }
+
+    /// Describe which REQUIRED_V1 flags are missing from this value.
+    #[must_use]
+    pub fn describe_missing_required_v1(self) -> Vec<&'static str> {
+        let missing = Self::REQUIRED_V1.0 & !self.0;
+        describe_flags(missing, Self::KNOWN)
+    }
+}
+
+impl std::fmt::Display for Ext4IncompatFeatures {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        format_flags(f, self.0, Self::KNOWN)
     }
 }
 
@@ -126,6 +211,24 @@ impl Ext4RoCompatFeatures {
     pub const VERITY: Self = Self(0x8000);
     pub const ORPHAN_PRESENT: Self = Self(0x10000);
 
+    /// All known ro_compat flags for iteration.
+    const KNOWN: &[(u32, &'static str)] = &[
+        (0x0001, "SPARSE_SUPER"),
+        (0x0002, "LARGE_FILE"),
+        (0x0004, "BTREE_DIR"),
+        (0x0008, "HUGE_FILE"),
+        (0x0010, "GDT_CSUM"),
+        (0x0020, "DIR_NLINK"),
+        (0x0040, "EXTRA_ISIZE"),
+        (0x0100, "QUOTA"),
+        (0x0200, "BIGALLOC"),
+        (0x0400, "METADATA_CSUM"),
+        (0x1000, "READONLY"),
+        (0x2000, "PROJECT"),
+        (0x8000, "VERITY"),
+        (0x1_0000, "ORPHAN_PRESENT"),
+    ];
+
     #[must_use]
     pub fn bits(self) -> u32 {
         self.0
@@ -135,6 +238,138 @@ impl Ext4RoCompatFeatures {
     pub fn contains(self, flag: Self) -> bool {
         (self.0 & flag.0) != 0
     }
+
+    /// Return names of all set flags. Unknown bits are included as hex.
+    #[must_use]
+    pub fn describe(self) -> Vec<&'static str> {
+        describe_flags(self.0, Self::KNOWN)
+    }
+
+    /// Return the raw unknown bits (not covered by any named constant).
+    #[must_use]
+    pub fn unknown_bits(self) -> u32 {
+        let known_mask: u32 = Self::KNOWN.iter().map(|(bit, _)| bit).fold(0, |a, b| a | b);
+        self.0 & !known_mask
+    }
+}
+
+impl std::fmt::Display for Ext4RoCompatFeatures {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        format_flags(f, self.0, Self::KNOWN)
+    }
+}
+
+// ── Feature diagnostics ─────────────────────────────────────────────────────
+
+/// Structured report of feature flag compatibility for v1 mount validation.
+///
+/// Produced by [`Ext4Superblock::feature_diagnostics_v1()`]. Callers use this
+/// to enrich error messages or produce UX output.
+#[derive(Debug, Clone)]
+pub struct FeatureDiagnostics {
+    /// Required incompat features that are missing (e.g., `["FILETYPE"]`).
+    pub missing_required: Vec<&'static str>,
+    /// Rejected incompat features that are present (e.g., `["ENCRYPT"]`).
+    pub rejected_present: Vec<&'static str>,
+    /// Raw bitmask of unknown incompat bits (not in any named constant).
+    pub unknown_incompat_bits: u32,
+    /// Raw bitmask of unknown ro_compat bits.
+    pub unknown_ro_compat_bits: u32,
+    /// Human-readable display of all incompat flags.
+    pub incompat_display: String,
+    /// Human-readable display of all ro_compat flags.
+    pub ro_compat_display: String,
+    /// Human-readable display of all compat flags.
+    pub compat_display: String,
+}
+
+impl FeatureDiagnostics {
+    /// True when all checks pass and the image can be mounted.
+    #[must_use]
+    pub fn is_ok(&self) -> bool {
+        self.missing_required.is_empty()
+            && self.rejected_present.is_empty()
+            && self.unknown_incompat_bits == 0
+    }
+}
+
+impl std::fmt::Display for FeatureDiagnostics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "compat={}, incompat={}, ro_compat={}",
+            self.compat_display, self.incompat_display, self.ro_compat_display
+        )?;
+        if !self.missing_required.is_empty() {
+            write!(
+                f,
+                "; missing required: {}",
+                self.missing_required.join(", ")
+            )?;
+        }
+        if !self.rejected_present.is_empty() {
+            write!(f, "; rejected: {}", self.rejected_present.join(", "))?;
+        }
+        if self.unknown_incompat_bits != 0 {
+            write!(f, "; unknown incompat: 0x{:X}", self.unknown_incompat_bits)?;
+        }
+        if self.unknown_ro_compat_bits != 0 {
+            write!(
+                f,
+                "; unknown ro_compat: 0x{:X}",
+                self.unknown_ro_compat_bits
+            )?;
+        }
+        Ok(())
+    }
+}
+
+// ── Shared flag helpers ─────────────────────────────────────────────────────
+
+/// Collect names of all set bits from a `(bit, name)` table.
+///
+/// Bits not present in `known` are silently omitted (callers that care
+/// about unknown bits should use `unknown_bits()` separately).
+fn describe_flags(bits: u32, known: &[(u32, &'static str)]) -> Vec<&'static str> {
+    known
+        .iter()
+        .filter(|(bit, _)| bits & bit != 0)
+        .map(|(_, name)| *name)
+        .collect()
+}
+
+/// Format a bitmask as a pipe-separated list of flag names.
+///
+/// Example output: `FILETYPE|EXTENTS|FLEX_BG` or `(none)` when zero.
+/// Unknown bits are appended as hex, e.g. `FILETYPE|0x80000000`.
+fn format_flags(
+    f: &mut std::fmt::Formatter<'_>,
+    bits: u32,
+    known: &[(u32, &'static str)],
+) -> std::fmt::Result {
+    if bits == 0 {
+        return f.write_str("(none)");
+    }
+    let mut first = true;
+    let mut remaining = bits;
+    for &(bit, name) in known {
+        if remaining & bit != 0 {
+            if !first {
+                f.write_str("|")?;
+            }
+            f.write_str(name)?;
+            remaining &= !bit;
+            first = false;
+        }
+    }
+    // Append any unknown bits as hex.
+    if remaining != 0 {
+        if !first {
+            f.write_str("|")?;
+        }
+        write!(f, "0x{remaining:X}")?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -482,6 +717,12 @@ impl Ext4Superblock {
         Ok(())
     }
 
+    /// Run v1 mount-time validation.
+    ///
+    /// Checks geometry, block size, and feature flags. Returns `ParseError`
+    /// with a static `field` + `reason` pair. Callers needing the specific
+    /// flag names for UX should also call [`feature_diagnostics_v1()`] on
+    /// failure to enrich the error message.
     pub fn validate_v1(&self) -> Result<(), ParseError> {
         self.validate_geometry()?;
 
@@ -492,30 +733,53 @@ impl Ext4Superblock {
             });
         }
 
+        // Check incompat features: required → rejected → unknown.
         if (self.feature_incompat.0 & Ext4IncompatFeatures::REQUIRED_V1.0)
             != Ext4IncompatFeatures::REQUIRED_V1.0
         {
             return Err(ParseError::InvalidField {
-                field: "s_feature_incompat",
-                reason: "missing required FILETYPE/EXTENTS features",
+                field: "feature_incompat",
+                reason: "missing required features (need FILETYPE+EXTENTS)",
             });
         }
 
         if (self.feature_incompat.0 & Ext4IncompatFeatures::REJECTED_V1.0) != 0 {
             return Err(ParseError::InvalidField {
-                field: "s_feature_incompat",
-                reason: "contains explicitly unsupported incompatible feature flags",
+                field: "feature_incompat",
+                reason: "unsupported features present (COMPRESSION/JOURNAL_DEV/INLINE_DATA/ENCRYPT/CASEFOLD rejected)",
             });
         }
 
         if (self.feature_incompat.0 & !Ext4IncompatFeatures::ALLOWED_V1.0) != 0 {
             return Err(ParseError::InvalidField {
-                field: "s_feature_incompat",
+                field: "feature_incompat",
                 reason: "unknown incompatible feature flags present",
             });
         }
 
         Ok(())
+    }
+
+    /// Produce structured diagnostics about feature flag compatibility.
+    ///
+    /// This does NOT fail on its own — it returns a summary that callers
+    /// can use for logging, error enrichment, or UX display.
+    #[must_use]
+    pub fn feature_diagnostics_v1(&self) -> FeatureDiagnostics {
+        let missing_required = self.feature_incompat.describe_missing_required_v1();
+        let rejected_present = self.feature_incompat.describe_rejected_v1();
+        let unknown_incompat = self.feature_incompat.unknown_bits();
+        let unknown_ro_compat = self.feature_ro_compat.unknown_bits();
+
+        FeatureDiagnostics {
+            missing_required,
+            rejected_present,
+            unknown_incompat_bits: unknown_incompat,
+            unknown_ro_compat_bits: unknown_ro_compat,
+            incompat_display: format!("{}", self.feature_incompat),
+            ro_compat_display: format!("{}", self.feature_ro_compat),
+            compat_display: format!("{}", self.feature_compat),
+        }
     }
 
     /// Compute the byte offset of a group descriptor within the GDT.
@@ -4637,5 +4901,142 @@ mod tests {
         // Signed: 0xC3 sign-extended + 0x80 terminator at byte 1
         // Unsigned: 0xC3 zero-extended + 0x80 terminator at byte 1
         assert_ne!(buf_signed[0], buf_unsigned[0]);
+    }
+
+    // ── Feature flag decode + validation tests ──────────────────────────
+
+    #[test]
+    fn incompat_describe_lists_set_flags() {
+        let flags = Ext4IncompatFeatures(
+            Ext4IncompatFeatures::FILETYPE.0
+                | Ext4IncompatFeatures::EXTENTS.0
+                | Ext4IncompatFeatures::FLEX_BG.0,
+        );
+        let names = flags.describe();
+        assert_eq!(names, vec!["FILETYPE", "EXTENTS", "FLEX_BG"]);
+    }
+
+    #[test]
+    fn incompat_describe_empty_for_zero() {
+        let flags = Ext4IncompatFeatures(0);
+        assert!(flags.describe().is_empty());
+    }
+
+    #[test]
+    fn incompat_unknown_bits_detects_unnamed() {
+        let flags = Ext4IncompatFeatures(Ext4IncompatFeatures::FILETYPE.0 | (1 << 30));
+        assert_eq!(flags.unknown_bits(), 1 << 30);
+    }
+
+    #[test]
+    fn incompat_describe_missing_required() {
+        // Only EXTENTS set, FILETYPE missing.
+        let flags = Ext4IncompatFeatures(Ext4IncompatFeatures::EXTENTS.0);
+        let missing = flags.describe_missing_required_v1();
+        assert_eq!(missing, vec!["FILETYPE"]);
+    }
+
+    #[test]
+    fn incompat_describe_rejected_v1() {
+        let flags = Ext4IncompatFeatures(
+            Ext4IncompatFeatures::FILETYPE.0
+                | Ext4IncompatFeatures::EXTENTS.0
+                | Ext4IncompatFeatures::ENCRYPT.0,
+        );
+        let rejected = flags.describe_rejected_v1();
+        assert_eq!(rejected, vec!["ENCRYPT"]);
+    }
+
+    #[test]
+    fn compat_display_format() {
+        let flags =
+            Ext4CompatFeatures(Ext4CompatFeatures::HAS_JOURNAL.0 | Ext4CompatFeatures::DIR_INDEX.0);
+        assert_eq!(format!("{flags}"), "HAS_JOURNAL|DIR_INDEX");
+    }
+
+    #[test]
+    fn incompat_display_with_unknown_bits() {
+        let flags = Ext4IncompatFeatures(Ext4IncompatFeatures::FILETYPE.0 | (1 << 28));
+        assert_eq!(format!("{flags}"), "FILETYPE|0x10000000");
+    }
+
+    #[test]
+    fn ro_compat_describe_all_known() {
+        let flags = Ext4RoCompatFeatures(
+            Ext4RoCompatFeatures::SPARSE_SUPER.0
+                | Ext4RoCompatFeatures::HUGE_FILE.0
+                | Ext4RoCompatFeatures::METADATA_CSUM.0,
+        );
+        let names = flags.describe();
+        assert_eq!(names, vec!["SPARSE_SUPER", "HUGE_FILE", "METADATA_CSUM"]);
+    }
+
+    #[test]
+    fn display_none_for_zero_flags() {
+        let flags = Ext4IncompatFeatures(0);
+        assert_eq!(format!("{flags}"), "(none)");
+    }
+
+    #[test]
+    fn feature_diagnostics_ok_for_valid_image() {
+        let mut sb = make_valid_sb();
+        let incompat =
+            (Ext4IncompatFeatures::FILETYPE.0 | Ext4IncompatFeatures::EXTENTS.0).to_le_bytes();
+        sb[0x60..0x64].copy_from_slice(&incompat);
+
+        let parsed = Ext4Superblock::parse_superblock_region(&sb).unwrap();
+        let diag = parsed.feature_diagnostics_v1();
+        assert!(diag.is_ok());
+        assert!(diag.missing_required.is_empty());
+        assert!(diag.rejected_present.is_empty());
+        assert_eq!(diag.unknown_incompat_bits, 0);
+    }
+
+    #[test]
+    fn feature_diagnostics_detects_missing_and_rejected() {
+        let mut sb = make_valid_sb();
+        // Only EXTENTS (missing FILETYPE) + ENCRYPT (rejected).
+        let incompat =
+            (Ext4IncompatFeatures::EXTENTS.0 | Ext4IncompatFeatures::ENCRYPT.0).to_le_bytes();
+        sb[0x60..0x64].copy_from_slice(&incompat);
+
+        let parsed = Ext4Superblock::parse_superblock_region(&sb).unwrap();
+        let diag = parsed.feature_diagnostics_v1();
+        assert!(!diag.is_ok());
+        assert_eq!(diag.missing_required, vec!["FILETYPE"]);
+        assert_eq!(diag.rejected_present, vec!["ENCRYPT"]);
+    }
+
+    #[test]
+    fn feature_diagnostics_display_is_informative() {
+        let mut sb = make_valid_sb();
+        let incompat =
+            (Ext4IncompatFeatures::FILETYPE.0 | Ext4IncompatFeatures::EXTENTS.0).to_le_bytes();
+        sb[0x60..0x64].copy_from_slice(&incompat);
+
+        let parsed = Ext4Superblock::parse_superblock_region(&sb).unwrap();
+        let diag = parsed.feature_diagnostics_v1();
+        let display = format!("{diag}");
+        assert!(display.contains("FILETYPE"));
+        assert!(display.contains("EXTENTS"));
+    }
+
+    #[test]
+    fn validate_v1_rejects_encrypt_with_actionable_reason() {
+        let mut sb = make_valid_sb();
+        let incompat = (Ext4IncompatFeatures::FILETYPE.0
+            | Ext4IncompatFeatures::EXTENTS.0
+            | Ext4IncompatFeatures::ENCRYPT.0)
+            .to_le_bytes();
+        sb[0x60..0x64].copy_from_slice(&incompat);
+
+        let parsed = Ext4Superblock::parse_superblock_region(&sb).unwrap();
+        let err = parsed.validate_v1().unwrap_err();
+        // Verify the error reason names the rejected features.
+        let reason = format!("{err}");
+        assert!(
+            reason.contains("ENCRYPT") || reason.contains("unsupported"),
+            "expected actionable error, got: {reason}",
+        );
     }
 }

@@ -14,7 +14,7 @@ pub use ext4::{
     DirBlockIter, Ext4CompatFeatures, Ext4DirEntry, Ext4DirEntryRef, Ext4DirEntryTail, Ext4DxEntry,
     Ext4DxRoot, Ext4Extent, Ext4ExtentHeader, Ext4ExtentIndex, Ext4FileType, Ext4GroupDesc,
     Ext4ImageReader, Ext4IncompatFeatures, Ext4Inode, Ext4RoCompatFeatures, Ext4Superblock,
-    Ext4Xattr, ExtentTree, dx_hash, iter_dir_block, lookup_in_dir_block, parse_dir_block,
-    parse_dx_root, parse_extent_tree, parse_inode_extent_tree, verify_group_desc_checksum,
-    verify_inode_checksum,
+    Ext4Xattr, ExtentTree, FeatureDiagnostics, dx_hash, iter_dir_block, lookup_in_dir_block,
+    parse_dir_block, parse_dx_root, parse_extent_tree, parse_inode_extent_tree,
+    verify_group_desc_checksum, verify_inode_checksum,
 };
