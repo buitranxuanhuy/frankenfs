@@ -1,0 +1,3 @@
+#![forbid(unsafe_code)]
+
+pub use ffs_ondisk::ext4::*;

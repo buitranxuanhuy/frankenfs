@@ -1,0 +1,16 @@
+[package]
+name = "ffs-inode"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ffs-types = { workspace = true }
+ffs-error = { workspace = true }
+ffs-block = { workspace = true }
+ffs-ondisk = { workspace = true }
+
+[lints]
+workspace = true

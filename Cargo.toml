@@ -1,0 +1,107 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ffs-types",
+    "crates/ffs-error",
+    "crates/ffs-ondisk",
+    "crates/ffs-block",
+    "crates/ffs-journal",
+    "crates/ffs-mvcc",
+    "crates/ffs-btree",
+    "crates/ffs-alloc",
+    "crates/ffs-inode",
+    "crates/ffs-dir",
+    "crates/ffs-extent",
+    "crates/ffs-xattr",
+    "crates/ffs-fuse",
+    "crates/ffs-repair",
+    "crates/ffs-core",
+    "crates/ffs",
+    "crates/ffs-cli",
+    "crates/ffs-tui",
+    "crates/ffs-harness",
+    # Legacy crates (retained for extraction reference)
+    "crates/ffs-ext4",
+    "crates/ffs-btrfs",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Dicklesworthstone/frankenfs"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+module_name_repetitions = { level = "allow", priority = 1 }
+missing_errors_doc = { level = "allow", priority = 1 }
+missing_panics_doc = { level = "allow", priority = 1 }
+missing_const_for_fn = { level = "allow", priority = 1 }
+cast_precision_loss = { level = "allow", priority = 1 }
+doc_markdown = { level = "allow", priority = 1 }
+
+[workspace.dependencies]
+# External dependencies
+anyhow = "1.0.97"
+bitflags = "2.9.0"
+blake3 = "1.6.0"
+clap = { version = "4.5.0", features = ["derive"] }
+crc32c = "0.6.8"
+criterion = { version = "0.5.1", features = ["html_reports"] }
+hex = "0.4.3"
+insta = "1.42.1"
+libc = "0.2.181"
+memchr = "2.7.4"
+parking_lot = "0.12.3"
+proptest = "1.6.0"
+serde = { version = "1.0.218", features = ["derive"] }
+serde_json = { version = "1.0.140", features = ["preserve_order"] }
+sha2 = "0.10.8"
+smallvec = "1.14.0"
+tempfile = "3.17.1"
+thiserror = "2.0.11"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+
+# Sibling project dependencies
+asupersync = { path = "/dp/asupersync" }
+ftui = { path = "/dp/frankentui/crates/ftui" }
+
+# Workspace crate cross-references
+ffs = { path = "crates/ffs" }
+ffs-alloc = { path = "crates/ffs-alloc" }
+ffs-block = { path = "crates/ffs-block" }
+ffs-btree = { path = "crates/ffs-btree" }
+ffs-btrfs = { path = "crates/ffs-btrfs" }
+ffs-cli = { path = "crates/ffs-cli" }
+ffs-core = { path = "crates/ffs-core" }
+ffs-dir = { path = "crates/ffs-dir" }
+ffs-error = { path = "crates/ffs-error" }
+ffs-ext4 = { path = "crates/ffs-ext4" }
+ffs-extent = { path = "crates/ffs-extent" }
+ffs-fuse = { path = "crates/ffs-fuse" }
+ffs-harness = { path = "crates/ffs-harness" }
+ffs-inode = { path = "crates/ffs-inode" }
+ffs-journal = { path = "crates/ffs-journal" }
+ffs-mvcc = { path = "crates/ffs-mvcc" }
+ffs-ondisk = { path = "crates/ffs-ondisk" }
+ffs-repair = { path = "crates/ffs-repair" }
+ffs-tui = { path = "crates/ffs-tui" }
+ffs-types = { path = "crates/ffs-types" }
+ffs-xattr = { path = "crates/ffs-xattr" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.release-perf]
+inherits = "release"
+opt-level = 3
