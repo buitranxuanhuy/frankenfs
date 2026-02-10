@@ -184,7 +184,7 @@ impl OpenFs {
         let ext4_geometry = match &flavor {
             FsFlavor::Ext4(sb) => {
                 if !options.skip_validation {
-                    sb.validate_v1().map_err(parse_error_to_ffs)?;
+                    sb.validate_v1().map_err(|e| parse_error_to_ffs(&e))?;
                 }
                 Some(Ext4Geometry {
                     groups_count: sb.groups_count(),
@@ -679,6 +679,7 @@ mod tests {
             self.data.lock().unwrap().len() as u64
         }
 
+        #[allow(clippy::cast_possible_truncation)]
         fn read_exact_at(
             &self,
             _cx: &Cx,
@@ -695,9 +696,11 @@ mod tests {
                 )));
             }
             buf.copy_from_slice(&data[off..end]);
+            drop(data);
             Ok(())
         }
 
+        #[allow(clippy::cast_possible_truncation)]
         fn write_all_at(&self, _cx: &Cx, offset: ByteOffset, buf: &[u8]) -> ffs_error::Result<()> {
             let off = offset.0 as usize;
             let mut data = self.data.lock().unwrap();
@@ -709,6 +712,7 @@ mod tests {
                 )));
             }
             data[off..end].copy_from_slice(buf);
+            drop(data);
             Ok(())
         }
 
@@ -974,10 +978,11 @@ mod tests {
     // ── OpenFs tests ─────────────────────────────────────────────────────
 
     /// Build a minimal synthetic ext4 image for OpenFs testing.
+    #[allow(clippy::cast_possible_truncation)]
     fn build_ext4_image(block_size_log: u32) -> Vec<u8> {
         let block_size = 1024_u32 << block_size_log;
-        let image_size = 128 * 1024; // 128K
-        let mut image = vec![0_u8; image_size];
+        let image_size: u32 = 128 * 1024; // 128K
+        let mut image = vec![0_u8; image_size as usize];
         let sb_off = EXT4_SUPERBLOCK_OFFSET;
 
         // magic
@@ -985,12 +990,12 @@ mod tests {
         // log_block_size
         image[sb_off + 0x18..sb_off + 0x1C].copy_from_slice(&block_size_log.to_le_bytes());
         // blocks_count_lo
-        let blocks_count = (image_size as u32) / block_size;
+        let blocks_count = image_size / block_size;
         image[sb_off + 0x04..sb_off + 0x08].copy_from_slice(&blocks_count.to_le_bytes());
         // inodes_count
-        image[sb_off + 0x00..sb_off + 0x04].copy_from_slice(&128_u32.to_le_bytes());
+        image[sb_off..sb_off + 0x04].copy_from_slice(&128_u32.to_le_bytes());
         // first_data_block
-        let first_data = if block_size == 1024 { 1_u32 } else { 0_u32 };
+        let first_data = u32::from(block_size == 1024);
         image[sb_off + 0x14..sb_off + 0x18].copy_from_slice(&first_data.to_le_bytes());
         // blocks_per_group
         image[sb_off + 0x20..sb_off + 0x24].copy_from_slice(&blocks_count.to_le_bytes());
@@ -1086,35 +1091,35 @@ mod tests {
     #[test]
     fn parse_error_to_ffs_mapping() {
         // Feature error
-        let e = parse_error_to_ffs(ParseError::InvalidField {
+        let e = parse_error_to_ffs(&ParseError::InvalidField {
             field: "feature_incompat",
             reason: "unsupported flags",
         });
         assert!(matches!(e, FfsError::UnsupportedFeature(_)));
 
         // Geometry error
-        let e = parse_error_to_ffs(ParseError::InvalidField {
+        let e = parse_error_to_ffs(&ParseError::InvalidField {
             field: "block_size",
             reason: "out of range",
         });
         assert!(matches!(e, FfsError::InvalidGeometry(_)));
 
         // Generic format error
-        let e = parse_error_to_ffs(ParseError::InvalidField {
+        let e = parse_error_to_ffs(&ParseError::InvalidField {
             field: "magic",
             reason: "wrong value",
         });
         assert!(matches!(e, FfsError::Format(_)));
 
         // Magic error
-        let e = parse_error_to_ffs(ParseError::InvalidMagic {
+        let e = parse_error_to_ffs(&ParseError::InvalidMagic {
             expected: 0xEF53,
             actual: 0x0000,
         });
         assert!(matches!(e, FfsError::Format(_)));
 
         // Truncation error
-        let e = parse_error_to_ffs(ParseError::InsufficientData {
+        let e = parse_error_to_ffs(&ParseError::InsufficientData {
             needed: 100,
             offset: 0,
             actual: 50,
