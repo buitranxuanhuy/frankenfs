@@ -684,18 +684,43 @@ impl Ext4Superblock {
 
     /// Validate basic geometry: blocks_per_group, inodes_per_group, counts.
     pub fn validate_geometry(&self) -> Result<(), ParseError> {
+        self.validate_geometry_fields()?;
+        self.validate_geometry_layout()
+    }
+
+    /// Validate individual superblock field values (sizes, bounds, consistency).
+    fn validate_geometry_fields(&self) -> Result<(), ParseError> {
+        // ── blocks_per_group ────────────────────────────────────────────
         if self.blocks_per_group == 0 {
             return Err(ParseError::InvalidField {
                 field: "s_blocks_per_group",
                 reason: "cannot be zero",
             });
         }
+        let max_blocks_per_group = self.block_size.saturating_mul(8);
+        if max_blocks_per_group > 0 && self.blocks_per_group > max_blocks_per_group {
+            return Err(ParseError::InvalidField {
+                field: "s_blocks_per_group",
+                reason: "exceeds block_size * 8 (block bitmap capacity)",
+            });
+        }
+
+        // ── inodes_per_group ────────────────────────────────────────────
         if self.inodes_per_group == 0 {
             return Err(ParseError::InvalidField {
                 field: "s_inodes_per_group",
                 reason: "cannot be zero",
             });
         }
+        let max_inodes_per_group = self.block_size.saturating_mul(8);
+        if max_inodes_per_group > 0 && self.inodes_per_group > max_inodes_per_group {
+            return Err(ParseError::InvalidField {
+                field: "s_inodes_per_group",
+                reason: "exceeds block_size * 8 (inode bitmap capacity)",
+            });
+        }
+
+        // ── inode_size ──────────────────────────────────────────────────
         if self.inode_size < 128 {
             return Err(ParseError::InvalidField {
                 field: "s_inode_size",
@@ -708,12 +733,92 @@ impl Ext4Superblock {
                 reason: "must be a power of two",
             });
         }
+        if u32::from(self.inode_size) > self.block_size {
+            return Err(ParseError::InvalidField {
+                field: "s_inode_size",
+                reason: "inode_size exceeds block_size",
+            });
+        }
+
+        // ── desc_size ───────────────────────────────────────────────────
+        if self.desc_size != 0 {
+            if self.desc_size < 32 {
+                return Err(ParseError::InvalidField {
+                    field: "s_desc_size",
+                    reason: "must be >= 32 when non-zero",
+                });
+            }
+            if u32::from(self.desc_size) > self.block_size {
+                return Err(ParseError::InvalidField {
+                    field: "s_desc_size",
+                    reason: "desc_size exceeds block_size",
+                });
+            }
+        }
+        // Check the raw field — group_desc_size() clamps to 64 for 64BIT,
+        // but the on-disk value should actually be >= 64.
+        if self.is_64bit() && self.desc_size < 64 {
+            return Err(ParseError::InvalidField {
+                field: "s_desc_size",
+                reason: "64BIT feature set but desc_size < 64",
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Validate cross-field layout: first_data_block, group count, GDT bounds,
+    /// and inodes_count vs group geometry.
+    fn validate_geometry_layout(&self) -> Result<(), ParseError> {
+        // ── first_data_block ────────────────────────────────────────────
         if u64::from(self.first_data_block) >= self.blocks_count {
             return Err(ParseError::InvalidField {
                 field: "s_first_data_block",
                 reason: "first_data_block >= blocks_count",
             });
         }
+        if self.block_size == 1024 && self.first_data_block != 1 {
+            return Err(ParseError::InvalidField {
+                field: "s_first_data_block",
+                reason: "must be 1 for 1K block size",
+            });
+        }
+        if self.block_size > 1024 && self.first_data_block != 0 {
+            return Err(ParseError::InvalidField {
+                field: "s_first_data_block",
+                reason: "must be 0 for block sizes > 1K",
+            });
+        }
+
+        // ── group count & GDT bounds ────────────────────────────────────
+        let group_count = self.groups_count();
+        if group_count == 0 {
+            return Err(ParseError::InvalidField {
+                field: "s_blocks_count",
+                reason: "zero block groups (blocks_count too small)",
+            });
+        }
+        let gdt_bytes = u64::from(group_count).saturating_mul(u64::from(self.group_desc_size()));
+        let device_bytes = self.blocks_count.saturating_mul(u64::from(self.block_size));
+        let gdt_start = self
+            .group_desc_offset(ffs_types::GroupNumber(0))
+            .unwrap_or(u64::MAX);
+        if gdt_start.saturating_add(gdt_bytes) > device_bytes {
+            return Err(ParseError::InvalidField {
+                field: "s_blocks_count",
+                reason: "group descriptor table extends beyond device",
+            });
+        }
+
+        // ── inodes_count vs group geometry ──────────────────────────────
+        let max_inodes = u64::from(group_count).saturating_mul(u64::from(self.inodes_per_group));
+        if u64::from(self.inodes_count) > max_inodes {
+            return Err(ParseError::InvalidField {
+                field: "s_inodes_count",
+                reason: "inodes_count exceeds groups * inodes_per_group",
+            });
+        }
+
         Ok(())
     }
 
@@ -1033,6 +1138,94 @@ pub fn verify_inode_checksum(
         return Err(ParseError::InvalidField {
             field: "i_checksum",
             reason: "inode CRC32C mismatch",
+        });
+    }
+    Ok(())
+}
+
+/// Verify the CRC32C checksum of a directory block's tail entry.
+///
+/// The ext4 directory block checksum covers the entire block minus the last
+/// 4 bytes (the checksum itself). The kernel computes:
+///
+/// ```text
+/// seed = ext4_chksum(csum_seed, &le_ino, 4)
+/// seed = ext4_chksum(seed, &le_gen, 4)
+/// csum = ext4_chksum(seed, dir_block[..block_size - 4])
+/// ```
+///
+/// Returns `Ok(())` if the checksum matches, `Err` on mismatch.
+pub fn verify_dir_block_checksum(
+    dir_block: &[u8],
+    csum_seed: u32,
+    ino: u32,
+    generation: u32,
+) -> Result<(), ParseError> {
+    let bs = dir_block.len();
+    if bs < 12 {
+        return Err(ParseError::InsufficientData {
+            needed: 12,
+            offset: 0,
+            actual: bs,
+        });
+    }
+
+    // The checksum tail is the last 12 bytes: inode=0, rec_len=12, name_len=0, file_type=0xDE, checksum
+    let tail_off = bs - 4;
+    let stored = read_le_u32(dir_block, tail_off)?;
+
+    // Per-inode seed
+    let seed = crc32c::crc32c_append(csum_seed, &ino.to_le_bytes());
+    let seed = crc32c::crc32c_append(seed, &generation.to_le_bytes());
+
+    // Checksum covers block[..block_size-4] (everything except the 4-byte checksum field)
+    let computed = crc32c::crc32c_append(seed, &dir_block[..tail_off]);
+
+    if computed != stored {
+        return Err(ParseError::InvalidField {
+            field: "dir_checksum",
+            reason: "directory block CRC32C mismatch",
+        });
+    }
+    Ok(())
+}
+
+/// Verify the CRC32C checksum of an extent tree block.
+///
+/// Extent tree blocks (non-root, stored in separate blocks) have a 4-byte
+/// checksum tail at `block[block_size - 4]`. The kernel computes:
+///
+/// ```text
+/// seed = ext4_chksum(csum_seed, &le_ino, 4)
+/// seed = ext4_chksum(seed, &le_gen, 4)
+/// csum = ext4_chksum(seed, extent_block[..block_size - 4])
+/// ```
+pub fn verify_extent_block_checksum(
+    extent_block: &[u8],
+    csum_seed: u32,
+    ino: u32,
+    generation: u32,
+) -> Result<(), ParseError> {
+    let bs = extent_block.len();
+    if bs < 16 {
+        return Err(ParseError::InsufficientData {
+            needed: 16,
+            offset: 0,
+            actual: bs,
+        });
+    }
+
+    let tail_off = bs - 4;
+    let stored = read_le_u32(extent_block, tail_off)?;
+
+    let seed = crc32c::crc32c_append(csum_seed, &ino.to_le_bytes());
+    let seed = crc32c::crc32c_append(seed, &generation.to_le_bytes());
+    let computed = crc32c::crc32c_append(seed, &extent_block[..tail_off]);
+
+    if computed != stored {
+        return Err(ParseError::InvalidField {
+            field: "extent_checksum",
+            reason: "extent block CRC32C mismatch",
         });
     }
     Ok(())
@@ -3248,6 +3441,250 @@ mod tests {
         bad[0x14..0x18].copy_from_slice(&99999_u32.to_le_bytes());
         let p = Ext4Superblock::parse_superblock_region(&bad).unwrap();
         assert!(p.validate_geometry().is_err());
+    }
+
+    #[test]
+    fn geometry_blocks_per_group_exceeds_bitmap() {
+        let mut sb = make_valid_sb();
+        // blocks_per_group = 4096*8+1 = 32769, exceeds bitmap capacity for 4K blocks
+        sb[0x20..0x24].copy_from_slice(&32769_u32.to_le_bytes());
+        sb[0x24..0x28].copy_from_slice(&32769_u32.to_le_bytes()); // clusters too
+        let p = Ext4Superblock::parse_superblock_region(&sb).unwrap();
+        let err = p.validate_geometry().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "s_blocks_per_group",
+                    ..
+                }
+            ),
+            "expected blocks_per_group bitmap error, got: {err}",
+        );
+    }
+
+    #[test]
+    fn geometry_inodes_per_group_exceeds_bitmap() {
+        let mut sb = make_valid_sb();
+        // inodes_per_group = 4096*8+1 = 32769
+        sb[0x28..0x2C].copy_from_slice(&32769_u32.to_le_bytes());
+        let p = Ext4Superblock::parse_superblock_region(&sb).unwrap();
+        let err = p.validate_geometry().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "s_inodes_per_group",
+                    ..
+                }
+            ),
+            "expected inodes_per_group bitmap error, got: {err}",
+        );
+    }
+
+    #[test]
+    fn geometry_inode_size_exceeds_block_size() {
+        let mut sb = make_valid_sb();
+        // inode_size = 8192 (power of two, but > 4K block_size)
+        sb[0x58..0x5A].copy_from_slice(&8192_u16.to_le_bytes());
+        let p = Ext4Superblock::parse_superblock_region(&sb).unwrap();
+        let err = p.validate_geometry().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "s_inode_size",
+                    reason: "inode_size exceeds block_size"
+                }
+            ),
+            "expected inode > block error, got: {err}",
+        );
+    }
+
+    #[test]
+    fn geometry_desc_size_too_small() {
+        let mut sb = make_valid_sb();
+        // desc_size = 16 (non-zero but < 32)
+        sb[0xFE..0x100].copy_from_slice(&16_u16.to_le_bytes());
+        let p = Ext4Superblock::parse_superblock_region(&sb).unwrap();
+        let err = p.validate_geometry().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "s_desc_size",
+                    ..
+                }
+            ),
+            "expected desc_size error, got: {err}",
+        );
+    }
+
+    #[test]
+    fn geometry_desc_size_exceeds_block_size() {
+        let mut sb = make_valid_sb();
+        // desc_size = 8192 (> 4K block size)
+        sb[0xFE..0x100].copy_from_slice(&8192_u16.to_le_bytes());
+        let p = Ext4Superblock::parse_superblock_region(&sb).unwrap();
+        let err = p.validate_geometry().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "s_desc_size",
+                    ..
+                }
+            ),
+            "expected desc_size > block error, got: {err}",
+        );
+    }
+
+    #[test]
+    fn geometry_64bit_needs_desc_size_64() {
+        let mut sb = make_valid_sb();
+        // Set 64BIT feature but leave desc_size = 0 (effective 32).
+        let incompat = (Ext4IncompatFeatures::FILETYPE.0
+            | Ext4IncompatFeatures::EXTENTS.0
+            | Ext4IncompatFeatures::BIT64.0)
+            .to_le_bytes();
+        sb[0x60..0x64].copy_from_slice(&incompat);
+        let p = Ext4Superblock::parse_superblock_region(&sb).unwrap();
+        let err = p.validate_geometry().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "s_desc_size",
+                    reason: "64BIT feature set but desc_size < 64"
+                }
+            ),
+            "expected 64bit/desc_size mismatch, got: {err}",
+        );
+    }
+
+    #[test]
+    fn geometry_64bit_with_desc_size_64_ok() {
+        let mut sb = make_valid_sb();
+        let incompat = (Ext4IncompatFeatures::FILETYPE.0
+            | Ext4IncompatFeatures::EXTENTS.0
+            | Ext4IncompatFeatures::BIT64.0)
+            .to_le_bytes();
+        sb[0x60..0x64].copy_from_slice(&incompat);
+        sb[0xFE..0x100].copy_from_slice(&64_u16.to_le_bytes());
+        let p = Ext4Superblock::parse_superblock_region(&sb).unwrap();
+        assert!(p.validate_geometry().is_ok());
+    }
+
+    #[test]
+    fn geometry_first_data_block_1k() {
+        // 1K block size requires first_data_block = 1.
+        let mut sb = make_valid_sb();
+        sb[0x18..0x1C].copy_from_slice(&0_u32.to_le_bytes()); // log_block_size=0 -> 1K
+        sb[0x1C..0x20].copy_from_slice(&0_u32.to_le_bytes()); // log_cluster_size=0
+        sb[0x14..0x18].copy_from_slice(&0_u32.to_le_bytes()); // first_data_block = 0 (wrong)
+        // Adjust blocks_per_group and inodes_per_group for 1K blocks.
+        // 1K * 8 = 8192 max blocks per group.
+        sb[0x20..0x24].copy_from_slice(&8192_u32.to_le_bytes());
+        sb[0x24..0x28].copy_from_slice(&8192_u32.to_le_bytes());
+        sb[0x28..0x2C].copy_from_slice(&2048_u32.to_le_bytes()); // inodes_per_group
+        sb[0x00..0x04].copy_from_slice(&2048_u32.to_le_bytes()); // inodes_count
+        let p = Ext4Superblock::parse_superblock_region(&sb).unwrap();
+        let err = p.validate_geometry().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "s_first_data_block",
+                    reason: "must be 1 for 1K block size"
+                }
+            ),
+            "expected 1K first_data_block error, got: {err}",
+        );
+
+        // Fix: first_data_block = 1 → should pass.
+        sb[0x14..0x18].copy_from_slice(&1_u32.to_le_bytes());
+        let p = Ext4Superblock::parse_superblock_region(&sb).unwrap();
+        assert!(p.validate_geometry().is_ok());
+    }
+
+    #[test]
+    fn geometry_first_data_block_4k_must_be_zero() {
+        let mut sb = make_valid_sb();
+        // 4K blocks, set first_data_block = 1 (wrong for >= 2K)
+        sb[0x14..0x18].copy_from_slice(&1_u32.to_le_bytes());
+        let p = Ext4Superblock::parse_superblock_region(&sb).unwrap();
+        let err = p.validate_geometry().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "s_first_data_block",
+                    reason: "must be 0 for block sizes > 1K"
+                }
+            ),
+            "expected 4K first_data_block error, got: {err}",
+        );
+    }
+
+    #[test]
+    fn geometry_gdt_exceeds_device() {
+        let mut sb = make_valid_sb();
+        // Tiny device: 4 blocks × 4K = 16K. With blocks_per_group=4,
+        // groups = 4/4 = 1 group → GDT needs 32 bytes at offset 4096.
+        // But give it blocks_per_group=1, so groups = 4 → GDT = 4×32 = 128 bytes.
+        // GDT at block 1 (byte 4096) + 128 = 4224, device = 4*4096 = 16384 → OK.
+        // Instead: make blocks_count very small (2 blocks).
+        // groups = 2 / blocks_per_group... Let's keep it simpler:
+        // blocks_count = 2, blocks_per_group = 1, so groups = 2.
+        // GDT = 2 * 32 = 64 bytes starting at block 1 = byte 4096.
+        // Device = 2 * 4096 = 8192. GDT at 4096 + 64 = 4160 < 8192 → still fits.
+        // Make it tighter: blocks_count = 1. But first_data_block=0 < 1 → passes.
+        // groups = 1 / 1 = 1. GDT = 32 at byte 4096. Device = 4096. 4096+32 > 4096 → FAIL!
+        sb[0x04..0x08].copy_from_slice(&1_u32.to_le_bytes()); // blocks_count_lo = 1
+        sb[0x20..0x24].copy_from_slice(&1_u32.to_le_bytes()); // blocks_per_group = 1
+        sb[0x24..0x28].copy_from_slice(&1_u32.to_le_bytes()); // clusters_per_group
+        sb[0x28..0x2C].copy_from_slice(&1_u32.to_le_bytes()); // inodes_per_group
+        sb[0x00..0x04].copy_from_slice(&1_u32.to_le_bytes()); // inodes_count
+        let p = Ext4Superblock::parse_superblock_region(&sb).unwrap();
+        let err = p.validate_geometry().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "s_blocks_count",
+                    reason: "group descriptor table extends beyond device"
+                }
+            ),
+            "expected GDT overflow, got: {err}",
+        );
+    }
+
+    #[test]
+    fn geometry_inodes_count_exceeds_groups() {
+        let mut sb = make_valid_sb();
+        // 1 group (blocks_per_group=32768 >= blocks_count=32768), inodes_per_group=8192.
+        // Set inodes_count > 1 * 8192 = 8193.
+        sb[0x00..0x04].copy_from_slice(&8193_u32.to_le_bytes());
+        let p = Ext4Superblock::parse_superblock_region(&sb).unwrap();
+        let err = p.validate_geometry().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "s_inodes_count",
+                    ..
+                }
+            ),
+            "expected inodes > groups*ipg, got: {err}",
+        );
+    }
+
+    #[test]
+    fn geometry_valid_sb_passes() {
+        // The default make_valid_sb should pass geometry checks.
+        let sb = make_valid_sb();
+        let p = Ext4Superblock::parse_superblock_region(&sb).unwrap();
+        assert!(p.validate_geometry().is_ok());
     }
 
     #[test]
