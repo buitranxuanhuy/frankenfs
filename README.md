@@ -114,7 +114,7 @@ Parser crates are pure (no I/O). MVCC knows nothing about files. FUSE knows noth
 
 ## Architecture
 
-FrankenFS is a 19-crate Cargo workspace with a strict DAG dependency graph:
+FrankenFS is a 21-crate Cargo workspace (19 core crates + 2 legacy/reference wrappers) with a strict DAG dependency graph:
 
 ```
                     ┌──────────┐  ┌──────────┐
@@ -410,7 +410,7 @@ A: Filesystem bugs in C frequently involve buffer overflows, use-after-free, and
 | [COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md](COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md) | 242KB | Canonical specification — 24 sections covering every subsystem |
 | [EXISTING_EXT4_BTRFS_STRUCTURE.md](EXISTING_EXT4_BTRFS_STRUCTURE.md) | 95KB | Behavioral extraction from Linux kernel ext4/btrfs source |
 | [PLAN_TO_PORT_FRANKENFS_TO_RUST.md](PLAN_TO_PORT_FRANKENFS_TO_RUST.md) | 69KB | 9-phase porting roadmap with scope and acceptance criteria |
-| [PROPOSED_ARCHITECTURE.md](PROPOSED_ARCHITECTURE.md) | 18KB | 19-crate architecture, trait hierarchy, data flow |
+| [PROPOSED_ARCHITECTURE.md](PROPOSED_ARCHITECTURE.md) | 18KB | 21-crate architecture (19 core + 2 legacy/reference), trait hierarchy, data flow |
 | [FEATURE_PARITY.md](FEATURE_PARITY.md) | 3KB | Quantitative implementation coverage tracking |
 | [AGENTS.md](AGENTS.md) | 10KB | Guidelines for AI coding agents working in this codebase |
 

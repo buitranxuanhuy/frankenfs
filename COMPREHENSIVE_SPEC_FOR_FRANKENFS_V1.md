@@ -26,6 +26,38 @@ This specification describes the **complete target system**. There is no "V1 sco
 
 Implementation is phased for sequencing, not scope reduction. A feature in Phase 9 is not optional -- it depends on Phase 8. A feature in Phase 2 that has not been implemented is implementation debt, not a spec omission. Agents MUST NOT treat codebase omissions as evidence that a specified feature is out of scope.
 
+### 0.1.1 Current Errata (Doc-vs-Code Drift)
+
+This section records *current* (not historical) drift between this spec and the codebase. It exists to prevent agents from "implementing to the wrong contract."
+
+- **Types drift:** Spec §0.3 Glossary + downstream sections rely on canonical newtypes (e.g. `GroupNumber`, `BlockSize`, `ByteOffset`) that are not yet present in `crates/ffs-types`. Resolution: implement them in `crates/ffs-types` and update call sites. Track: `bd-14w`.
+- **ParseError vs FfsError drift:** Spec §2/§10 assume parser errors (`ParseError`) remain format-local, while `FfsError` models mount/runtime/FUSE behavior. The code currently exposes both (`crates/ffs-core/src/lib.rs` returns `ParseError` from `parse_ext4/parse_btrfs` and uses `FfsError` for device probing), but the mapping policy is not yet canonicalized. Resolution: define the mapping boundary and implement contextual conversion in `ffs-core`. Tracks: `bd-126`, `bd-2fy`.
+- **Missing normative traits (integration points):** Spec §8/§9/§14 define normative traits (repair manager, scrub progress, semantics ops) that are not yet present in code (`crates/ffs-repair` is currently stub-only, `crates/ffs-fuse` is scaffolding). Resolution: introduce the traits in the owning crates without creating dependency cycles, then migrate scaffolding to those contracts. Tracks: `bd-2l4`, `bd-3bf`, `bd-hv6`.
+
+### 0.1.2 Audit Checklist (Mechanical)
+
+Run these from the repo root to re-audit for drift:
+
+```bash
+# Workspace membership + crate count sanity.
+cargo metadata --no-deps --format-version 1 | jq '.workspace_members | length'
+ls crates | wc -l
+
+# Crate map / count wording drift.
+rg -n "19[- ]crate|19 crates|21[- ]crate|21 crates" -S *.md
+
+# fuser planned vs required drift.
+rg -n "\\bfuser\\b" -S Cargo.toml crates/ffs-fuse/Cargo.toml *.md
+
+# Top-level normative contract presence in code.
+rg -n "pub struct (GroupNumber|BlockSize|ByteOffset)\\b" -S crates/ffs-types
+rg -n "enum (ParseError|FfsError)\\b" -S crates
+rg -n "trait (RepairManager|BlockEventSink|FfsOperations|FuseBackend)\\b" -S crates
+
+# Forbidden runtime creep.
+rg -n "\\btokio\\b" Cargo.lock
+```
+
 ### 0.2 Normative Language
 
 Per RFC 2119 / RFC 8174:
@@ -173,7 +205,7 @@ pub struct BlockVersion {
 |-----------|------|------------|---------|
 | **asupersync** | `/dp/asupersync` | Cx, Budget, Region, Lab, RaptorQ codec, blocking_pool | Concurrency, cancellation, deterministic testing, fountain codes |
 | **frankentui** | `/dp/frankentui` (`ftui`) | Theme, widgets, event loop | TUI rendering for `ffs-tui` |
-| **fuser** | crates.io | `Filesystem` trait, `MountOption`, `Session` | FUSE protocol bindings |
+| **fuser** | crates.io | `Filesystem` trait, `MountOption`, `Session` | FUSE protocol bindings (planned; introduced in Phase 7) |
 
 **Hard constraints:**
 
@@ -196,7 +228,7 @@ pub struct BlockVersion {
 | 10 | `ffs-dir` | Linear scan, htree lookup, `dx_hash`, dir entry CRUD |
 | 11 | `ffs-extent` | Logical-to-physical mapping, extent allocation, holes |
 | 12 | `ffs-xattr` | Inline + block xattrs, namespace routing |
-| 13 | `ffs-fuse` | `fuser::Filesystem` implementation |
+| 13 | `ffs-fuse` | FUSE adapter scaffolding; `FuseBackend` + mount wiring now, `fuser::Filesystem` integration in Phase 7 |
 | 14 | `ffs-repair` | RaptorQ: generate/store repair symbols, scrub, recovery |
 | 15 | `ffs-core` | Mount orchestration, superblock validation, config, lifecycle |
 | 16 | `ffs` | Public API facade, re-exports |
@@ -546,7 +578,7 @@ The scrub process MUST run inside an `asupersync::Region` owned by the mount lif
 | Crate | Role | Interface |
 |-------|------|-----------|
 | `ffs-repair` | Primary: encode, store, decode, scrub | `asupersync::raptorq::{RaptorQSender, RaptorQReceiver, SystematicParams}` |
-| `ffs-block` | Consumer: checksum triggers repair; dirty notifications | `ffs-repair::BlockEventSink` |
+| `ffs-block` | Consumer: checksum triggers repair; dirty notifications | `ffs-block::BlockEventSink` (implemented by `ffs-repair`) |
 | `ffs-core` | Orchestrator: scrub scheduling, policy, DurabilityAutopilot | `ffs-repair::RepairManager`, `asupersync::RaptorQConfig` |
 | `ffs-harness` | Testing: inject corruption, verify recovery | `ffs-repair::RepairManager` via `ffs` facade |
 | `ffs-tui` | Display: scrub progress, repair stats | `ffs-repair::ScrubReport` (read-only) |
@@ -656,6 +688,87 @@ Written blocks make repair symbols **stale**. Two modes:
 2. **Lazy** (`eager_refresh = false`): Mark group dirty; refresh during next scrub. Between write and refresh, the repair set MUST NOT be used for recovery of affected source block partitions.
 
 The `repair_generation` counter MUST be incremented only after a **full** symbol refresh of the group completes. Partial refreshes MUST NOT increment the counter.
+
+### 3.11 Durability Autopilot (Bayesian Expected-Loss)
+
+When `RepairPolicy::autopilot` is `Some`, `ffs-core` SHOULD choose `overhead_ratio` at the start of each scrub cycle (and MAY adjust it mid-scrub if evidence shifts materially).
+
+The autopilot exists to prevent two failure modes:
+
+1. **Under-redundancy:** too little repair overhead leads to unrecoverable multi-block corruption.
+2. **Over-redundancy:** too much repair overhead wastes space and increases write amplification.
+
+#### 3.11.1 Posterior Model
+
+The autopilot maintains a conjugate **Beta posterior** over per-block corruption probability `p` for a scrub interval:
+
+- Prior: `p ~ Beta(alpha=1, beta=1)` (uniform).
+- Observation: a scrub reports `(scanned_blocks, corrupted_blocks)`.
+- Update: `alpha += corrupted_blocks`, `beta += (scanned_blocks - corrupted_blocks)`.
+
+Posterior mean and variance:
+
+```
+E[p] = alpha / (alpha + beta)
+Var[p] = alpha*beta / ((alpha+beta)^2 * (alpha+beta+1))
+```
+
+The autopilot MUST use a conservative upper estimate:
+
+```
+p_hi = clamp(E[p] + z * sqrt(Var[p]), 0, 1)
+```
+
+Default: `z = 3.0` (intentionally conservative).
+
+#### 3.11.2 Unrecoverable Tail-Risk Bound
+
+Let:
+
+- `r` be a candidate overhead ratio in `[1.01, 1.10]`
+- `rho = r - 1.0` be the repair budget fraction (repair blocks / source blocks)
+- `K` be the number of source blocks per group (use filesystem geometry when available; default 32,768)
+
+Model the next interval's corruptions as `N ~ Binomial(K, p)`. Recovery is feasible when `N <= rho*K`.
+
+The autopilot MUST use a conservative Chernoff-style bound on unrecoverable risk:
+
+1. If `rho <= p_hi`, then `risk_bound = 1.0` (we cannot even cover the conservative rate).
+2. Else:
+
+```
+risk_bound = exp(-K * D(rho || p_hi))
+D(q||p) = q*ln(q/p) + (1-q)*ln((1-q)/(1-p))
+```
+
+This is a bound, not an exact probability; it is chosen for speed, monotonicity, and explainability.
+
+#### 3.11.3 Expected-Loss Selection
+
+Given candidate ratios `{r_i}`, the autopilot chooses:
+
+```
+L(r) = redundancy_cost * (r - 1) + corruption_cost * risk_bound(r)
+r* = argmin_r L(r)
+```
+
+`redundancy_cost` and `corruption_cost` are mount-configurable loss scalars with conservative defaults (high cost for unrecoverable outcomes).
+
+#### 3.11.4 Explainability Contract
+
+The autopilot MUST produce an evidence-carrying decision record:
+
+```rust
+pub struct RedundancyDecision {
+    pub repair_overhead: f64,
+    pub expected_loss: f64,
+    pub posterior_mean_corruption_rate: f64,
+    pub posterior_hi_corruption_rate: f64,
+    pub unrecoverable_risk_bound: f64,
+    pub redundancy_loss: f64,
+    pub corruption_loss: f64,
+}
+```
 
 ---
 
@@ -4112,7 +4225,7 @@ Phases MUST NOT be reordered; the dependency chain is strict.
 
 **Goal:** Workspace scaffolding, specs, empty stubs.
 
-**Acceptance:** `cargo check --workspace` passes. All 19 crates present with `#![forbid(unsafe_code)]`. Clippy and rustfmt clean.
+**Acceptance:** `cargo check --workspace` passes. All 21 crates present (19 core + 2 legacy/reference wrappers) with `#![forbid(unsafe_code)]`. Clippy and rustfmt clean.
 
 ### 16.3 Phase 2: Types & On-Disk (5,000 LOC)
 
@@ -4434,6 +4547,25 @@ Injection methods: `flip_bit(block, offset, bit)`, `zero_block(block)`, `randomi
 | B-14 | Concurrent read scaling (1-16 threads) | factor | >= 0.8x linear at 8 |
 
 Results recorded in `baselines/baseline-YYYYMMDD.md`. CI flags regressions > 10%.
+
+### 17.8 Extreme Software Optimization Loop (Mandatory)
+
+FrankenFS performance work MUST follow a strict optimize-with-proof loop:
+
+1. **Baseline:** measure before changes (`hyperfine` against `ffs-harness` and relevant microbenches).
+2. **Profile:** identify hotspots (Rust: `cargo flamegraph`; allocation: `heaptrack`; syscalls: `strace -c`).
+3. **Prove behavior unchanged:** conformance fixtures + parity report MUST match, and any golden outputs MUST be checksum-verified.
+4. **One lever at a time:** each commit changes exactly one performance lever (data structure, algorithm, batching, caching).
+5. **Re-measure:** record deltas in `baselines/` and re-profile (hotspots shift).
+
+For every optimization PR/patch, include an "isomorphism proof" note with:
+
+- Ordering preserved: yes/no + why
+- Tie-breaking unchanged: yes/no + why
+- Floating-point identical: identical/N/A
+- RNG seeds unchanged: unchanged/N/A
+- Fixture parity: `ffs-harness -- check-fixtures` matches
+- Parity report: `ffs-harness -- parity` unchanged (or updated intentionally)
 
 ---
 
@@ -5700,7 +5832,7 @@ Isolation) while allowing genuine parallel execution:
 ### 23.3 A Filesystem Written in 100% Safe Rust
 
 FrankenFS enforces `#![forbid(unsafe_code)]` at the workspace level. Every
-crate in the 19-crate workspace carries this attribute. There are zero
+crate in the workspace carries this attribute (including legacy/reference crates). There are zero
 `unsafe` blocks in FrankenFS source code.
 
 **What this means:**

@@ -1,32 +1,34 @@
 # PROPOSED_ARCHITECTURE.md — FrankenFS (ffs)
 
-> 19-crate Cargo workspace architecture for a memory-safe, FUSE-based Rust reimplementation of ext4 and btrfs with block-level MVCC and RaptorQ self-healing.
+> 21-crate Cargo workspace architecture (19 core crates + 2 legacy/reference wrappers) for a memory-safe, FUSE-based Rust reimplementation of ext4 and btrfs with block-level MVCC and RaptorQ self-healing.
 
 ---
 
 ## 1. Crate Map
 
-| # | Crate | Role | Key Dependencies |
-|---|-------|------|-----------------|
-| 1 | `ffs-types` | Newtypes: BlockNumber, InodeNumber, TxnId, CommitSeq, Snapshot, ParseError; binary read helpers (read_le_u16/u32/u64); ext4/btrfs magic constants | `serde`, `thiserror` |
-| 2 | `ffs-error` | FfsError enum, Result<T> alias, errno mappings (ENOENT, EIO, ENOSPC, ...) | `thiserror` |
-| 3 | `ffs-ondisk` | ext4 + btrfs on-disk format parsing: superblocks, headers, keys/items, ext4 group desc/inodes/extents/dirs, JBD2 structures | `ffs-types`, `ffs-error`, `crc32c`, `serde` |
-| 4 | `ffs-block` | Block I/O layer: BlockDevice trait, ARC (Adaptive Replacement Cache), read/write with Cx, dirty page tracking | `ffs-types`, `ffs-error`, `asupersync`, `parking_lot` |
-| 5 | `ffs-journal` | JBD2-compatible journal replay + native COW journal: transaction lifecycle, descriptor/commit/revoke blocks | `ffs-types`, `ffs-error`, `ffs-block` |
-| 6 | `ffs-mvcc` | Block-level MVCC: version chains (BlockVersion), snapshot isolation, first-committer-wins conflict detection, GC of old versions | `ffs-types`, `serde`, `thiserror` |
-| 7 | `ffs-btree` | B-tree operations used by ext4 (extents/htree) and btrfs (metadata trees): search, insert, split, merge, tree walk | `ffs-types`, `ffs-error`, `ffs-block`, `ffs-ondisk` |
-| 8 | `ffs-alloc` | Block/inode allocation: mballoc-style multi-block allocator (buddy system, best-fit, prealloc), Orlov inode allocator | `ffs-types`, `ffs-error`, `ffs-block`, `ffs-ondisk` |
-| 9 | `ffs-inode` | Inode management: read/write/create/delete, permissions, timestamps, flags | `ffs-types`, `ffs-error`, `ffs-block`, `ffs-ondisk` |
-| 10 | `ffs-dir` | Directory operations: linear scan, htree (hashed B-tree) lookup, dx_hash, create/delete entries | `ffs-types`, `ffs-error`, `ffs-inode` |
-| 11 | `ffs-extent` | Extent mapping: logical→physical block resolution, extent allocation, hole detection | `ffs-types`, `ffs-error`, `ffs-btree`, `ffs-alloc` |
-| 12 | `ffs-xattr` | Extended attributes: inline (after inode extra fields), external block, namespace routing (user/system/security/trusted) | `ffs-types`, `ffs-error`, `ffs-block`, `ffs-ondisk` |
-| 13 | `ffs-fuse` | FUSE interface: FuseBackend trait, MountOptions, FrankenFuseMount — delegates to ffs-core engine (not domain crates directly) | `ffs-core`, `ffs-types`, `asupersync`, `serde`, `thiserror` |
-| 14 | `ffs-repair` | RaptorQ self-healing: generate/store repair symbols per block group, detect corruption via checksum, recover blocks, background scrub | `ffs-types`, `ffs-error`, `ffs-block`, `asupersync` |
-| 15 | `ffs-core` | Engine integration: format detection (FsFlavor), FrankenFsEngine (MVCC wrapper), DurabilityAutopilot (Bayesian redundancy), mount orchestration | `ffs-types`, `ffs-ondisk`, `ffs-mvcc`, `asupersync`, `serde`, `thiserror` |
-| 16 | `ffs` | Public API facade: re-exports core functionality, stable external interface | `ffs-core` |
-| 17 | `ffs-cli` | CLI binary: `ffs inspect` (currently), planned: `ffs mount`, `ffs fsck`, `ffs info`, `ffs repair` | `ffs-core`, `anyhow`, `serde`, `serde_json`, `ftui` |
-| 18 | `ffs-tui` | TUI monitoring: live cache stats, MVCC version counts, repair status, I/O throughput | `ffs`, `ftui` |
-| 19 | `ffs-harness` | Conformance testing harness: parity reports, sparse JSON fixtures, compare FrankenFS behavior against real ext4/btrfs images | `ffs-core`, `ffs-ondisk`, `ffs-types`, `anyhow`, `hex`, `serde`, `serde_json`; dev: `criterion` |
+| # | Crate | Role | Key Dependencies | Primary Phase |
+|---|-------|------|-----------------|--------------|
+| 1 | `ffs-types` | Newtypes: BlockNumber, InodeNumber, TxnId, CommitSeq, Snapshot, ParseError; binary read helpers (read_le_u16/u32/u64); ext4/btrfs magic constants | `serde`, `thiserror` | 2 |
+| 2 | `ffs-error` | FfsError enum, Result<T> alias, errno mappings (ENOENT, EIO, ENOSPC, ...) | `thiserror` | 2 |
+| 3 | `ffs-ondisk` | ext4 + btrfs on-disk format parsing: superblocks, headers, keys/items, ext4 group desc/inodes/extents/dirs, JBD2 structures | `ffs-types`, `ffs-error`, `crc32c`, `serde` | 2 |
+| 4 | `ffs-block` | Block I/O layer: BlockDevice trait, ARC (Adaptive Replacement Cache), read/write with Cx, dirty page tracking | `ffs-types`, `ffs-error`, `asupersync`, `parking_lot` | 3 |
+| 5 | `ffs-journal` | JBD2-compatible journal replay + native COW journal: transaction lifecycle, descriptor/commit/revoke blocks | `ffs-types`, `ffs-error`, `ffs-block` | 6 |
+| 6 | `ffs-mvcc` | Block-level MVCC: version chains (BlockVersion), snapshot isolation, first-committer-wins conflict detection, GC of old versions | `ffs-types`, `serde`, `thiserror` | 6 |
+| 7 | `ffs-btree` | B-tree operations used by ext4 (extents/htree) and btrfs (metadata trees): search, insert, split, merge, tree walk | `ffs-types`, `ffs-error`, `ffs-block`, `ffs-ondisk` | 4 |
+| 8 | `ffs-alloc` | Block/inode allocation: mballoc-style multi-block allocator (buddy system, best-fit, prealloc), Orlov inode allocator | `ffs-types`, `ffs-error`, `ffs-block`, `ffs-ondisk` | 4 |
+| 9 | `ffs-inode` | Inode management: read/write/create/delete, permissions, timestamps, flags | `ffs-types`, `ffs-error`, `ffs-block`, `ffs-ondisk` | 5 |
+| 10 | `ffs-dir` | Directory operations: linear scan, htree (hashed B-tree) lookup, dx_hash, create/delete entries | `ffs-types`, `ffs-error`, `ffs-inode` | 5 |
+| 11 | `ffs-extent` | Extent mapping: logical→physical block resolution, extent allocation, hole detection | `ffs-types`, `ffs-error`, `ffs-btree`, `ffs-alloc` | 4 |
+| 12 | `ffs-xattr` | Extended attributes: inline (after inode extra fields), external block, namespace routing (user/system/security/trusted) | `ffs-types`, `ffs-error`, `ffs-block`, `ffs-ondisk` | 5 |
+| 13 | `ffs-fuse` | FUSE interface: FuseBackend trait, MountOptions, FrankenFuseMount — delegates to ffs-core engine (not domain crates directly) | `ffs-core`, `ffs-types`, `asupersync`, `serde`, `thiserror` | 7 |
+| 14 | `ffs-repair` | RaptorQ self-healing: generate/store repair symbols per block group, detect corruption via checksum, recover blocks, background scrub | `ffs-types`, `ffs-error`, `ffs-block`, `asupersync` | 8 |
+| 15 | `ffs-core` | Engine integration: format detection (FsFlavor), FrankenFsEngine (MVCC wrapper), DurabilityAutopilot (Bayesian redundancy), mount orchestration | `ffs-types`, `ffs-ondisk`, `ffs-mvcc`, `asupersync`, `serde`, `thiserror` | 7 |
+| 16 | `ffs` | Public API facade: re-exports core functionality, stable external interface | `ffs-core` | 9 |
+| 17 | `ffs-cli` | CLI binary: `ffs inspect` (currently), planned: `ffs mount`, `ffs fsck`, `ffs info`, `ffs repair` | `ffs-core`, `anyhow`, `serde`, `serde_json`, `ftui` | 9 |
+| 18 | `ffs-tui` | TUI monitoring: live cache stats, MVCC version counts, repair status, I/O throughput | `ffs`, `ftui` | 9 |
+| 19 | `ffs-harness` | Conformance testing harness: parity reports, sparse JSON fixtures, compare FrankenFS behavior against real ext4/btrfs images | `ffs-core`, `ffs-ondisk`, `ffs-types`, `anyhow`, `hex`, `serde`, `serde_json`; dev: `criterion` | 9 |
+| 20 | `ffs-ext4` | Legacy/reference wrapper for ext4 parsing APIs (re-exports `ffs-ondisk::ext4::*`) | `ffs-ondisk` | 1 |
+| 21 | `ffs-btrfs` | Legacy/reference wrapper for btrfs parsing APIs (re-exports `ffs-ondisk::btrfs::*`) | `ffs-ondisk` | 1 |
 
 ---
 

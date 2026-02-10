@@ -111,8 +111,8 @@ novel capabilities shared across both filesystems:
 
 | Deliverable | Description |
 |---|---|
-| 19-crate Cargo workspace | Modular, independently testable crates |
-| FUSE filesystem binary | Mounts ext4 images in Linux userspace via `fuser` |
+| 21-crate Cargo workspace (19 core + 2 legacy/reference wrappers) | Modular, independently testable crates |
+| FUSE filesystem binary | Mounts ext4 images in Linux userspace via `fuser` (planned; Phase 7) |
 | CLI (`ffs-cli`) | `mount`, `fsck`, `info`, `dump` commands |
 | TUI (`ffs-tui`) | Live monitoring dashboard (cache, MVCC, repair stats) |
 | Conformance harness | Automated comparison against Linux kernel ext4 driver |
@@ -141,6 +141,8 @@ novel capabilities shared across both filesystems:
 | 17 | `ffs-cli` | Command-line interface | 9 |
 | 18 | `ffs-tui` | Terminal UI (frankentui-based) | 9 |
 | 19 | `ffs-harness` | Conformance test harness | 9 |
+| 20 | `ffs-ext4` | Legacy/reference wrapper: re-exports `ffs-ondisk::ext4::*` | 1 |
+| 21 | `ffs-btrfs` | Legacy/reference wrapper: re-exports `ffs-ondisk::btrfs::*` | 1 |
 
 ### 1.3 Target Platform
 
@@ -155,7 +157,7 @@ novel capabilities shared across both filesystems:
 |---|---|---|
 | `asupersync` | Cx capability contexts, cooperative cancellation, RaptorQ codec, lab runtime for deterministic testing | workspace |
 | `ftui` (frankentui) | TUI rendering framework | workspace (path = /dp/frankentui/crates/ftui) |
-| `fuser` | FUSE protocol implementation | ^0.15 |
+| `fuser` | FUSE protocol implementation | planned (Phase 7); not yet in workspace dependencies |
 | `crc32c` | CRC32C checksums (ext4 metadata_csum) | ^0.6 |
 | `blake3` | BLAKE3 checksums (native-mode integrity) | ^1 |
 | `parking_lot` | Fast mutexes and RwLocks | ^0.12 |
@@ -234,7 +236,7 @@ Source location: `/data/projects/frankenfs/legacy_ext4_and_btrfs_code/linux-fs/f
 | 7 -- FUSE Interface | ffs-fuse, ffs-core | 4,000 | fuser integration, mount orchestration |
 | 8 -- RaptorQ Repair | ffs-repair | 4,000 | Fountain codes, scrub, self-healing |
 | 9 -- CLI, TUI & Harness | ffs-cli, ffs-tui, ffs-harness, ffs | 5,000 | User-facing tools, conformance tests |
-| **Total** | **19 crates** | **~45,500** | **~22% of legacy C LOC** |
+| **Total** | **21 crates (19 core + 2 legacy/reference wrappers)** | **~45,500** | **~22% of legacy C LOC** |
 
 The reduction from ~205K C LOC to ~45.5K Rust LOC reflects:
 
@@ -257,7 +259,7 @@ The reduction from ~205K C LOC to ~45.5K Rust LOC reflects:
 
 ### Phase 1: Bootstrap (Current)
 
-**Goal:** Establish the Cargo workspace, create all 19 crate stubs, write the
+**Goal:** Establish the Cargo workspace, create all 21 crate stubs (19 core + 2 legacy/reference wrappers), write the
 four specification documents, and verify the workspace compiles.
 
 **Deliverables:**
@@ -265,7 +267,7 @@ four specification documents, and verify the workspace compiles.
 | Artifact | Description |
 |---|---|
 | `Cargo.toml` (workspace root) | Workspace members, shared dependency versions, workspace lints |
-| 19 crate `Cargo.toml` + `src/lib.rs` stubs | Empty crates with correct inter-crate dependencies declared |
+| 21 crate `Cargo.toml` + `src/lib.rs` stubs | Empty crates with correct inter-crate dependencies declared |
 | `PLAN_TO_PORT_FRANKENFS_TO_RUST.md` | This document |
 | `PROPOSED_ARCHITECTURE.md` | Crate topology, data-flow, trait contracts |
 | `AGENTS.md` | Agent assignments, coordination protocol, code conventions |
