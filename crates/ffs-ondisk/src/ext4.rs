@@ -2,9 +2,9 @@
 
 use ffs_types::{
     EXT4_EXTENTS_FL, EXT4_FAST_SYMLINK_MAX, EXT4_HUGE_FILE_FL, EXT4_INDEX_FL, EXT4_SUPER_MAGIC,
-    EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, EXT4_XATTR_MAGIC, ParseError, S_IFBLK, S_IFCHR,
-    S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, ensure_slice, ext4_block_size_from_log,
-    read_fixed, read_le_u16, read_le_u32, trim_nul_padded,
+    EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, EXT4_XATTR_MAGIC, GroupNumber, InodeNumber,
+    ParseError, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK,
+    ensure_slice, ext4_block_size_from_log, read_fixed, read_le_u16, read_le_u32, trim_nul_padded,
 };
 use serde::{Deserialize, Serialize};
 
@@ -918,6 +918,76 @@ impl Ext4Superblock {
         let byte_offset = u64::from(index) * u64::from(self.inode_size);
         (group, index, byte_offset)
     }
+
+    /// Validated inode location: returns group, index, and byte offset within
+    /// the group's inode table.
+    ///
+    /// Unlike [`inode_table_offset`](Self::inode_table_offset), this checks
+    /// that `ino` is valid (non-zero, within `inodes_count`).
+    pub fn locate_inode(&self, ino: InodeNumber) -> Result<InodeLocation, ParseError> {
+        if ino.0 == 0 {
+            return Err(ParseError::InvalidField {
+                field: "inode_number",
+                reason: "inode 0 is invalid in ext4",
+            });
+        }
+        if ino.0 > u64::from(self.inodes_count) {
+            return Err(ParseError::InvalidField {
+                field: "inode_number",
+                reason: "inode number exceeds inodes_count",
+            });
+        }
+        let group = ffs_types::inode_to_group(ino, self.inodes_per_group);
+        let index = ffs_types::inode_index_in_group(ino, self.inodes_per_group);
+        let offset_in_table = u64::from(index)
+            .checked_mul(u64::from(self.inode_size))
+            .ok_or(ParseError::InvalidField {
+                field: "inode_offset",
+                reason: "overflow computing inode offset in table",
+            })?;
+        Ok(InodeLocation {
+            group,
+            index,
+            offset_in_table,
+        })
+    }
+
+    /// Compute the absolute device byte offset of an inode, given the group
+    /// descriptor's `inode_table` block pointer.
+    ///
+    /// This is a pure helper — no I/O required. Use [`locate_inode`](Self::locate_inode)
+    /// first to get the [`InodeLocation`], then pass the group descriptor's
+    /// `inode_table` field here.
+    pub fn inode_device_offset(
+        &self,
+        loc: &InodeLocation,
+        inode_table_block: u64,
+    ) -> Result<u64, ParseError> {
+        let table_start_byte = inode_table_block
+            .checked_mul(u64::from(self.block_size))
+            .ok_or(ParseError::InvalidField {
+                field: "bg_inode_table",
+                reason: "overflow computing inode table byte offset",
+            })?;
+        table_start_byte
+            .checked_add(loc.offset_in_table)
+            .ok_or(ParseError::InvalidField {
+                field: "inode_offset",
+                reason: "overflow computing absolute inode offset",
+            })
+    }
+}
+
+/// Result of [`Ext4Superblock::locate_inode`]: which block group and where
+/// within the inode table an inode resides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InodeLocation {
+    /// Block group containing this inode.
+    pub group: GroupNumber,
+    /// Zero-based index within the group's inode table.
+    pub index: u32,
+    /// Byte offset from the start of the group's inode table.
+    pub offset_in_table: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3685,6 +3755,101 @@ mod tests {
         let sb = make_valid_sb();
         let p = Ext4Superblock::parse_superblock_region(&sb).unwrap();
         assert!(p.validate_geometry().is_ok());
+    }
+
+    // ── Inode location math tests ───────────────────────────────────────
+
+    #[test]
+    fn locate_inode_zero_is_invalid() {
+        let sb = Ext4Superblock::parse_superblock_region(&make_valid_sb()).unwrap();
+        let err = sb.locate_inode(InodeNumber(0)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "inode_number",
+                    reason: "inode 0 is invalid in ext4"
+                }
+            ),
+            "expected inode 0 error, got: {err}",
+        );
+    }
+
+    #[test]
+    fn locate_inode_exceeds_count() {
+        let sb = Ext4Superblock::parse_superblock_region(&make_valid_sb()).unwrap();
+        // make_valid_sb has inodes_count = 8192
+        let err = sb.locate_inode(InodeNumber(8193)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "inode_number",
+                    reason: "inode number exceeds inodes_count"
+                }
+            ),
+            "expected out-of-range error, got: {err}",
+        );
+    }
+
+    #[test]
+    fn locate_inode_first() {
+        let sb = Ext4Superblock::parse_superblock_region(&make_valid_sb()).unwrap();
+        let loc = sb.locate_inode(InodeNumber(1)).unwrap();
+        assert_eq!(loc.group, GroupNumber(0));
+        assert_eq!(loc.index, 0);
+        assert_eq!(loc.offset_in_table, 0);
+    }
+
+    #[test]
+    fn locate_inode_last_in_group() {
+        let sb = Ext4Superblock::parse_superblock_region(&make_valid_sb()).unwrap();
+        // inodes_per_group = 8192, inode_size = 256
+        // Inode 8192 is the last inode in group 0.
+        let loc = sb.locate_inode(InodeNumber(8192)).unwrap();
+        assert_eq!(loc.group, GroupNumber(0));
+        assert_eq!(loc.index, 8191);
+        assert_eq!(loc.offset_in_table, u64::from(8191_u32) * 256);
+    }
+
+    #[test]
+    fn locate_inode_boundary() {
+        // Make a 2-group filesystem: 2 * 8192 = 16384 inodes, 2 * 32768 = 65536 blocks.
+        let mut sb_buf = make_valid_sb();
+        sb_buf[0x00..0x04].copy_from_slice(&16384_u32.to_le_bytes()); // inodes_count
+        sb_buf[0x04..0x08].copy_from_slice(&65536_u32.to_le_bytes()); // blocks_count_lo
+        let sb = Ext4Superblock::parse_superblock_region(&sb_buf).unwrap();
+
+        // First inode of second group.
+        let loc = sb.locate_inode(InodeNumber(8193)).unwrap();
+        assert_eq!(loc.group, GroupNumber(1));
+        assert_eq!(loc.index, 0);
+        assert_eq!(loc.offset_in_table, 0);
+
+        // Last valid inode.
+        let loc = sb.locate_inode(InodeNumber(16384)).unwrap();
+        assert_eq!(loc.group, GroupNumber(1));
+        assert_eq!(loc.index, 8191);
+    }
+
+    #[test]
+    fn inode_device_offset_basic() {
+        let sb = Ext4Superblock::parse_superblock_region(&make_valid_sb()).unwrap();
+        let loc = sb.locate_inode(InodeNumber(1)).unwrap();
+        // Suppose inode table starts at block 100.
+        let abs = sb.inode_device_offset(&loc, 100).unwrap();
+        assert_eq!(abs, 100 * 4096); // block 100 * 4K
+    }
+
+    #[test]
+    fn inode_device_offset_with_index() {
+        let sb = Ext4Superblock::parse_superblock_region(&make_valid_sb()).unwrap();
+        let loc = sb.locate_inode(InodeNumber(3)).unwrap();
+        // Inode 3 → index 2, offset = 2 * 256 = 512
+        assert_eq!(loc.index, 2);
+        assert_eq!(loc.offset_in_table, 512);
+        let abs = sb.inode_device_offset(&loc, 50).unwrap();
+        assert_eq!(abs, 50 * 4096 + 512);
     }
 
     #[test]
