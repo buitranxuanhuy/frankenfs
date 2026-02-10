@@ -1215,13 +1215,17 @@ pub fn verify_inode_checksum(
 
 /// Verify the CRC32C checksum of a directory block's tail entry.
 ///
-/// The ext4 directory block checksum covers the entire block minus the last
-/// 4 bytes (the checksum itself). The kernel computes:
+/// The ext4 directory block checksum covers the directory entries up to
+/// (but NOT including) the 12-byte `ext4_dir_entry_tail` structure at the
+/// end of the block. The stored checksum is within that tail at offset +8.
 ///
 /// ```text
+/// tail_struct = block[block_size - 12 ..]   // 12-byte ext4_dir_entry_tail
+/// stored_csum = tail_struct[8..12]          // det_checksum field
+///
 /// seed = ext4_chksum(csum_seed, &le_ino, 4)
 /// seed = ext4_chksum(seed, &le_gen, 4)
-/// csum = ext4_chksum(seed, dir_block[..block_size - 4])
+/// csum = ext4_chksum(seed, dir_block[..block_size - 12])
 /// ```
 ///
 /// Returns `Ok(())` if the checksum matches, `Err` on mismatch.
@@ -1240,16 +1244,23 @@ pub fn verify_dir_block_checksum(
         });
     }
 
-    // The checksum tail is the last 12 bytes: inode=0, rec_len=12, name_len=0, file_type=0xDE, checksum
-    let tail_off = bs - 4;
-    let stored = read_le_u32(dir_block, tail_off)?;
+    // The 12-byte tail structure at the end of the block:
+    //   [0..4]  det_reserved_zero1 (inode=0)
+    //   [4..6]  det_rec_len (12)
+    //   [6]     det_reserved_zero2 (name_len=0)
+    //   [7]     det_reserved_ft (0xDE)
+    //   [8..12] det_checksum
+    // Stored checksum is at block_size - 4.
+    let stored = read_le_u32(dir_block, bs - 4)?;
 
-    // Per-inode seed
+    // Per-inode seed: i_csum_seed = crc32c(crc32c(csum_seed, le_ino), le_gen)
     let seed = crc32c::crc32c_append(csum_seed, &ino.to_le_bytes());
     let seed = crc32c::crc32c_append(seed, &generation.to_le_bytes());
 
-    // Checksum covers block[..block_size-4] (everything except the 4-byte checksum field)
-    let computed = crc32c::crc32c_append(seed, &dir_block[..tail_off]);
+    // Kernel checksums block[0..block_size - 12]: the dir entry data before
+    // the 12-byte tail. The entire tail struct is excluded from coverage.
+    let coverage_end = bs - 12;
+    let computed = crc32c::crc32c_append(seed, &dir_block[..coverage_end]);
 
     if computed != stored {
         return Err(ParseError::InvalidField {
@@ -1263,12 +1274,18 @@ pub fn verify_dir_block_checksum(
 /// Verify the CRC32C checksum of an extent tree block.
 ///
 /// Extent tree blocks (non-root, stored in separate blocks) have a 4-byte
-/// checksum tail at `block[block_size - 4]`. The kernel computes:
+/// checksum tail immediately after the extent entry slots. The kernel
+/// defines `EXT4_EXTENT_TAIL_OFFSET(hdr) = 12 + 12 * eh_max`, so the
+/// CRC covers `extent_block[0..12 + 12*eh_max]` and the stored checksum
+/// lives at that same offset.
 ///
 /// ```text
+/// tail_off = sizeof(ext4_extent_header) + sizeof(ext4_extent) * eh_max
+///          = 12 + 12 * eh_max
 /// seed = ext4_chksum(csum_seed, &le_ino, 4)
 /// seed = ext4_chksum(seed, &le_gen, 4)
-/// csum = ext4_chksum(seed, extent_block[..block_size - 4])
+/// csum = ext4_chksum(seed, extent_block[..tail_off])
+/// stored = le32(extent_block[tail_off..tail_off+4])
 /// ```
 pub fn verify_extent_block_checksum(
     extent_block: &[u8],
@@ -1285,7 +1302,17 @@ pub fn verify_extent_block_checksum(
         });
     }
 
-    let tail_off = bs - 4;
+    // eh_max is at offset 4 in the 12-byte extent header
+    let eh_max = usize::from(read_le_u16(extent_block, 4)?);
+    let tail_off = 12 + 12 * eh_max;
+    if tail_off + 4 > bs {
+        return Err(ParseError::InsufficientData {
+            needed: tail_off + 4,
+            offset: 0,
+            actual: bs,
+        });
+    }
+
     let stored = read_le_u32(extent_block, tail_off)?;
 
     let seed = crc32c::crc32c_append(csum_seed, &ino.to_le_bytes());
@@ -5883,5 +5910,95 @@ mod tests {
         let inode = Ext4Inode::parse_from_bytes(&buf).unwrap();
         // 60 bytes of i_block area should be present.
         assert_eq!(inode.extent_bytes.len(), 60);
+    }
+
+    // ── Directory block checksum verification ────────────────────────────
+
+    #[test]
+    fn dir_block_checksum_round_trip() {
+        let csum_seed = 0xDEAD_BEEF_u32;
+        let ino: u32 = 2;
+        let generation: u32 = 42;
+        let block_size = 4096_usize;
+
+        // Build a synthetic dir block: one entry + checksum tail
+        let mut block = vec![0_u8; block_size];
+        // Write a single dir entry "." spanning block minus 12 bytes for tail
+        let entry_rec_len = u16::try_from(block_size - 12).unwrap();
+        write_dir_entry(&mut block, 0, 2, 2, b".", entry_rec_len);
+
+        // Write checksum tail sentinel at block_size - 12
+        let tail_off = block_size - 12;
+        block[tail_off..tail_off + 4].copy_from_slice(&0_u32.to_le_bytes()); // inode=0
+        block[tail_off + 4..tail_off + 6].copy_from_slice(&12_u16.to_le_bytes());
+        block[tail_off + 6] = 0; // name_len=0
+        block[tail_off + 7] = EXT4_FT_DIR_CSUM; // 0xDE
+
+        // Compute expected checksum: coverage excludes the entire 12-byte tail
+        let seed = crc32c::crc32c_append(csum_seed, &ino.to_le_bytes());
+        let seed = crc32c::crc32c_append(seed, &generation.to_le_bytes());
+        let checksum = crc32c::crc32c_append(seed, &block[..block_size - 12]);
+
+        // Store checksum in tail (last 4 bytes)
+        block[block_size - 4..].copy_from_slice(&checksum.to_le_bytes());
+
+        // Verify: should pass
+        verify_dir_block_checksum(&block, csum_seed, ino, generation)
+            .expect("valid dir block checksum");
+
+        // Corrupt one byte in the block → should fail
+        block[10] ^= 0xFF;
+        assert!(verify_dir_block_checksum(&block, csum_seed, ino, generation).is_err());
+    }
+
+    #[test]
+    fn dir_block_checksum_rejects_too_small() {
+        let small = [0_u8; 8];
+        let err = verify_dir_block_checksum(&small, 0, 1, 1).unwrap_err();
+        assert!(matches!(err, ParseError::InsufficientData { .. }));
+    }
+
+    // ── Extent block checksum verification ───────────────────────────────
+
+    #[test]
+    fn extent_block_checksum_round_trip() {
+        let csum_seed = 0xCAFE_BABE_u32;
+        let ino: u32 = 11;
+        let generation: u32 = 7;
+        let block_size = 4096_usize;
+
+        // Build a synthetic extent block
+        let mut block = vec![0_u8; block_size];
+        // Write an extent header at offset 0
+        block[0..2].copy_from_slice(&EXT4_EXTENT_MAGIC.to_le_bytes()); // magic
+        block[2..4].copy_from_slice(&0_u16.to_le_bytes()); // entries=0
+        block[4..6].copy_from_slice(&4_u16.to_le_bytes()); // max=4
+        block[6..8].copy_from_slice(&0_u16.to_le_bytes()); // depth=0
+        block[8..12].copy_from_slice(&0_u32.to_le_bytes()); // generation
+
+        // Compute checksum: tail is at 12 + 12 * eh_max = 12 + 12 * 4 = 60
+        let eh_max = 4_usize;
+        let tail_off = 12 + 12 * eh_max;
+        let seed = crc32c::crc32c_append(csum_seed, &ino.to_le_bytes());
+        let seed = crc32c::crc32c_append(seed, &generation.to_le_bytes());
+        let checksum = crc32c::crc32c_append(seed, &block[..tail_off]);
+
+        // Store at tail (right after the extent entry slots)
+        block[tail_off..tail_off + 4].copy_from_slice(&checksum.to_le_bytes());
+
+        // Verify: should pass
+        verify_extent_block_checksum(&block, csum_seed, ino, generation)
+            .expect("valid extent block checksum");
+
+        // Corrupt → should fail
+        block[5] ^= 0x01;
+        assert!(verify_extent_block_checksum(&block, csum_seed, ino, generation).is_err());
+    }
+
+    #[test]
+    fn extent_block_checksum_rejects_too_small() {
+        let small = [0_u8; 12];
+        let err = verify_extent_block_checksum(&small, 0, 1, 1).unwrap_err();
+        assert!(matches!(err, ParseError::InsufficientData { .. }));
     }
 }
