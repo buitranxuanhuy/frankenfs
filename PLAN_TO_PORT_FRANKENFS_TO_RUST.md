@@ -50,7 +50,7 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` complete.
 
 ### 0.3 `ffs-error` (Error Model + Errno Mapping)
 
-- [ ] Canonicalize `FfsError` variant set (no duplicates across docs)
+- [x] Canonicalize `FfsError` variant set (no duplicates across docs)
 - [x] Implement errno mapping (`impl From<&FfsError> for libc::c_int` or equivalent)
 - [ ] Add `Unsupported`/`IncompatibleFeature`/`UnsupportedBlockSize` variants as required by mount validation
 
@@ -297,7 +297,7 @@ parsing with round-trip fidelity.
 | Crate | Key Items |
 |---|---|
 | `ffs-types` | `BlockNumber(u64)`, `InodeNumber(u64)`, `TxnId(u64)`, `CommitSeq(u64)`, `Snapshot { high: CommitSeq }`, `ParseError` enum; binary read helpers (`read_le_u16/u32/u64`, `ensure_slice`, `trim_nul_padded`); ext4/btrfs magic constants |
-| `ffs-error` | `FfsError` enum (14 variants: Io, Corruption, Format, MvccConflict, Cancelled, NoSpace, NotFound, PermissionDenied, NotDirectory, IsDirectory, NotEmpty, NameTooLong, Exists, RepairFailed); `Result<T>` alias. See canonical listing in PROPOSED_ARCHITECTURE.md Section 7. |
+| `ffs-error` | `FfsError` enum (16 variants: Io, Corruption, Format, Parse, MvccConflict, Cancelled, NoSpace, NotFound, PermissionDenied, ReadOnly, NotDirectory, IsDirectory, NotEmpty, NameTooLong, Exists, RepairFailed); `Result<T>` alias. See canonical listing in `crates/ffs-error/src/lib.rs`. |
 | `ffs-ondisk` | Parsing and serialization for all ext4 on-disk structures |
 
 **Key On-Disk Structures:**
@@ -745,11 +745,13 @@ Every `FfsError` variant maps to a POSIX errno for FUSE:
 | `Io` | `EIO` | I/O error |
 | `Corruption` | `EIO` | On-disk corruption detected |
 | `Format` | `EINVAL` | Invalid on-disk format |
+| `Parse` | `EINVAL` | Parse-layer error surfaced to user |
 | `MvccConflict` | `EAGAIN` | SSI conflict; retry transaction |
 | `Cancelled` | `EINTR` | Cx cancellation |
 | `NoSpace` | `ENOSPC` | No free blocks or inodes |
 | `NotFound` | `ENOENT` | File or directory not found |
 | `PermissionDenied` | `EACCES` | Insufficient permissions |
+| `ReadOnly` | `EROFS` | Write attempted on read-only mount |
 | `NotDirectory` | `ENOTDIR` | Path component is not a directory |
 | `IsDirectory` | `EISDIR` | Attempted file operation on a directory |
 | `NotEmpty` | `ENOTEMPTY` | rmdir on non-empty directory |
@@ -757,7 +759,7 @@ Every `FfsError` variant maps to a POSIX errno for FUSE:
 | `Exists` | `EEXIST` | File already exists in create/mkdir |
 | `RepairFailed` | `EIO` | RaptorQ repair could not recover data |
 
-> **Note:** These are the canonical 14 FfsError variants. See `ffs-error/src/lib.rs` for the normative definition.
+> **Note:** These are the canonical 16 FfsError variants. See `crates/ffs-error/src/lib.rs` for the normative definition and mapping policy documentation.
 
 **Acceptance Criteria:**
 - Mount a real ext4 test image via FUSE.
