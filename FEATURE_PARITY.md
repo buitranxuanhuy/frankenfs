@@ -6,12 +6,17 @@
 
 | Domain | Implemented | Total Tracked | Coverage |
 |--------|-------------|---------------|----------|
-| ext4 metadata parsing | 6 | 19 | 31.6% |
-| btrfs metadata parsing | 4 | 20 | 20.0% |
+| ext4 metadata parsing | 9 | 19 | 47.4% |
+| btrfs metadata parsing | 7 | 20 | 35.0% |
 | MVCC/COW core | 4 | 14 | 28.6% |
-| FUSE surface | 1 | 12 | 8.3% |
-| Self-healing durability policy | 2 | 10 | 20.0% |
-| Overall | 17 | 75 | 22.7% |
+| FUSE surface | 6 | 12 | 50.0% |
+| self-healing durability policy | 2 | 10 | 20.0% |
+| **Overall** | **28** | **75** | **37.3%** |
+
+> **Canonical source:** The `ParityReport::current()` function in `ffs-harness` is the
+> authoritative source for implemented/total counts. This table MUST match those
+> values at all times. A CI test (`parity_report_matches_feature_parity_md`)
+> enforces this invariant.
 
 ## 2. Tracked Capability Matrix
 
@@ -23,13 +28,19 @@
 | ext4 extent entry decode | `fs/ext4/ext4_extents.h` | ✅ | Implemented in `ffs-ext4` |
 | ext4 feature flag validation | `fs/ext4/super.c` | ✅ | Basic checks implemented |
 | ext4 group descriptor decode | `fs/ext4/ext4.h` | ✅ | Implemented in `ffs-ondisk` (`Ext4GroupDesc`) |
+| ext4 directory entry parsing | `fs/ext4/dir.c` | ✅ | Implemented in `ffs-ondisk` |
+| ext4 inode device read | `fs/ext4/inode.c` | ✅ | `OpenFs::read_inode` via `ByteDevice` |
+| ext4 path resolution | `fs/ext4/namei.c` | ✅ | `OpenFs::resolve_path` |
 | ext4 journal replay parity | `fs/ext4/ext4_jbd2.c` | ❌ | Not yet implemented |
 | ext4 allocator parity | `fs/ext4/mballoc.c` | ❌ | Not yet implemented |
 | ext4 orphan recovery parity | `fs/ext4/orphan.c` | ❌ | Not yet implemented |
-| btrfs superblock decode | `fs/btrfs/disk-io.c` | ✅ | Implemented in `ffs-btrfs` |
-| btrfs btree header decode | `fs/btrfs/ctree.c` | ✅ | Implemented in `ffs-btrfs` |
-| btrfs leaf item metadata decode | `fs/btrfs/ctree.c` | ✅ | Implemented in `ffs-btrfs` |
-| btrfs geometry validation | `fs/btrfs/fs.c` | ✅ | Basic checks implemented |
+| btrfs superblock decode | `fs/btrfs/disk-io.c` | ✅ | Implemented in `ffs-ondisk` |
+| btrfs btree header decode | `fs/btrfs/ctree.c` | ✅ | Implemented in `ffs-ondisk` |
+| btrfs leaf item metadata decode | `fs/btrfs/ctree.c` | ✅ | Implemented in `ffs-ondisk` |
+| btrfs internal node parsing | `fs/btrfs/ctree.c` | ✅ | `parse_internal_items` in `ffs-ondisk` |
+| btrfs sys_chunk mapping | `fs/btrfs/volumes.c` | ✅ | `map_logical_to_physical` in `ffs-ondisk` |
+| btrfs read-only tree walk | `fs/btrfs/ctree.c` | ✅ | `walk_tree` in `ffs-btrfs` |
+| btrfs open/validate pipeline | `fs/btrfs/disk-io.c` | ✅ | `BtrfsContext` in `ffs-core` |
 | btrfs transaction parity | `fs/btrfs/transaction.c` | ❌ | Not yet implemented |
 | btrfs delayed refs parity | `fs/btrfs/delayed-ref.c` | ❌ | Not yet implemented |
 | btrfs scrub parity | `fs/btrfs/scrub.c` | ❌ | Not yet implemented |
@@ -40,6 +51,11 @@
 | COW block rewrite path | FrankenFS spec §3 | 🟡 | Basic version copy only |
 | durability policy model | FrankenFS spec §4 | ✅ | Bayesian expected-loss selector |
 | asupersync config mapping | FrankenFS spec §4 | ✅ | `RaptorQConfig` mapping implemented |
+| FUSE getattr | FrankenFS spec §9 | ✅ | `FsOps::getattr` via `OpenFs` |
+| FUSE lookup | FrankenFS spec §9 | ✅ | `FsOps::lookup` via `OpenFs` |
+| FUSE readdir | FrankenFS spec §9 | ✅ | `FsOps::readdir` via `OpenFs` |
+| FUSE read | FrankenFS spec §9 | ✅ | `FsOps::read` via `OpenFs` |
+| FUSE readlink | FrankenFS spec §9 | ✅ | `FsOps::readlink` via `OpenFs` |
 | FUSE mount runtime | FrankenFS spec §9 | ❌ | Interface scaffold only |
 | CLI inspect command | FrankenFS spec §6 | ✅ | Implemented in `ffs-cli` |
 | fixture conformance harness | FrankenFS spec §7 | ✅ | Implemented in `ffs-harness` |
