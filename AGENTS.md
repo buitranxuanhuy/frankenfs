@@ -277,3 +277,97 @@ Primary legacy modules for extraction:
 - Clearly separate: implemented, partially implemented, not implemented
 
 No hand-wavy “done” claims without tests, metrics, and parity evidence.
+
+---
+
+## Playbooks
+
+### Session Start Ritual (Cass-Proven)
+
+1. Read `AGENTS.md` and `README.md` fully.
+2. Get oriented: run `git status --porcelain`, `bv --robot-next`, `br ready --json`.
+3. Claim exactly one bead and announce it to other agents (Agent Mail thread = bead ID).
+4. Make the smallest correct change set that advances parity, specs, or conformance.
+5. Run gates (fmt/check/clippy/test) before claiming “done”.
+
+### Cass Archaeology (Context Recovery)
+
+Rules:
+- Do not pipe large cass outputs to `head`/`tail` (broken pipe panics). Redirect to a file, then inspect the file.
+
+Copy-paste workflow:
+
+```bash
+# Health + refresh (always first)
+cass status --json && cass index --json
+
+# Terrain scan: who did what, when?
+cass search "*" --workspace /data/projects/frankenfs --aggregate agent,date --limit 1 --json
+
+# Find the exact prior discussion/prompt
+cass search "KEYWORD" --workspace /data/projects/frankenfs --json --fields minimal --limit 50
+
+# Follow a hit
+cass view /path/from/source_path.jsonl -n LINE -C 20
+cass expand /path/from/source_path.jsonl --line LINE --context 3
+cass context /path/from/source_path.jsonl --json
+```
+
+### Alien-Artifact Mode (Principled, Auditable Decisions)
+
+Use when logic is high-risk (MVCC conflict rules, repair policy, consistency, corruption decisions).
+
+Elicitation prompt (copy-paste):
+
+```
+Now, TRULY think even harder. Surely there is some math invented in the
+last 60 years that would be relevant and helpful here? Super hard, esoteric
+math that would be ultra accretive and give a ton of alpha for the specific
+problems we're trying to solve here, as efficiently as possible?
+
+REALLY RUMINATE ON THIS!!! DIG DEEP!!
+
+STUFF THAT EVEN TERRY TAO WOULD HAVE TO CONCENTRATE SUPER HARD ON!
+```
+
+Required outputs for “alien artifact” quality work:
+- Explicit invariants (what MUST remain true).
+- Evidence ledger (what evidence drove what decision).
+- Loss matrix / expected-loss rule for any threshold-like decision.
+
+### Extreme Optimization Loop (One Lever, Behavior-Proven)
+
+Rules:
+- Profile first.
+- One optimization lever per commit.
+- Prove behavior unchanged (goldens or invariants) for every change.
+
+```bash
+# Baseline
+hyperfine --warmup 3 --runs 10 'COMMAND'
+
+# Verify unchanged behavior (example pattern)
+sha256sum golden_outputs/* > golden_checksums.txt
+sha256sum -c golden_checksums.txt
+```
+
+Isomorphism proof template (required for perf work):
+- Ordering preserved: yes/no + why
+- Tie-breaking unchanged: yes/no + why
+- Floating-point identical: identical/N/A
+- RNG seeds unchanged: unchanged/N/A
+- Goldens verified: `sha256sum -c golden_checksums.txt` (or equivalent)
+
+### Porting-To-Rust Essence Extraction (Spec-First)
+
+Rules:
+- Never translate C line-by-line.
+- Extract behavior into spec docs first, then implement from the spec.
+- Conformance harness is the arbiter, not vibes.
+
+Minimal checklist:
+1. Extract behavior into `EXISTING_EXT4_BTRFS_STRUCTURE.md` (what, not how).
+2. Update `PROPOSED_ARCHITECTURE.md` (crate/module boundaries, trait contracts).
+3. Implement idiomatically in Rust.
+4. Add/extend fixtures + harness tests.
+5. Update `FEATURE_PARITY.md` in the same change set.
