@@ -93,17 +93,40 @@ impl Default for DurabilityPosterior {
 }
 
 impl DurabilityPosterior {
-    pub fn observe(&mut self, corruption_event: bool) {
-        if corruption_event {
-            self.alpha += 1.0;
-        } else {
-            self.beta += 1.0;
-        }
+    /// Observe a single Bernoulli event ("did we see any corruption?").
+    ///
+    /// This is intentionally coarse; prefer `observe_blocks()` when scrub can
+    /// report counts.
+    pub fn observe_event(&mut self, corruption_event: bool) {
+        self.observe_blocks(1, u64::from(corruption_event));
+    }
+
+    /// Observe scrub results as counts of scanned vs corrupted blocks.
+    ///
+    /// Uses a Beta-Binomial conjugate update where `alpha` counts "corrupt"
+    /// and `beta` counts "clean".
+    pub fn observe_blocks(&mut self, scanned_blocks: u64, corrupted_blocks: u64) {
+        let scanned = scanned_blocks as f64;
+        let corrupted = (corrupted_blocks.min(scanned_blocks)) as f64;
+        let clean = (scanned - corrupted).max(0.0);
+        self.alpha += corrupted;
+        self.beta += clean;
     }
 
     #[must_use]
-    pub fn expected_corruption_rate(self) -> f64 {
+    pub fn expected_corruption_rate(&self) -> f64 {
         self.alpha / (self.alpha + self.beta)
+    }
+
+    #[must_use]
+    pub fn variance(&self) -> f64 {
+        let a = self.alpha;
+        let b = self.beta;
+        let denom = (a + b).powi(2) * (a + b + 1.0);
+        if denom <= 0.0 {
+            return 0.0;
+        }
+        (a * b) / denom
     }
 }
 
@@ -111,6 +134,7 @@ impl DurabilityPosterior {
 pub struct DurabilityLossModel {
     pub corruption_cost: f64,
     pub redundancy_cost: f64,
+    pub z_score: f64,
 }
 
 impl Default for DurabilityLossModel {
@@ -118,6 +142,7 @@ impl Default for DurabilityLossModel {
         Self {
             corruption_cost: 10_000.0,
             redundancy_cost: 25.0,
+            z_score: 3.0,
         }
     }
 }
@@ -126,7 +151,11 @@ impl Default for DurabilityLossModel {
 pub struct RedundancyDecision {
     pub repair_overhead: f64,
     pub expected_loss: f64,
-    pub posterior_corruption_rate: f64,
+    pub posterior_mean_corruption_rate: f64,
+    pub posterior_hi_corruption_rate: f64,
+    pub unrecoverable_risk_bound: f64,
+    pub redundancy_loss: f64,
+    pub corruption_loss: f64,
 }
 
 impl RedundancyDecision {
@@ -152,38 +181,95 @@ impl DurabilityAutopilot {
         Self::default()
     }
 
-    pub fn observe(&mut self, corruption_event: bool) {
-        self.posterior.observe(corruption_event);
+    pub fn observe_event(&mut self, corruption_event: bool) {
+        self.posterior.observe_event(corruption_event);
+    }
+
+    pub fn observe_scrub(&mut self, scanned_blocks: u64, corrupted_blocks: u64) {
+        self.posterior
+            .observe_blocks(scanned_blocks, corrupted_blocks);
     }
 
     #[must_use]
     pub fn choose_overhead(&self, candidates: &[f64]) -> RedundancyDecision {
-        let p = self.posterior.expected_corruption_rate();
+        self.choose_overhead_for_group(candidates, 32_768)
+    }
+
+    #[must_use]
+    pub fn choose_overhead_for_group(
+        &self,
+        candidates: &[f64],
+        source_block_count: u32,
+    ) -> RedundancyDecision {
+        const MIN_OVERHEAD: f64 = 1.01;
+        const MAX_OVERHEAD: f64 = 1.10;
+        const DEFAULT_OVERHEAD: f64 = 1.05;
+
+        let p_mean = self.posterior.expected_corruption_rate();
+        let p_hi = self
+            .loss
+            .z_score
+            .mul_add(self.posterior.variance().sqrt(), p_mean)
+            .clamp(0.0, 1.0);
+
         let mut best = RedundancyDecision {
-            repair_overhead: 1.05,
+            repair_overhead: DEFAULT_OVERHEAD,
             expected_loss: f64::INFINITY,
-            posterior_corruption_rate: p,
+            posterior_mean_corruption_rate: p_mean,
+            posterior_hi_corruption_rate: p_hi,
+            unrecoverable_risk_bound: 1.0,
+            redundancy_loss: 0.0,
+            corruption_loss: f64::INFINITY,
         };
 
+        let k = f64::from(source_block_count.max(1));
+        let mut considered_any = false;
+
         for candidate in candidates {
-            let factor = if *candidate <= 0.0 {
+            if !candidate.is_finite() || *candidate < MIN_OVERHEAD || *candidate > MAX_OVERHEAD {
+                continue;
+            }
+            considered_any = true;
+
+            // Repair budget fraction relative to source blocks.
+            let rho = (candidate - 1.0).clamp(0.0, 1.0);
+
+            // Conservative tail-risk estimate (Chernoff bound) for:
+            //   P(N >= rho*K) where N ~ Binomial(K, p) and p is conservatively taken as p_hi.
+            let risk_bound = if p_hi <= 0.0 {
+                0.0
+            } else if rho <= p_hi {
                 1.0
             } else {
-                candidate.powi(2)
+                let eps = 1e-12;
+                let q = rho.clamp(eps, 1.0 - eps);
+                let p = p_hi.clamp(eps, 1.0 - eps);
+                let kl = q * (q / p).ln() + (1.0 - q) * ((1.0 - q) / (1.0 - p)).ln();
+                (-k * kl.max(0.0)).exp()
             };
-            let effective_corruption = p / factor;
-            let expected_loss = self.loss.corruption_cost.mul_add(
-                effective_corruption,
-                self.loss.redundancy_cost * (candidate - 1.0).max(0.0),
-            );
+
+            let redundancy_loss = self.loss.redundancy_cost * rho;
+            let corruption_loss = self.loss.corruption_cost * risk_bound;
+            let expected_loss = redundancy_loss + corruption_loss;
 
             if expected_loss < best.expected_loss {
                 best = RedundancyDecision {
                     repair_overhead: *candidate,
                     expected_loss,
-                    posterior_corruption_rate: p,
+                    posterior_mean_corruption_rate: p_mean,
+                    posterior_hi_corruption_rate: p_hi,
+                    unrecoverable_risk_bound: risk_bound,
+                    redundancy_loss,
+                    corruption_loss,
                 };
             }
+        }
+
+        if !considered_any {
+            best.repair_overhead = DEFAULT_OVERHEAD;
+            best.redundancy_loss = self.loss.redundancy_cost * (DEFAULT_OVERHEAD - 1.0);
+            best.corruption_loss = self.loss.corruption_cost;
+            best.expected_loss = best.redundancy_loss + best.corruption_loss;
         }
 
         best
@@ -266,12 +352,16 @@ mod tests {
 
     #[test]
     fn durability_autopilot_prefers_more_redundancy_when_failures_observed() {
-        let mut autopilot = DurabilityAutopilot::new();
-        for _ in 0..8 {
-            autopilot.observe(true);
-        }
+        let candidates = [1.02, 1.05, 1.10];
 
-        let decision = autopilot.choose_overhead(&[1.02, 1.05, 1.10, 1.20]);
-        assert!(decision.repair_overhead >= 1.05);
+        let mut clean = DurabilityAutopilot::new();
+        clean.observe_scrub(10_000, 0);
+        let clean_decision = clean.choose_overhead(&candidates);
+        assert!((clean_decision.repair_overhead - 1.02).abs() < 1e-12);
+
+        let mut dirty = DurabilityAutopilot::new();
+        dirty.observe_scrub(10_000, 300);
+        let dirty_decision = dirty.choose_overhead(&candidates);
+        assert!(dirty_decision.repair_overhead >= 1.05);
     }
 }

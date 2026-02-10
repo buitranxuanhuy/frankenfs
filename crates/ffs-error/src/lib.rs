@@ -54,6 +54,11 @@ pub enum FfsError {
 
 impl FfsError {
     /// Convert this error into a POSIX errno suitable for FUSE replies.
+    ///
+    /// Policy notes:
+    /// - `Cancelled` maps to `EINTR` to align with POSIX "interrupted system call"
+    ///   semantics and FUSE interruption behavior. Callers may retry at a higher
+    ///   layer when appropriate.
     #[must_use]
     pub fn to_errno(&self) -> libc::c_int {
         match self {
@@ -61,7 +66,7 @@ impl FfsError {
             Self::Corruption { .. } | Self::RepairFailed(_) => libc::EIO,
             Self::Format(_) => libc::EINVAL,
             Self::MvccConflict { .. } => libc::EAGAIN,
-            Self::Cancelled => libc::ECANCELED,
+            Self::Cancelled => libc::EINTR,
             Self::NoSpace => libc::ENOSPC,
             Self::NotFound(_) => libc::ENOENT,
             Self::PermissionDenied => libc::EACCES,

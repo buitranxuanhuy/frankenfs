@@ -36,7 +36,7 @@ pub struct BlockSize(u32);
 impl BlockSize {
     /// Create a `BlockSize` if `value` is a power of two in [1024, 65536].
     pub fn new(value: u32) -> Result<Self, ParseError> {
-        if !value.is_power_of_two() || value < 1024 || value > 65536 {
+        if !value.is_power_of_two() || !(1024..=65536).contains(&value) {
             return Err(ParseError::InvalidField {
                 field: "block_size",
                 reason: "must be power of two in 1024..=65536",
@@ -63,6 +63,7 @@ impl BlockSize {
     }
 
     /// Convert a block number to a byte offset.
+    #[must_use]
     pub fn block_to_byte(self, block: BlockNumber) -> Option<u64> {
         block.0.checked_mul(u64::from(self.0))
     }
@@ -71,6 +72,52 @@ impl BlockSize {
 /// Block group index (ext4: u32 group number).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct GroupNumber(pub u32);
+
+/// Byte offset on a `ByteDevice` (pread/pwrite semantics).
+///
+/// This is a unit-carrying wrapper to prevent mixing bytes and blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ByteOffset(pub u64);
+
+impl ByteOffset {
+    pub const ZERO: Self = Self(0);
+
+    /// Add a byte count, returning `None` on overflow.
+    #[must_use]
+    pub fn checked_add(self, bytes: u64) -> Option<Self> {
+        self.0.checked_add(bytes).map(Self)
+    }
+
+    /// Subtract a byte count, returning `None` on underflow.
+    #[must_use]
+    pub fn checked_sub(self, bytes: u64) -> Option<Self> {
+        self.0.checked_sub(bytes).map(Self)
+    }
+
+    /// Multiply by a scalar, returning `None` on overflow.
+    #[must_use]
+    pub fn checked_mul(self, factor: u64) -> Option<Self> {
+        self.0.checked_mul(factor).map(Self)
+    }
+}
+
+/// Stable device identifier (future-proofing for multi-device support).
+///
+/// For now, this is typically derived from the on-disk UUID fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct DeviceId(pub u128);
+
+impl DeviceId {
+    #[must_use]
+    pub fn from_uuid_bytes_be(bytes: [u8; 16]) -> Self {
+        Self(u128::from_be_bytes(bytes))
+    }
+
+    #[must_use]
+    pub fn to_uuid_bytes_be(self) -> [u8; 16] {
+        self.0.to_be_bytes()
+    }
+}
 
 /// Inode or filesystem generation counter (ext4: u32, btrfs: u64).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -184,6 +231,18 @@ impl fmt::Display for GroupNumber {
     }
 }
 
+impl fmt::Display for ByteOffset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl fmt::Display for DeviceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:032x}", self.0)
+    }
+}
+
 impl fmt::Display for Generation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
@@ -215,27 +274,40 @@ impl BlockNumber {
 ///
 /// `first_data_block` is typically 0 for 4K blocks and 1 for 1K blocks.
 #[must_use]
-pub fn block_to_group(block: BlockNumber, blocks_per_group: u32, first_data_block: u32) -> GroupNumber {
+#[allow(clippy::cast_possible_truncation)] // ext4 group count is u32
+pub fn block_to_group(
+    block: BlockNumber,
+    blocks_per_group: u32,
+    first_data_block: u32,
+) -> GroupNumber {
     let adjusted = block.0.saturating_sub(u64::from(first_data_block));
     GroupNumber((adjusted / u64::from(blocks_per_group)) as u32)
 }
 
 /// Compute the first block of a given block group.
-pub fn group_first_block(group: GroupNumber, blocks_per_group: u32, first_data_block: u32) -> Option<BlockNumber> {
+pub fn group_first_block(
+    group: GroupNumber,
+    blocks_per_group: u32,
+    first_data_block: u32,
+) -> Option<BlockNumber> {
     let offset = u64::from(group.0).checked_mul(u64::from(blocks_per_group))?;
-    offset.checked_add(u64::from(first_data_block)).map(BlockNumber)
+    offset
+        .checked_add(u64::from(first_data_block))
+        .map(BlockNumber)
 }
 
 /// Compute the inode's block group from its inode number.
 ///
 /// Inode numbers are 1-indexed; group assignment uses `(ino - 1) / inodes_per_group`.
 #[must_use]
+#[allow(clippy::cast_possible_truncation)] // ext4 group count is u32
 pub fn inode_to_group(ino: InodeNumber, inodes_per_group: u32) -> GroupNumber {
     GroupNumber(((ino.0.saturating_sub(1)) / u64::from(inodes_per_group)) as u32)
 }
 
 /// Compute the index of an inode within its block group.
 #[must_use]
+#[allow(clippy::cast_possible_truncation)] // modulo by u32 always fits in u32
 pub fn inode_index_in_group(ino: InodeNumber, inodes_per_group: u32) -> u32 {
     ((ino.0.saturating_sub(1)) % u64::from(inodes_per_group)) as u32
 }
@@ -315,14 +387,26 @@ mod tests {
         assert_eq!(block_to_group(BlockNumber(32767), 32768, 0), GroupNumber(0));
         assert_eq!(block_to_group(BlockNumber(32768), 32768, 0), GroupNumber(1));
 
-        assert_eq!(group_first_block(GroupNumber(0), 32768, 0), Some(BlockNumber(0)));
-        assert_eq!(group_first_block(GroupNumber(1), 32768, 0), Some(BlockNumber(32768)));
+        assert_eq!(
+            group_first_block(GroupNumber(0), 32768, 0),
+            Some(BlockNumber(0))
+        );
+        assert_eq!(
+            group_first_block(GroupNumber(1), 32768, 0),
+            Some(BlockNumber(32768))
+        );
 
         // 1K blocks, first_data_block = 1, 8192 blocks per group
         assert_eq!(block_to_group(BlockNumber(1), 8192, 1), GroupNumber(0));
         assert_eq!(block_to_group(BlockNumber(8193), 8192, 1), GroupNumber(1));
-        assert_eq!(group_first_block(GroupNumber(0), 8192, 1), Some(BlockNumber(1)));
-        assert_eq!(group_first_block(GroupNumber(1), 8192, 1), Some(BlockNumber(8193)));
+        assert_eq!(
+            group_first_block(GroupNumber(0), 8192, 1),
+            Some(BlockNumber(1))
+        );
+        assert_eq!(
+            group_first_block(GroupNumber(1), 8192, 1),
+            Some(BlockNumber(8193))
+        );
     }
 
     #[test]
@@ -331,6 +415,16 @@ mod tests {
         assert_eq!(BlockNumber(u64::MAX).checked_add(1), None);
         assert_eq!(BlockNumber(10).checked_sub(3), Some(BlockNumber(7)));
         assert_eq!(BlockNumber(0).checked_sub(1), None);
+    }
+
+    #[test]
+    fn test_byte_offset_checked_ops() {
+        assert_eq!(ByteOffset(10).checked_add(5), Some(ByteOffset(15)));
+        assert_eq!(ByteOffset(u64::MAX).checked_add(1), None);
+        assert_eq!(ByteOffset(10).checked_sub(3), Some(ByteOffset(7)));
+        assert_eq!(ByteOffset(0).checked_sub(1), None);
+        assert_eq!(ByteOffset(3).checked_mul(7), Some(ByteOffset(21)));
+        assert_eq!(ByteOffset(u64::MAX).checked_mul(2), None);
     }
 
     #[test]

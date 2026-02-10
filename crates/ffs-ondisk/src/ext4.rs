@@ -1,9 +1,8 @@
 #![forbid(unsafe_code)]
 
 use ffs_types::{
-    EXT4_SUPER_MAGIC, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, ParseError,
-    ensure_slice, ext4_block_size_from_log, read_fixed, read_le_u16, read_le_u32,
-    trim_nul_padded,
+    EXT4_SUPER_MAGIC, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, ParseError, ensure_slice,
+    ext4_block_size_from_log, read_fixed, read_le_u16, read_le_u32, trim_nul_padded,
 };
 use serde::{Deserialize, Serialize};
 
@@ -154,6 +153,12 @@ impl Ext4Superblock {
                 reason: "invalid shift",
             });
         };
+        if !matches!(block_size, 1024 | 2048 | 4096) {
+            return Err(ParseError::InvalidField {
+                field: "s_log_block_size",
+                reason: "unsupported block size",
+            });
+        }
 
         // Read single-byte fields via ensure_slice
         let checksum_type = ensure_slice(region, 0x175, 1)?[0];
@@ -195,7 +200,7 @@ impl Ext4Superblock {
             // State & error tracking
             state: read_le_u16(region, 0x3A)?,
             errors: read_le_u16(region, 0x3C)?,
-            mnt_count: read_le_u16(region, 0x32)?,
+            mnt_count: read_le_u16(region, 0x34)?,
             max_mnt_count: read_le_u16(region, 0x36)?,
             error_count: read_le_u32(region, 0x194)?,
 
@@ -282,11 +287,14 @@ impl Ext4Superblock {
 
     /// Number of block groups in this filesystem.
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // ext4 group count is u32
     pub fn groups_count(&self) -> u32 {
         if self.blocks_per_group == 0 {
             return 0;
         }
-        let data_blocks = self.blocks_count.saturating_sub(u64::from(self.first_data_block));
+        let data_blocks = self
+            .blocks_count
+            .saturating_sub(u64::from(self.first_data_block));
         let groups = data_blocks.div_ceil(u64::from(self.blocks_per_group));
         groups as u32
     }
@@ -300,17 +308,24 @@ impl Ext4Superblock {
     /// Compute the crc32c checksum seed used for metadata checksums.
     ///
     /// If `INCOMPAT_CSUM_SEED` is set, uses the precomputed `checksum_seed` field.
-    /// Otherwise, computes `crc32c(~0, uuid)`.
+    /// Otherwise, computes `ext4_chksum(~0, uuid)`.
+    ///
+    /// The kernel's `ext4_chksum(sbi, seed, data, len)` maps to
+    /// `crc32c::crc32c_append(seed, data)` — **not** `crc32c::crc32c(data)`,
+    /// which uses a different initial value.
     #[must_use]
     pub fn csum_seed(&self) -> u32 {
         if self.has_incompat(EXT4_FEATURE_INCOMPAT_CSUM_SEED) {
             self.checksum_seed
         } else {
-            crc32c::crc32c(&self.uuid)
+            // kernel: ext4_chksum(sbi, ~0, uuid, 16) = crc32c_append(!0, uuid)
+            crc32c::crc32c_append(!0u32, &self.uuid)
         }
     }
 
     /// Validate the superblock's own CRC32C checksum.
+    ///
+    /// The kernel computes: `ext4_chksum(sbi, ~0, sb_bytes[..0x3FC])`.
     pub fn validate_checksum(&self, raw_region: &[u8]) -> Result<(), ParseError> {
         if !self.has_metadata_csum() {
             return Ok(());
@@ -322,11 +337,8 @@ impl Ext4Superblock {
                 actual: raw_region.len(),
             });
         }
-        // Zero out the checksum field (last 4 bytes) before computing
-        let mut buf = [0_u8; EXT4_SUPERBLOCK_SIZE];
-        buf.copy_from_slice(&raw_region[..EXT4_SUPERBLOCK_SIZE]);
-        buf[0x3FC..0x400].copy_from_slice(&[0; 4]);
-        let computed = crc32c::crc32c(&buf);
+        // kernel: ext4_chksum(sbi, ~0, es, offsetof(s_checksum))
+        let computed = crc32c::crc32c_append(!0u32, &raw_region[..0x3FC]);
         if computed != self.checksum {
             return Err(ParseError::InvalidField {
                 field: "s_checksum",
@@ -409,8 +421,13 @@ impl Ext4Superblock {
     ///
     /// The group descriptor table starts at the block after the superblock
     /// (block `first_data_block + 1` for 1K blocks, block 1 for >= 2K blocks).
+    #[must_use]
     pub fn group_desc_offset(&self, group: ffs_types::GroupNumber) -> Option<u64> {
-        let gdt_start_block = if self.block_size == 1024 { 2_u64 } else { 1_u64 };
+        let gdt_start_block = if self.block_size == 1024 {
+            2_u64
+        } else {
+            1_u64
+        };
         let gdt_start_byte = gdt_start_block.checked_mul(u64::from(self.block_size))?;
         let desc_offset = u64::from(group.0).checked_mul(u64::from(self.group_desc_size()))?;
         gdt_start_byte.checked_add(desc_offset)
@@ -422,7 +439,10 @@ impl Ext4Superblock {
     /// The caller must read the group descriptor to find the inode table's
     /// starting block, then add the returned byte offset.
     #[must_use]
-    pub fn inode_table_offset(&self, ino: ffs_types::InodeNumber) -> (ffs_types::GroupNumber, u32, u64) {
+    pub fn inode_table_offset(
+        &self,
+        ino: ffs_types::InodeNumber,
+    ) -> (ffs_types::GroupNumber, u32, u64) {
         let group = ffs_types::inode_to_group(ino, self.inodes_per_group);
         let index = ffs_types::inode_index_in_group(ino, self.inodes_per_group);
         let byte_offset = u64::from(index) * u64::from(self.inode_size);
@@ -507,6 +527,150 @@ impl Ext4GroupDesc {
     }
 }
 
+// ── Checksum verification helpers ────────────────────────────────────────────
+
+/// Offset of `bg_checksum` within a group descriptor (2 bytes).
+const GD_CHECKSUM_OFFSET: usize = 0x1E;
+
+/// Verify a group descriptor's CRC32C checksum (metadata_csum mode).
+///
+/// `raw_gd` is the raw on-disk group descriptor bytes (32 or 64 bytes).
+/// `csum_seed` comes from `Ext4Superblock::csum_seed()`.
+/// `group_number` is the block group index.
+/// `desc_size` is from `Ext4Superblock::group_desc_size()`.
+pub fn verify_group_desc_checksum(
+    raw_gd: &[u8],
+    csum_seed: u32,
+    group_number: u32,
+    desc_size: u16,
+) -> Result<(), ParseError> {
+    let ds = usize::from(desc_size);
+    if raw_gd.len() < ds {
+        return Err(ParseError::InsufficientData {
+            needed: ds,
+            offset: 0,
+            actual: raw_gd.len(),
+        });
+    }
+
+    let le_group = group_number.to_le_bytes();
+
+    // kernel: csum = ext4_chksum(csum_seed, &le_group, 4)
+    let mut csum = crc32c::crc32c_append(csum_seed, &le_group);
+    // kernel: csum = ext4_chksum(csum, gd[0..bg_checksum_offset], offset)
+    csum = crc32c::crc32c_append(csum, &raw_gd[..GD_CHECKSUM_OFFSET]);
+    // kernel: csum = ext4_chksum(csum, &dummy_csum, 2)  (zero out checksum field)
+    csum = crc32c::crc32c_append(csum, &[0, 0]);
+    // kernel: if offset+2 < desc_size, csum rest
+    let after_csum = GD_CHECKSUM_OFFSET + 2;
+    if after_csum < ds {
+        csum = crc32c::crc32c_append(csum, &raw_gd[after_csum..ds]);
+    }
+
+    let expected = (csum & 0xFFFF) as u16;
+    let stored = read_le_u16(raw_gd, GD_CHECKSUM_OFFSET)?;
+
+    if expected != stored {
+        return Err(ParseError::InvalidField {
+            field: "bg_checksum",
+            reason: "group descriptor CRC32C mismatch",
+        });
+    }
+    Ok(())
+}
+
+/// Offset of `i_checksum_lo` within an ext4 inode (osd2 area, 2 bytes).
+const INODE_CHECKSUM_LO_OFFSET: usize = 0x7C;
+/// Offset of `i_checksum_hi` within an ext4 inode (extended area, 2 bytes).
+const INODE_CHECKSUM_HI_OFFSET: usize = 0x82;
+
+/// Verify an inode's CRC32C checksum (metadata_csum mode).
+///
+/// `raw_inode` is the raw on-disk inode bytes (inode_size bytes).
+/// `csum_seed` comes from `Ext4Superblock::csum_seed()`.
+/// `ino` is the inode number.
+/// `inode_size` is from the superblock.
+#[allow(clippy::cast_possible_truncation)] // checksum is 32-bit
+pub fn verify_inode_checksum(
+    raw_inode: &[u8],
+    csum_seed: u32,
+    ino: u32,
+    inode_size: u16,
+) -> Result<(), ParseError> {
+    let is = usize::from(inode_size);
+    if raw_inode.len() < is || is < 128 {
+        return Err(ParseError::InsufficientData {
+            needed: is.max(128),
+            offset: 0,
+            actual: raw_inode.len(),
+        });
+    }
+
+    // Per-inode seed: ext4_chksum(csum_seed, &le_ino, 4)
+    //   then:        ext4_chksum(ino_seed, &le_gen, 4)
+    let le_ino = ino.to_le_bytes();
+    let ino_seed = crc32c::crc32c_append(csum_seed, &le_ino);
+    let generation = read_le_u32(raw_inode, 0x64)?;
+    let le_gen = generation.to_le_bytes();
+    let ino_seed = crc32c::crc32c_append(ino_seed, &le_gen);
+
+    // CRC base inode (128 bytes), skipping i_checksum_lo at 0x7C (2 bytes)
+    let mut csum = crc32c::crc32c_append(ino_seed, &raw_inode[..INODE_CHECKSUM_LO_OFFSET]);
+    csum = crc32c::crc32c_append(csum, &[0, 0]); // zero out checksum_lo
+    let after_csum_lo = INODE_CHECKSUM_LO_OFFSET + 2;
+    csum = crc32c::crc32c_append(csum, &raw_inode[after_csum_lo..128]);
+
+    // Extended area (when inode_size > 128)
+    if is > 128 {
+        // CRC bytes from 128 up to i_checksum_hi at 0x82
+        csum = crc32c::crc32c_append(csum, &raw_inode[128..INODE_CHECKSUM_HI_OFFSET]);
+
+        // Check if i_checksum_hi fits (i_extra_isize >= 4)
+        let extra_isize = if raw_inode.len() >= 0x82 {
+            read_le_u16(raw_inode, 0x80)?
+        } else {
+            0
+        };
+        let extra_end = 128 + usize::from(extra_isize);
+        if extra_end >= INODE_CHECKSUM_HI_OFFSET + 2 {
+            // Zero out checksum_hi
+            csum = crc32c::crc32c_append(csum, &[0, 0]);
+            let after_csum_hi = INODE_CHECKSUM_HI_OFFSET + 2;
+            if after_csum_hi < is {
+                csum = crc32c::crc32c_append(csum, &raw_inode[after_csum_hi..is]);
+            }
+        } else {
+            // No checksum_hi field, CRC the rest
+            if INODE_CHECKSUM_HI_OFFSET < is {
+                csum = crc32c::crc32c_append(csum, &raw_inode[INODE_CHECKSUM_HI_OFFSET..is]);
+            }
+        }
+    }
+
+    // Extract stored checksum (lo + hi)
+    let stored_lo = u32::from(read_le_u16(raw_inode, INODE_CHECKSUM_LO_OFFSET)?);
+    let stored_hi = if is > 128 {
+        let extra_isize = read_le_u16(raw_inode, 0x80)?;
+        let extra_end = 128 + usize::from(extra_isize);
+        if extra_end >= INODE_CHECKSUM_HI_OFFSET + 2 {
+            u32::from(read_le_u16(raw_inode, INODE_CHECKSUM_HI_OFFSET)?)
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    let stored = stored_lo | (stored_hi << 16);
+
+    if csum != stored {
+        return Err(ParseError::InvalidField {
+            field: "i_checksum",
+            reason: "inode CRC32C mismatch",
+        });
+    }
+    Ok(())
+}
+
 /// ext4 inode flags
 const EXT4_HUGE_FILE_FL: u32 = 0x0004_0000;
 
@@ -548,8 +712,10 @@ pub struct Ext4Inode {
 impl Ext4Inode {
     /// Parse an ext4 inode from raw bytes.
     ///
-    /// `inode_size` is from the superblock (`s_inode_size`). Minimum 128 bytes,
-    /// but we require at least 160 for the standard fields + i_block area.
+    /// Requires at least 128 bytes. Extended fields (timestamps, checksum,
+    /// projid) are read when the buffer is large enough and `i_extra_isize`
+    /// indicates they are present.
+    #[allow(clippy::too_many_lines, clippy::similar_names)]
     pub fn parse_from_bytes(bytes: &[u8]) -> Result<Self, ParseError> {
         if bytes.len() < 128 {
             return Err(ParseError::InsufficientData {
@@ -601,8 +767,16 @@ impl Ext4Inode {
         let blocks = blocks_raw;
 
         // ── Extended area (0x80+, when inode_size > 128) ─────────────────
-        let (extra_isize, checksum_hi, atime_extra, ctime_extra, mtime_extra,
-             crtime, crtime_extra, projid) = if bytes.len() > 0x82 {
+        let (
+            extra_isize,
+            checksum_hi,
+            atime_extra,
+            ctime_extra,
+            mtime_extra,
+            crtime,
+            crtime_extra,
+            projid,
+        ) = if bytes.len() > 0x82 {
             let extra_isize = read_le_u16(bytes, 0x80)?;
             let extra_end = 128_usize + usize::from(extra_isize);
 
@@ -641,8 +815,16 @@ impl Ext4Inode {
             } else {
                 0
             };
-            (extra_isize, checksum_hi, atime_extra, ctime_extra, mtime_extra,
-             crtime, crtime_extra, projid)
+            (
+                extra_isize,
+                checksum_hi,
+                atime_extra,
+                ctime_extra,
+                mtime_extra,
+                crtime,
+                crtime_extra,
+                projid,
+            )
         } else {
             (0, 0, 0, 0, 0, 0, 0, 0)
         };
@@ -705,28 +887,40 @@ impl Ext4Inode {
     #[must_use]
     pub fn atime_full(&self) -> (i64, u32) {
         let epoch = i64::from(Self::extra_epoch(self.atime_extra)) << 32;
-        (epoch | i64::from(self.atime), Self::extra_nsec(self.atime_extra))
+        (
+            epoch | i64::from(self.atime),
+            Self::extra_nsec(self.atime_extra),
+        )
     }
 
     /// Full modification time as (seconds_since_epoch, nanoseconds).
     #[must_use]
     pub fn mtime_full(&self) -> (i64, u32) {
         let epoch = i64::from(Self::extra_epoch(self.mtime_extra)) << 32;
-        (epoch | i64::from(self.mtime), Self::extra_nsec(self.mtime_extra))
+        (
+            epoch | i64::from(self.mtime),
+            Self::extra_nsec(self.mtime_extra),
+        )
     }
 
     /// Full inode change time as (seconds_since_epoch, nanoseconds).
     #[must_use]
     pub fn ctime_full(&self) -> (i64, u32) {
         let epoch = i64::from(Self::extra_epoch(self.ctime_extra)) << 32;
-        (epoch | i64::from(self.ctime), Self::extra_nsec(self.ctime_extra))
+        (
+            epoch | i64::from(self.ctime),
+            Self::extra_nsec(self.ctime_extra),
+        )
     }
 
     /// Full creation time as (seconds_since_epoch, nanoseconds).
     #[must_use]
     pub fn crtime_full(&self) -> (i64, u32) {
         let epoch = i64::from(Self::extra_epoch(self.crtime_extra)) << 32;
-        (epoch | i64::from(self.crtime), Self::extra_nsec(self.crtime_extra))
+        (
+            epoch | i64::from(self.crtime),
+            Self::extra_nsec(self.crtime_extra),
+        )
     }
 }
 
@@ -865,6 +1059,302 @@ pub fn parse_inode_extent_tree(
     parse_extent_tree(&inode.extent_bytes)
 }
 
+// ── Directory entry parsing ─────────────────────────────────────────────────
+
+/// ext4 file type constants from directory entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum Ext4FileType {
+    Unknown = 0,
+    RegFile = 1,
+    Dir = 2,
+    Chrdev = 3,
+    Blkdev = 4,
+    Fifo = 5,
+    Sock = 6,
+    Symlink = 7,
+}
+
+impl Ext4FileType {
+    #[must_use]
+    pub fn from_raw(val: u8) -> Self {
+        match val {
+            1 => Self::RegFile,
+            2 => Self::Dir,
+            3 => Self::Chrdev,
+            4 => Self::Blkdev,
+            5 => Self::Fifo,
+            6 => Self::Sock,
+            7 => Self::Symlink,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Sentinel file_type value for directory entry checksum tails.
+const EXT4_FT_DIR_CSUM: u8 = 0xDE;
+
+/// A parsed ext4 directory entry (`ext4_dir_entry_2`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ext4DirEntry {
+    pub inode: u32,
+    pub rec_len: u16,
+    pub name_len: u8,
+    pub file_type: Ext4FileType,
+    pub name: Vec<u8>,
+}
+
+impl Ext4DirEntry {
+    /// The actual on-disk size consumed by this entry (padded to 4 bytes).
+    #[must_use]
+    pub fn actual_size(&self) -> usize {
+        // 8 bytes header + name_len, rounded up to 4-byte boundary
+        (8 + usize::from(self.name_len) + 3) & !3
+    }
+
+    /// Return the name as a UTF-8 string (lossy).
+    #[must_use]
+    pub fn name_str(&self) -> String {
+        String::from_utf8_lossy(&self.name).into_owned()
+    }
+
+    /// Whether this is the `.` entry.
+    #[must_use]
+    pub fn is_dot(&self) -> bool {
+        self.name == b"."
+    }
+
+    /// Whether this is the `..` entry.
+    #[must_use]
+    pub fn is_dotdot(&self) -> bool {
+        self.name == b".."
+    }
+}
+
+/// A checksum tail at the end of a directory block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ext4DirEntryTail {
+    pub checksum: u32,
+}
+
+/// Decode `rec_len` from its on-disk representation.
+///
+/// For blocks > 64K the kernel encodes large values by stealing the low 2 bits:
+/// `decoded = (raw & 0xFFFC) | ((raw & 0x3) << 16)`.
+/// A raw value of 0 or 0xFFFF maps to `block_size`.
+#[must_use]
+fn rec_len_from_disk(raw: u16, block_size: u32) -> u32 {
+    let len = u32::from(raw);
+    if len == u32::from(u16::MAX) || len == 0 {
+        return block_size;
+    }
+    (len & 0xFFFC) | ((len & 0x3) << 16)
+}
+
+/// Parse all directory entries from a single directory data block.
+///
+/// Returns the entries (excluding checksum tails) and an optional
+/// checksum tail if one was found at the end.
+pub fn parse_dir_block(
+    block: &[u8],
+    block_size: u32,
+) -> Result<(Vec<Ext4DirEntry>, Option<Ext4DirEntryTail>), ParseError> {
+    let mut entries = Vec::new();
+    let mut tail = None;
+    let mut offset = 0_usize;
+
+    while offset + 8 <= block.len() {
+        let inode = read_le_u32(block, offset)?;
+        let rec_len_raw = read_le_u16(block, offset + 4)?;
+        let name_len = ensure_slice(block, offset + 6, 1)?[0];
+        let file_type_raw = ensure_slice(block, offset + 7, 1)?[0];
+
+        let rec_len = rec_len_from_disk(rec_len_raw, block_size);
+
+        // Sanity: rec_len must be >= 8 and must not go past end of block
+        if rec_len < 8 {
+            return Err(ParseError::InvalidField {
+                field: "de_rec_len",
+                reason: "directory entry rec_len < 8",
+            });
+        }
+        let entry_end = offset
+            .checked_add(rec_len as usize)
+            .ok_or(ParseError::InvalidField {
+                field: "de_rec_len",
+                reason: "overflow",
+            })?;
+        if entry_end > block.len() {
+            return Err(ParseError::InvalidField {
+                field: "de_rec_len",
+                reason: "directory entry extends past block boundary",
+            });
+        }
+
+        // Detect checksum tail: inode=0, name_len=0, file_type=0xDE, rec_len=12
+        if inode == 0 && name_len == 0 && file_type_raw == EXT4_FT_DIR_CSUM && rec_len == 12 {
+            if offset + 12 <= block.len() {
+                tail = Some(Ext4DirEntryTail {
+                    checksum: read_le_u32(block, offset + 8)?,
+                });
+            }
+            break;
+        }
+
+        // Skip deleted entries (inode == 0)
+        if inode == 0 {
+            offset = entry_end;
+            continue;
+        }
+
+        // Read name bytes
+        let name_end = offset + 8 + usize::from(name_len);
+        if name_end > entry_end {
+            return Err(ParseError::InvalidField {
+                field: "de_name_len",
+                reason: "name extends past rec_len",
+            });
+        }
+        let name = block[offset + 8..name_end].to_vec();
+
+        entries.push(Ext4DirEntry {
+            inode,
+            rec_len: rec_len_raw,
+            name_len,
+            file_type: Ext4FileType::from_raw(file_type_raw),
+            name,
+        });
+
+        offset = entry_end;
+    }
+
+    Ok((entries, tail))
+}
+
+/// Look up a single name in a directory data block.
+///
+/// Returns the matching entry if found.
+#[must_use]
+pub fn lookup_in_dir_block(block: &[u8], block_size: u32, target: &[u8]) -> Option<Ext4DirEntry> {
+    let (entries, _) = parse_dir_block(block, block_size).ok()?;
+    entries.into_iter().find(|e| e.name == target)
+}
+
+// ── High-level image readers ────────────────────────────────────────────────
+
+/// Parsed context for reading ext4 structures from an image.
+///
+/// Caches the superblock so that multiple lookups avoid re-parsing it.
+#[derive(Debug, Clone)]
+pub struct Ext4ImageReader {
+    pub sb: Ext4Superblock,
+}
+
+impl Ext4ImageReader {
+    /// Create a reader by parsing the superblock from `image`.
+    pub fn new(image: &[u8]) -> Result<Self, ParseError> {
+        let sb = Ext4Superblock::parse_from_image(image)?;
+        Ok(Self { sb })
+    }
+
+    /// Read a group descriptor by group number.
+    pub fn read_group_desc(
+        &self,
+        image: &[u8],
+        group: ffs_types::GroupNumber,
+    ) -> Result<Ext4GroupDesc, ParseError> {
+        let offset = self
+            .sb
+            .group_desc_offset(group)
+            .ok_or(ParseError::InvalidField {
+                field: "group_desc_offset",
+                reason: "overflow computing group descriptor offset",
+            })?;
+        let offset_usize = usize::try_from(offset).map_err(|_| ParseError::InvalidField {
+            field: "group_desc_offset",
+            reason: "offset exceeds addressable range",
+        })?;
+        let desc_size = self.sb.group_desc_size();
+        let slice = ensure_slice(image, offset_usize, usize::from(desc_size))?;
+        Ext4GroupDesc::parse_from_bytes(slice, desc_size)
+    }
+
+    /// Read an inode by inode number from a raw disk image.
+    pub fn read_inode(
+        &self,
+        image: &[u8],
+        ino: ffs_types::InodeNumber,
+    ) -> Result<Ext4Inode, ParseError> {
+        if ino.0 == 0 {
+            return Err(ParseError::InvalidField {
+                field: "inode_number",
+                reason: "inode 0 is invalid in ext4",
+            });
+        }
+
+        let (group, _index, byte_offset_in_table) = self.sb.inode_table_offset(ino);
+
+        // Read the group descriptor to find the inode table's start block
+        let gd = self.read_group_desc(image, group)?;
+
+        // Compute absolute byte offset of the inode
+        let table_start_byte = gd
+            .inode_table
+            .checked_mul(u64::from(self.sb.block_size))
+            .ok_or(ParseError::InvalidField {
+                field: "bg_inode_table",
+                reason: "overflow computing inode table byte offset",
+            })?;
+        let inode_byte =
+            table_start_byte
+                .checked_add(byte_offset_in_table)
+                .ok_or(ParseError::InvalidField {
+                    field: "inode_offset",
+                    reason: "overflow computing inode byte offset",
+                })?;
+
+        let inode_offset = usize::try_from(inode_byte).map_err(|_| ParseError::InvalidField {
+            field: "inode_offset",
+            reason: "inode offset exceeds addressable range",
+        })?;
+
+        let inode_size = usize::from(self.sb.inode_size);
+        let slice = ensure_slice(image, inode_offset, inode_size)?;
+        Ext4Inode::parse_from_bytes(slice)
+    }
+
+    /// Read a data block by block number, returning a slice.
+    pub fn read_block<'a>(
+        &self,
+        image: &'a [u8],
+        block: ffs_types::BlockNumber,
+    ) -> Result<&'a [u8], ParseError> {
+        let byte =
+            block
+                .0
+                .checked_mul(u64::from(self.sb.block_size))
+                .ok_or(ParseError::InvalidField {
+                    field: "block_offset",
+                    reason: "overflow computing block byte offset",
+                })?;
+        let offset = usize::try_from(byte).map_err(|_| ParseError::InvalidField {
+            field: "block_offset",
+            reason: "block offset exceeds addressable range",
+        })?;
+        ensure_slice(image, offset, self.sb.block_size as usize)
+    }
+
+    /// Read a directory block and parse its entries.
+    pub fn read_dir_block(
+        &self,
+        image: &[u8],
+        block: ffs_types::BlockNumber,
+    ) -> Result<(Vec<Ext4DirEntry>, Option<Ext4DirEntryTail>), ParseError> {
+        let data = self.read_block(image, block)?;
+        parse_dir_block(data, self.sb.block_size)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -891,6 +1381,22 @@ mod tests {
         assert_eq!(parsed.blocks_count, 200);
         assert_eq!(parsed.block_size, 4096);
         assert_eq!(parsed.volume_name, "franks");
+    }
+
+    #[test]
+    fn parse_ext4_superblock_region_rejects_unsupported_block_size() {
+        let mut sb = [0_u8; EXT4_SUPERBLOCK_SIZE];
+        sb[0x38..0x3A].copy_from_slice(&EXT4_SUPER_MAGIC.to_le_bytes());
+        sb[0x18..0x1C].copy_from_slice(&3_u32.to_le_bytes()); // log_block_size=3 -> 8K
+
+        let err = Ext4Superblock::parse_superblock_region(&sb).expect_err("reject");
+        assert!(matches!(
+            err,
+            ParseError::InvalidField {
+                field: "s_log_block_size",
+                reason: "unsupported block size"
+            }
+        ));
     }
 
     /// Helper: build a minimal valid superblock buffer with required geometry.
@@ -958,7 +1464,7 @@ mod tests {
     #[test]
     fn superblock_new_fields_parse() {
         let mut sb = make_valid_sb();
-        sb[0x2C..0x30].copy_from_slice(&1700000000_u32.to_le_bytes()); // mtime
+        sb[0x2C..0x30].copy_from_slice(&1_700_000_000_u32.to_le_bytes()); // mtime
         sb[0x3A..0x3C].copy_from_slice(&1_u16.to_le_bytes()); // state=clean
         sb[0x4C..0x50].copy_from_slice(&1_u32.to_le_bytes()); // rev_level=DYNAMIC
         sb[0x54..0x58].copy_from_slice(&11_u32.to_le_bytes()); // first_ino
@@ -1095,6 +1601,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::similar_names)]
     fn inode_expanded_fields() {
         let mut raw = [0_u8; 256];
 
@@ -1159,13 +1666,13 @@ mod tests {
         assert_eq!(inode.mtime, 1_700_000_200);
 
         // Extended timestamps
-        let (ctime_s, ctime_ns) = inode.ctime_full();
-        assert_eq!(ctime_s, 1_700_000_100);
-        assert_eq!(ctime_ns, 500_000_000);
+        let (ctime_sec, ctime_nsec) = inode.ctime_full();
+        assert_eq!(ctime_sec, 1_700_000_100);
+        assert_eq!(ctime_nsec, 500_000_000);
 
-        let (mtime_s, mtime_ns) = inode.mtime_full();
-        assert_eq!(mtime_s, 1_700_000_200);
-        assert_eq!(mtime_ns, 250_000_000);
+        let (mtime_sec, mtime_nsec) = inode.mtime_full();
+        assert_eq!(mtime_sec, 1_700_000_200);
+        assert_eq!(mtime_nsec, 250_000_000);
 
         // Creation time
         assert_eq!(inode.crtime, 1_600_000_000);
@@ -1185,5 +1692,296 @@ mod tests {
         let inode = Ext4Inode::parse_from_bytes(&raw).unwrap();
         assert_eq!(inode.uid, 0x0001_FFFF); // 131071
         assert_eq!(inode.gid, 0x0002_1234); // 135732
+    }
+
+    // ── Directory entry tests ───────────────────────────────────────────
+
+    /// Build a directory entry in a buffer at `offset`.
+    #[allow(clippy::cast_possible_truncation)]
+    fn write_dir_entry(
+        buf: &mut [u8],
+        offset: usize,
+        inode: u32,
+        ft: u8,
+        name: &[u8],
+        rec_len: u16,
+    ) {
+        buf[offset..offset + 4].copy_from_slice(&inode.to_le_bytes());
+        buf[offset + 4..offset + 6].copy_from_slice(&rec_len.to_le_bytes());
+        buf[offset + 6] = name.len() as u8;
+        buf[offset + 7] = ft;
+        buf[offset + 8..offset + 8 + name.len()].copy_from_slice(name);
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn parse_dir_block_basic() {
+        let block_size = 4096_u32;
+        let mut block = vec![0_u8; block_size as usize];
+
+        // Entry 1: "." → inode 2, type=dir, rec_len=12
+        write_dir_entry(&mut block, 0, 2, 2, b".", 12);
+        // Entry 2: ".." → inode 2, type=dir, rec_len=12
+        write_dir_entry(&mut block, 12, 2, 2, b"..", 12);
+        // Entry 3: "hello.txt" → inode 12, type=regular, rec_len fills rest of block
+        let remaining = block_size as u16 - 24;
+        write_dir_entry(&mut block, 24, 12, 1, b"hello.txt", remaining);
+
+        let (entries, tail) = parse_dir_block(&block, block_size).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(tail.is_none());
+
+        assert!(entries[0].is_dot());
+        assert_eq!(entries[0].inode, 2);
+        assert_eq!(entries[0].file_type, Ext4FileType::Dir);
+
+        assert!(entries[1].is_dotdot());
+        assert_eq!(entries[1].inode, 2);
+
+        assert_eq!(entries[2].name_str(), "hello.txt");
+        assert_eq!(entries[2].inode, 12);
+        assert_eq!(entries[2].file_type, Ext4FileType::RegFile);
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn parse_dir_block_with_checksum_tail() {
+        let block_size = 4096_u32;
+        let mut block = vec![0_u8; block_size as usize];
+
+        // Single entry: "." that spans almost the whole block, leaving 12 bytes for tail
+        let entry_rec_len = block_size as u16 - 12;
+        write_dir_entry(&mut block, 0, 2, 2, b".", entry_rec_len);
+
+        // Checksum tail at end of block (last 12 bytes)
+        let tail_off = (block_size - 12) as usize;
+        block[tail_off..tail_off + 4].copy_from_slice(&0_u32.to_le_bytes()); // inode=0
+        block[tail_off + 4..tail_off + 6].copy_from_slice(&12_u16.to_le_bytes()); // rec_len=12
+        block[tail_off + 6] = 0; // name_len=0
+        block[tail_off + 7] = EXT4_FT_DIR_CSUM; // file_type=0xDE
+        block[tail_off + 8..tail_off + 12].copy_from_slice(&0xDEAD_BEEF_u32.to_le_bytes());
+
+        let (entries, tail) = parse_dir_block(&block, block_size).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].is_dot());
+
+        let tail = tail.expect("should have checksum tail");
+        assert_eq!(tail.checksum, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn parse_dir_block_skips_deleted_entries() {
+        let block_size = 1024_u32;
+        let mut block = vec![0_u8; block_size as usize];
+
+        // Entry 1: "a" → inode 5, rec_len=12
+        write_dir_entry(&mut block, 0, 5, 1, b"a", 12);
+        // Entry 2: deleted (inode=0), rec_len=12
+        write_dir_entry(&mut block, 12, 0, 0, b"", 12);
+        // Entry 3: "b" → inode 6, rec_len fills rest
+        let remaining = block_size as u16 - 24;
+        write_dir_entry(&mut block, 24, 6, 1, b"b", remaining);
+
+        let (entries, _) = parse_dir_block(&block, block_size).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, b"a");
+        assert_eq!(entries[1].name, b"b");
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn lookup_in_dir_block_finds_entry() {
+        let block_size = 4096_u32;
+        let mut block = vec![0_u8; block_size as usize];
+
+        write_dir_entry(&mut block, 0, 2, 2, b".", 12);
+        write_dir_entry(&mut block, 12, 2, 2, b"..", 12);
+        let remaining = block_size as u16 - 24;
+        write_dir_entry(&mut block, 24, 42, 1, b"myfile", remaining);
+
+        let found = lookup_in_dir_block(&block, block_size, b"myfile");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().inode, 42);
+
+        let not_found = lookup_in_dir_block(&block, block_size, b"missing");
+        assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn dir_entry_file_types() {
+        assert_eq!(Ext4FileType::from_raw(0), Ext4FileType::Unknown);
+        assert_eq!(Ext4FileType::from_raw(1), Ext4FileType::RegFile);
+        assert_eq!(Ext4FileType::from_raw(2), Ext4FileType::Dir);
+        assert_eq!(Ext4FileType::from_raw(7), Ext4FileType::Symlink);
+        assert_eq!(Ext4FileType::from_raw(255), Ext4FileType::Unknown);
+    }
+
+    // ── Ext4ImageReader integration test ────────────────────────────────
+
+    /// Build a minimal synthetic ext4 image with superblock, GDT, and inode table.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn image_reader_reads_inode() {
+        // Layout: 4K blocks, 1 group
+        //   Block 0: boot + superblock (offset 1024..2048)
+        //   Block 1: group descriptor table
+        //   Block 2: inode table (8192 inodes * 256 bytes, but we only populate a few)
+        let block_size = 4096_usize;
+        let image_blocks = 32; // 128K image
+        let mut image = vec![0_u8; block_size * image_blocks];
+
+        // Write superblock at offset 1024
+        let sb_off = EXT4_SUPERBLOCK_OFFSET;
+        let mut sb = [0_u8; EXT4_SUPERBLOCK_SIZE];
+        sb[0x38..0x3A].copy_from_slice(&EXT4_SUPER_MAGIC.to_le_bytes());
+        sb[0x18..0x1C].copy_from_slice(&2_u32.to_le_bytes()); // log_block_size=2 → 4K
+        sb[0x00..0x04].copy_from_slice(&8192_u32.to_le_bytes()); // inodes_count
+        sb[0x04..0x08].copy_from_slice(&(image_blocks as u32).to_le_bytes()); // blocks_count_lo
+        sb[0x14..0x18].copy_from_slice(&0_u32.to_le_bytes()); // first_data_block=0
+        sb[0x20..0x24].copy_from_slice(&(image_blocks as u32).to_le_bytes()); // blocks_per_group
+        sb[0x28..0x2C].copy_from_slice(&8192_u32.to_le_bytes()); // inodes_per_group
+        sb[0x58..0x5A].copy_from_slice(&256_u16.to_le_bytes()); // inode_size=256
+        image[sb_off..sb_off + EXT4_SUPERBLOCK_SIZE].copy_from_slice(&sb);
+
+        // Write group descriptor at block 1 (offset 4096)
+        // bg_inode_table_lo = block 2 (offset 8192)
+        let gdt_off = block_size; // block 1
+        let mut gd = [0_u8; 32];
+        gd[0x08..0x0C].copy_from_slice(&2_u32.to_le_bytes()); // inode_table_lo = block 2
+        image[gdt_off..gdt_off + 32].copy_from_slice(&gd);
+
+        // Write inode 2 (root) at inode table block 2, index 1 (offset = 256)
+        // Inode table starts at block 2 = byte 8192
+        // Inode 2 is at index 1 → byte 8192 + 256 = 8448
+        let inode_table_off = 2 * block_size; // block 2
+        let inode2_off = inode_table_off + 256; // index 1 * 256
+        image[inode2_off..inode2_off + 2].copy_from_slice(&0o040_755_u16.to_le_bytes()); // mode: directory
+        image[inode2_off + 0x02..inode2_off + 0x04].copy_from_slice(&0_u16.to_le_bytes()); // uid_lo=0 (root)
+        image[inode2_off + 0x04..inode2_off + 0x08].copy_from_slice(&4096_u32.to_le_bytes()); // size_lo
+        image[inode2_off + 0x1A..inode2_off + 0x1C].copy_from_slice(&2_u16.to_le_bytes()); // links=2
+        image[inode2_off + 0x64..inode2_off + 0x68].copy_from_slice(&1_u32.to_le_bytes()); // generation=1
+
+        // Read it back via Ext4ImageReader
+        let reader = Ext4ImageReader::new(&image).expect("parse image");
+        assert_eq!(reader.sb.block_size, 4096);
+        assert_eq!(reader.sb.inodes_per_group, 8192);
+
+        let inode = reader
+            .read_inode(&image, ffs_types::InodeNumber(2))
+            .expect("read inode 2");
+        assert_eq!(inode.mode, 0o040_755);
+        assert_eq!(inode.uid, 0);
+        assert_eq!(inode.size, 4096);
+        assert_eq!(inode.links_count, 2);
+        assert_eq!(inode.generation, 1);
+
+        // Inode 0 should be rejected
+        assert!(
+            reader
+                .read_inode(&image, ffs_types::InodeNumber(0))
+                .is_err()
+        );
+
+        // Read a block
+        let block_data = reader
+            .read_block(&image, ffs_types::BlockNumber(0))
+            .expect("read block 0");
+        assert_eq!(block_data.len(), 4096);
+    }
+
+    // ── Checksum verification tests ─────────────────────────────────────
+
+    /// Helper: compute group descriptor checksum the same way the kernel does,
+    /// then store it, and verify our verification function accepts it.
+    #[test]
+    fn group_desc_checksum_round_trip() {
+        let uuid = [1_u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        // Compute csum_seed = ext4_chksum(~0, uuid, 16) = crc32c_append(!0, uuid)
+        let csum_seed = crc32c::crc32c_append(!0u32, &uuid);
+
+        let group_number: u32 = 0;
+        let desc_size: u16 = 32;
+
+        // Build a group descriptor with known fields
+        let mut gd = [0_u8; 32];
+        gd[0x00..0x04].copy_from_slice(&100_u32.to_le_bytes()); // block_bitmap
+        gd[0x04..0x08].copy_from_slice(&200_u32.to_le_bytes()); // inode_bitmap
+        gd[0x08..0x0C].copy_from_slice(&300_u32.to_le_bytes()); // inode_table
+        gd[0x0C..0x0E].copy_from_slice(&50_u16.to_le_bytes()); // free_blocks_lo
+
+        // Compute the checksum the same way the kernel does
+        let le_group = group_number.to_le_bytes();
+        let mut csum = crc32c::crc32c_append(csum_seed, &le_group);
+        csum = crc32c::crc32c_append(csum, &gd[..GD_CHECKSUM_OFFSET]);
+        csum = crc32c::crc32c_append(csum, &[0, 0]);
+        let after = GD_CHECKSUM_OFFSET + 2;
+        if after < 32 {
+            csum = crc32c::crc32c_append(csum, &gd[after..32]);
+        }
+        let checksum = (csum & 0xFFFF) as u16;
+
+        // Store it
+        gd[GD_CHECKSUM_OFFSET..GD_CHECKSUM_OFFSET + 2].copy_from_slice(&checksum.to_le_bytes());
+
+        // Verify it passes
+        verify_group_desc_checksum(&gd, csum_seed, group_number, desc_size)
+            .expect("checksum should match");
+
+        // Corrupt one byte and verify it fails
+        gd[0] ^= 0xFF;
+        assert!(verify_group_desc_checksum(&gd, csum_seed, group_number, desc_size).is_err());
+    }
+
+    /// Helper: compute inode checksum the same way the kernel does,
+    /// then store it, and verify our verification function accepts it.
+    #[test]
+    fn inode_checksum_round_trip() {
+        let uuid = [0xAA_u8; 16];
+        let csum_seed = crc32c::crc32c_append(!0u32, &uuid);
+        let ino: u32 = 2;
+        let inode_size: u16 = 256;
+
+        let mut raw = [0_u8; 256];
+        // mode = directory
+        raw[0x00..0x02].copy_from_slice(&0o040_755_u16.to_le_bytes());
+        // uid_lo
+        raw[0x02..0x04].copy_from_slice(&1000_u16.to_le_bytes());
+        // generation
+        raw[0x64..0x68].copy_from_slice(&42_u32.to_le_bytes());
+        // extra_isize = 32 (covers checksum_hi and more)
+        raw[0x80..0x82].copy_from_slice(&32_u16.to_le_bytes());
+
+        // Compute checksum:
+        // ino_seed = crc32c_append(csum_seed, le_ino)
+        // ino_seed = crc32c_append(ino_seed, le_gen)
+        let ino_seed = crc32c::crc32c_append(csum_seed, &ino.to_le_bytes());
+        let ino_seed = crc32c::crc32c_append(ino_seed, &42_u32.to_le_bytes());
+
+        // CRC base inode, zeroing i_checksum_lo at 0x7C
+        let mut csum = crc32c::crc32c_append(ino_seed, &raw[..INODE_CHECKSUM_LO_OFFSET]);
+        csum = crc32c::crc32c_append(csum, &[0, 0]);
+        csum = crc32c::crc32c_append(csum, &raw[INODE_CHECKSUM_LO_OFFSET + 2..128]);
+
+        // Extended area, zeroing i_checksum_hi at 0x82
+        csum = crc32c::crc32c_append(csum, &raw[128..INODE_CHECKSUM_HI_OFFSET]);
+        csum = crc32c::crc32c_append(csum, &[0, 0]);
+        csum = crc32c::crc32c_append(csum, &raw[INODE_CHECKSUM_HI_OFFSET + 2..256]);
+
+        // Store lo and hi
+        let csum_lo = (csum & 0xFFFF) as u16;
+        let csum_hi = ((csum >> 16) & 0xFFFF) as u16;
+        raw[INODE_CHECKSUM_LO_OFFSET..INODE_CHECKSUM_LO_OFFSET + 2]
+            .copy_from_slice(&csum_lo.to_le_bytes());
+        raw[INODE_CHECKSUM_HI_OFFSET..INODE_CHECKSUM_HI_OFFSET + 2]
+            .copy_from_slice(&csum_hi.to_le_bytes());
+
+        // Verify it passes
+        verify_inode_checksum(&raw, csum_seed, ino, inode_size)
+            .expect("inode checksum should match");
+
+        // Corrupt one byte and verify it fails
+        raw[0x10] ^= 0x01;
+        assert!(verify_inode_checksum(&raw, csum_seed, ino, inode_size).is_err());
     }
 }

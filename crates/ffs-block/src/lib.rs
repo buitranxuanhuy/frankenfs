@@ -8,8 +8,8 @@
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
 use ffs_types::{
-    BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE, BlockNumber, EXT4_SUPERBLOCK_OFFSET,
-    EXT4_SUPERBLOCK_SIZE,
+    BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE, BlockNumber, ByteOffset,
+    EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE,
 };
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
@@ -55,10 +55,10 @@ pub trait ByteDevice: Send + Sync {
     fn len_bytes(&self) -> u64;
 
     /// Read exactly `buf.len()` bytes from `offset` into `buf`.
-    fn read_exact_at(&self, cx: &Cx, offset: u64, buf: &mut [u8]) -> Result<()>;
+    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()>;
 
     /// Write all bytes in `buf` to `offset`.
-    fn write_all_at(&self, cx: &Cx, offset: u64, buf: &[u8]) -> Result<()>;
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<()>;
 
     /// Flush pending writes to stable storage.
     fn sync(&self, cx: &Cx) -> Result<()>;
@@ -107,9 +107,10 @@ impl ByteDevice for FileByteDevice {
         self.len
     }
 
-    fn read_exact_at(&self, cx: &Cx, offset: u64, buf: &mut [u8]) -> Result<()> {
+    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
         cx_checkpoint(cx)?;
         let end = offset
+            .0
             .checked_add(
                 u64::try_from(buf.len())
                     .map_err(|_| FfsError::Format("read length overflows u64".to_owned()))?,
@@ -123,17 +124,18 @@ impl ByteDevice for FileByteDevice {
             )));
         }
 
-        self.file.read_exact_at(buf, offset)?;
+        self.file.read_exact_at(buf, offset.0)?;
         cx_checkpoint(cx)?;
         Ok(())
     }
 
-    fn write_all_at(&self, cx: &Cx, offset: u64, buf: &[u8]) -> Result<()> {
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<()> {
         cx_checkpoint(cx)?;
         if !self.writable {
             return Err(FfsError::PermissionDenied);
         }
         let end = offset
+            .0
             .checked_add(
                 u64::try_from(buf.len())
                     .map_err(|_| FfsError::Format("write length overflows u64".to_owned()))?,
@@ -147,7 +149,7 @@ impl ByteDevice for FileByteDevice {
             )));
         }
 
-        self.file.write_all_at(buf, offset)?;
+        self.file.write_all_at(buf, offset.0)?;
         cx_checkpoint(cx)?;
         Ok(())
     }
@@ -235,7 +237,7 @@ impl<D: ByteDevice> BlockDevice for ByteBlockDevice<D> {
                 FfsError::Format("block_size does not fit usize".to_owned())
             })?
         ];
-        self.inner.read_exact_at(cx, offset, &mut buf)?;
+        self.inner.read_exact_at(cx, ByteOffset(offset), &mut buf)?;
         cx_checkpoint(cx)?;
         Ok(BlockBuf::new(buf))
     }
@@ -261,7 +263,7 @@ impl<D: ByteDevice> BlockDevice for ByteBlockDevice<D> {
             .0
             .checked_mul(u64::from(self.block_size))
             .ok_or_else(|| FfsError::Format("block offset overflow".to_owned()))?;
-        self.inner.write_all_at(cx, offset, data)?;
+        self.inner.write_all_at(cx, ByteOffset(offset), data)?;
         cx_checkpoint(cx)?;
         Ok(())
     }
@@ -287,7 +289,7 @@ pub fn read_ext4_superblock_region(
     let mut buf = [0_u8; EXT4_SUPERBLOCK_SIZE];
     let offset = u64::try_from(EXT4_SUPERBLOCK_OFFSET)
         .map_err(|_| FfsError::Format("ext4 superblock offset does not fit u64".to_owned()))?;
-    dev.read_exact_at(cx, offset, &mut buf)?;
+    dev.read_exact_at(cx, ByteOffset(offset), &mut buf)?;
     Ok(buf)
 }
 
@@ -299,7 +301,7 @@ pub fn read_btrfs_superblock_region(
     let mut buf = [0_u8; BTRFS_SUPER_INFO_SIZE];
     let offset = u64::try_from(BTRFS_SUPER_INFO_OFFSET)
         .map_err(|_| FfsError::Format("btrfs superblock offset does not fit u64".to_owned()))?;
-    dev.read_exact_at(cx, offset, &mut buf)?;
+    dev.read_exact_at(cx, ByteOffset(offset), &mut buf)?;
     Ok(buf)
 }
 
@@ -542,9 +544,9 @@ mod tests {
             u64::try_from(self.bytes.lock().len()).unwrap_or(0)
         }
 
-        fn read_exact_at(&self, _cx: &Cx, offset: u64, buf: &mut [u8]) -> Result<()> {
-            let offset =
-                usize::try_from(offset).map_err(|_| FfsError::Format("offset overflow".into()))?;
+        fn read_exact_at(&self, _cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
+            let offset = usize::try_from(offset.0)
+                .map_err(|_| FfsError::Format("offset overflow".into()))?;
             let end = offset
                 .checked_add(buf.len())
                 .ok_or_else(|| FfsError::Format("range overflow".into()))?;
@@ -557,9 +559,9 @@ mod tests {
             Ok(())
         }
 
-        fn write_all_at(&self, _cx: &Cx, offset: u64, buf: &[u8]) -> Result<()> {
-            let offset =
-                usize::try_from(offset).map_err(|_| FfsError::Format("offset overflow".into()))?;
+        fn write_all_at(&self, _cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<()> {
+            let offset = usize::try_from(offset.0)
+                .map_err(|_| FfsError::Format("offset overflow".into()))?;
             let end = offset
                 .checked_add(buf.len())
                 .ok_or_else(|| FfsError::Format("range overflow".into()))?;
