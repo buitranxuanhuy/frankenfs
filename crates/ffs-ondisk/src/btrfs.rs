@@ -10,6 +10,14 @@ const BTRFS_HEADER_SIZE: usize = 101;
 const BTRFS_ITEM_SIZE: usize = 25;
 const BTRFS_SUPER_LABEL_OFFSET: usize = 0x12B;
 const BTRFS_SUPER_LABEL_LEN: usize = 256;
+const BTRFS_SYS_CHUNK_ARRAY_OFFSET: usize = 0x32B;
+const BTRFS_SYS_CHUNK_ARRAY_MAX: usize = 2048;
+/// Size of a btrfs_disk_key on disk (objectid:u64 + type:u8 + offset:u64).
+const BTRFS_DISK_KEY_SIZE: usize = 17;
+/// Minimum chunk size: header fields before the stripe array (48 bytes).
+const BTRFS_CHUNK_FIXED_SIZE: usize = 48;
+/// Size of one btrfs_stripe on disk (devid:u64 + offset:u64 + dev_uuid:16).
+const BTRFS_STRIPE_SIZE: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BtrfsSuperblock {
@@ -37,9 +45,12 @@ pub struct BtrfsSuperblock {
     pub chunk_root_level: u8,
     pub log_root_level: u8,
     pub label: String,
+    pub sys_chunk_array_size: u32,
+    pub sys_chunk_array: Vec<u8>,
 }
 
 impl BtrfsSuperblock {
+    #[allow(clippy::too_many_lines)]
     pub fn parse_superblock_region(region: &[u8]) -> Result<Self, ParseError> {
         if region.len() < BTRFS_SUPER_INFO_SIZE {
             return Err(ParseError::InsufficientData {
@@ -59,12 +70,71 @@ impl BtrfsSuperblock {
 
         let sectorsize = read_le_u32(region, 0x90)?;
         let nodesize = read_le_u32(region, 0x94)?;
-        if sectorsize == 0 || nodesize == 0 {
+        let stripesize = read_le_u32(region, 0x9C)?;
+
+        // Validate sectorsize: must be non-zero and power-of-two, 4K typical
+        if sectorsize == 0 || !sectorsize.is_power_of_two() {
             return Err(ParseError::InvalidField {
-                field: "sectorsize/nodesize",
-                reason: "zero value",
+                field: "sectorsize",
+                reason: "must be non-zero power of two",
             });
         }
+        // Validate nodesize: must be non-zero and power-of-two, typically 4K-64K
+        if nodesize == 0 || !nodesize.is_power_of_two() {
+            return Err(ParseError::InvalidField {
+                field: "nodesize",
+                reason: "must be non-zero power of two",
+            });
+        }
+        // Validate stripesize: must be non-zero and power-of-two when set
+        if stripesize != 0 && !stripesize.is_power_of_two() {
+            return Err(ParseError::InvalidField {
+                field: "stripesize",
+                reason: "must be zero or power of two",
+            });
+        }
+        // Sane upper bounds (256K for sector/stripe, 256K for node)
+        if sectorsize > 256 * 1024 {
+            return Err(ParseError::InvalidField {
+                field: "sectorsize",
+                reason: "exceeds 256K upper bound",
+            });
+        }
+        if nodesize > 256 * 1024 {
+            return Err(ParseError::InvalidField {
+                field: "nodesize",
+                reason: "exceeds 256K upper bound",
+            });
+        }
+
+        // Parse sys_chunk_array_size and validate
+        let sys_chunk_array_size = read_le_u32(region, 0xA0)?;
+        let sys_array_len =
+            usize::try_from(sys_chunk_array_size).map_err(|_| ParseError::IntegerConversion {
+                field: "sys_chunk_array_size",
+            })?;
+        if sys_array_len > BTRFS_SYS_CHUNK_ARRAY_MAX {
+            return Err(ParseError::InvalidField {
+                field: "sys_chunk_array_size",
+                reason: "exceeds 2048 byte limit",
+            });
+        }
+
+        // Extract sys_chunk_array bytes
+        let array_end = BTRFS_SYS_CHUNK_ARRAY_OFFSET
+            .checked_add(sys_array_len)
+            .ok_or(ParseError::InvalidField {
+                field: "sys_chunk_array",
+                reason: "offset overflow",
+            })?;
+        if array_end > region.len() {
+            return Err(ParseError::InsufficientData {
+                needed: array_end,
+                offset: BTRFS_SYS_CHUNK_ARRAY_OFFSET,
+                actual: region.len(),
+            });
+        }
+        let sys_chunk_array = region[BTRFS_SYS_CHUNK_ARRAY_OFFSET..array_end].to_vec();
 
         Ok(Self {
             csum: read_fixed::<32>(region, 0x00)?,
@@ -82,7 +152,7 @@ impl BtrfsSuperblock {
             num_devices: read_le_u64(region, 0x88)?,
             sectorsize,
             nodesize,
-            stripesize: read_le_u32(region, 0x9C)?,
+            stripesize,
             compat_flags: read_le_u64(region, 0xAC)?,
             compat_ro_flags: read_le_u64(region, 0xB4)?,
             incompat_flags: read_le_u64(region, 0xBC)?,
@@ -94,6 +164,8 @@ impl BtrfsSuperblock {
                 region,
                 BTRFS_SUPER_LABEL_OFFSET,
             )?),
+            sys_chunk_array_size,
+            sys_chunk_array,
         })
     }
 
@@ -116,6 +188,134 @@ impl BtrfsSuperblock {
         Self::parse_superblock_region(&image[BTRFS_SUPER_INFO_OFFSET..end])
     }
 }
+
+// ── sys_chunk_array entry types ──────────────────────────────────────────────
+
+/// A single stripe within a btrfs chunk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BtrfsStripe {
+    pub devid: u64,
+    pub offset: u64,
+    pub dev_uuid: [u8; 16],
+}
+
+/// A parsed entry from the superblock's sys_chunk_array.
+///
+/// Each entry consists of a `btrfs_disk_key` followed by a `btrfs_chunk`
+/// (which embeds one or more `btrfs_stripe` entries).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BtrfsChunkEntry {
+    pub key: BtrfsKey,
+    pub length: u64,
+    pub owner: u64,
+    pub stripe_len: u64,
+    pub chunk_type: u64,
+    pub io_align: u32,
+    pub io_width: u32,
+    pub sector_size: u32,
+    pub num_stripes: u16,
+    pub sub_stripes: u16,
+    pub stripes: Vec<BtrfsStripe>,
+}
+
+/// Parse all entries from a sys_chunk_array byte slice.
+///
+/// The array contains alternating `btrfs_disk_key` + `btrfs_chunk` entries.
+/// Each chunk embeds `num_stripes` stripe descriptors.
+pub fn parse_sys_chunk_array(data: &[u8]) -> Result<Vec<BtrfsChunkEntry>, ParseError> {
+    let mut entries = Vec::new();
+    let mut cur = 0_usize;
+
+    while cur < data.len() {
+        // Need at least a disk key (17 bytes)
+        if cur + BTRFS_DISK_KEY_SIZE > data.len() {
+            return Err(ParseError::InsufficientData {
+                needed: BTRFS_DISK_KEY_SIZE,
+                offset: cur,
+                actual: data.len() - cur,
+            });
+        }
+
+        let key = BtrfsKey {
+            objectid: read_le_u64(data, cur)?,
+            item_type: data[cur + 8],
+            offset: read_le_u64(data, cur + 9)?,
+        };
+        cur += BTRFS_DISK_KEY_SIZE;
+
+        // Need at least the fixed chunk header (48 bytes) to read num_stripes
+        if cur + BTRFS_CHUNK_FIXED_SIZE > data.len() {
+            return Err(ParseError::InsufficientData {
+                needed: BTRFS_CHUNK_FIXED_SIZE,
+                offset: cur,
+                actual: data.len() - cur,
+            });
+        }
+
+        let length = read_le_u64(data, cur)?;
+        let owner = read_le_u64(data, cur + 8)?;
+        let stripe_len = read_le_u64(data, cur + 16)?;
+        let chunk_type = read_le_u64(data, cur + 24)?;
+        let io_align = read_le_u32(data, cur + 32)?;
+        let io_width = read_le_u32(data, cur + 36)?;
+        let sector_size = read_le_u32(data, cur + 40)?;
+        let num_stripes = read_le_u16(data, cur + 44)?;
+        let sub_stripes = read_le_u16(data, cur + 46)?;
+        cur += BTRFS_CHUNK_FIXED_SIZE;
+
+        if num_stripes == 0 {
+            return Err(ParseError::InvalidField {
+                field: "num_stripes",
+                reason: "chunk must have at least one stripe",
+            });
+        }
+
+        let stripes_count = usize::from(num_stripes);
+        let stripes_bytes =
+            stripes_count
+                .checked_mul(BTRFS_STRIPE_SIZE)
+                .ok_or(ParseError::InvalidField {
+                    field: "num_stripes",
+                    reason: "stripe count overflow",
+                })?;
+
+        if cur + stripes_bytes > data.len() {
+            return Err(ParseError::InsufficientData {
+                needed: stripes_bytes,
+                offset: cur,
+                actual: data.len() - cur,
+            });
+        }
+
+        let mut stripes = Vec::with_capacity(stripes_count);
+        for _ in 0..stripes_count {
+            stripes.push(BtrfsStripe {
+                devid: read_le_u64(data, cur)?,
+                offset: read_le_u64(data, cur + 8)?,
+                dev_uuid: read_fixed::<16>(data, cur + 16)?,
+            });
+            cur += BTRFS_STRIPE_SIZE;
+        }
+
+        entries.push(BtrfsChunkEntry {
+            key,
+            length,
+            owner,
+            stripe_len,
+            chunk_type,
+            io_align,
+            io_width,
+            sector_size,
+            num_stripes,
+            sub_stripes,
+            stripes,
+        });
+    }
+
+    Ok(entries)
+}
+
+// ── Tree node types ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BtrfsKey {
@@ -270,6 +470,104 @@ mod tests {
         assert_eq!(parsed.sectorsize, 4096);
         assert_eq!(parsed.nodesize, 16384);
         assert_eq!(parsed.label, "ffs");
+    }
+
+    #[test]
+    fn superblock_sys_chunk_array_parsed() {
+        // Build a superblock with a single sys_chunk_array entry
+        let mut sb = [0_u8; BTRFS_SUPER_INFO_SIZE];
+        sb[0x40..0x48].copy_from_slice(&BTRFS_MAGIC.to_le_bytes());
+        sb[0x90..0x94].copy_from_slice(&4096_u32.to_le_bytes());
+        sb[0x94..0x98].copy_from_slice(&16384_u32.to_le_bytes());
+        sb[0x9C..0xA0].copy_from_slice(&65536_u32.to_le_bytes());
+
+        // Build a sys_chunk_array entry: disk_key (17) + chunk_fixed (48) + 1 stripe (32) = 97
+        let entry_size: u32 = 97;
+        sb[0xA0..0xA4].copy_from_slice(&entry_size.to_le_bytes());
+
+        let base = BTRFS_SYS_CHUNK_ARRAY_OFFSET;
+        // disk_key: objectid=256, type=228 (CHUNK_ITEM_KEY), offset=0
+        sb[base..base + 8].copy_from_slice(&256_u64.to_le_bytes());
+        sb[base + 8] = 228;
+        sb[base + 9..base + 17].copy_from_slice(&0_u64.to_le_bytes());
+        // chunk: length=8MiB, owner=2, stripe_len=64K, type=2 (SYSTEM)
+        let c = base + 17;
+        sb[c..c + 8].copy_from_slice(&(8 * 1024 * 1024_u64).to_le_bytes());
+        sb[c + 8..c + 16].copy_from_slice(&2_u64.to_le_bytes());
+        sb[c + 16..c + 24].copy_from_slice(&(64 * 1024_u64).to_le_bytes());
+        sb[c + 24..c + 32].copy_from_slice(&2_u64.to_le_bytes()); // type=SYSTEM
+        sb[c + 32..c + 36].copy_from_slice(&4096_u32.to_le_bytes());
+        sb[c + 36..c + 40].copy_from_slice(&4096_u32.to_le_bytes());
+        sb[c + 40..c + 44].copy_from_slice(&4096_u32.to_le_bytes());
+        sb[c + 44..c + 46].copy_from_slice(&1_u16.to_le_bytes()); // num_stripes=1
+        sb[c + 46..c + 48].copy_from_slice(&0_u16.to_le_bytes()); // sub_stripes=0
+        // stripe: devid=1, offset=0, uuid=zeros
+        let s = c + 48;
+        sb[s..s + 8].copy_from_slice(&1_u64.to_le_bytes());
+        sb[s + 8..s + 16].copy_from_slice(&0_u64.to_le_bytes());
+
+        let parsed = BtrfsSuperblock::parse_superblock_region(&sb).expect("sb parse");
+        assert_eq!(parsed.sys_chunk_array_size, entry_size);
+        assert_eq!(parsed.sys_chunk_array.len(), 97);
+
+        let entries = parse_sys_chunk_array(&parsed.sys_chunk_array).expect("chunk parse");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key.objectid, 256);
+        assert_eq!(entries[0].key.item_type, 228);
+        assert_eq!(entries[0].length, 8 * 1024 * 1024);
+        assert_eq!(entries[0].num_stripes, 1);
+        assert_eq!(entries[0].stripes[0].devid, 1);
+    }
+
+    #[test]
+    fn superblock_rejects_non_power_of_two_sectorsize() {
+        let mut sb = [0_u8; BTRFS_SUPER_INFO_SIZE];
+        sb[0x40..0x48].copy_from_slice(&BTRFS_MAGIC.to_le_bytes());
+        sb[0x90..0x94].copy_from_slice(&3000_u32.to_le_bytes()); // not power of 2
+        sb[0x94..0x98].copy_from_slice(&16384_u32.to_le_bytes());
+        let err = BtrfsSuperblock::parse_superblock_region(&sb).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "sectorsize",
+                    ..
+                }
+            ),
+            "expected sectorsize error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn superblock_rejects_non_power_of_two_nodesize() {
+        let mut sb = [0_u8; BTRFS_SUPER_INFO_SIZE];
+        sb[0x40..0x48].copy_from_slice(&BTRFS_MAGIC.to_le_bytes());
+        sb[0x90..0x94].copy_from_slice(&4096_u32.to_le_bytes());
+        sb[0x94..0x98].copy_from_slice(&5000_u32.to_le_bytes()); // not power of 2
+        let err = BtrfsSuperblock::parse_superblock_region(&sb).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "nodesize",
+                    ..
+                }
+            ),
+            "expected nodesize error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_sys_chunk_array_empty() {
+        let entries = parse_sys_chunk_array(&[]).expect("empty array is valid");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn parse_sys_chunk_array_truncated_key() {
+        let data = [0_u8; 10]; // too short for a disk_key
+        let err = parse_sys_chunk_array(&data).unwrap_err();
+        assert!(matches!(err, ParseError::InsufficientData { .. }));
     }
 
     #[test]
