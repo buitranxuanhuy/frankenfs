@@ -370,6 +370,14 @@ See [FEATURE_PARITY.md](FEATURE_PARITY.md) for the full capability matrix and [P
 
 ---
 
+## V1 Filesystem Scope
+
+**ext4:** Single-device images with block sizes 1K/2K/4K. Requires `FILETYPE` + `EXTENTS` feature flags. Read-only FUSE mount. Features explicitly excluded: `COMPRESSION`, `ENCRYPT`, `CASEFOLD`, `INLINE_DATA`, `JOURNAL_DEV`. Images with excluded flags are rejected at mount time.
+
+**btrfs:** Single-device images only. Metadata parsing + validation (superblock, leaf items, sys_chunk_array). Read-only mount is phased (not yet implemented). Multi-device, RAID profiles, transparent compression, and send/receive are out of scope for V1.
+
+See [COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md](COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md) for the full normative scope.
+
 ## Limitations
 
 - **Read-only mount only.** `ffs mount` supports read-only ext4 via FUSE. Write support and btrfs mount are not yet implemented.
@@ -387,7 +395,7 @@ See [FEATURE_PARITY.md](FEATURE_PARITY.md) for the full capability matrix and [P
 A: Kernel filesystems can't be extended with MVCC or self-healing from userspace. FrankenFS is a research vehicle for exploring what ext4/btrfs could look like with modern concurrency control and erasure coding, while remaining mount-compatible with existing images.
 
 **Q: Can I mount my real ext4 partition with this today?**
-A: No. FrankenFS can *inspect* ext4/btrfs images (read metadata, validate structures), but the FUSE mount path is not yet functional. Do not use this on data you care about.
+A: `ffs mount` supports read-only ext4 mounting via FUSE for images with supported feature flags. This is experimental — do not rely on it for production data. btrfs mount is not yet supported.
 
 **Q: What does "spec-first" mean?**
 A: Instead of translating C to Rust line by line, we first extract the *behavioral contract* of each kernel subsystem into specification documents (~400KB of structured Markdown). Then we implement from the spec in idiomatic Rust. This avoids carrying over C-isms and allows architectural improvements.
