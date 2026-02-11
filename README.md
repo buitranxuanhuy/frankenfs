@@ -21,7 +21,7 @@
 
 **The problem:** Linux filesystems are trapped in kernel space. ext4 is 30 years old with a global journal lock (JBD2) that serializes all writes. btrfs has better internals but remains kernel-only, hard to test, and impossible to extend from userspace. Both lack automatic corruption recovery — you run `fsck` after the fact and hope.
 
-**The solution:** FrankenFS extracts the *behavior* of ext4 and btrfs from ~205K lines of Linux kernel C (v6.19) and re-implements it idiomatically in Rust as a FUSE filesystem. It reads and writes real ext4/btrfs disk images while adding two structural innovations that the kernel implementations can't:
+**The solution:** FrankenFS extracts the *behavior* of ext4 and btrfs from ~205K lines of Linux kernel C (v6.19) and re-implements it idiomatically in Rust as a FUSE filesystem. It reads real ext4/btrfs disk images today (with experimental read-only ext4 mount) and is evolving toward safe write-path support, while adding two structural innovations that the kernel implementations can't:
 
 | What | How | Why it matters |
 |------|-----|----------------|
@@ -251,7 +251,7 @@ The `rust-toolchain.toml` pins the nightly channel. Cargo handles the rest.
 ### Requirements
 
 - **Rust nightly** (edition 2024, minimum version 1.85)
-- **Linux** (FUSE target — `libfuse-dev` or `fuse3` for eventual mount support)
+- **Linux** (FUSE target — `libfuse-dev` or `fuse3` for mount support)
 - **FUSE headers**: `sudo apt install libfuse-dev` (Debian/Ubuntu) or `sudo dnf install fuse-devel` (Fedora)
 
 ---
@@ -286,8 +286,16 @@ cargo run -p ffs-harness -- parity
 # Inspect ext4 or btrfs image metadata (JSON output)
 cargo run -p ffs-cli -- inspect <image-path> --json
 
+# Mount an ext4 image via FUSE (read-only)
+cargo run -p ffs-cli -- mount <image-path> <mountpoint>
+
+# Run a read-only scrub over image blocks
+cargo run -p ffs-cli -- scrub <image-path> --json
+
+# Show current feature parity report
+cargo run -p ffs-cli -- parity --json
+
 # Planned (not yet implemented):
-# ffs mount <image> <mountpoint>
 # ffs fsck <image>
 # ffs info <image>
 # ffs repair <image>
@@ -336,18 +344,18 @@ cargo test --workspace
 
 ## Project Status
 
-FrankenFS is in **early development**. The workspace compiles, on-disk parsing and MVCC scaffolding work, but it is not yet a mountable filesystem.
+FrankenFS is in **early development**. The workspace compiles, on-disk parsing and MVCC scaffolding work, and supports experimental read-only ext4 mounting via FUSE. btrfs mounting and write-path support are still in progress.
 
 ### Feature Parity
 
 | Domain | Coverage |
 |--------|----------|
-| ext4 metadata parsing | 31.6% (6/19) |
-| btrfs metadata parsing | 20.0% (4/20) |
+| ext4 metadata parsing | 47.4% (9/19) |
+| btrfs metadata parsing | 35.0% (7/20) |
 | MVCC/COW core | 28.6% (4/14) |
-| FUSE surface | 8.3% (1/12) |
+| FUSE surface | 50.0% (6/12) |
 | Self-healing durability | 20.0% (2/10) |
-| **Overall** | **22.7% (17/75)** |
+| **Overall** | **37.3% (28/75)** |
 
 ### What Works Today
 
@@ -355,14 +363,14 @@ FrankenFS is in **early development**. The workspace compiles, on-disk parsing a
 - btrfs superblock, B-tree header, leaf item metadata decoding, and geometry validation
 - MVCC snapshot visibility, commit sequencing, first-committer-wins conflict detection
 - Bayesian durability policy model and RaptorQ config mapping
-- CLI `inspect` command with JSON output
+- CLI `inspect`, `mount` (ext4 read-only), `scrub`, and `parity` commands
 - Conformance fixture harness and Criterion benchmark scaffolding
 
 ### What's Next
 
 - ext4 journal replay and allocator mutation paths
 - btrfs transaction/delayed-ref/scrub parity
-- Full FUSE mount (read-only, then read-write)
+- Broaden FUSE coverage beyond the current ext4 read-only surface and add btrfs read-only mount
 - Block I/O with ARC cache integration
 - RaptorQ corruption recovery pipeline
 

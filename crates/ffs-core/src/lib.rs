@@ -2,17 +2,17 @@
 
 use asupersync::{Cx, RaptorQConfig};
 use ffs_block::{
-    BlockBuf, BlockDevice, ByteDevice, FileByteDevice, read_btrfs_superblock_region,
-    read_ext4_superblock_region,
+    read_btrfs_superblock_region, read_ext4_superblock_region, BlockBuf, BlockDevice, ByteDevice,
+    FileByteDevice,
 };
-use ffs_btrfs::{BtrfsLeafEntry, walk_tree};
+use ffs_btrfs::{walk_tree, BtrfsLeafEntry};
 use ffs_error::FfsError;
-use ffs_journal::{JournalRegion, ReplayOutcome, replay_jbd2};
+use ffs_journal::{replay_jbd2, JournalRegion, ReplayOutcome};
 use ffs_mvcc::{CommitError, MvccStore, Transaction};
 use ffs_ondisk::{
-    BtrfsChunkEntry, BtrfsSuperblock, Ext4DirEntry, Ext4Extent, Ext4FileType, Ext4GroupDesc,
-    Ext4ImageReader, Ext4Inode, Ext4Superblock, Ext4Xattr, ExtentTree, lookup_in_dir_block,
-    parse_dir_block, parse_extent_tree, parse_inode_extent_tree, parse_sys_chunk_array,
+    lookup_in_dir_block, parse_dir_block, parse_extent_tree, parse_inode_extent_tree,
+    parse_sys_chunk_array, BtrfsChunkEntry, BtrfsSuperblock, Ext4DirEntry, Ext4Extent,
+    Ext4FileType, Ext4GroupDesc, Ext4ImageReader, Ext4Inode, Ext4Superblock, Ext4Xattr, ExtentTree,
 };
 use ffs_types::{
     BlockNumber, ByteOffset, CommitSeq, GroupNumber, InodeNumber, ParseError, Snapshot, TxnId,
@@ -958,24 +958,39 @@ fn validate_btrfs_superblock(sb: &BtrfsSuperblock) -> Result<(), FfsError> {
 ///
 /// This is the crate-boundary conversion described in the `ffs-error` error
 /// taxonomy. During mount-time validation, `ParseError::InvalidField` is
-/// mapped based on the field name to distinguish unsupported features from
-/// geometry errors from format errors.
+/// mapped based on the field name to distinguish incompatible feature
+/// contracts, unsupported features/block sizes, geometry errors, and format
+/// errors.
 fn parse_error_to_ffs(e: &ParseError) -> FfsError {
     match e {
         ParseError::InvalidField { field, reason } => {
+            let field_lc = field.to_ascii_lowercase();
+            let reason_lc = reason.to_ascii_lowercase();
+
+            // ext4 block size can be valid on-disk but unsupported by v1 scope.
+            if field_lc.contains("block_size") && reason_lc.contains("unsupported") {
+                FfsError::UnsupportedBlockSize(format!("{field}: {reason}"))
+            }
+            // ext4 incompat contract failures (missing required or unknown bits).
+            else if field_lc.contains("feature_incompat")
+                && (reason_lc.contains("missing required")
+                    || reason_lc.contains("unknown incompatible"))
+            {
+                FfsError::IncompatibleFeature(format!("{field}: {reason}"))
+            }
             // Feature validation failures → UnsupportedFeature
-            if field.contains("feature") || reason.contains("unsupported") {
+            else if field_lc.contains("feature") || reason_lc.contains("unsupported") {
                 FfsError::UnsupportedFeature(format!("{field}: {reason}"))
             }
             // Geometry failures → InvalidGeometry
-            else if field.contains("block_size")
-                || field.contains("blocks_per_group")
-                || field.contains("inodes_per_group")
-                || field.contains("inode_size")
-                || field.contains("desc_size")
-                || field.contains("first_data_block")
-                || field.contains("blocks_count")
-                || field.contains("inodes_count")
+            else if field_lc.contains("block_size")
+                || field_lc.contains("blocks_per_group")
+                || field_lc.contains("inodes_per_group")
+                || field_lc.contains("inode_size")
+                || field_lc.contains("desc_size")
+                || field_lc.contains("first_data_block")
+                || field_lc.contains("blocks_count")
+                || field_lc.contains("inodes_count")
             {
                 FfsError::InvalidGeometry(format!("{field}: {reason}"))
             }
@@ -1160,7 +1175,7 @@ pub trait FsOps: Send + Sync {
     /// file identified by `ino`. Returns fewer bytes at EOF. Returns
     /// `FfsError::IsDirectory` if `ino` is a directory.
     fn read(&self, cx: &Cx, ino: InodeNumber, offset: u64, size: u32)
-    -> ffs_error::Result<Vec<u8>>;
+        -> ffs_error::Result<Vec<u8>>;
 
     /// Read the target of a symbolic link.
     ///
@@ -1707,7 +1722,11 @@ fn erfc_approx(x: f64) -> f64 {
             + t * (-0.284_496_736
                 + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
     let result = poly * (-x * x).exp();
-    if x >= 0.0 { result } else { 2.0 - result }
+    if x >= 0.0 {
+        result
+    } else {
+        2.0 - result
+    }
 }
 
 /// ln(Beta(a, b)) = ln(Γ(a)) + ln(Γ(b)) - ln(Γ(a+b))
@@ -2329,8 +2348,8 @@ impl FrankenFsEngine {
 mod tests {
     use super::*;
     use ffs_types::{
-        BTRFS_MAGIC, BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE, ByteOffset, EXT4_SUPER_MAGIC,
-        EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE,
+        ByteOffset, BTRFS_MAGIC, BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE,
+        EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, EXT4_SUPER_MAGIC,
     };
     use std::sync::Mutex;
 
@@ -2831,7 +2850,13 @@ mod tests {
         // Should fail with default options
         let err = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap_err();
         assert!(
-            matches!(err, FfsError::UnsupportedFeature(_) | FfsError::Format(_)),
+            matches!(
+                err,
+                FfsError::UnsupportedFeature(_)
+                    | FfsError::IncompatibleFeature(_)
+                    | FfsError::UnsupportedBlockSize(_)
+                    | FfsError::Format(_)
+            ),
             "expected feature/format error, got {err:?}",
         );
 
@@ -2885,9 +2910,23 @@ mod tests {
         });
         assert!(matches!(e, FfsError::UnsupportedFeature(_)));
 
-        // Geometry error
+        // Incompatible feature contract error
+        let e = parse_error_to_ffs(&ParseError::InvalidField {
+            field: "feature_incompat",
+            reason: "missing required features (need FILETYPE+EXTENTS)",
+        });
+        assert!(matches!(e, FfsError::IncompatibleFeature(_)));
+
+        // Unsupported block size (valid ext4, out of v1 support envelope)
         let e = parse_error_to_ffs(&ParseError::InvalidField {
             field: "block_size",
+            reason: "unsupported (FrankenFS v1 supports 1K/2K/4K ext4 only)",
+        });
+        assert!(matches!(e, FfsError::UnsupportedBlockSize(_)));
+
+        // Geometry error
+        let e = parse_error_to_ffs(&ParseError::InvalidField {
+            field: "blocks_per_group",
             reason: "out of range",
         });
         assert!(matches!(e, FfsError::InvalidGeometry(_)));

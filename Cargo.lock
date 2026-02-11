@@ -653,6 +653,7 @@ dependencies = [
  "crc32c",
  "ffs-block",
  "ffs-error",
+ "ffs-ondisk",
  "ffs-types",
  "parking_lot",
 ]

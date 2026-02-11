@@ -7,7 +7,10 @@ use ffs_block::{BlockDevice, ByteBlockDevice, FileByteDevice};
 use ffs_core::{FsFlavor, FsOps, OpenFs, detect_filesystem_at_path};
 use ffs_fuse::MountOptions;
 use ffs_harness::ParityReport;
-use ffs_repair::scrub::{BlockValidator, Scrubber, Severity, ZeroCheckValidator};
+use ffs_repair::scrub::{
+    BlockValidator, BtrfsSuperblockValidator, CompositeValidator, Ext4SuperblockValidator,
+    Scrubber, Severity, ZeroCheckValidator,
+};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -238,9 +241,16 @@ fn scrub_cmd(path: &PathBuf, json: bool) -> Result<()> {
     let block_dev = ByteBlockDevice::new(byte_dev, block_size)
         .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
 
-    // Use the zero-check validator as a baseline. Format-specific validators
-    // (ext4 metadata_csum, btrfs csum) will be added as they're implemented.
-    let validator: Box<dyn BlockValidator> = Box::new(ZeroCheckValidator);
+    let validator: Box<dyn BlockValidator> = match &flavor {
+        FsFlavor::Ext4(_) => Box::new(CompositeValidator::new(vec![
+            Box::new(ZeroCheckValidator),
+            Box::new(Ext4SuperblockValidator::new(block_size)),
+        ])),
+        FsFlavor::Btrfs(_) => Box::new(CompositeValidator::new(vec![
+            Box::new(ZeroCheckValidator),
+            Box::new(BtrfsSuperblockValidator::new(block_size)),
+        ])),
+    };
 
     if !json {
         let fs_name = match &flavor {

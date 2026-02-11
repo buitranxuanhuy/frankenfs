@@ -22,7 +22,7 @@
 //! |--------------------|------------------|-----------|
 //! | `InsufficientData` | `Corruption { block, detail }` | Truncated metadata indicates corruption or a truncated image |
 //! | `InvalidMagic` | `Format(detail)` | Wrong magic means wrong filesystem type, not corruption |
-//! | `InvalidField` | `Format(detail)` | Structurally invalid field values are format violations |
+//! | `InvalidField` | `Format` / `UnsupportedFeature` / `IncompatibleFeature` / `UnsupportedBlockSize` / `InvalidGeometry` | `ffs-core` adds mount-validation context from field+reason |
 //! | `IntegerConversion` | `Corruption { block, detail }` | Arithmetic overflow in parsed values suggests corruption |
 //!
 //! When a `ParseError` occurs during mount-time validation (before the
@@ -33,12 +33,14 @@
 //!
 //! ## Mount-Validation Errors
 //!
-//! Mount-time validation (`validate_v1()` in ffs-ondisk) can fail for three
+//! Mount-time validation (`validate_v1()` in ffs-ondisk) can fail for five
 //! distinct reasons, each with its own FfsError variant:
 //!
 //! | Failure | FfsError Variant | errno | Example |
 //! |---------|------------------|-------|---------|
 //! | Feature not supported by this build | `UnsupportedFeature` | `EOPNOTSUPP` | ENCRYPT, INLINE_DATA |
+//! | Incompatible feature contract not met | `IncompatibleFeature` | `EOPNOTSUPP` | missing FILETYPE+EXTENTS, unknown incompat bits |
+//! | Block size valid in ext4 but unsupported by FrankenFS v1 | `UnsupportedBlockSize` | `EOPNOTSUPP` | 8K ext4 image |
 //! | Block size or geometry out of range | `InvalidGeometry` | `EINVAL` | 64K blocks, zero blocks_per_group |
 //! | Structurally invalid format | `Format` | `EINVAL` | Bad magic, unknown revision |
 //!
@@ -61,6 +63,8 @@
 //! | `Format` | `EINVAL` | 22 |
 //! | `Parse` | `EINVAL` | 22 |
 //! | `UnsupportedFeature` | `EOPNOTSUPP` | 95 |
+//! | `IncompatibleFeature` | `EOPNOTSUPP` | 95 |
+//! | `UnsupportedBlockSize` | `EOPNOTSUPP` | 95 |
 //! | `InvalidGeometry` | `EINVAL` | 22 |
 //! | `MvccConflict` | `EAGAIN` | 11 |
 //! | `Cancelled` | `EINTR` | 4 |
@@ -128,6 +132,19 @@ pub enum FfsError {
     /// "we don't support this yet" from "this image is broken."
     #[error("unsupported feature: {0}")]
     UnsupportedFeature(String),
+
+    /// The filesystem image's compatibility contract cannot be satisfied.
+    ///
+    /// Used when required compatibility bits are missing or unknown
+    /// incompatible feature bits are present.
+    #[error("incompatible feature set: {0}")]
+    IncompatibleFeature(String),
+
+    /// The image's block size is valid for the format but unsupported by this build.
+    ///
+    /// For v1 ext4 compatibility, FrankenFS currently supports 1K/2K/4K only.
+    #[error("unsupported block size: {0}")]
+    UnsupportedBlockSize(String),
 
     /// On-disk geometry is invalid or out of the supported range.
     ///
@@ -199,6 +216,10 @@ impl FfsError {
     ///   during live operation they should be wrapped as `Corruption` instead.
     /// - `UnsupportedFeature` → `EOPNOTSUPP`: distinguishes "not implemented"
     ///   from "structurally invalid."
+    /// - `IncompatibleFeature` → `EOPNOTSUPP`: required/known compatibility
+    ///   contracts are not satisfiable for this image.
+    /// - `UnsupportedBlockSize` → `EOPNOTSUPP`: block size is valid on-disk
+    ///   but outside this build's declared support envelope.
     /// - `InvalidGeometry` → `EINVAL`: bad on-disk parameters.
     /// - `ReadOnly` → `EROFS`: standard read-only filesystem errno.
     #[must_use]
@@ -207,7 +228,9 @@ impl FfsError {
             Self::Io(err) => err.raw_os_error().unwrap_or(libc::EIO),
             Self::Corruption { .. } | Self::RepairFailed(_) => libc::EIO,
             Self::Format(_) | Self::Parse(_) | Self::InvalidGeometry(_) => libc::EINVAL,
-            Self::UnsupportedFeature(_) => libc::EOPNOTSUPP,
+            Self::UnsupportedFeature(_)
+            | Self::IncompatibleFeature(_)
+            | Self::UnsupportedBlockSize(_) => libc::EOPNOTSUPP,
             Self::MvccConflict { .. } => libc::EAGAIN,
             Self::Cancelled => libc::EINTR,
             Self::NoSpace => libc::ENOSPC,
@@ -246,6 +269,14 @@ mod tests {
             (FfsError::Parse("test".into()), libc::EINVAL),
             (
                 FfsError::UnsupportedFeature("ENCRYPT".into()),
+                libc::EOPNOTSUPP,
+            ),
+            (
+                FfsError::IncompatibleFeature("feature_incompat: missing FILETYPE".into()),
+                libc::EOPNOTSUPP,
+            ),
+            (
+                FfsError::UnsupportedBlockSize("block_size: 8192".into()),
                 libc::EOPNOTSUPP,
             ),
             (
@@ -302,6 +333,15 @@ mod tests {
         let unsup = FfsError::UnsupportedFeature("ENCRYPT".into());
         assert_eq!(unsup.to_string(), "unsupported feature: ENCRYPT");
 
+        let incompat = FfsError::IncompatibleFeature("missing FILETYPE+EXTENTS".into());
+        assert_eq!(
+            incompat.to_string(),
+            "incompatible feature set: missing FILETYPE+EXTENTS"
+        );
+
+        let blk = FfsError::UnsupportedBlockSize("8192".into());
+        assert_eq!(blk.to_string(), "unsupported block size: 8192");
+
         let geom = FfsError::InvalidGeometry("blocks_per_group=0".into());
         assert_eq!(geom.to_string(), "invalid geometry: blocks_per_group=0");
     }
@@ -310,10 +350,14 @@ mod tests {
     fn mount_validation_errnos_are_distinct() {
         // UnsupportedFeature should be EOPNOTSUPP, not EINVAL
         let unsup = FfsError::UnsupportedFeature("ENCRYPT".into());
+        let incompat = FfsError::IncompatibleFeature("unknown incompat bits".into());
+        let blk = FfsError::UnsupportedBlockSize("8192".into());
         let geom = FfsError::InvalidGeometry("bad block size".into());
         let fmt = FfsError::Format("bad magic".into());
 
         assert_eq!(unsup.to_errno(), libc::EOPNOTSUPP);
+        assert_eq!(incompat.to_errno(), libc::EOPNOTSUPP);
+        assert_eq!(blk.to_errno(), libc::EOPNOTSUPP);
         assert_eq!(geom.to_errno(), libc::EINVAL);
         assert_eq!(fmt.to_errno(), libc::EINVAL);
 

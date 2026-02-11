@@ -25,7 +25,11 @@
 use asupersync::Cx;
 use ffs_block::{BlockBuf, BlockDevice};
 use ffs_error::{FfsError, Result};
-use ffs_types::BlockNumber;
+use ffs_ondisk::{BtrfsSuperblock, Ext4Superblock, verify_btrfs_superblock_checksum};
+use ffs_types::{
+    BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE, BlockNumber, EXT4_SUPERBLOCK_OFFSET,
+    EXT4_SUPERBLOCK_SIZE, ParseError,
+};
 use std::fmt;
 
 // ── Corruption taxonomy ─────────────────────────────────────────────────────
@@ -282,6 +286,154 @@ impl BlockValidator for ZeroCheckValidator {
     }
 }
 
+/// Validator for the canonical ext4 primary superblock.
+///
+/// Checks parseability, basic geometry sanity, and metadata checksum integrity
+/// (when `METADATA_CSUM` is enabled).
+#[derive(Debug, Clone, Copy)]
+pub struct Ext4SuperblockValidator {
+    block_size: u32,
+}
+
+impl Ext4SuperblockValidator {
+    #[must_use]
+    pub fn new(block_size: u32) -> Self {
+        Self { block_size }
+    }
+
+    fn target_block_and_offset(self) -> (u64, usize) {
+        if self.block_size == 1024 {
+            (1, 0)
+        } else {
+            (0, EXT4_SUPERBLOCK_OFFSET)
+        }
+    }
+}
+
+impl BlockValidator for Ext4SuperblockValidator {
+    fn validate(&self, block: BlockNumber, data: &BlockBuf) -> BlockVerdict {
+        let (target_block, offset) = self.target_block_and_offset();
+        if block.0 != target_block {
+            return BlockVerdict::Skip;
+        }
+
+        let end = offset.saturating_add(EXT4_SUPERBLOCK_SIZE);
+        let Some(region) = data.as_slice().get(offset..end) else {
+            return BlockVerdict::Corrupt(vec![(
+                CorruptionKind::StructuralInvariant,
+                Severity::Critical,
+                format!(
+                    "ext4 superblock region out of bounds in block {block}: need bytes {offset}..{end}, got {}",
+                    data.as_slice().len()
+                ),
+            )]);
+        };
+
+        let sb = match Ext4Superblock::parse_superblock_region(region) {
+            Ok(sb) => sb,
+            Err(err) => {
+                return BlockVerdict::Corrupt(vec![parse_error_issue(
+                    "ext4 superblock parse failed",
+                    &err,
+                )]);
+            }
+        };
+
+        let mut issues = Vec::new();
+        if let Err(err) = sb.validate_geometry() {
+            issues.push(parse_error_issue("ext4 superblock geometry invalid", &err));
+        }
+        if let Err(err) = sb.validate_checksum(region) {
+            issues.push(parse_error_issue("ext4 superblock checksum invalid", &err));
+        }
+
+        if issues.is_empty() {
+            BlockVerdict::Clean
+        } else {
+            BlockVerdict::Corrupt(issues)
+        }
+    }
+}
+
+/// Validator for the canonical btrfs primary superblock.
+///
+/// Checks parseability and superblock checksum integrity.
+#[derive(Debug, Clone, Copy)]
+pub struct BtrfsSuperblockValidator {
+    block_size: u32,
+}
+
+impl BtrfsSuperblockValidator {
+    #[must_use]
+    pub fn new(block_size: u32) -> Self {
+        Self { block_size }
+    }
+
+    fn target_block_and_offset(self) -> (u64, usize) {
+        if self.block_size == 0 {
+            return (0, 0);
+        }
+        let block_size = u64::from(self.block_size);
+        let byte_offset = BTRFS_SUPER_INFO_OFFSET as u64;
+        (
+            byte_offset / block_size,
+            usize::try_from(byte_offset % block_size).unwrap_or(0),
+        )
+    }
+}
+
+impl BlockValidator for BtrfsSuperblockValidator {
+    fn validate(&self, block: BlockNumber, data: &BlockBuf) -> BlockVerdict {
+        let (target_block, offset) = self.target_block_and_offset();
+        if block.0 != target_block {
+            return BlockVerdict::Skip;
+        }
+
+        let end = offset.saturating_add(BTRFS_SUPER_INFO_SIZE);
+        let Some(region) = data.as_slice().get(offset..end) else {
+            return BlockVerdict::Corrupt(vec![(
+                CorruptionKind::StructuralInvariant,
+                Severity::Critical,
+                format!(
+                    "btrfs superblock region out of bounds in block {block}: need bytes {offset}..{end}, got {}",
+                    data.as_slice().len()
+                ),
+            )]);
+        };
+
+        let mut issues = Vec::new();
+        if let Err(err) = BtrfsSuperblock::parse_superblock_region(region) {
+            issues.push(parse_error_issue("btrfs superblock parse failed", &err));
+        }
+        if let Err(err) = verify_btrfs_superblock_checksum(region) {
+            issues.push(parse_error_issue("btrfs superblock checksum invalid", &err));
+        }
+
+        if issues.is_empty() {
+            BlockVerdict::Clean
+        } else {
+            BlockVerdict::Corrupt(issues)
+        }
+    }
+}
+
+fn parse_error_issue(prefix: &str, err: &ParseError) -> (CorruptionKind, Severity, String) {
+    let (kind, severity) = match err {
+        ParseError::InvalidMagic { .. } => (CorruptionKind::BadMagic, Severity::Critical),
+        ParseError::InvalidField { field, .. }
+            if field.contains("checksum") || field.contains("csum") =>
+        {
+            (CorruptionKind::ChecksumMismatch, Severity::Critical)
+        }
+        ParseError::InsufficientData { .. }
+        | ParseError::InvalidField { .. }
+        | ParseError::IntegerConversion { .. } => {
+            (CorruptionKind::StructuralInvariant, Severity::Critical)
+        }
+    };
+    (kind, severity, format!("{prefix}: {err}"))
+}
+
 /// A composite validator that runs multiple validators and merges their findings.
 pub struct CompositeValidator {
     validators: Vec<Box<dyn BlockValidator>>,
@@ -328,6 +480,7 @@ impl BlockValidator for CompositeValidator {
 mod tests {
     use super::*;
     use ffs_block::BlockBuf;
+    use ffs_ondisk::{Ext4IncompatFeatures, Ext4RoCompatFeatures};
     use parking_lot::RwLock;
     use std::collections::HashMap;
 
@@ -471,6 +624,40 @@ mod tests {
         let crc = crc32c::crc32c(&block[4..]);
         block[..4].copy_from_slice(&crc.to_le_bytes());
         block
+    }
+
+    fn make_valid_ext4_superblock_region() -> [u8; EXT4_SUPERBLOCK_SIZE] {
+        let mut sb = [0_u8; EXT4_SUPERBLOCK_SIZE];
+        sb[0x38..0x3A].copy_from_slice(&ffs_types::EXT4_SUPER_MAGIC.to_le_bytes()); // magic
+        sb[0x18..0x1C].copy_from_slice(&2_u32.to_le_bytes()); // 4KiB blocks
+        sb[0x1C..0x20].copy_from_slice(&2_u32.to_le_bytes()); // 4KiB clusters
+        sb[0x00..0x04].copy_from_slice(&8192_u32.to_le_bytes()); // inodes_count
+        sb[0x04..0x08].copy_from_slice(&32768_u32.to_le_bytes()); // blocks_count_lo
+        sb[0x14..0x18].copy_from_slice(&0_u32.to_le_bytes()); // first_data_block
+        sb[0x20..0x24].copy_from_slice(&32768_u32.to_le_bytes()); // blocks_per_group
+        sb[0x24..0x28].copy_from_slice(&32768_u32.to_le_bytes()); // clusters_per_group
+        sb[0x28..0x2C].copy_from_slice(&8192_u32.to_le_bytes()); // inodes_per_group
+        sb[0x58..0x5A].copy_from_slice(&256_u16.to_le_bytes()); // inode_size
+        let incompat =
+            (Ext4IncompatFeatures::FILETYPE.0 | Ext4IncompatFeatures::EXTENTS.0).to_le_bytes();
+        sb[0x60..0x64].copy_from_slice(&incompat);
+        sb[0x64..0x68].copy_from_slice(&Ext4RoCompatFeatures::METADATA_CSUM.0.to_le_bytes());
+        sb[0x175] = 1; // checksum_type=crc32c
+
+        let checksum = crc32c::crc32c_append(!0_u32, &sb[..0x3FC]);
+        sb[0x3FC..0x400].copy_from_slice(&checksum.to_le_bytes());
+        sb
+    }
+
+    fn make_valid_btrfs_superblock_region() -> Vec<u8> {
+        let mut sb = vec![0_u8; BTRFS_SUPER_INFO_SIZE];
+        sb[0x40..0x48].copy_from_slice(&ffs_types::BTRFS_MAGIC.to_le_bytes());
+        sb[0x90..0x94].copy_from_slice(&4096_u32.to_le_bytes()); // sectorsize
+        sb[0x94..0x98].copy_from_slice(&16384_u32.to_le_bytes()); // nodesize
+        sb[0xC4..0xC6].copy_from_slice(&0_u16.to_le_bytes()); // csum_type=CRC32C
+        let csum = crc32c::crc32c(&sb[0x20..BTRFS_SUPER_INFO_SIZE]);
+        sb[0..4].copy_from_slice(&csum.to_le_bytes());
+        sb
     }
 
     // ── Tests ───────────────────────────────────────────────────────────
@@ -621,6 +808,99 @@ mod tests {
             .expect("scrub should succeed");
         assert_eq!(report.blocks_scanned, 8);
         assert!(report.is_clean());
+    }
+
+    #[test]
+    fn ext4_superblock_validator_accepts_valid_primary_superblock() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096, 8);
+        let mut block0 = vec![0_u8; 4096];
+        let sb = make_valid_ext4_superblock_region();
+        block0[1024..2048].copy_from_slice(&sb);
+        dev.write(BlockNumber(0), block0);
+
+        let report = Scrubber::new(&dev, &Ext4SuperblockValidator::new(4096))
+            .scrub_all(&cx)
+            .expect("scrub should succeed");
+        assert!(report.is_clean());
+    }
+
+    #[test]
+    fn ext4_superblock_validator_detects_checksum_corruption() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096, 8);
+        let mut block0 = vec![0_u8; 4096];
+        let mut sb = make_valid_ext4_superblock_region();
+        sb[0x50] ^= 0x01; // invalidate checksum without touching checksum field
+        block0[1024..2048].copy_from_slice(&sb);
+        dev.write(BlockNumber(0), block0);
+
+        let report = Scrubber::new(&dev, &Ext4SuperblockValidator::new(4096))
+            .scrub_all(&cx)
+            .expect("scrub should succeed");
+
+        assert_eq!(report.blocks_corrupt, 1);
+        assert_eq!(report.findings.len(), 1);
+        let finding = &report.findings[0];
+        assert_eq!(finding.block, BlockNumber(0));
+        assert_eq!(finding.kind, CorruptionKind::ChecksumMismatch);
+    }
+
+    #[test]
+    fn ext4_superblock_validator_handles_1k_block_layout() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(1024, 4);
+        let mut sb = make_valid_ext4_superblock_region();
+        sb[0x18..0x1C].copy_from_slice(&0_u32.to_le_bytes()); // log_block_size=0 -> 1KiB
+        sb[0x1C..0x20].copy_from_slice(&0_u32.to_le_bytes()); // log_cluster_size=0 -> 1KiB
+        sb[0x14..0x18].copy_from_slice(&1_u32.to_le_bytes()); // first_data_block=1 for 1KiB
+        sb[0x20..0x24].copy_from_slice(&8192_u32.to_le_bytes()); // blocks_per_group
+        sb[0x24..0x28].copy_from_slice(&8192_u32.to_le_bytes()); // clusters_per_group
+        sb[0x04..0x08].copy_from_slice(&8193_u32.to_le_bytes()); // blocks_count_lo
+        let checksum = crc32c::crc32c_append(!0_u32, &sb[..0x3FC]);
+        sb[0x3FC..0x400].copy_from_slice(&checksum.to_le_bytes());
+        dev.write(BlockNumber(1), sb.to_vec());
+
+        let report = Scrubber::new(&dev, &Ext4SuperblockValidator::new(1024))
+            .scrub_all(&cx)
+            .expect("scrub should succeed");
+        assert!(report.is_clean(), "unexpected findings: {:?}", report.findings);
+    }
+
+    #[test]
+    fn btrfs_superblock_validator_accepts_valid_superblock() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(16384, 8);
+        let mut block4 = vec![0_u8; 16384];
+        let sb = make_valid_btrfs_superblock_region();
+        block4[..BTRFS_SUPER_INFO_SIZE].copy_from_slice(&sb);
+        dev.write(BlockNumber(4), block4);
+
+        let report = Scrubber::new(&dev, &BtrfsSuperblockValidator::new(16384))
+            .scrub_all(&cx)
+            .expect("scrub should succeed");
+        assert!(report.is_clean());
+    }
+
+    #[test]
+    fn btrfs_superblock_validator_detects_checksum_corruption() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(16384, 8);
+        let mut block4 = vec![0_u8; 16384];
+        let mut sb = make_valid_btrfs_superblock_region();
+        sb[0x50] ^= 0x01;
+        block4[..BTRFS_SUPER_INFO_SIZE].copy_from_slice(&sb);
+        dev.write(BlockNumber(4), block4);
+
+        let report = Scrubber::new(&dev, &BtrfsSuperblockValidator::new(16384))
+            .scrub_all(&cx)
+            .expect("scrub should succeed");
+
+        assert_eq!(report.blocks_corrupt, 1);
+        assert_eq!(report.findings.len(), 1);
+        let finding = &report.findings[0];
+        assert_eq!(finding.block, BlockNumber(4));
+        assert_eq!(finding.kind, CorruptionKind::ChecksumMismatch);
     }
 
     #[test]
