@@ -359,7 +359,7 @@ pub fn htree_find_leaf(entries: &[HtreeEntry], target_hash: u32) -> Option<u32> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ffs_ondisk::{parse_dir_block, Ext4FileType};
+    use ffs_ondisk::{Ext4FileType, parse_dir_block};
 
     #[test]
     fn init_dir_block_contains_dot_and_dotdot() {

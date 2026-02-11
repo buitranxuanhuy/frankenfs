@@ -135,14 +135,14 @@ pub fn allocate_extent(
     cx_checkpoint(cx)?;
 
     if count == 0 || count > u32::from(u16::MAX >> 1) {
-        return Err(FfsError::Format(
-            "extent count must be 1..=32767".into(),
-        ));
+        return Err(FfsError::Format("extent count must be 1..=32767".into()));
     }
 
     // Allocate physical blocks.
-    let BlockAlloc { start, count: allocated } =
-        ffs_alloc::alloc_blocks(cx, dev, geo, groups, count, hint)?;
+    let BlockAlloc {
+        start,
+        count: allocated,
+    } = ffs_alloc::alloc_blocks(cx, dev, geo, groups, count, hint)?;
 
     // Build the extent.
     #[expect(clippy::cast_possible_truncation)]
@@ -192,13 +192,13 @@ pub fn allocate_unwritten_extent(
     cx_checkpoint(cx)?;
 
     if count == 0 || count > u32::from(u16::MAX >> 1) {
-        return Err(FfsError::Format(
-            "extent count must be 1..=32767".into(),
-        ));
+        return Err(FfsError::Format("extent count must be 1..=32767".into()));
     }
 
-    let BlockAlloc { start, count: allocated } =
-        ffs_alloc::alloc_blocks(cx, dev, geo, groups, count, hint)?;
+    let BlockAlloc {
+        start,
+        count: allocated,
+    } = ffs_alloc::alloc_blocks(cx, dev, geo, groups, count, hint)?;
 
     #[expect(clippy::cast_possible_truncation)]
     let extent = Ext4Extent {
@@ -259,8 +259,7 @@ pub fn truncate_extents(
 
         if ext_start >= new_logical_end {
             // Fully beyond truncation point: remove and free all blocks.
-            let freed =
-                ffs_btree::delete_range(cx, dev, root_bytes, ext_start, ext_len)?;
+            let freed = ffs_btree::delete_range(cx, dev, root_bytes, ext_start, ext_len)?;
             for f in &freed {
                 ffs_alloc::free_blocks(
                     cx,
@@ -277,8 +276,7 @@ pub fn truncate_extents(
             let keep_len = new_logical_end - ext_start;
             let remove_start = ext_start + keep_len;
             let remove_count = ext_end - new_logical_end;
-            let freed =
-                ffs_btree::delete_range(cx, dev, root_bytes, remove_start, remove_count)?;
+            let freed = ffs_btree::delete_range(cx, dev, root_bytes, remove_start, remove_count)?;
             for f in &freed {
                 ffs_alloc::free_blocks(
                     cx,
@@ -357,7 +355,9 @@ pub fn mark_written(
     let mut unwritten_extents = Vec::new();
     ffs_btree::walk(cx, dev, root_bytes, &mut |ext: &Ext4Extent| {
         if ext.is_unwritten() {
-            let ext_end = ext.logical_block.saturating_add(u32::from(ext.actual_len()));
+            let ext_end = ext
+                .logical_block
+                .saturating_add(u32::from(ext.actual_len()));
             if ext.logical_block < range_end && ext_end > logical_start {
                 unwritten_extents.push(*ext);
             }
@@ -373,8 +373,7 @@ pub fn mark_written(
         ffs_btree::delete_range(cx, dev, root_bytes, ext.logical_block, ext_len)?;
 
         // Build replacement extents based on overlap type.
-        let replacements =
-            split_for_mark_written(&ext, logical_start, range_end, ext_end, count);
+        let replacements = split_for_mark_written(&ext, logical_start, range_end, ext_end, count);
 
         let mut tree_alloc = GroupBlockAllocator {
             cx,
@@ -615,9 +614,17 @@ mod tests {
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
 
-        let mapping =
-            allocate_extent(&cx, &dev, &mut root, &geo, &mut groups, 0, 10, &AllocHint::default())
-                .unwrap();
+        let mapping = allocate_extent(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            10,
+            &AllocHint::default(),
+        )
+        .unwrap();
         assert_eq!(mapping.logical_start, 0);
         assert_eq!(mapping.count, 10);
         assert!(!mapping.unwritten);
@@ -631,9 +638,17 @@ mod tests {
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
 
-        let m1 =
-            allocate_extent(&cx, &dev, &mut root, &geo, &mut groups, 0, 5, &AllocHint::default())
-                .unwrap();
+        let m1 = allocate_extent(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            5,
+            &AllocHint::default(),
+        )
+        .unwrap();
         let m2 = allocate_extent(
             &cx,
             &dev,
@@ -653,7 +668,11 @@ mod tests {
 
         // Walk should find both extents.
         let mut count = 0;
-        ffs_btree::walk(&cx, &dev, &root, &mut |_: &Ext4Extent| { count += 1; Ok(()) }).unwrap();
+        ffs_btree::walk(&cx, &dev, &root, &mut |_: &Ext4Extent| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(count, 2);
     }
 
@@ -697,8 +716,17 @@ mod tests {
         let mut root = empty_root();
 
         // Allocate blocks 0-9 and 10-19.
-        allocate_extent(&cx, &dev, &mut root, &geo, &mut groups, 0, 10, &AllocHint::default())
-            .unwrap();
+        allocate_extent(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            10,
+            &AllocHint::default(),
+        )
+        .unwrap();
         allocate_extent(
             &cx,
             &dev,
@@ -714,8 +742,7 @@ mod tests {
         let initial_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
 
         // Truncate at logical block 10 — should remove second extent.
-        let freed =
-            truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 10).unwrap();
+        let freed = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 10).unwrap();
         assert_eq!(freed, 10);
 
         let after_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
@@ -723,7 +750,11 @@ mod tests {
 
         // Only first extent should remain.
         let mut count = 0;
-        ffs_btree::walk(&cx, &dev, &root, &mut |_: &Ext4Extent| { count += 1; Ok(()) }).unwrap();
+        ffs_btree::walk(&cx, &dev, &root, &mut |_: &Ext4Extent| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(count, 1);
     }
 
@@ -735,16 +766,28 @@ mod tests {
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
 
-        allocate_extent(&cx, &dev, &mut root, &geo, &mut groups, 0, 10, &AllocHint::default())
-            .unwrap();
+        allocate_extent(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            10,
+            &AllocHint::default(),
+        )
+        .unwrap();
 
-        let freed =
-            truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 0).unwrap();
+        let freed = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 0).unwrap();
         assert_eq!(freed, 10);
 
         // Tree should be empty.
         let mut count = 0;
-        ffs_btree::walk(&cx, &dev, &root, &mut |_: &Ext4Extent| { count += 1; Ok(()) }).unwrap();
+        ffs_btree::walk(&cx, &dev, &root, &mut |_: &Ext4Extent| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(count, 0);
     }
 
@@ -758,14 +801,22 @@ mod tests {
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
 
-        allocate_extent(&cx, &dev, &mut root, &geo, &mut groups, 0, 10, &AllocHint::default())
-            .unwrap();
+        allocate_extent(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            10,
+            &AllocHint::default(),
+        )
+        .unwrap();
 
         let initial_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
 
         // Punch hole in blocks 3-6 (4 blocks).
-        let freed =
-            punch_hole(&cx, &dev, &mut root, &geo, &mut groups, 3, 4).unwrap();
+        let freed = punch_hole(&cx, &dev, &mut root, &geo, &mut groups, 3, 4).unwrap();
         assert!(freed > 0);
 
         let after_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
@@ -780,8 +831,7 @@ mod tests {
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
 
-        let freed =
-            punch_hole(&cx, &dev, &mut root, &geo, &mut groups, 0, 10).unwrap();
+        let freed = punch_hole(&cx, &dev, &mut root, &geo, &mut groups, 0, 10).unwrap();
         assert_eq!(freed, 0);
     }
 
@@ -868,7 +918,11 @@ mod tests {
 
         // Should have 3 extents now: [0-2] unwritten, [3-6] written, [7-9] unwritten.
         let mut count = 0;
-        ffs_btree::walk(&cx, &dev, &root, &mut |_: &Ext4Extent| { count += 1; Ok(()) }).unwrap();
+        ffs_btree::walk(&cx, &dev, &root, &mut |_: &Ext4Extent| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(count, 3);
     }
 
@@ -880,8 +934,16 @@ mod tests {
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
 
-        let result =
-            allocate_extent(&cx, &dev, &mut root, &geo, &mut groups, 0, 0, &AllocHint::default());
+        let result = allocate_extent(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            0,
+            &AllocHint::default(),
+        );
         assert!(result.is_err());
     }
 }

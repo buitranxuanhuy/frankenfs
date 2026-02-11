@@ -2,17 +2,17 @@
 
 use asupersync::{Cx, RaptorQConfig};
 use ffs_block::{
-    read_btrfs_superblock_region, read_ext4_superblock_region, BlockBuf, BlockDevice, ByteDevice,
-    FileByteDevice,
+    BlockBuf, BlockDevice, ByteDevice, FileByteDevice, read_btrfs_superblock_region,
+    read_ext4_superblock_region,
 };
-use ffs_btrfs::{walk_tree, BtrfsLeafEntry};
+use ffs_btrfs::{BtrfsLeafEntry, walk_tree};
 use ffs_error::FfsError;
-use ffs_journal::{replay_jbd2, JournalRegion, ReplayOutcome};
+use ffs_journal::{JournalRegion, ReplayOutcome, replay_jbd2};
 use ffs_mvcc::{CommitError, MvccStore, Transaction};
 use ffs_ondisk::{
-    lookup_in_dir_block, parse_dir_block, parse_extent_tree, parse_inode_extent_tree,
-    parse_sys_chunk_array, BtrfsChunkEntry, BtrfsSuperblock, Ext4DirEntry, Ext4Extent,
-    Ext4FileType, Ext4GroupDesc, Ext4ImageReader, Ext4Inode, Ext4Superblock, Ext4Xattr, ExtentTree,
+    BtrfsChunkEntry, BtrfsSuperblock, Ext4DirEntry, Ext4Extent, Ext4FileType, Ext4GroupDesc,
+    Ext4ImageReader, Ext4Inode, Ext4Superblock, Ext4Xattr, ExtentTree, lookup_in_dir_block,
+    parse_dir_block, parse_extent_tree, parse_inode_extent_tree, parse_sys_chunk_array,
 };
 use ffs_types::{
     BlockNumber, ByteOffset, CommitSeq, GroupNumber, InodeNumber, ParseError, Snapshot, TxnId,
@@ -1175,7 +1175,7 @@ pub trait FsOps: Send + Sync {
     /// file identified by `ino`. Returns fewer bytes at EOF. Returns
     /// `FfsError::IsDirectory` if `ino` is a directory.
     fn read(&self, cx: &Cx, ino: InodeNumber, offset: u64, size: u32)
-        -> ffs_error::Result<Vec<u8>>;
+    -> ffs_error::Result<Vec<u8>>;
 
     /// Read the target of a symbolic link.
     ///
@@ -1722,11 +1722,7 @@ fn erfc_approx(x: f64) -> f64 {
             + t * (-0.284_496_736
                 + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
     let result = poly * (-x * x).exp();
-    if x >= 0.0 {
-        result
-    } else {
-        2.0 - result
-    }
+    if x >= 0.0 { result } else { 2.0 - result }
 }
 
 /// ln(Beta(a, b)) = ln(Γ(a)) + ln(Γ(b)) - ln(Γ(a+b))
@@ -2348,8 +2344,8 @@ impl FrankenFsEngine {
 mod tests {
     use super::*;
     use ffs_types::{
-        ByteOffset, BTRFS_MAGIC, BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE,
-        EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, EXT4_SUPER_MAGIC,
+        BTRFS_MAGIC, BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE, ByteOffset, EXT4_SUPER_MAGIC,
+        EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE,
     };
     use std::sync::Mutex;
 

@@ -7,9 +7,9 @@
 
 use ftui::layout::{Constraint, Flex, Rect};
 use ftui::render::frame::Frame;
+use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::widgets::Widget;
 use ftui::{Cmd, Event, KeyCode, Model};
 
 // ── Metric snapshot ─────────────────────────────────────────────────────────
@@ -123,9 +123,7 @@ impl Model for Dashboard {
     fn update(&mut self, msg: Self::Message) -> Cmd<Self::Message> {
         match msg {
             DashboardMsg::Input(Event::Key(key)) => {
-                if matches!(key.code, KeyCode::Char('q' | 'Q'))
-                    || key.code == KeyCode::Escape
-                {
+                if matches!(key.code, KeyCode::Char('q' | 'Q')) || key.code == KeyCode::Escape {
                     return Cmd::quit();
                 }
                 Cmd::none()

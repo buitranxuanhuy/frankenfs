@@ -34,7 +34,7 @@ impl ParityReport {
             CoverageDomain::new("btrfs metadata parsing", 7, 20),
             CoverageDomain::new("MVCC/COW core", 4, 14),
             CoverageDomain::new("FUSE surface", 6, 12),
-            CoverageDomain::new("self-healing durability policy", 2, 10),
+            CoverageDomain::new("self-healing durability policy", 3, 10),
         ];
 
         let overall_implemented = domains.iter().map(|d| d.implemented).sum();

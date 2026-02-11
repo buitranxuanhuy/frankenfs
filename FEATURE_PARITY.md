@@ -10,8 +10,8 @@
 | btrfs metadata parsing | 7 | 20 | 35.0% |
 | MVCC/COW core | 4 | 14 | 28.6% |
 | FUSE surface | 6 | 12 | 50.0% |
-| self-healing durability policy | 2 | 10 | 20.0% |
-| **Overall** | **28** | **75** | **37.3%** |
+| self-healing durability policy | 3 | 10 | 30.0% |
+| **Overall** | **29** | **75** | **38.7%** |
 
 > **Canonical source:** The `ParityReport::current()` function in `ffs-harness` is the
 > authoritative source for implemented/total counts. This table MUST match those
@@ -51,6 +51,7 @@
 | COW block rewrite path | FrankenFS spec §3 | 🟡 | Basic version copy only |
 | durability policy model | FrankenFS spec §4 | ✅ | Bayesian expected-loss selector |
 | asupersync config mapping | FrankenFS spec §4 | ✅ | `RaptorQConfig` mapping implemented |
+| format-aware scrub superblock validation | FrankenFS spec §4 | ✅ | `Ext4SuperblockValidator` + `BtrfsSuperblockValidator` in `ffs-repair`, wired into `ffs-cli scrub` |
 | FUSE getattr | FrankenFS spec §9 | ✅ | `FsOps::getattr` via `OpenFs` |
 | FUSE lookup | FrankenFS spec §9 | ✅ | `FsOps::lookup` via `OpenFs` |
 | FUSE readdir | FrankenFS spec §9 | ✅ | `FsOps::readdir` via `OpenFs` |

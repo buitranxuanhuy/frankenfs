@@ -236,8 +236,8 @@ impl FsGeometry {
     #[must_use]
     #[expect(clippy::cast_possible_truncation)]
     pub fn blocks_in_group(&self, group: GroupNumber) -> u32 {
-        let group_start =
-            u64::from(self.first_data_block) + u64::from(group.0) * u64::from(self.blocks_per_group);
+        let group_start = u64::from(self.first_data_block)
+            + u64::from(group.0) * u64::from(self.blocks_per_group);
         let remaining = self.total_blocks.saturating_sub(group_start);
         if remaining >= u64::from(self.blocks_per_group) {
             self.blocks_per_group
@@ -306,9 +306,7 @@ pub fn alloc_blocks(
             #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             if g >= 0 && (g as u32) < geo.group_count {
                 let group = GroupNumber(g as u32);
-                if let Some(alloc) =
-                    try_alloc_in_group(cx, dev, geo, groups, group, count, hint)?
-                {
+                if let Some(alloc) = try_alloc_in_group(cx, dev, geo, groups, group, count, hint)? {
                     return Ok(alloc);
                 }
             }
@@ -467,10 +465,7 @@ pub fn alloc_inode(
 }
 
 /// Orlov: choose a group for a new directory.
-fn orlov_choose_group_for_dir(
-    _geo: &FsGeometry,
-    groups: &[GroupStats],
-) -> Result<GroupNumber> {
+fn orlov_choose_group_for_dir(_geo: &FsGeometry, groups: &[GroupStats]) -> Result<GroupNumber> {
     if groups.is_empty() {
         return Err(FfsError::NoSpace);
     }
@@ -620,7 +615,6 @@ mod tests {
                 blocks: Mutex::new(HashMap::new()),
             }
         }
-
     }
 
     impl BlockDevice for MemBlockDevice {
@@ -852,8 +846,7 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
 
-        let result =
-            alloc_inode(&cx, &dev, &geo, &mut groups, GroupNumber(0), false).unwrap();
+        let result = alloc_inode(&cx, &dev, &geo, &mut groups, GroupNumber(0), false).unwrap();
         assert_eq!(result.ino, InodeNumber(1));
         assert_eq!(result.group, GroupNumber(0));
         assert_eq!(groups[0].free_inodes, 2047);
@@ -872,8 +865,7 @@ mod tests {
         groups[2].used_dirs = 10;
         groups[3].used_dirs = 30;
 
-        let result =
-            alloc_inode(&cx, &dev, &geo, &mut groups, GroupNumber(0), true).unwrap();
+        let result = alloc_inode(&cx, &dev, &geo, &mut groups, GroupNumber(0), true).unwrap();
         // Orlov should prefer group 2 (fewest dirs, above-average free).
         assert_eq!(result.group, GroupNumber(2));
     }
@@ -885,8 +877,7 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
 
-        let result =
-            alloc_inode(&cx, &dev, &geo, &mut groups, GroupNumber(1), false).unwrap();
+        let result = alloc_inode(&cx, &dev, &geo, &mut groups, GroupNumber(1), false).unwrap();
         assert_eq!(groups[1].free_inodes, 2047);
 
         free_inode(&cx, &dev, &geo, &mut groups, result.ino).unwrap();
@@ -904,8 +895,7 @@ mod tests {
             g.free_inodes = 0;
         }
 
-        let result =
-            alloc_inode(&cx, &dev, &geo, &mut groups, GroupNumber(0), false);
+        let result = alloc_inode(&cx, &dev, &geo, &mut groups, GroupNumber(0), false);
         assert!(matches!(result, Err(FfsError::NoSpace)));
     }
 

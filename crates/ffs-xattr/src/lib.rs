@@ -6,11 +6,11 @@
 //! system, security, and trusted attribute namespaces.
 
 use ffs_error::{FfsError, Result};
-use ffs_ondisk::{parse_ibody_xattrs, parse_xattr_block, Ext4Inode, Ext4Xattr};
+use ffs_ondisk::{Ext4Inode, Ext4Xattr, parse_ibody_xattrs, parse_xattr_block};
 use ffs_types::{
-    ParseError, EXT4_XATTR_INDEX_POSIX_ACL_ACCESS, EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT,
+    EXT4_XATTR_INDEX_POSIX_ACL_ACCESS, EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT,
     EXT4_XATTR_INDEX_SECURITY, EXT4_XATTR_INDEX_SYSTEM, EXT4_XATTR_INDEX_TRUSTED,
-    EXT4_XATTR_INDEX_USER, EXT4_XATTR_MAGIC,
+    EXT4_XATTR_INDEX_USER, EXT4_XATTR_MAGIC, ParseError,
 };
 
 const INLINE_HEADER_LEN: usize = 4;

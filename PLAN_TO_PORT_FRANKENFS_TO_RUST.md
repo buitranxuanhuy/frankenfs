@@ -52,7 +52,7 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` complete.
 
 - [x] Canonicalize `FfsError` variant set (no duplicates across docs)
 - [x] Implement errno mapping (`impl From<&FfsError> for libc::c_int` or equivalent)
-- [ ] Add `Unsupported`/`IncompatibleFeature`/`UnsupportedBlockSize` variants as required by mount validation
+- [x] Add explicit `IncompatibleFeature` + `UnsupportedBlockSize` variants (with `EOPNOTSUPP` errno mapping) and wire mount-validation conversion paths in `ffs-core::parse_error_to_ffs`
 
 ### 0.4 `ffs-ondisk` ext4 (Parsing + Validation)
 

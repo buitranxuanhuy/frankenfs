@@ -299,14 +299,7 @@ pub fn insert(
     let child_pos = find_index_pos(&indexes, extent.logical_block);
     let child_block = indexes[child_pos].leaf_block;
 
-    let split = insert_descend(
-        cx,
-        dev,
-        child_block,
-        header.depth - 1,
-        extent,
-        alloc,
-    )?;
+    let split = insert_descend(cx, dev, child_block, header.depth - 1, extent, alloc)?;
 
     if let Some(new_entry) = split {
         // Child was split, need to insert new index entry in root.
@@ -396,16 +389,14 @@ fn insert_descend(
 
             if usize::from(header.entries) < usize::from(max) {
                 // Space in this node.
-                let pos =
-                    indexes.partition_point(|e| e.logical_block < new_entry.logical_block);
+                let pos = indexes.partition_point(|e| e.logical_block < new_entry.logical_block);
                 indexes.insert(pos, new_entry);
                 let new_data = serialize_index_block(block_size, depth, &indexes);
                 dev.write_block(cx, BlockNumber(block), &new_data)?;
                 Ok(None)
             } else {
                 // This node is also full: split it.
-                let pos =
-                    indexes.partition_point(|e| e.logical_block < new_entry.logical_block);
+                let pos = indexes.partition_point(|e| e.logical_block < new_entry.logical_block);
                 indexes.insert(pos, new_entry);
                 let mid = indexes.len() / 2;
                 let right_indexes = indexes.split_off(mid);
@@ -735,7 +726,10 @@ fn validate_header(header: &Ext4ExtentHeader, max_allowed: u16) -> Result<()> {
     if header.entries > header.max_entries {
         return Err(FfsError::Corruption {
             block: 0,
-            detail: format!("extent entries {} > max {}", header.entries, header.max_entries),
+            detail: format!(
+                "extent entries {} > max {}",
+                header.entries, header.max_entries
+            ),
         });
     }
     if header.max_entries > max_allowed {
@@ -761,10 +755,12 @@ fn parse_leaf_entries(data: &[u8], header: &Ext4ExtentHeader) -> Result<Vec<Ext4
                 detail: "leaf entry out of bounds".into(),
             });
         }
-        let logical_block = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+        let logical_block =
+            u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
         let raw_len = u16::from_le_bytes([data[off + 4], data[off + 5]]);
         let start_hi = u16::from_le_bytes([data[off + 6], data[off + 7]]);
-        let start_lo = u32::from_le_bytes([data[off + 8], data[off + 9], data[off + 10], data[off + 11]]);
+        let start_lo =
+            u32::from_le_bytes([data[off + 8], data[off + 9], data[off + 10], data[off + 11]]);
         let physical_start = u64::from(start_lo) | (u64::from(start_hi) << 32);
 
         extents.push(Ext4Extent {
@@ -787,8 +783,10 @@ fn parse_index_entries(data: &[u8], header: &Ext4ExtentHeader) -> Result<Vec<Ext
                 detail: "index entry out of bounds".into(),
             });
         }
-        let logical_block = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-        let leaf_lo = u32::from_le_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]);
+        let logical_block =
+            u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+        let leaf_lo =
+            u32::from_le_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]);
         let leaf_hi = u16::from_le_bytes([data[off + 8], data[off + 9]]);
         let leaf_block = u64::from(leaf_lo) | (u64::from(leaf_hi) << 32);
 
@@ -1118,7 +1116,10 @@ mod tests {
         for i in 0..4 {
             let result = search(&cx, &dev, &root, i * 100).unwrap();
             match result {
-                SearchResult::Found { extent, offset_in_extent } => {
+                SearchResult::Found {
+                    extent,
+                    offset_in_extent,
+                } => {
                     assert_eq!(extent.logical_block, i * 100);
                     assert_eq!(offset_in_extent, 0);
                 }

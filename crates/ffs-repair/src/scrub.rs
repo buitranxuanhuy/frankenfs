@@ -864,7 +864,11 @@ mod tests {
         let report = Scrubber::new(&dev, &Ext4SuperblockValidator::new(1024))
             .scrub_all(&cx)
             .expect("scrub should succeed");
-        assert!(report.is_clean(), "unexpected findings: {:?}", report.findings);
+        assert!(
+            report.is_clean(),
+            "unexpected findings: {:?}",
+            report.findings
+        );
     }
 
     #[test]

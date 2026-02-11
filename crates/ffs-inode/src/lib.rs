@@ -196,7 +196,10 @@ fn serialize_inode(inode: &Ext4Inode, inode_size: usize) -> Vec<u8> {
 
         // Inline xattrs go after 128 + extra_isize.
         let xattr_start = 128 + usize::from(inode.extra_isize);
-        let xattr_copy = inode.xattr_ibody.len().min(inode_size.saturating_sub(xattr_start));
+        let xattr_copy = inode
+            .xattr_ibody
+            .len()
+            .min(inode_size.saturating_sub(xattr_start));
         if xattr_start < inode_size && xattr_copy > 0 {
             buf[xattr_start..xattr_start + xattr_copy]
                 .copy_from_slice(&inode.xattr_ibody[..xattr_copy]);
@@ -231,8 +234,7 @@ fn compute_and_set_checksum(raw: &mut [u8], csum_seed: u32, ino: u32) {
 
     // Store checksum.
     let lo = (csum & 0xFFFF) as u16;
-    raw[INODE_CHECKSUM_LO_OFFSET..INODE_CHECKSUM_LO_OFFSET + 2]
-        .copy_from_slice(&lo.to_le_bytes());
+    raw[INODE_CHECKSUM_LO_OFFSET..INODE_CHECKSUM_LO_OFFSET + 2].copy_from_slice(&lo.to_le_bytes());
     if is >= INODE_CHECKSUM_HI_OFFSET + 2 {
         let hi = ((csum >> 16) & 0xFFFF) as u16;
         raw[INODE_CHECKSUM_HI_OFFSET..INODE_CHECKSUM_HI_OFFSET + 2]
@@ -270,8 +272,7 @@ pub fn create_inode(
     cx_checkpoint(cx)?;
 
     let is_dir = (mode & 0xF000) == file_type::S_IFDIR;
-    let alloc =
-        ffs_alloc::alloc_inode(cx, dev, geo, groups, parent_group, is_dir)?;
+    let alloc = ffs_alloc::alloc_inode(cx, dev, geo, groups, parent_group, is_dir)?;
 
     if is_dir {
         let gidx = alloc.group.0 as usize;
@@ -665,7 +666,17 @@ mod tests {
 
         let free_before = groups[0].free_inodes;
 
-        delete_inode(&cx, &dev, &geo, &mut groups, ino, &mut inode, 0, 1_700_000_001).unwrap();
+        delete_inode(
+            &cx,
+            &dev,
+            &geo,
+            &mut groups,
+            ino,
+            &mut inode,
+            0,
+            1_700_000_001,
+        )
+        .unwrap();
 
         assert_eq!(inode.links_count, 0);
         assert_eq!(inode.dtime, 1_700_000_001);
