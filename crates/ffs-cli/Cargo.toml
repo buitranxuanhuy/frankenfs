@@ -10,9 +10,11 @@ rust-version.workspace = true
 anyhow = { workspace = true }
 asupersync = { workspace = true }
 clap = { workspace = true }
+ffs-block = { workspace = true }
 ffs-core = { workspace = true }
 ffs-fuse = { workspace = true }
 ffs-harness = { workspace = true }
+ffs-repair = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

@@ -450,9 +450,11 @@ dependencies = [
  "anyhow",
  "asupersync",
  "clap",
+ "ffs-block",
  "ffs-core",
  "ffs-fuse",
  "ffs-harness",
+ "ffs-repair",
  "serde",
  "serde_json",
 ]
