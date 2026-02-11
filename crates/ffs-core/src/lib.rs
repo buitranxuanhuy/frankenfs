@@ -1899,6 +1899,68 @@ impl DurabilityAutopilot {
     }
 }
 
+// ── Repair Policy ────────────────────────────────────────────────────────────
+
+/// Mount-configurable repair policy governing overhead ratio and autopilot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepairPolicy {
+    /// Static overhead ratio, range `[1.01, 1.10]`, default `1.05`.
+    pub overhead_ratio: f64,
+    /// Refresh repair symbols eagerly on every write?
+    pub eager_refresh: bool,
+    /// When present, the autopilot's `choose_overhead()` overrides the static
+    /// ratio at each scrub cycle.
+    #[serde(skip)]
+    pub autopilot: Option<DurabilityAutopilot>,
+}
+
+impl Default for RepairPolicy {
+    fn default() -> Self {
+        Self {
+            overhead_ratio: 1.05,
+            eager_refresh: false,
+            autopilot: None,
+        }
+    }
+}
+
+impl RepairPolicy {
+    /// Return the effective overhead ratio.  When autopilot is engaged, query
+    /// it with the standard candidate set; otherwise return the static ratio.
+    #[must_use]
+    pub fn effective_overhead(&self) -> f64 {
+        self.effective_overhead_for_group(32_768)
+    }
+
+    /// Return the effective overhead ratio for a specific group size.
+    #[must_use]
+    pub fn effective_overhead_for_group(&self, source_block_count: u32) -> f64 {
+        self.autopilot.as_ref().map_or(self.overhead_ratio, |ap| {
+            let candidates: Vec<f64> = (1..=10).map(|i| f64::from(i).mul_add(0.01, 1.0)).collect();
+            ap.choose_overhead_for_group(&candidates, source_block_count)
+                .repair_overhead
+        })
+    }
+
+    /// Return the full `RedundancyDecision` when autopilot is engaged, or
+    /// `None` when using static overhead.
+    #[must_use]
+    pub fn autopilot_decision(&self) -> Option<RedundancyDecision> {
+        self.autopilot_decision_for_group(32_768)
+    }
+
+    /// Return the full `RedundancyDecision` for a given group size.
+    #[must_use]
+    pub fn autopilot_decision_for_group(
+        &self,
+        source_block_count: u32,
+    ) -> Option<RedundancyDecision> {
+        let ap = self.autopilot.as_ref()?;
+        let candidates: Vec<f64> = (1..=10).map(|i| f64::from(i).mul_add(0.01, 1.0)).collect();
+        Some(ap.choose_overhead_for_group(&candidates, source_block_count))
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct FrankenFsEngine {
     store: MvccStore,
@@ -3652,5 +3714,280 @@ mod tests {
         let fs = OpenFs::from_device(&cx, Box::new(dev), &opts).unwrap();
         assert!(fs.is_btrfs());
         assert!(fs.btrfs_context.is_some());
+    }
+
+    // ── DurabilityAutopilot tests ────────────────────────────────────────
+
+    /// Standard candidate set: 1% to 10% overhead.
+    fn standard_candidates() -> Vec<f64> {
+        (1..=10).map(|i| f64::from(i).mul_add(0.01, 1.0)).collect()
+    }
+
+    #[test]
+    fn posterior_uniform_prior() {
+        let p = DurabilityPosterior::default();
+        assert!((p.alpha - 1.0).abs() < f64::EPSILON);
+        assert!((p.beta - 1.0).abs() < f64::EPSILON);
+        assert!((p.expected_corruption_rate() - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn posterior_observe_blocks_updates_correctly() {
+        let mut p = DurabilityPosterior::default();
+        // Scrub 1000 blocks, find 10 corrupt.
+        p.observe_blocks(1000, 10);
+        // alpha = 1 + 10 = 11, beta = 1 + 990 = 991
+        assert!((p.alpha - 11.0).abs() < f64::EPSILON);
+        assert!((p.beta - 991.0).abs() < f64::EPSILON);
+        let rate = p.expected_corruption_rate();
+        assert!((rate - 11.0 / 1002.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn posterior_converges_to_empirical_rate() {
+        let mut p = DurabilityPosterior::default();
+        // Many observations at 2% corruption rate.
+        for _ in 0..100 {
+            p.observe_blocks(10_000, 200);
+        }
+        let rate = p.expected_corruption_rate();
+        assert!((rate - 0.02).abs() < 0.001, "expected ~0.02, got {rate}");
+    }
+
+    #[test]
+    fn posterior_variance_decreases_with_observations() {
+        let mut p = DurabilityPosterior::default();
+        let var_before = p.variance();
+        p.observe_blocks(10_000, 100);
+        let var_after = p.variance();
+        assert!(
+            var_after < var_before,
+            "variance should decrease: {var_before} -> {var_after}"
+        );
+    }
+
+    #[test]
+    fn autopilot_fresh_picks_lowest_overhead() {
+        // With no observations (uniform prior), p_hi clamps to 1.0.
+        // All candidates have risk_bound=1.0 (rho <= p_hi), so the
+        // corruption_loss is identical.  Tiebreaker is redundancy_loss,
+        // which is minimized at the lowest candidate.
+        let ap = DurabilityAutopilot::new();
+        let d = ap.choose_overhead(&standard_candidates());
+        assert!(
+            (d.repair_overhead - 1.01).abs() < f64::EPSILON,
+            "fresh autopilot should pick lowest overhead (risk equal), got {}",
+            d.repair_overhead
+        );
+        assert!(d.expected_loss.is_finite());
+        assert!(d.posterior_mean_corruption_rate > 0.0);
+        // All candidates have same risk, so corruption_loss is maximal.
+        assert!((d.unrecoverable_risk_bound - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn autopilot_low_corruption_picks_low_overhead() {
+        let mut ap = DurabilityAutopilot::new();
+        // 10 clean scrubs of 100K blocks each, zero corruption.
+        for _ in 0..10 {
+            ap.observe_scrub(100_000, 0);
+        }
+        let d = ap.choose_overhead(&standard_candidates());
+        // With ~1M clean blocks observed, posterior p is very low.
+        // The autopilot should pick a low overhead since risk is negligible.
+        assert!(
+            d.repair_overhead <= 1.03,
+            "low corruption should yield low overhead, got {}",
+            d.repair_overhead
+        );
+        assert!(d.unrecoverable_risk_bound < 1e-10);
+        assert!(d.corruption_loss < d.redundancy_loss);
+    }
+
+    #[test]
+    fn autopilot_high_corruption_picks_high_overhead() {
+        let mut ap = DurabilityAutopilot::new();
+        // Heavy corruption: 5% of blocks corrupt per scrub.
+        for _ in 0..5 {
+            ap.observe_scrub(10_000, 500);
+        }
+        let d = ap.choose_overhead(&standard_candidates());
+        // p is around 5%, so overhead should be high to cover.
+        assert!(
+            d.repair_overhead >= 1.06,
+            "high corruption should yield high overhead, got {}",
+            d.repair_overhead
+        );
+        assert!(d.posterior_mean_corruption_rate > 0.04);
+    }
+
+    #[test]
+    fn autopilot_reacts_to_corruption_increase() {
+        // Use a modest clean history so corruption isn't swamped.
+        let mut ap = DurabilityAutopilot::new();
+        ap.observe_scrub(10_000, 0);
+        let d_clean = ap.choose_overhead(&standard_candidates());
+
+        // Observe heavy corruption: 5% of blocks corrupt, enough data to
+        // push the posterior mean above 1% so overhead must increase.
+        for _ in 0..20 {
+            ap.observe_scrub(10_000, 500);
+        }
+        let d_corrupt = ap.choose_overhead(&standard_candidates());
+
+        assert!(
+            d_corrupt.repair_overhead > d_clean.repair_overhead,
+            "overhead should increase after corruption: {} -> {}",
+            d_clean.repair_overhead,
+            d_corrupt.repair_overhead,
+        );
+        assert!(d_corrupt.posterior_mean_corruption_rate > d_clean.posterior_mean_corruption_rate);
+    }
+
+    #[test]
+    fn decision_contains_explainable_fields() {
+        let mut ap = DurabilityAutopilot::new();
+        ap.observe_scrub(50_000, 25);
+        let d = ap.choose_overhead(&standard_candidates());
+
+        // All evidence fields must be populated and finite.
+        assert!(d.repair_overhead.is_finite());
+        assert!(d.expected_loss.is_finite());
+        assert!(d.posterior_mean_corruption_rate.is_finite());
+        assert!(d.posterior_hi_corruption_rate.is_finite());
+        assert!(d.unrecoverable_risk_bound.is_finite());
+        assert!(d.redundancy_loss.is_finite());
+        assert!(d.corruption_loss.is_finite());
+
+        // Consistency: expected_loss = redundancy_loss + corruption_loss.
+        let sum = d.redundancy_loss + d.corruption_loss;
+        assert!(
+            (d.expected_loss - sum).abs() < 1e-10,
+            "loss should decompose: {} != {} + {}",
+            d.expected_loss,
+            d.redundancy_loss,
+            d.corruption_loss,
+        );
+
+        // p_hi >= p_mean (upper bound).
+        assert!(d.posterior_hi_corruption_rate >= d.posterior_mean_corruption_rate);
+
+        // Overhead is in valid range.
+        assert!(d.repair_overhead >= 1.01);
+        assert!(d.repair_overhead <= 1.10);
+    }
+
+    #[test]
+    fn risk_bound_monotonically_decreases_with_overhead() {
+        let mut ap = DurabilityAutopilot::new();
+        ap.observe_scrub(100_000, 50);
+        let candidates = standard_candidates();
+
+        let mut prev_risk = f64::INFINITY;
+        for &c in &candidates {
+            let d = ap.choose_overhead_for_group(&[c], 32_768);
+            assert!(
+                d.unrecoverable_risk_bound <= prev_risk + f64::EPSILON,
+                "risk should decrease: at overhead {c}, risk {} > prev {prev_risk}",
+                d.unrecoverable_risk_bound,
+            );
+            prev_risk = d.unrecoverable_risk_bound;
+        }
+    }
+
+    #[test]
+    fn autopilot_no_valid_candidates_uses_default() {
+        let ap = DurabilityAutopilot::new();
+        // Pass only out-of-range candidates.
+        let d = ap.choose_overhead(&[0.5, 2.0, f64::NAN, f64::INFINITY]);
+        assert!((d.repair_overhead - 1.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn autopilot_empty_candidates_uses_default() {
+        let ap = DurabilityAutopilot::new();
+        let d = ap.choose_overhead(&[]);
+        assert!((d.repair_overhead - 1.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn autopilot_group_size_affects_risk() {
+        let mut ap = DurabilityAutopilot::new();
+        ap.observe_scrub(100_000, 50);
+
+        // Large group: more blocks = tighter concentration = lower risk.
+        let d_large = ap.choose_overhead_for_group(&standard_candidates(), 32_768);
+        // Small group: fewer blocks = wider variance = higher risk.
+        let d_small = ap.choose_overhead_for_group(&standard_candidates(), 100);
+
+        // Small groups should pick higher (or equal) overhead.
+        assert!(
+            d_small.repair_overhead >= d_large.repair_overhead,
+            "small group ({}) should need >= overhead than large group ({})",
+            d_small.repair_overhead,
+            d_large.repair_overhead,
+        );
+    }
+
+    #[test]
+    fn loss_model_custom_costs() {
+        let mut ap = DurabilityAutopilot {
+            posterior: DurabilityPosterior::default(),
+            loss: DurabilityLossModel {
+                corruption_cost: 1.0,
+                redundancy_cost: 1_000_000.0,
+                z_score: 3.0,
+            },
+        };
+        // When redundancy is extremely expensive, should pick lowest overhead.
+        ap.observe_scrub(100_000, 10);
+        let d = ap.choose_overhead(&standard_candidates());
+        assert!(
+            (d.repair_overhead - 1.01).abs() < f64::EPSILON,
+            "high redundancy cost should pick 1.01, got {}",
+            d.repair_overhead,
+        );
+    }
+
+    #[test]
+    fn decision_serializes_to_json() {
+        let mut ap = DurabilityAutopilot::new();
+        ap.observe_scrub(10_000, 5);
+        let d = ap.choose_overhead(&standard_candidates());
+        let json = serde_json::to_string(&d).expect("serialize");
+        let d2: RedundancyDecision = serde_json::from_str(&json).expect("deserialize");
+        assert!((d.repair_overhead - d2.repair_overhead).abs() < f64::EPSILON);
+        assert!((d.expected_loss - d2.expected_loss).abs() < 1e-10);
+    }
+
+    // ── RepairPolicy tests ───────────────────────────────────────────────
+
+    #[test]
+    fn repair_policy_default_is_static_5pct() {
+        let p = RepairPolicy::default();
+        assert!((p.overhead_ratio - 1.05).abs() < f64::EPSILON);
+        assert!(!p.eager_refresh);
+        assert!(p.autopilot.is_none());
+        assert!((p.effective_overhead() - 1.05).abs() < f64::EPSILON);
+        assert!(p.autopilot_decision().is_none());
+    }
+
+    #[test]
+    fn repair_policy_with_autopilot_delegates() {
+        let mut ap = DurabilityAutopilot::new();
+        for _ in 0..10 {
+            ap.observe_scrub(100_000, 0);
+        }
+        let policy = RepairPolicy {
+            overhead_ratio: 1.05,
+            eager_refresh: false,
+            autopilot: Some(ap),
+        };
+        let overhead = policy.effective_overhead();
+        // Should come from autopilot, not static ratio.
+        assert!((1.01..=1.10).contains(&overhead));
+
+        let decision = policy.autopilot_decision().expect("should have decision");
+        assert!((decision.repair_overhead - overhead).abs() < f64::EPSILON);
     }
 }
