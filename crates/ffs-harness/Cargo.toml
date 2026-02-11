@@ -22,6 +22,10 @@ criterion = { workspace = true }
 name = "metadata_parse"
 harness = false
 
+[[bench]]
+name = "ondisk_parse"
+harness = false
+
 [[bin]]
 name = "ffs-harness"
 path = "src/main.rs"
