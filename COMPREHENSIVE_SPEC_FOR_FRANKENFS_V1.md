@@ -769,6 +769,194 @@ pub struct RedundancyDecision {
 }
 ```
 
+### 3.12 Decode Proofs (Auditable Repair)
+
+Every RaptorQ decode that repairs a corrupted block MUST produce a **decode proof** — a structured witness artifact that makes the repair auditable and replayable. This pattern is extracted from FrankenSQLite's `EcsDecodeProof` system and adapted for filesystem block groups.
+
+#### 3.12.1 Proof Structure
+
+```rust
+pub struct DecodeProof {
+    pub group: GroupNumber,
+    pub corrupted_blocks: Vec<BlockNumber>,
+    pub symbols_available: u32,
+    pub symbols_required: u32,
+    pub decode_success: bool,
+    pub failure_reason: Option<DecodeFailureReason>,
+    pub accepted_symbol_digests: Vec<SymbolDigest>,
+    pub rejected_symbols: Vec<RejectedSymbol>,
+    pub recovered_block_checksums: Vec<(BlockNumber, [u8; 32])>,
+    pub repair_generation: u64,
+    pub timestamp: SystemTime,
+}
+
+pub struct SymbolDigest {
+    pub esi: u32,
+    pub digest: [u8; 32],  // BLAKE3 of symbol payload
+}
+
+pub struct RejectedSymbol {
+    pub esi: u32,
+    pub reason: SymbolRejectionReason,
+}
+
+pub enum SymbolRejectionReason {
+    ChecksumMismatch,
+    GenerationMismatch,
+    FormatViolation,
+    DuplicateEsi,
+}
+
+pub enum DecodeFailureReason {
+    InsufficientSymbols,
+    RankDeficiency,
+    IntegrityMismatch,
+}
+```
+
+#### 3.12.2 Proof Emission Rules
+
+1. **On successful recovery**: proof MUST include the BLAKE3 checksums of all recovered blocks and digests of all symbols fed to the decoder. This enables replay-verification without re-decoding.
+2. **On failed recovery**: proof MUST include the failure reason, the count of available vs required symbols, and the list of rejected symbols with rejection reasons.
+3. **Storage**: proofs SHOULD be emitted to the evidence ledger (Section 3.13) and MAY be persisted in a dedicated region of the repair metadata area for post-mortem analysis.
+4. **Lab mode**: under asupersync lab runtime, proofs MUST be emitted for every decode attempt. In production, proofs MUST be emitted for every decode attempt (both success and failure) because repair events are infrequent and the forensic value is high.
+
+### 3.13 Evidence Ledger for Repair Actions
+
+All repair-related decisions and actions MUST produce evidence ledger entries. This pattern is extracted from FrankenSQLite's evidence ledger discipline, which ensures that every automatic policy change, every repair action, and every redundancy decision is auditable.
+
+#### 3.13.1 Ledger Entry Schema
+
+```rust
+pub struct RepairLedgerEntry {
+    pub timestamp: SystemTime,
+    pub kind: RepairLedgerKind,
+    pub group: Option<GroupNumber>,
+    pub detail: serde_json::Value,
+}
+
+pub enum RepairLedgerKind {
+    /// Block recovery attempted (success or failure).
+    RecoveryAttempt { proof: DecodeProof },
+    /// Repair symbols regenerated for a group.
+    SymbolRefresh { generation_before: u64, generation_after: u64 },
+    /// Group marked stale by a write.
+    GroupStaleMarked { block: BlockNumber },
+    /// Autopilot overhead ratio change.
+    OverheadAdjusted { decision: RedundancyDecision },
+    /// Scrub cycle completed.
+    ScrubComplete { report: ScrubReport },
+}
+```
+
+#### 3.13.2 Ledger Guarantees
+
+- Every `RepairManager` method that mutates state MUST emit a ledger entry before returning.
+- The ledger is append-only and bounded (configurable maximum entries; default 10,000 with FIFO eviction of oldest entries).
+- In lab mode, the ledger MUST be inspectable by test assertions.
+- The `ffs-tui` crate MAY display recent ledger entries in the Repair panel.
+
+### 3.14 Deterministic Symbol Generation
+
+Repair symbol generation MUST be **deterministic**: given the same source blocks and the same overhead configuration, the resulting repair symbols MUST be byte-identical across invocations. This property, extracted from FrankenSQLite's deterministic encoding model, enables:
+
+1. **Verification without original decode**: a verifier can re-encode from source blocks and compare symbol digests without performing a full RaptorQ decode.
+2. **Idempotent refresh**: re-encoding a non-stale group produces identical symbols and can be safely skipped.
+3. **Incremental repair**: if only one source block changed, only the affected symbols need regeneration (the stale set is deterministically computable).
+
+#### 3.14.1 Seed Derivation
+
+The RaptorQ encoding seed for each group MUST be derived deterministically from the group number and filesystem UUID:
+
+```rust
+pub fn repair_seed(fs_uuid: &[u8; 16], group: GroupNumber) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ffs:repair:seed:v1");
+    hasher.update(fs_uuid);
+    hasher.update(&group.0.to_le_bytes());
+    let hash = hasher.finalize();
+    u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap())
+}
+```
+
+This ensures that independent agents (e.g., a scrub daemon and a manual `ffs repair` invocation) generate identical symbols for the same group state.
+
+### 3.15 Per-Source Block Validation
+
+Before feeding source blocks to the RaptorQ decoder, each block MUST be independently validated. This addresses the same problem FrankenSQLite solves with per-source xxh3_128 hashes in its `.wal-fec` sidecar: once a checksum chain breaks, blocks after the break point cannot be validated by chain verification alone.
+
+#### 3.15.1 Validation Strategy
+
+The `RepairGroupDescExt` (Section 3.7.2) MUST be extended with an array of per-source-block BLAKE3 digests:
+
+```rust
+pub struct RepairGroupDescExt {
+    // ... existing fields from Section 3.7.2 ...
+
+    /// BLAKE3 digests of each source block at the time repair symbols were generated.
+    /// Length = source_block_count. Stored in dedicated validation blocks
+    /// immediately before the repair symbol blocks.
+    pub source_digests_start_block: u32,
+    pub source_digests_block_count: u32,
+}
+```
+
+On recovery:
+1. Read each source block and compute its BLAKE3 digest.
+2. Compare against the stored digest. Blocks that match are **validated sources**; blocks that mismatch are **erased** (treated as missing for the decoder).
+3. Feed validated sources + repair symbols to the RaptorQ decoder.
+4. After decode, verify recovered blocks against their stored digests.
+
+This prevents the decoder from being poisoned by silently corrupted blocks that happen to pass CRC32C (probability ~2^-32 per block) but have incorrect data.
+
+### 3.16 Tail Group and Metadata Special Cases
+
+#### 3.16.1 Tail Block Groups
+
+The last block group in the filesystem may contain fewer than `blocks_per_group` blocks. Repair symbol generation MUST handle this gracefully:
+
+- K (source symbol count) = actual data blocks in the group (may be < `blocks_per_group`).
+- Repair overhead is still `ceil(K * (overhead_ratio - 1.0))`.
+- OTI parameters MUST be derived from the actual K, not the nominal group size.
+- For very small tail groups (K < 8), enforce a minimum of 3 repair symbols (extracted from FrankenSQLite's `small_k_min_repair` policy).
+
+#### 3.16.2 Metadata Block Protection
+
+Superblock, group descriptor table, and inode table blocks are disproportionately critical. Loss of the superblock or GDT renders the entire filesystem unmountable. Analogous to FrankenSQLite's special-case page-1 treatment:
+
+- Superblock copies (primary at block 0/1, and backup copies in block groups 0, 1, 3, 5, 7, ...) are already redundant by ext4 convention.
+- Group descriptor blocks SHOULD receive elevated repair overhead (2x default) when native mode repair is enabled, because GDT loss cascades to all groups.
+- The `RepairPolicy` SHOULD accept per-group-class overhead overrides:
+
+```rust
+pub struct RepairPolicy {
+    pub overhead_ratio: f64,                 // default for data groups
+    pub metadata_overhead_ratio: Option<f64>, // override for groups containing GDT/superblock
+    pub eager_refresh: bool,
+    pub autopilot: Option<DurabilityAutopilot>,
+}
+```
+
+### 3.17 FrankenSQLite Design Extraction Summary
+
+This section records the key design choices extracted from FrankenSQLite's proven RaptorQ self-healing implementation and how each adapts to the FrankenFS filesystem context.
+
+| FrankenSQLite Design Choice | Filesystem Adaptation | Section |
+|----|----|-----|
+| Sidecar files (`.wal-fec`, `.db-fec`) store symbols outside the main file | Symbols stored in **reserved blocks at end of each block group** (in-image; no sidecar needed because the filesystem controls block allocation) | 3.7 |
+| Per-commit-group encoding (K = pages per transaction) | Per-block-group encoding (K = blocks per group, typically 32,768) | 3.3, 3.7 |
+| Small fixed repair count (default R=2 symbols per WAL commit group) | Proportional overhead (default 5%, yielding ~1,639 repair symbols per 32K-block group) | 3.8 |
+| Pipelined symbol generation (async, not on commit critical path) | Lazy refresh (mark group stale on write, re-encode on next scrub) as default; eager refresh as option | 3.10 |
+| Generation digest prevents stale sidecar attacks | `repair_generation` counter in group descriptor must match stored symbols | 3.7.2 |
+| Per-source xxh3_128 hashes for independent frame validation | Per-source BLAKE3 digests stored in validation blocks (Section 3.15) | 3.15 |
+| Decode proofs (mathematical witness for every repair) | Decode proofs with BLAKE3 digests of recovered blocks (Section 3.12) | 3.12 |
+| Evidence ledger (auditable record of every policy change and repair action) | Repair evidence ledger with structured entries (Section 3.13) | 3.13 |
+| Deterministic encoding (same input = same symbols) via content-addressed seed | Deterministic seed from fs_uuid + group_number (Section 3.14) | 3.14 |
+| Special page-1 treatment (elevated redundancy for header page) | Elevated overhead for metadata groups containing superblock/GDT (Section 3.16.2) | 3.16 |
+| Small-K clamping (minimum 3 repair symbols for objects with K <= 8) | Minimum 3 repair symbols for tail block groups with K < 8 (Section 3.16.1) | 3.16 |
+| Checkpoint-only sidecar updates (single writer, no concurrent mutation) | Symbol refresh only during scrub (lazy mode) or committed write path (eager mode); never during read | 3.10 |
+| Bayesian autopilot for redundancy tuning | Beta posterior over corruption rate with expected-loss overhead selection (Section 3.11) | 3.11 |
+
 ---
 
 ## 4. Asupersync Deep Integration
