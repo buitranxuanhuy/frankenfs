@@ -5,5 +5,6 @@
 //! detects corruption via checksum mismatch (crc32c or BLAKE3), recovers
 //! corrupted blocks from repair symbols, and runs background scrub passes.
 
+pub mod codec;
 pub mod scrub;
 pub mod symbol;
