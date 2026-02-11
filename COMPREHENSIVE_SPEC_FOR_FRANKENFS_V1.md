@@ -2487,6 +2487,8 @@ Key types and modules:
 - `le.rs`: `read_le_u16(data, offset)`, `read_le_u32(data, offset)`, `read_le_u64(data, offset)` -- little-endian parse helpers that read from byte slices at a given offset. `ensure_slice(data, offset, len)` for bounds-checked subslice extraction. `read_fixed::<N>(data, offset)` for fixed-size arrays. `trim_nul_padded(bytes)` for NUL-terminated strings. Used pervasively in `ffs-ondisk`.
 > **[CORRECTION]** The spec originally described `Le16(u16)`, `Le32(u32)`, `Le64(u64)` wrapper types. The actual implementation uses free functions (`read_le_u16`, etc.) rather than newtype wrappers.
 
+> **[CROSS-LINK]** The canonical listing of implemented vs planned newtypes is in §16.3 (Phase 2). The module descriptions above represent the target state; types not yet in code include `BlockCount`, `LogicalBlock`, `FileMode`, `Timestamp`, `InodeSize`, `GroupDescSize`, `DxHashVersion`, `DxHash`, `InodeFlags`, `FeatureCompat/Incompat/RoCompat`, and `MountFlags`. `BlockBuf` is implemented in `ffs-block` (not `ffs-types`), which is the correct placement since it is an I/O-adjacent type.
+
 Public API surface: ~60 types, all `#[derive(Debug, Clone)]`, most `Copy`.
 `Cx` is currently imported from `asupersync` directly by crates that need it;
 we may introduce a re-export via `ffs-types` later if API-stability concerns
@@ -4629,7 +4631,7 @@ Phases MUST NOT be reordered; the dependency chain is strict.
 
 **Goal:** Foundational type system and ext4 on-disk structure parsing. Parse real ext4 superblock, group descriptors, inodes, extents, and directory entries.
 
-**ffs-types:** Newtypes `BlockNumber(u64)`, `InodeNumber(u64)`, `TxnId(u64)`, `CommitSeq(u64)`, `Snapshot { high: CommitSeq }`, `ParseError` enum. Binary read helpers (`read_le_u16/u32/u64`, `ensure_slice`, `trim_nul_padded`). ext4/btrfs magic constants. Additional planned newtypes: `GroupNumber(u32)`, `LogicalBlock(u64)`, `FileMode` (bitflags), `Timestamp { seconds: i64, nanoseconds: u32 }`, `BlockBuf`.
+**ffs-types:** (Canonical definitions in `ffs-types/src/lib.rs`.) Implemented newtypes: `BlockNumber(u64)`, `InodeNumber(u64)`, `TxnId(u64)`, `CommitSeq(u64)`, `Snapshot { high: CommitSeq }`, `BlockSize(u32)` (validated), `GroupNumber(u32)`, `ByteOffset(u64)`, `DeviceId(u128)`, `Generation(u64)`, `Ext4InodeNumber(u32)`, `BtrfsObjectId(u64)`, `ParseError` enum. Binary read helpers (`read_le_u16/u32/u64`, `ensure_slice`, `trim_nul_padded`). ext4/btrfs magic constants. Planned newtypes (not yet in code): `BlockCount(u64)`, `LogicalBlock(u64)`, `FileMode(u16)`, `Timestamp { secs: i64, nsec: u32 }`, `InodeSize(u16)`. Note: `BlockBuf` is implemented in `ffs-block` (not `ffs-types`).
 
 > **Note:** `InodeNumber` is `u64` (not `u32`) to support both ext4 32-bit inodes and btrfs 64-bit objectids. The ext4 on-disk format stores 32-bit inode numbers; conversion happens at the parsing boundary.
 
