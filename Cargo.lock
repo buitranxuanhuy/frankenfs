@@ -449,6 +449,7 @@ dependencies = [
 name = "ffs-alloc"
 version = "0.1.0"
 dependencies = [
+ "asupersync",
  "ffs-block",
  "ffs-error",
  "ffs-ondisk",
@@ -470,6 +471,7 @@ dependencies = [
 name = "ffs-btree"
 version = "0.1.0"
 dependencies = [
+ "asupersync",
  "ffs-block",
  "ffs-error",
  "ffs-ondisk",
@@ -522,9 +524,13 @@ dependencies = [
 name = "ffs-dir"
 version = "0.1.0"
 dependencies = [
+ "asupersync",
+ "ffs-block",
  "ffs-error",
  "ffs-inode",
+ "ffs-ondisk",
  "ffs-types",
+ "libc",
 ]
 
 [[package]]
@@ -546,9 +552,12 @@ dependencies = [
 name = "ffs-extent"
 version = "0.1.0"
 dependencies = [
+ "asupersync",
  "ffs-alloc",
+ "ffs-block",
  "ffs-btree",
  "ffs-error",
+ "ffs-ondisk",
  "ffs-types",
 ]
 
@@ -585,8 +594,12 @@ dependencies = [
 name = "ffs-inode"
 version = "0.1.0"
 dependencies = [
+ "asupersync",
+ "crc32c",
+ "ffs-alloc",
  "ffs-block",
  "ffs-error",
+ "ffs-extent",
  "ffs-ondisk",
  "ffs-types",
 ]
@@ -595,9 +608,12 @@ dependencies = [
 name = "ffs-journal"
 version = "0.1.0"
 dependencies = [
+ "asupersync",
+ "crc32c",
  "ffs-block",
  "ffs-error",
  "ffs-types",
+ "parking_lot",
 ]
 
 [[package]]
@@ -731,6 +747,7 @@ version = "0.1.1"
 dependencies = [
  "ftui-core",
  "rustc-hash",
+ "serde",
 ]
 
 [[package]]

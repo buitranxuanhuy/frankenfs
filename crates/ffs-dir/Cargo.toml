@@ -9,7 +9,13 @@ rust-version.workspace = true
 [dependencies]
 ffs-types = { workspace = true }
 ffs-error = { workspace = true }
+ffs-block = { workspace = true }
+ffs-ondisk = { workspace = true }
 ffs-inode = { workspace = true }
+asupersync = { workspace = true }
+
+[dev-dependencies]
+libc = { workspace = true }
 
 [lints]
 workspace = true
