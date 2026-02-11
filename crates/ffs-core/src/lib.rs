@@ -1128,7 +1128,7 @@ fn inode_to_attr(sb: &Ext4Superblock, ino: InodeNumber, inode: &Ext4Inode) -> In
         nlink: u32::from(inode.links_count),
         uid: inode.uid,
         gid: inode.gid,
-        rdev: 0,
+        rdev: inode.device_number(),
         blksize: sb.block_size,
     }
 }
@@ -2392,6 +2392,65 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── inode_to_attr tests ───────────────────────────────────────────────
+
+    /// Build a minimal Ext4Superblock for unit tests.
+    fn make_test_superblock() -> Ext4Superblock {
+        let mut sb_buf = vec![0_u8; EXT4_SUPERBLOCK_SIZE];
+        sb_buf[0x38..0x3A].copy_from_slice(&EXT4_SUPER_MAGIC.to_le_bytes());
+        sb_buf[0x18..0x1C].copy_from_slice(&2_u32.to_le_bytes()); // log_block_size=2 → 4K
+        sb_buf[0x00..0x04].copy_from_slice(&1024_u32.to_le_bytes()); // inodes_count
+        sb_buf[0x04..0x08].copy_from_slice(&4096_u32.to_le_bytes()); // blocks_count
+        sb_buf[0x20..0x24].copy_from_slice(&4096_u32.to_le_bytes()); // blocks_per_group
+        sb_buf[0x28..0x2C].copy_from_slice(&1024_u32.to_le_bytes()); // inodes_per_group
+        sb_buf[0x58..0x5A].copy_from_slice(&256_u16.to_le_bytes()); // inode_size
+        Ext4Superblock::parse_superblock_region(&sb_buf).expect("test superblock")
+    }
+
+    /// Build a minimal inode buffer with mode and device encoding in i_block.
+    fn make_test_inode(mode: u16, block0: u32, block1: u32) -> Ext4Inode {
+        let mut buf = [0_u8; 128];
+        buf[0x00..0x02].copy_from_slice(&mode.to_le_bytes());
+        buf[0x28..0x2C].copy_from_slice(&block0.to_le_bytes());
+        buf[0x2C..0x30].copy_from_slice(&block1.to_le_bytes());
+        Ext4Inode::parse_from_bytes(&buf).expect("test inode")
+    }
+
+    #[test]
+    fn inode_to_attr_block_device_rdev() {
+        use ffs_types::{S_IFBLK, S_IFCHR};
+
+        let sb = make_test_superblock();
+
+        // Block device: major=8, minor=1 → /dev/sda1 (new format in i_block[1])
+        let inode = make_test_inode(S_IFBLK | 0o660, 0, 0x0801);
+        let attr = inode_to_attr(&sb, InodeNumber(100), &inode);
+        assert_eq!(attr.kind, FileType::BlockDevice);
+        assert_eq!(attr.rdev, 0x0801);
+        assert_eq!(attr.perm, 0o660);
+
+        // Char device: major=1, minor=3 → /dev/null (old format in i_block[0])
+        let inode = make_test_inode(S_IFCHR | 0o666, 0x0103, 0);
+        let attr = inode_to_attr(&sb, InodeNumber(101), &inode);
+        assert_eq!(attr.kind, FileType::CharDevice);
+        assert_eq!(attr.rdev, 0x0103);
+        assert_eq!(attr.perm, 0o666);
+    }
+
+    #[test]
+    fn inode_to_attr_regular_file_rdev_zero() {
+        use ffs_types::S_IFREG;
+
+        let sb = make_test_superblock();
+        let inode = make_test_inode(S_IFREG | 0o644, 0, 0);
+        let attr = inode_to_attr(&sb, InodeNumber(11), &inode);
+        assert_eq!(attr.kind, FileType::RegularFile);
+        assert_eq!(attr.rdev, 0);
+        assert_eq!(attr.perm, 0o644);
+        assert_eq!(attr.uid, 0);
+        assert_eq!(attr.gid, 0);
     }
 
     // ── OpenFs tests ─────────────────────────────────────────────────────

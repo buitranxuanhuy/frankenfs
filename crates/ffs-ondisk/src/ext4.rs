@@ -1605,6 +1605,65 @@ impl Ext4Inode {
         self.mode & 0o7777
     }
 
+    // ── Device number helpers ───────────────────────────────────────────
+
+    /// For block/char device inodes, extract the device number from the i_block area.
+    ///
+    /// Returns the device number in Linux `new_encode_dev` format (suitable for
+    /// FUSE `rdev` / `st_rdev`). For non-device inodes, returns 0.
+    ///
+    /// ext4 stores device numbers in `i_block[0]` (old 16-bit format) or
+    /// `i_block[1]` (new 32-bit format). If `i_block[0]` is non-zero, it holds
+    /// the old encoding; otherwise `i_block[1]` holds the new encoding.
+    #[must_use]
+    pub fn device_number(&self) -> u32 {
+        if !self.is_blkdev() && !self.is_chrdev() {
+            return 0;
+        }
+        if self.extent_bytes.len() < 8 {
+            return 0;
+        }
+
+        let block0 = u32::from_le_bytes([
+            self.extent_bytes[0],
+            self.extent_bytes[1],
+            self.extent_bytes[2],
+            self.extent_bytes[3],
+        ]);
+
+        if block0 != 0 {
+            // Old-format: 8-bit major in bits[15:8], 8-bit minor in bits[7:0].
+            // This is already compatible with new_encode_dev for ≤8-bit values.
+            block0 & 0xFFFF
+        } else {
+            // New-format in i_block[1]: 12-bit major, 20-bit minor.
+            u32::from_le_bytes([
+                self.extent_bytes[4],
+                self.extent_bytes[5],
+                self.extent_bytes[6],
+                self.extent_bytes[7],
+            ])
+        }
+    }
+
+    /// Extract the major device number for block/char device inodes.
+    ///
+    /// Uses the Linux `new_decode_dev` convention: `major = (rdev >> 8) & 0xFFF`.
+    #[must_use]
+    pub fn device_major(&self) -> u32 {
+        (self.device_number() >> 8) & 0xFFF
+    }
+
+    /// Extract the minor device number for block/char device inodes.
+    ///
+    /// Uses the Linux `new_decode_dev` convention:
+    /// `minor = (rdev & 0xFF) | ((rdev >> 12) & 0xFFF00)`.
+    #[must_use]
+    pub fn device_minor(&self) -> u32 {
+        let rdev = self.device_number();
+        (rdev & 0xFF) | ((rdev >> 12) & 0xFFF00)
+    }
+
     // ── Symlink helpers ─────────────────────────────────────────────────
 
     /// Whether this is a "fast" (inline) symlink stored in the inode's i_block area.
@@ -6000,5 +6059,78 @@ mod tests {
         let small = [0_u8; 12];
         let err = verify_extent_block_checksum(&small, 0, 1, 1).unwrap_err();
         assert!(matches!(err, ParseError::InsufficientData { .. }));
+    }
+
+    // ── Device number tests ──────────────────────────────────────────
+
+    /// Build a minimal 128-byte block device inode with i_block device encoding.
+    fn make_device_inode(mode: u16, block0: u32, block1: u32) -> Ext4Inode {
+        let mut buf = [0_u8; 128];
+        // mode at offset 0x00
+        buf[0x00..0x02].copy_from_slice(&mode.to_le_bytes());
+        // i_block area at 0x28 (60 bytes)
+        buf[0x28..0x2C].copy_from_slice(&block0.to_le_bytes());
+        buf[0x2C..0x30].copy_from_slice(&block1.to_le_bytes());
+        Ext4Inode::parse_from_bytes(&buf).expect("device inode parse")
+    }
+
+    #[test]
+    fn device_number_old_format_block_device() {
+        // Old format: major=8, minor=0 → /dev/sda = 0x0800
+        let inode = make_device_inode(S_IFBLK | 0o660, 0x0800, 0);
+        assert!(inode.is_blkdev());
+        assert_eq!(inode.device_number(), 0x0800);
+        assert_eq!(inode.device_major(), 8);
+        assert_eq!(inode.device_minor(), 0);
+    }
+
+    #[test]
+    fn device_number_old_format_char_device() {
+        // Old format: major=1, minor=3 → /dev/null = 0x0103
+        let inode = make_device_inode(S_IFCHR | 0o666, 0x0103, 0);
+        assert!(inode.is_chrdev());
+        assert_eq!(inode.device_number(), 0x0103);
+        assert_eq!(inode.device_major(), 1);
+        assert_eq!(inode.device_minor(), 3);
+    }
+
+    #[test]
+    fn device_number_new_format() {
+        // New format in i_block[1]: major=8, minor=1 → /dev/sda1
+        // new_encode_dev: (minor & 0xFF) | (major << 8) | ((minor & ~0xFF) << 12)
+        // = (1 & 0xFF) | (8 << 8) | 0 = 0x0801
+        let inode = make_device_inode(S_IFBLK | 0o660, 0, 0x0801);
+        assert!(inode.is_blkdev());
+        assert_eq!(inode.device_number(), 0x0801);
+        assert_eq!(inode.device_major(), 8);
+        assert_eq!(inode.device_minor(), 1);
+    }
+
+    #[test]
+    fn device_number_new_format_large_minor() {
+        // New format with large minor: major=8, minor=256
+        // new_encode_dev: (256 & 0xFF) | (8 << 8) | ((256 & ~0xFF) << 12)
+        // = 0 | 0x0800 | (0x100 << 12) = 0x0800 | 0x100000 = 0x100800
+        let inode = make_device_inode(S_IFBLK | 0o660, 0, 0x10_0800);
+        assert!(inode.is_blkdev());
+        assert_eq!(inode.device_number(), 0x10_0800);
+        assert_eq!(inode.device_major(), 8);
+        assert_eq!(inode.device_minor(), 256);
+    }
+
+    #[test]
+    fn device_number_returns_zero_for_regular_file() {
+        let inode = make_device_inode(S_IFREG | 0o644, 0x0800, 0);
+        assert!(inode.is_regular());
+        assert_eq!(inode.device_number(), 0);
+        assert_eq!(inode.device_major(), 0);
+        assert_eq!(inode.device_minor(), 0);
+    }
+
+    #[test]
+    fn device_number_returns_zero_for_directory() {
+        let inode = make_device_inode(S_IFDIR | 0o755, 0, 0);
+        assert!(inode.is_dir());
+        assert_eq!(inode.device_number(), 0);
     }
 }
