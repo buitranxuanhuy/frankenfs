@@ -8,7 +8,7 @@
 
 | # | Crate | Role | Key Dependencies | Primary Phase |
 |---|-------|------|-----------------|--------------|
-| 1 | `ffs-types` | Newtypes: BlockNumber, InodeNumber, TxnId, CommitSeq, Snapshot, ParseError; binary read helpers (read_le_u16/u32/u64); ext4/btrfs magic constants | `serde`, `thiserror` | 2 |
+| 1 | `ffs-types` | Newtypes: BlockNumber, BlockSize, ByteOffset, InodeNumber, TxnId, CommitSeq, Snapshot, GroupNumber, DeviceId, Generation, ParseError; binary read helpers (read_le_u16/u32/u64); ext4/btrfs magic constants | `serde`, `thiserror` | 2 |
 | 2 | `ffs-error` | FfsError enum, Result<T> alias, errno mappings (ENOENT, EIO, ENOSPC, ...) | `thiserror` | 2 |
 | 3 | `ffs-ondisk` | ext4 + btrfs on-disk format parsing: superblocks, headers, keys/items, ext4 group desc/inodes/extents/dirs, JBD2 structures | `ffs-types`, `ffs-error`, `crc32c`, `serde` | 2 |
 | 4 | `ffs-block` | Block I/O layer: BlockDevice trait, ARC (Adaptive Replacement Cache), read/write with Cx, dirty page tracking | `ffs-types`, `ffs-error`, `asupersync`, `parking_lot` | 3 |

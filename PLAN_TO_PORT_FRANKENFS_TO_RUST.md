@@ -296,7 +296,7 @@ parsing with round-trip fidelity.
 
 | Crate | Key Items |
 |---|---|
-| `ffs-types` | `BlockNumber(u64)`, `InodeNumber(u64)`, `TxnId(u64)`, `CommitSeq(u64)`, `Snapshot { high: CommitSeq }`, `ParseError` enum; binary read helpers (`read_le_u16/u32/u64`, `ensure_slice`, `trim_nul_padded`); ext4/btrfs magic constants |
+| `ffs-types` | (Canonical definitions in `ffs-types/src/lib.rs`.) `BlockNumber(u64)`, `BlockSize(u32)` (validated), `ByteOffset(u64)`, `InodeNumber(u64)`, `TxnId(u64)`, `CommitSeq(u64)`, `Snapshot { high: CommitSeq }`, `GroupNumber(u32)`, `DeviceId(u128)`, `Generation(u64)`, `Ext4InodeNumber(u32)`, `BtrfsObjectId(u64)`, `ParseError` enum; binary read helpers (`read_le_u16/u32/u64`, `ensure_slice`, `trim_nul_padded`); ext4/btrfs magic constants |
 | `ffs-error` | `FfsError` enum (18 variants: Io, Corruption, Format, Parse, UnsupportedFeature, InvalidGeometry, MvccConflict, Cancelled, NoSpace, NotFound, PermissionDenied, ReadOnly, NotDirectory, IsDirectory, NotEmpty, NameTooLong, Exists, RepairFailed); `Result<T>` alias. See canonical listing in `crates/ffs-error/src/lib.rs`. |
 | `ffs-ondisk` | Parsing and serialization for all ext4 on-disk structures |
 
@@ -621,8 +621,9 @@ In native mode, FrankenFS uses copy-on-write journaling:
 
 - **No write-ahead log.** Instead of writing blocks to the journal first and
   then to their final location, COW writes to a *new* location every time.
-- **Version chain.** Each block has a linked list of versions, ordered by LSN.
-  The current version is at the head.
+- **Version chain.** Each block has a linked list of versions, ordered by
+  MVCC `CommitSeq` (the monotonic commit sequence). The current version is at
+  the head.
 - **Atomic commit.** A transaction commits by atomically updating the version
   pointers (a single metadata write).
 - **Instant recovery.** No replay needed; the version store always points to the
@@ -645,13 +646,13 @@ SSI detects write-write and write-read conflicts that would violate
 serializability. FrankenFS implements SSI using the Cahill-Rohm-Fekete algorithm:
 
 1. **Read tracking:** Each transaction records the set of blocks it read and the
-   version (LSN) it observed.
+   version (`CommitSeq`) it observed.
 2. **Write tracking:** Each transaction records the set of blocks it wrote.
 3. **Conflict detection at commit time:**
    - **RW conflict (dangerous structure):** Transaction T1 read block B at
      version V1; transaction T2 wrote block B creating version V2 where
-     V1 < V2 <= T1.commit_lsn. If T2 committed before T1, this is a
-     *rw-antidependency* from T1 to T2.
+     V1 < V2. If T2 committed before T1, this is a *rw-antidependency* from T1
+     to T2.
    - **Dangerous structure:** If two rw-antidependencies form a cycle
      (T1 -rw-> T2 -rw-> T3 -rw-> T1 or T1 -rw-> T2 -rw-> T1), one
      transaction must abort.
@@ -1317,7 +1318,7 @@ These are not hard requirements but targets for acceptable performance:
 | **GF(256)** | Galois Field with 256 elements -- the finite field used in RaptorQ encoding |
 | **htree** | Hashed B-tree -- ext4's indexed directory format for fast filename lookup |
 | **JBD2** | Journaling Block Device v2 -- ext4's write-ahead logging subsystem |
-| **LSN** | Log Sequence Number -- monotonically increasing identifier for journal entries |
+| **LSN** | Log Sequence Number -- monotonically increasing identifier for journal entries (distinct from MVCC `CommitSeq`) |
 | **mballoc** | Multi-block allocator -- ext4's block allocation subsystem |
 | **MVCC** | Multi-Version Concurrency Control -- concurrent access via versioned data |
 | **Orlov allocator** | Inode allocation strategy that spreads directories and co-locates files |

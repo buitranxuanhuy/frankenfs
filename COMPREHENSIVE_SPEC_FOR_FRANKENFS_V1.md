@@ -182,19 +182,7 @@ FrankenFS is a **Rust 2024 workspace** (core 19 crates + optional legacy/referen
 
 **Innovation 1: Block-Level MVCC with Version Chains.** Every block has a version chain. Writes create new versions; readers see consistent snapshots. Enables concurrent readers that never block writers, concurrent disjoint-block writers without coordination, zero-cost snapshots, and SSI conflict detection.
 
-```rust
-// Core MVCC types (normative, defined in ffs-types / ffs-mvcc)
-pub struct TxnId(pub u64);
-pub struct CommitSeq(pub u64);
-pub struct Snapshot { pub high: CommitSeq }
-
-pub struct BlockVersion {
-    pub block: BlockNumber,
-    pub commit_seq: CommitSeq,
-    pub writer: TxnId,
-    pub bytes: Vec<u8>,  // exactly block_size bytes
-}
-```
+Core MVCC types are defined in `ffs-types` / `ffs-mvcc` and specified in §5 (MVCC Formal Model): `TxnId`, `CommitSeq`, `Snapshot`, and `BlockVersion`.
 
 **Innovation 2: RaptorQ Self-Healing Per Block Group.** Every block group maintains RaptorQ repair symbols (default 5% overhead). Background scrub detects corruption and triggers automatic recovery. No external backups or RAID required.
 
