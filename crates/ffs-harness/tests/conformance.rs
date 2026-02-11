@@ -120,3 +120,51 @@ fn parity_report_totals_are_consistent() {
     assert_eq!(implemented_sum, report.overall_implemented);
     assert_eq!(total_sum, report.overall_total);
 }
+
+/// CI gate: verify that every fixture listed in checksums.sha256 exists,
+/// is non-empty, and parses successfully. The actual SHA-256 comparison
+/// is done by `scripts/verify_golden.sh` (which calls `sha256sum -c`).
+#[test]
+fn fixture_checksum_manifest_is_complete() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let checksums_path = workspace.join("conformance/fixtures/checksums.sha256");
+    let checksums_text = std::fs::read_to_string(&checksums_path)
+        .expect("read conformance/fixtures/checksums.sha256");
+
+    let listed_files: Vec<&str> = checksums_text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| l.split_once("  ").map(|(_, f)| f))
+        .collect();
+
+    assert!(
+        !listed_files.is_empty(),
+        "checksums.sha256 should list fixture files"
+    );
+
+    let fixtures_dir = workspace.join("conformance/fixtures");
+    for filename in &listed_files {
+        let path = fixtures_dir.join(filename);
+        let data = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("fixture {filename} missing or unreadable: {e}"));
+        assert!(!data.is_empty(), "fixture {filename} should be non-empty");
+    }
+
+    // Verify all .json fixture files are listed in the manifest
+    let actual_jsons: Vec<_> = std::fs::read_dir(&fixtures_dir)
+        .expect("read fixtures dir")
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+
+    for json_file in &actual_jsons {
+        assert!(
+            listed_files.contains(&json_file.as_str()),
+            "fixture {json_file} exists but is not listed in checksums.sha256"
+        );
+    }
+}
