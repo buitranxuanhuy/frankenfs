@@ -329,7 +329,7 @@ ffs-repair::scrub() [background]
 All errors flow through `FfsError` (defined in `ffs-error`):
 
 ```rust
-/// 14 variants — this is the canonical definition. See ffs-error/src/lib.rs.
+/// 18 variants — this is the canonical definition. See ffs-error/src/lib.rs.
 #[derive(Debug, thiserror::Error)]
 pub enum FfsError {
     #[error("I/O error: {0}")]
@@ -340,6 +340,15 @@ pub enum FfsError {
 
     #[error("invalid on-disk format: {0}")]
     Format(String),
+
+    #[error("parse error: {0}")]
+    Parse(String),
+
+    #[error("unsupported feature: {0}")]
+    UnsupportedFeature(String),
+
+    #[error("invalid geometry: {0}")]
+    InvalidGeometry(String),
 
     #[error("MVCC conflict: transaction {tx} conflicts on block {block}")]
     MvccConflict { tx: u64, block: u64 },
@@ -355,6 +364,9 @@ pub enum FfsError {
 
     #[error("permission denied")]
     PermissionDenied,
+
+    #[error("read-only filesystem")]
+    ReadOnly,
 
     #[error("not a directory")]
     NotDirectory,
@@ -376,7 +388,7 @@ pub enum FfsError {
 }
 ```
 
-> **Canonical variant count: 14.** Other sections of the spec that reference FfsError with different counts or variant names (e.g., `AlreadyExists` for `Exists`, `DirectoryNotEmpty` for `NotEmpty`) are non-normative — this listing and `ffs-error/src/lib.rs` are the single source of truth.
+> **Canonical variant count: 18.** Other sections of the spec that reference FfsError with different counts or variant names (e.g., `AlreadyExists` for `Exists`, `DirectoryNotEmpty` for `NotEmpty`) are non-normative — this listing and `ffs-error/src/lib.rs` are the single source of truth.
 
 ---
 

@@ -2374,8 +2374,8 @@ pedantic+nursery at deny, common versions via `[workspace.dependencies]`.
 
 | # | Crate | Role | Key Deps |
 |---|-------|------|----------|
-| 1 | `ffs-types` | Newtypes (`BlockNumber`, `InodeNumber`, `TxnId`, `CommitSeq`, `Snapshot`), parse helpers, ext4/btrfs magic constants | `serde`, `thiserror` |
-| 2 | `ffs-error` | `FfsError` (14 variants), `Result<T>`, errno mapping (`to_errno()`) | `libc`, `thiserror` |
+| 1 | `ffs-types` | Newtypes (`BlockNumber`, `BlockSize`, `ByteOffset`, `InodeNumber`, `TxnId`, `CommitSeq`, `Snapshot`, `GroupNumber`, `DeviceId`, `Generation`, `ParseError`), parse helpers, ext4/btrfs magic constants | `serde`, `thiserror` |
+| 2 | `ffs-error` | `FfsError` (18 variants), `Result<T>`, errno mapping (`to_errno()`) | `libc`, `thiserror` |
 | 3 | `ffs-ondisk` | Pure ext4 + btrfs parsing (superblocks, extents, leaf items); no I/O | `ffs-types`, `ffs-error`, `crc32c`, `serde` |
 | 4 | `ffs-block` | Block I/O: `ByteDevice`, `BlockDevice`, ARC cache; Cx-aware I/O | `ffs-types`, `ffs-error`, `asupersync`, `parking_lot` |
 | 5 | `ffs-journal` | JBD2-compatible journal replay scaffolding (phased) | `ffs-types`, `ffs-error`, `ffs-block` |
@@ -2485,7 +2485,7 @@ justify it.
 **`ffs-error`** (~600 LOC estimated)
 
 Error types using `thiserror` derive. This crate defines the canonical
-workspace error enum `FfsError` (14 variants), a `Result<T>` alias, and
+workspace error enum `FfsError` (18 variants), a `Result<T>` alias, and
 `FfsError::to_errno()` for POSIX/FUSE integration.
 
 Canonical source of truth: `crates/ffs-error/src/lib.rs`.
@@ -4623,7 +4623,7 @@ Phases MUST NOT be reordered; the dependency chain is strict.
 
 > **Note:** `InodeNumber` is `u64` (not `u32`) to support both ext4 32-bit inodes and btrfs 64-bit objectids. The ext4 on-disk format stores 32-bit inode numbers; conversion happens at the parsing boundary.
 
-**ffs-error:** `FfsError` enum (**14 variants** — canonical definition in `ffs-error/src/lib.rs` and PROPOSED_ARCHITECTURE.md Section 7): `Io` -> `EIO`, `Corruption` -> `EIO`, `Format` -> `EINVAL`, `MvccConflict` -> `EAGAIN`, `Cancelled` -> `EINTR`, `NoSpace` -> `ENOSPC`, `NotFound` -> `ENOENT`, `PermissionDenied` -> `EACCES`, `NotDirectory` -> `ENOTDIR`, `IsDirectory` -> `EISDIR`, `NotEmpty` -> `ENOTEMPTY`, `NameTooLong` -> `ENAMETOOLONG`, `Exists` -> `EEXIST`, `RepairFailed` -> `EIO`.
+**ffs-error:** `FfsError` enum (**18 variants** — canonical definition in `ffs-error/src/lib.rs` and PROPOSED_ARCHITECTURE.md Section 7): `Io` -> `EIO`, `Corruption` -> `EIO`, `Format` -> `EINVAL`, `Parse` -> `EINVAL`, `UnsupportedFeature` -> `EOPNOTSUPP`, `InvalidGeometry` -> `EINVAL`, `MvccConflict` -> `EAGAIN`, `Cancelled` -> `EINTR`, `NoSpace` -> `ENOSPC`, `NotFound` -> `ENOENT`, `PermissionDenied` -> `EACCES`, `ReadOnly` -> `EROFS`, `NotDirectory` -> `ENOTDIR`, `IsDirectory` -> `EISDIR`, `NotEmpty` -> `ENOTEMPTY`, `NameTooLong` -> `ENAMETOOLONG`, `Exists` -> `EEXIST`, `RepairFailed` -> `EIO`.
 
 **ffs-ondisk:** On-disk parsers are **pure** (no I/O, no ambient authority) and return
 `Result<T, ParseError>`. User-facing layers (mount/CLI/FUSE) return `FfsError` and MUST

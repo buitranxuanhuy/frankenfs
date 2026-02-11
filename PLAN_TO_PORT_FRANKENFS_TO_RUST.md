@@ -3,7 +3,7 @@
 > **FrankenFS** -- A memory-safe, FUSE-based Rust reimplementation of ext4 and
 > btrfs with block-level MVCC and RaptorQ self-healing.
 >
-> This document is the **master porting plan** following the four-document
+> This document is the **canonical porting plan** following the four-document
 > methodology. It defines scope, exclusions, source metrics, phased delivery,
 > cross-cutting concerns, risks, and success criteria.
 >
@@ -1083,16 +1083,17 @@ audited and their safety invariants are well-understood.
 ### 5.5 Error Handling
 
 All fallible operations return `Result<T, FfsError>`. The `FfsError` enum is
-defined in `ffs-error` and has **14 canonical variants** — see `ffs-error/src/lib.rs`
+defined in `ffs-error` and has **18 canonical variants** — see `ffs-error/src/lib.rs`
 and PROPOSED_ARCHITECTURE.md Section 7 for the single normative listing.
 
-The 14 variants are: `Io`, `Corruption`, `Format`, `MvccConflict`, `Cancelled`,
-`NoSpace`, `NotFound`, `PermissionDenied`, `NotDirectory`, `IsDirectory`,
-`NotEmpty`, `NameTooLong`, `Exists`, `RepairFailed`.
+The 18 variants are: `Io`, `Corruption`, `Format`, `Parse`, `UnsupportedFeature`,
+`InvalidGeometry`, `MvccConflict`, `Cancelled`, `NoSpace`, `NotFound`,
+`PermissionDenied`, `ReadOnly`, `NotDirectory`, `IsDirectory`, `NotEmpty`,
+`NameTooLong`, `Exists`, `RepairFailed`.
 
 > **Important:** Earlier revisions of this document listed 19 variants with names
 > like `AlreadyExists`, `ReadOnly`, `InvalidArgument`, `TooLarge`, `Journal`,
-> `Unsupported`, `Range`. Those are **non-normative** — the implemented 14-variant
+> `Unsupported`, `Range`. Those are **non-normative** — the implemented 18-variant
 > enum in `ffs-error/src/lib.rs` is the source of truth.
 
 ### 5.6 Logging and Tracing
