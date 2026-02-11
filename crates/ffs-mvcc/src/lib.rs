@@ -738,4 +738,483 @@ mod tests {
         }
         writer_handle.join().expect("writer panicked");
     }
+
+    // ── Lab runtime deterministic concurrency tests ─────────────────────
+    //
+    // These tests use the asupersync lab runtime for deterministic, seed-
+    // driven scheduling.  Instead of OS thread interleaving (non-deterministic),
+    // each test spawns async tasks that yield at specific points.  The lab
+    // scheduler picks the next task deterministically based on the seed.
+    //
+    // Same seed → same interleaving → same result.  Different seeds explore
+    // different interleavings.  This makes concurrency bugs reproducible.
+    //
+    // Invariants verified:
+    //   1. Snapshot visibility — readers see only committed versions ≤ snap.
+    //   2. FCW (first-committer-wins) — exactly one writer succeeds per block.
+    //   3. No lost updates — every committed write is observable.
+    //   4. Write skew — documents a known FCW limitation (SSI prerequisite).
+
+    use asupersync::lab::{LabConfig, LabRuntime};
+    use asupersync::types::Budget;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context as TaskContext, Poll};
+
+    /// A future that yields once before completing, creating a scheduling
+    /// opportunity for the lab runtime.
+    struct YieldOnce {
+        yielded: bool,
+    }
+
+    impl Future for YieldOnce {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
+            if self.yielded {
+                Poll::Ready(())
+            } else {
+                self.yielded = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    async fn yield_now() {
+        YieldOnce { yielded: false }.await;
+    }
+
+    /// Run N tasks that all write to the same block under lab scheduling.
+    ///
+    /// All transactions are pre-begun at the same snapshot so that the
+    /// interesting interleaving is the commit order (which the lab
+    /// scheduler determines based on the seed).
+    ///
+    /// Returns: (Vec<commit outcomes as Ok(seq)/Err>, steps executed).
+    fn run_fcw_scenario(seed: u64, num_writers: usize) -> (Vec<Result<u64, usize>>, u64) {
+        let mut runtime = LabRuntime::new(LabConfig::new(seed).max_steps(100_000));
+        let region = runtime.state.create_root_region(Budget::INFINITE);
+
+        let store = Arc::new(std::sync::Mutex::new(MvccStore::new()));
+        let results = Arc::new(std::sync::Mutex::new(vec![None; num_writers]));
+        let block = BlockNumber(42);
+
+        // Pre-begin all transactions at the same snapshot.  This ensures
+        // FCW is actually exercised regardless of scheduling order.
+        let txns: Vec<Transaction> = {
+            let mut s = store.lock().unwrap();
+            (0..num_writers).map(|_| s.begin()).collect()
+        };
+
+        for (i, txn) in txns.into_iter().enumerate() {
+            let store = Arc::clone(&store);
+            let results = Arc::clone(&results);
+            let (task_id, _handle) = runtime
+                .state
+                .create_task(region, Budget::INFINITE, async move {
+                    // Stage write.
+                    let mut txn = txn;
+                    let writer_val = u8::try_from(i % 256).expect("fits u8");
+                    txn.stage_write(block, vec![writer_val; 8]);
+                    yield_now().await; // Scheduling point — other writers may stage.
+
+                    // Commit (order determined by lab scheduler).
+                    let outcome = {
+                        let mut s = store.lock().unwrap();
+                        s.commit(txn)
+                    };
+                    results.lock().unwrap()[i] = Some(outcome.map(|seq| seq.0).map_err(|_| i));
+                })
+                .expect("create task");
+            runtime.scheduler.lock().unwrap().schedule(task_id, 0);
+        }
+
+        let steps = runtime.run_until_quiescent();
+
+        let results: Vec<Result<u64, usize>> = Arc::try_unwrap(results)
+            .unwrap()
+            .into_inner()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.expect("task should have completed"))
+            .collect();
+
+        (results, steps)
+    }
+
+    /// Lab determinism: same seed → identical FCW conflict pattern.
+    ///
+    /// Runs the same scenario 3 times with the same seed and asserts the
+    /// commit outcomes are identical.
+    #[test]
+    fn lab_deterministic_fcw_same_seed() {
+        let seed = 42;
+        let (r1, _) = run_fcw_scenario(seed, 4);
+        let (r2, _) = run_fcw_scenario(seed, 4);
+        let (r3, _) = run_fcw_scenario(seed, 4);
+
+        assert_eq!(
+            r1, r2,
+            "same seed must produce identical outcomes (run 1 vs 2)"
+        );
+        assert_eq!(
+            r2, r3,
+            "same seed must produce identical outcomes (run 2 vs 3)"
+        );
+    }
+
+    /// Lab invariant: FCW — across many seeds, exactly one writer succeeds.
+    ///
+    /// For each seed, N tasks write to the same block.  The invariant is
+    /// that exactly one commit succeeds (Ok) and the rest fail (Err).
+    #[test]
+    fn lab_fcw_invariant_across_seeds() {
+        let num_writers = 4;
+        for seed in 0_u64..50 {
+            let (results, _) = run_fcw_scenario(seed, num_writers);
+            let successes = results.iter().filter(|r| r.is_ok()).count();
+            assert_eq!(
+                successes, 1,
+                "seed {seed}: expected exactly 1 success, got {successes} in {results:?}"
+            );
+        }
+    }
+
+    /// Lab invariant: no lost updates — disjoint block writers under varied scheduling.
+    ///
+    /// N tasks each write to their own block.  Across many seeds, all N
+    /// writes must be visible at the final snapshot.
+    #[test]
+    fn lab_no_lost_updates_disjoint_blocks() {
+        let num_writers: usize = 8;
+
+        for seed in 0_u64..30 {
+            let mut runtime = LabRuntime::new(LabConfig::new(seed).max_steps(100_000));
+            let region = runtime.state.create_root_region(Budget::INFINITE);
+
+            let store = Arc::new(std::sync::Mutex::new(MvccStore::new()));
+            let committed = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+            for i in 0..num_writers {
+                let store = Arc::clone(&store);
+                let committed = Arc::clone(&committed);
+                let block = BlockNumber(u64::try_from(i).unwrap());
+                let (task_id, _handle) = runtime
+                    .state
+                    .create_task(region, Budget::INFINITE, async move {
+                        let txn = {
+                            let mut s = store.lock().unwrap();
+                            s.begin()
+                        };
+                        yield_now().await;
+
+                        let mut txn = txn;
+                        let val = u8::try_from(i % 256).unwrap();
+                        txn.stage_write(block, vec![val; 4]);
+                        yield_now().await;
+
+                        let result = {
+                            let mut s = store.lock().unwrap();
+                            s.commit(txn)
+                        };
+                        if result.is_ok() {
+                            committed.lock().unwrap().push(i);
+                        }
+                    })
+                    .expect("create task");
+                runtime.scheduler.lock().unwrap().schedule(task_id, 0);
+            }
+
+            runtime.run_until_quiescent();
+
+            let committed = Arc::try_unwrap(committed).unwrap().into_inner().unwrap();
+            assert_eq!(
+                committed.len(),
+                num_writers,
+                "seed {seed}: all {num_writers} disjoint writers must succeed, got {committed:?}"
+            );
+
+            // Verify all data is visible.
+            let store = Arc::try_unwrap(store).unwrap().into_inner().unwrap();
+            let snap = store.current_snapshot();
+            for i in 0..num_writers {
+                let block = BlockNumber(u64::try_from(i).unwrap());
+                let val = u8::try_from(i % 256).unwrap();
+                let data = store
+                    .read_visible(block, snap)
+                    .unwrap_or_else(|| panic!("seed {seed}: block {i} must be visible"));
+                assert_eq!(data, &[val; 4], "seed {seed}: block {i} data mismatch");
+            }
+        }
+    }
+
+    /// Lab invariant: snapshot visibility under interleaved writers.
+    ///
+    /// A snapshot is captured before writers begin.  Under all interleavings,
+    /// reads at that snapshot return the initial version, never a writer's.
+    #[test]
+    fn lab_snapshot_visibility_under_interleaving() {
+        for seed in 0_u64..30 {
+            let mut runtime = LabRuntime::new(LabConfig::new(seed).max_steps(100_000));
+            let region = runtime.state.create_root_region(Budget::INFINITE);
+
+            let store = Arc::new(std::sync::Mutex::new(MvccStore::new()));
+            let block = BlockNumber(1);
+
+            // Seed an initial version.
+            {
+                let mut s = store.lock().unwrap();
+                let mut txn = s.begin();
+                txn.stage_write(block, vec![0xAA; 4]);
+                s.commit(txn).expect("seed commit");
+            }
+
+            // Pre-capture snapshot before any writer task runs.
+            let reader_snap = store.lock().unwrap().current_snapshot();
+
+            let reader_result = Arc::new(std::sync::Mutex::new(None));
+
+            // Reader task: reads at the pre-captured snapshot.
+            {
+                let store = Arc::clone(&store);
+                let reader_result = Arc::clone(&reader_result);
+                let (task_id, _handle) = runtime
+                    .state
+                    .create_task(region, Budget::INFINITE, async move {
+                        yield_now().await; // Writers may commit here.
+                        yield_now().await; // Extra yield for more interleaving.
+
+                        let data = {
+                            let s = store.lock().unwrap();
+                            s.read_visible(block, reader_snap).map(<[u8]>::to_vec)
+                        };
+                        *reader_result.lock().unwrap() = Some(data);
+                    })
+                    .expect("create task");
+                runtime.scheduler.lock().unwrap().schedule(task_id, 0);
+            }
+
+            // Writer tasks: commit new versions.
+            for v in 1_u8..=3 {
+                let store = Arc::clone(&store);
+                let (task_id, _handle) = runtime
+                    .state
+                    .create_task(region, Budget::INFINITE, async move {
+                        yield_now().await;
+                        let mut s = store.lock().unwrap();
+                        let mut txn = s.begin();
+                        txn.stage_write(block, vec![v; 4]);
+                        s.commit(txn).expect("writer commit");
+                    })
+                    .expect("create task");
+                runtime.scheduler.lock().unwrap().schedule(task_id, 0);
+            }
+
+            runtime.run_until_quiescent();
+
+            let result = Arc::try_unwrap(reader_result)
+                .unwrap()
+                .into_inner()
+                .unwrap()
+                .expect("reader task should have completed");
+
+            // The reader's snapshot was captured before writers,
+            // so it must see 0xAA regardless of interleaving.
+            let data = result.expect("block must be visible at initial snapshot");
+            assert_eq!(
+                data,
+                vec![0xAA; 4],
+                "seed {seed}: reader must see initial version (0xAA), not a later writer's data"
+            );
+        }
+    }
+
+    /// Lab: write skew scenario — documents the FCW limitation.
+    ///
+    /// Classic write skew: T1 reads block A, T2 reads block B.
+    /// T1 writes block B based on A's value, T2 writes block A based on B's value.
+    /// Under FCW, both succeed because they write disjoint blocks.
+    /// This is a known anomaly that SSI (bd-1wx) will prevent.
+    ///
+    /// The test verifies:
+    /// - FCW allows both commits (expected, not a bug under FCW).
+    /// - The resulting state violates a cross-block constraint.
+    ///
+    /// When SSI is implemented, this test should be updated to assert that
+    /// at least one transaction is aborted.
+    #[test]
+    fn lab_write_skew_under_fcw() {
+        let block_a = BlockNumber(100);
+        let block_b = BlockNumber(200);
+
+        for seed in 0_u64..20 {
+            let mut runtime = LabRuntime::new(LabConfig::new(seed).max_steps(100_000));
+            let region = runtime.state.create_root_region(Budget::INFINITE);
+
+            let store = Arc::new(std::sync::Mutex::new(MvccStore::new()));
+
+            // Seed: both blocks start with value 1.
+            // Constraint: block_a + block_b should remain ≤ 2.
+            // Each transaction reads one block (sees 1), and sets the
+            // other block to 2 (believing the total is 1+2=3 is ok for
+            // its local view, but the combined effect is 2+2=4 — violated).
+            {
+                let mut s = store.lock().unwrap();
+                let mut txn = s.begin();
+                txn.stage_write(block_a, vec![1]);
+                txn.stage_write(block_b, vec![1]);
+                s.commit(txn).expect("seed commit");
+            }
+
+            let outcomes = Arc::new(std::sync::Mutex::new((None, None)));
+
+            // Pre-begin both transactions at the same snapshot so they
+            // each see A=1, B=1 and write disjoint blocks.
+            let (txn1, txn2) = {
+                let mut s = store.lock().unwrap();
+                (s.begin(), s.begin())
+            };
+
+            // T1: writes B to 2 (based on having seen A=1 at snapshot).
+            {
+                let store = Arc::clone(&store);
+                let outcomes = Arc::clone(&outcomes);
+                let (task_id, _handle) = runtime
+                    .state
+                    .create_task(region, Budget::INFINITE, async move {
+                        yield_now().await;
+
+                        let mut txn1 = txn1;
+                        txn1.stage_write(block_b, vec![2]);
+                        let result = {
+                            let mut s = store.lock().unwrap();
+                            s.commit(txn1)
+                        };
+                        outcomes.lock().unwrap().0 = Some(result.is_ok());
+                    })
+                    .expect("create task");
+                runtime.scheduler.lock().unwrap().schedule(task_id, 0);
+            }
+
+            // T2: writes A to 2 (based on having seen B=1 at snapshot).
+            {
+                let store = Arc::clone(&store);
+                let outcomes = Arc::clone(&outcomes);
+                let (task_id, _handle) = runtime
+                    .state
+                    .create_task(region, Budget::INFINITE, async move {
+                        yield_now().await;
+
+                        let mut txn2 = txn2;
+                        txn2.stage_write(block_a, vec![2]);
+                        let result = {
+                            let mut s = store.lock().unwrap();
+                            s.commit(txn2)
+                        };
+                        outcomes.lock().unwrap().1 = Some(result.is_ok());
+                    })
+                    .expect("create task");
+                runtime.scheduler.lock().unwrap().schedule(task_id, 0);
+            }
+
+            runtime.run_until_quiescent();
+
+            let outcomes = Arc::try_unwrap(outcomes).unwrap().into_inner().unwrap();
+            let t1_ok = outcomes.0.expect("T1 should complete");
+            let t2_ok = outcomes.1.expect("T2 should complete");
+
+            // Under FCW, both succeed because they write disjoint blocks.
+            // This IS the write skew anomaly — FCW does not detect it.
+            assert!(
+                t1_ok && t2_ok,
+                "seed {seed}: under FCW, both disjoint-block writers should succeed \
+                 (write skew is expected). Got t1={t1_ok}, t2={t2_ok}"
+            );
+
+            // Verify the constraint IS violated (both blocks are now 2).
+            let s = store.lock().unwrap();
+            let snap = s.current_snapshot();
+            let a = s.read_visible(block_a, snap).unwrap()[0];
+            let b = s.read_visible(block_b, snap).unwrap()[0];
+            drop(s);
+            assert!(
+                a + b > 2,
+                "seed {seed}: write skew should produce a+b > 2, got a={a} b={b}"
+            );
+        }
+    }
+
+    /// Lab: interleaved commit ordering with same-block conflict.
+    ///
+    /// Verifies that the commit-order winner is deterministic per seed.
+    /// All transactions pre-begin at the same snapshot, all write the
+    /// same block, and exactly one succeeds per seed.
+    #[test]
+    fn lab_commit_order_determines_winner() {
+        let block = BlockNumber(7);
+        let num_tasks: usize = 5;
+
+        for seed in 0_u64..30 {
+            let mut runtime = LabRuntime::new(LabConfig::new(seed).max_steps(100_000));
+            let region = runtime.state.create_root_region(Budget::INFINITE);
+
+            let store = Arc::new(std::sync::Mutex::new(MvccStore::new()));
+            let winner = Arc::new(std::sync::Mutex::new(None));
+
+            // Pre-begin all at the same snapshot.
+            let txns: Vec<Transaction> = {
+                let mut s = store.lock().unwrap();
+                (0..num_tasks).map(|_| s.begin()).collect()
+            };
+
+            for (i, txn) in txns.into_iter().enumerate() {
+                let store = Arc::clone(&store);
+                let winner = Arc::clone(&winner);
+                let (task_id, _handle) = runtime
+                    .state
+                    .create_task(region, Budget::INFINITE, async move {
+                        let mut txn = txn;
+                        let val = u8::try_from(i % 256).unwrap();
+                        txn.stage_write(block, vec![val; 4]);
+                        yield_now().await;
+
+                        let result = {
+                            let mut s = store.lock().unwrap();
+                            s.commit(txn)
+                        };
+                        if result.is_ok() {
+                            let mut w = winner.lock().unwrap();
+                            assert!(w.is_none(), "seed {seed}: two tasks both claimed to win!");
+                            *w = Some(i);
+                        }
+                    })
+                    .expect("create task");
+                runtime.scheduler.lock().unwrap().schedule(task_id, 0);
+            }
+
+            runtime.run_until_quiescent();
+
+            let w = Arc::try_unwrap(winner).unwrap().into_inner().unwrap();
+            assert!(
+                w.is_some(),
+                "seed {seed}: no task won the FCW race (all failed?)"
+            );
+
+            // Verify the winner's data is visible.
+            let data = {
+                let s = store.lock().unwrap();
+                let snap = s.current_snapshot();
+                s.read_visible(block, snap)
+                    .expect("winner data must be visible")
+                    .to_vec()
+            };
+            let expected_val = u8::try_from(w.unwrap() % 256).unwrap();
+            assert_eq!(
+                data,
+                vec![expected_val; 4],
+                "seed {seed}: visible data should match winner's write"
+            );
+        }
+    }
 }

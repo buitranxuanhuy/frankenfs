@@ -13,7 +13,7 @@
 | 3 | `ffs-ondisk` | ext4 + btrfs on-disk format parsing: superblocks, headers, keys/items, ext4 group desc/inodes/extents/dirs, JBD2 structures | `ffs-types`, `ffs-error`, `crc32c`, `serde` | 2 |
 | 4 | `ffs-block` | Block I/O layer: BlockDevice trait, ARC (Adaptive Replacement Cache), read/write with Cx, dirty page tracking | `ffs-types`, `ffs-error`, `asupersync`, `parking_lot` | 3 |
 | 5 | `ffs-journal` | JBD2-compatible journal replay + native COW journal: transaction lifecycle, descriptor/commit/revoke blocks | `ffs-types`, `ffs-error`, `ffs-block` | 6 |
-| 6 | `ffs-mvcc` | Block-level MVCC: version chains (BlockVersion), snapshot isolation, first-committer-wins conflict detection, GC of old versions | `ffs-types`, `ffs-error`, `ffs-block`, `asupersync`, `parking_lot`, `serde`, `thiserror` | 6 |
+| 6 | `ffs-mvcc` | Block-level MVCC: version chains (BlockVersion), snapshot isolation, first-committer-wins conflict detection, GC of old versions; planned: durable version store overlay (bd-1u7) | `ffs-types`, `ffs-error`, `ffs-block`, `asupersync`, `parking_lot`, `serde`, `thiserror` | 6 |
 | 7 | `ffs-btree` | B-tree operations used by ext4 (extents/htree) and btrfs (metadata trees): search, insert, split, merge, tree walk | `ffs-types`, `ffs-error`, `ffs-block`, `ffs-ondisk` | 4 |
 | 8 | `ffs-alloc` | Block/inode allocation: mballoc-style multi-block allocator (buddy system, best-fit, prealloc), Orlov inode allocator | `ffs-types`, `ffs-error`, `ffs-block`, `ffs-ondisk` | 4 |
 | 9 | `ffs-inode` | Inode management: read/write/create/delete, permissions, timestamps, flags | `ffs-types`, `ffs-error`, `ffs-block`, `ffs-ondisk` | 5 |
@@ -81,7 +81,7 @@
     └─────────┘  └────────────┘ └────────────┘
 ```
 
-> **Note:** `ffs-fuse` depends on `ffs-core` (which orchestrates domain crates), NOT on domain crates directly. This is the canonical layering — ffs-core is the integration point, ffs-fuse is a thin FUSE protocol adapter. `ffs-mvcc` now depends on `ffs-block` for versioned block storage (MvccBlockDevice wraps a BlockDevice to provide snapshot-isolated reads/writes). `ffs-core` depends on `ffs-btrfs` for btrfs root tree walking during format detection and multi-format support.
+> **Note:** `ffs-fuse` depends on `ffs-core` (which orchestrates domain crates), NOT on domain crates directly. This is the canonical layering — ffs-core is the integration point, ffs-fuse is a thin FUSE protocol adapter. `ffs-mvcc` now depends on `ffs-block` for versioned block storage (MvccBlockDevice wraps a BlockDevice to provide snapshot-isolated reads/writes). As MVCC persistence lands (bd-1u7), `ffs-mvcc` will additionally use `ByteDevice` (via `ffs-block`) to implement an append-only durable overlay log for versioned blocks (see COMPREHENSIVE_SPEC §5.9). `ffs-core` depends on `ffs-btrfs` for btrfs root tree walking during format detection and multi-format support.
 
 ---
 
@@ -170,6 +170,16 @@ pub trait MvccBlockManager: Send + Sync {
     fn active_transaction_count(&self) -> usize;
 }
 ```
+
+#### 3.2.1 MVCC Persistence (VersionStore overlay; planned — bd-1u7)
+
+MVCC durability is provided by an **append-only version store overlay**:
+
+- Each commit appends `VERSION` records (block, commit_seq, bytes) and then appends a `COMMIT` marker record.
+- Recovery replays only commits with a valid `COMMIT` marker.
+- The version store is byte-addressed and built on the canonical `ByteDevice` trait (Section 3.1).
+
+Canonical design details (record format, crash-consistency protocol, replay procedure, and compaction strategy) live in `COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md` §5.9.
 
 ### 3.3 Filesystem Operations Trait (planned — lives in `ffs-core`)
 
@@ -390,6 +400,10 @@ pub struct MountConfig {
 
     /// Enable MVCC (native mode) or JBD2-compat (legacy mode).
     pub mvcc_enabled: bool,
+
+    /// Optional MVCC overlay path for durable versioned blocks (append-only log).
+    /// When None, MVCC is in-memory only (dev/testing).
+    pub mvcc_overlay_path: Option<PathBuf>,
 
     /// Enable RaptorQ self-healing.
     pub repair_enabled: bool,
