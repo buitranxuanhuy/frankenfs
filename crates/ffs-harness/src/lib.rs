@@ -299,6 +299,58 @@ pub fn validate_btrfs_leaf_fixture(path: &Path) -> Result<(BtrfsHeader, Vec<Btrf
     Ok((header, items))
 }
 
+// ── Golden reference types ────────────────────────────────────────
+//
+// Versioned schema for kernel-derived golden outputs. The capture
+// pipeline (scripts/capture_ext4_reference.sh) produces JSON in this
+// format; conformance tests parse it and compare against ffs-ondisk.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoldenReference {
+    pub version: u32,
+    pub source: String,
+    pub image_params: GoldenImageParams,
+    pub superblock: GoldenSuperblock,
+    pub directories: Vec<GoldenDirectory>,
+    pub files: Vec<GoldenFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoldenImageParams {
+    pub size_bytes: u64,
+    pub block_size: u32,
+    pub volume_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoldenSuperblock {
+    pub block_size: u32,
+    pub blocks_count: u64,
+    pub inodes_count: u32,
+    pub volume_name: String,
+    pub free_blocks_count: u64,
+    pub free_inodes_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoldenDirectory {
+    pub path: String,
+    pub entries: Vec<GoldenDirEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoldenDirEntry {
+    pub name: String,
+    pub file_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoldenFile {
+    pub path: String,
+    pub size: u64,
+    pub content: Vec<u8>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
