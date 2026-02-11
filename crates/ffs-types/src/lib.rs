@@ -12,6 +12,12 @@ pub const BTRFS_SUPER_INFO_OFFSET: usize = 64 * 1024;
 pub const BTRFS_SUPER_INFO_SIZE: usize = 4096;
 pub const BTRFS_MAGIC: u64 = 0x4D5F_5366_5248_425F;
 
+/// btrfs checksum algorithm types (stored in superblock `csum_type` field).
+pub const BTRFS_CSUM_TYPE_CRC32C: u16 = 0;
+pub const BTRFS_CSUM_TYPE_XXHASH64: u16 = 1;
+pub const BTRFS_CSUM_TYPE_SHA256: u16 = 2;
+pub const BTRFS_CSUM_TYPE_BLAKE2B: u16 = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct BlockNumber(pub u64);
 

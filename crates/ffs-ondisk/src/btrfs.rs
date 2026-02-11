@@ -620,6 +620,82 @@ pub fn parse_internal_items(block: &[u8]) -> Result<(BtrfsHeader, Vec<BtrfsKeyPt
     Ok((header, ptrs))
 }
 
+// ── Checksum verification ───────────────────────────────────────────────────
+
+/// Verify the CRC32C checksum of a btrfs superblock.
+///
+/// The checksum covers `region[0x20..]` (everything after the 32-byte `csum`
+/// field). The expected checksum is stored as a little-endian u32 in
+/// `region[0..4]`.
+///
+/// Only CRC32C (`csum_type == 0`) is currently supported. Other algorithms
+/// return an error.
+pub fn verify_superblock_checksum(region: &[u8]) -> Result<(), ParseError> {
+    if region.len() < BTRFS_SUPER_INFO_SIZE {
+        return Err(ParseError::InsufficientData {
+            needed: BTRFS_SUPER_INFO_SIZE,
+            offset: 0,
+            actual: region.len(),
+        });
+    }
+
+    let csum_type = read_le_u16(region, 0xC4)?;
+    if csum_type != ffs_types::BTRFS_CSUM_TYPE_CRC32C {
+        return Err(ParseError::InvalidField {
+            field: "csum_type",
+            reason: "only CRC32C (type 0) is currently supported",
+        });
+    }
+
+    let stored = read_le_u32(region, 0)?;
+    let computed = crc32c::crc32c(&region[0x20..BTRFS_SUPER_INFO_SIZE]);
+
+    if stored != computed {
+        return Err(ParseError::InvalidField {
+            field: "superblock_csum",
+            reason: "CRC32C checksum mismatch",
+        });
+    }
+
+    Ok(())
+}
+
+/// Verify the CRC32C checksum of a btrfs tree block (leaf or internal node).
+///
+/// The checksum covers `block[0x20..block.len()]` (everything after the
+/// 32-byte `csum` field in the header). The expected checksum is stored as a
+/// little-endian u32 in `block[0..4]`.
+///
+/// Only CRC32C (`csum_type == 0`) is currently supported.
+pub fn verify_tree_block_checksum(block: &[u8], csum_type: u16) -> Result<(), ParseError> {
+    if block.len() < BTRFS_HEADER_SIZE {
+        return Err(ParseError::InsufficientData {
+            needed: BTRFS_HEADER_SIZE,
+            offset: 0,
+            actual: block.len(),
+        });
+    }
+
+    if csum_type != ffs_types::BTRFS_CSUM_TYPE_CRC32C {
+        return Err(ParseError::InvalidField {
+            field: "csum_type",
+            reason: "only CRC32C (type 0) is currently supported",
+        });
+    }
+
+    let stored = read_le_u32(block, 0)?;
+    let computed = crc32c::crc32c(&block[0x20..]);
+
+    if stored != computed {
+        return Err(ParseError::InvalidField {
+            field: "tree_block_csum",
+            reason: "CRC32C checksum mismatch",
+        });
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1024,6 +1100,95 @@ mod tests {
                 }
             ),
             "expected nritems error, got: {err:?}"
+        );
+    }
+
+    // ── Checksum verification tests ──────────────────────────────────
+
+    /// Build a valid superblock with correct CRC32C checksum.
+    fn make_checksummed_sb() -> Vec<u8> {
+        let mut sb = vec![0_u8; BTRFS_SUPER_INFO_SIZE];
+        sb[0x40..0x48].copy_from_slice(&BTRFS_MAGIC.to_le_bytes());
+        sb[0x90..0x94].copy_from_slice(&4096_u32.to_le_bytes()); // sectorsize
+        sb[0x94..0x98].copy_from_slice(&16384_u32.to_le_bytes()); // nodesize
+        sb[0xC4..0xC6].copy_from_slice(&0_u16.to_le_bytes()); // csum_type=CRC32C
+        // Compute CRC32C over bytes[0x20..4096] and store in bytes[0..4]
+        let csum = crc32c::crc32c(&sb[0x20..BTRFS_SUPER_INFO_SIZE]);
+        sb[0..4].copy_from_slice(&csum.to_le_bytes());
+        sb
+    }
+
+    #[test]
+    fn verify_superblock_checksum_valid() {
+        let sb = make_checksummed_sb();
+        verify_superblock_checksum(&sb).expect("valid checksum");
+    }
+
+    #[test]
+    fn verify_superblock_checksum_corrupt() {
+        let mut sb = make_checksummed_sb();
+        // Flip a bit in the payload
+        sb[0x50] ^= 0x01;
+        let err = verify_superblock_checksum(&sb).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "superblock_csum",
+                    ..
+                }
+            ),
+            "expected checksum mismatch, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_superblock_checksum_unsupported_type() {
+        let mut sb = make_checksummed_sb();
+        // Change csum_type to XXHASH64
+        sb[0xC4..0xC6].copy_from_slice(&1_u16.to_le_bytes());
+        let err = verify_superblock_checksum(&sb).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "csum_type",
+                    ..
+                }
+            ),
+            "expected unsupported csum_type error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_tree_block_checksum_valid() {
+        let mut block = vec![0_u8; 16384]; // nodesize=16K
+        // Set up a minimal header
+        block[0x64] = 0; // level=0 (leaf)
+        block[0x60..0x64].copy_from_slice(&0_u32.to_le_bytes()); // nritems=0
+        // Compute CRC32C over bytes[0x20..] and store in [0..4]
+        let csum = crc32c::crc32c(&block[0x20..]);
+        block[0..4].copy_from_slice(&csum.to_le_bytes());
+        verify_tree_block_checksum(&block, 0).expect("valid tree block checksum");
+    }
+
+    #[test]
+    fn verify_tree_block_checksum_corrupt() {
+        let mut block = vec![0_u8; 16384];
+        let csum = crc32c::crc32c(&block[0x20..]);
+        block[0..4].copy_from_slice(&csum.to_le_bytes());
+        // Corrupt a byte
+        block[0x30] ^= 0xFF;
+        let err = verify_tree_block_checksum(&block, 0).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "tree_block_csum",
+                    ..
+                }
+            ),
+            "expected tree block checksum mismatch, got: {err:?}"
         );
     }
 }
