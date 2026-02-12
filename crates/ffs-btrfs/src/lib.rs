@@ -6,6 +6,7 @@
 
 pub use ffs_ondisk::btrfs::*;
 use ffs_types::ParseError;
+use std::collections::HashSet;
 
 /// A single leaf item yielded by tree traversal: key + raw payload bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +30,17 @@ pub fn walk_tree(
     nodesize: u32,
 ) -> Result<Vec<BtrfsLeafEntry>, ParseError> {
     let mut results = Vec::new();
-    walk_node(read_physical, chunks, root_logical, nodesize, &mut results)?;
+    let mut active_path = HashSet::new();
+    let mut visited_nodes = HashSet::new();
+    walk_node(
+        read_physical,
+        chunks,
+        root_logical,
+        nodesize,
+        &mut results,
+        &mut active_path,
+        &mut visited_nodes,
+    )?;
     Ok(results)
 }
 
@@ -39,7 +50,22 @@ fn walk_node(
     logical: u64,
     nodesize: u32,
     out: &mut Vec<BtrfsLeafEntry>,
+    active_path: &mut HashSet<u64>,
+    visited_nodes: &mut HashSet<u64>,
 ) -> Result<(), ParseError> {
+    if !active_path.insert(logical) {
+        return Err(ParseError::InvalidField {
+            field: "logical_address",
+            reason: "cycle detected in btrfs tree pointers",
+        });
+    }
+    if !visited_nodes.insert(logical) {
+        return Err(ParseError::InvalidField {
+            field: "logical_address",
+            reason: "duplicate node reference in btrfs tree pointers",
+        });
+    }
+
     let mapping = map_logical_to_physical(chunks, logical)?.ok_or(ParseError::InvalidField {
         field: "logical_address",
         reason: "not covered by any chunk",
@@ -64,10 +90,19 @@ fn walk_node(
     } else {
         let (_, ptrs) = parse_internal_items(&block)?;
         for kp in &ptrs {
-            walk_node(read_physical, chunks, kp.blockptr, nodesize, out)?;
+            walk_node(
+                read_physical,
+                chunks,
+                kp.blockptr,
+                nodesize,
+                out,
+                active_path,
+                visited_nodes,
+            )?;
         }
     }
 
+    active_path.remove(&logical);
     Ok(())
 }
 
@@ -298,5 +333,96 @@ mod tests {
 
         let entries = walk_tree(&mut read, &chunks, logical, NODESIZE).expect("walk");
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn walk_self_cycle_fails_fast() {
+        let root_logical = 0x1_0000_u64;
+        let chunks = identity_chunks();
+
+        let mut root = vec![0_u8; NODESIZE as usize];
+        write_header(&mut root, root_logical, 1, 1, 1, 10);
+        write_key_ptr(&mut root, 0, 256, 1, root_logical, 10);
+
+        let blocks: HashMap<u64, Vec<u8>> = [(root_logical, root)].into();
+        let mut read = |phys: u64| -> Result<Vec<u8>, ParseError> {
+            blocks.get(&phys).cloned().ok_or(ParseError::InvalidField {
+                field: "physical",
+                reason: "block not in test image",
+            })
+        };
+
+        let err = walk_tree(&mut read, &chunks, root_logical, NODESIZE).unwrap_err();
+        assert!(matches!(
+            err,
+            ParseError::InvalidField {
+                field: "logical_address",
+                reason: "cycle detected in btrfs tree pointers",
+            }
+        ));
+    }
+
+    #[test]
+    fn walk_two_node_cycle_fails_fast() {
+        let a_logical = 0x1_0000_u64;
+        let b_logical = 0x2_0000_u64;
+        let chunks = identity_chunks();
+
+        let mut a = vec![0_u8; NODESIZE as usize];
+        write_header(&mut a, a_logical, 1, 1, 1, 10);
+        write_key_ptr(&mut a, 0, 256, 1, b_logical, 10);
+
+        let mut b = vec![0_u8; NODESIZE as usize];
+        write_header(&mut b, b_logical, 1, 1, 1, 10);
+        write_key_ptr(&mut b, 0, 256, 1, a_logical, 10);
+
+        let blocks: HashMap<u64, Vec<u8>> = [(a_logical, a), (b_logical, b)].into();
+        let mut read = |phys: u64| -> Result<Vec<u8>, ParseError> {
+            blocks.get(&phys).cloned().ok_or(ParseError::InvalidField {
+                field: "physical",
+                reason: "block not in test image",
+            })
+        };
+
+        let err = walk_tree(&mut read, &chunks, a_logical, NODESIZE).unwrap_err();
+        assert!(matches!(
+            err,
+            ParseError::InvalidField {
+                field: "logical_address",
+                reason: "cycle detected in btrfs tree pointers",
+            }
+        ));
+    }
+
+    #[test]
+    fn walk_duplicate_child_reference_fails_fast() {
+        let root_logical = 0x1_0000_u64;
+        let leaf_logical = 0x2_0000_u64;
+        let chunks = identity_chunks();
+
+        let mut root = vec![0_u8; NODESIZE as usize];
+        write_header(&mut root, root_logical, 2, 1, 1, 10);
+        write_key_ptr(&mut root, 0, 256, 1, leaf_logical, 10);
+        write_key_ptr(&mut root, 1, 512, 1, leaf_logical, 10);
+
+        let mut leaf = vec![0_u8; NODESIZE as usize];
+        write_header(&mut leaf, leaf_logical, 0, 0, 5, 10);
+
+        let blocks: HashMap<u64, Vec<u8>> = [(root_logical, root), (leaf_logical, leaf)].into();
+        let mut read = |phys: u64| -> Result<Vec<u8>, ParseError> {
+            blocks.get(&phys).cloned().ok_or(ParseError::InvalidField {
+                field: "physical",
+                reason: "block not in test image",
+            })
+        };
+
+        let err = walk_tree(&mut read, &chunks, root_logical, NODESIZE).unwrap_err();
+        assert!(matches!(
+            err,
+            ParseError::InvalidField {
+                field: "logical_address",
+                reason: "duplicate node reference in btrfs tree pointers",
+            }
+        ));
     }
 }
