@@ -354,7 +354,7 @@ FrankenFS is in **early development**. The workspace compiles, on-disk parsing a
 | btrfs metadata parsing | 35.0% (7/20) |
 | MVCC/COW core | 28.6% (4/14) |
 | FUSE surface | 50.0% (6/12) |
-| Self-healing durability | 30.0% (3/10) |
+| self-healing durability policy | 30.0% (3/10) |
 | **Overall** | **38.7% (29/75)** |
 
 ### What Works Today

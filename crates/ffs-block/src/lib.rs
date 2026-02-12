@@ -12,7 +12,7 @@ use ffs_types::{
     EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE,
 };
 use parking_lot::Mutex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::os::unix::fs::FileExt;
@@ -317,6 +317,8 @@ pub struct CacheMetrics {
     pub misses: u64,
     /// Number of resident blocks evicted to make room for new entries.
     pub evictions: u64,
+    /// Number of dirty flushes (dirty blocks written during sync/eviction).
+    pub dirty_flushes: u64,
     /// Current number of blocks in the T1 (recently accessed) list.
     pub t1_len: usize,
     /// Current number of blocks in the T2 (frequently accessed) list.
@@ -327,6 +329,8 @@ pub struct CacheMetrics {
     pub b2_len: usize,
     /// Total number of resident (cached) blocks.
     pub resident: usize,
+    /// Current number of dirty (modified but not yet flushed) blocks.
+    pub dirty_blocks: usize,
     /// Maximum cache capacity in blocks.
     pub capacity: usize,
     /// Current adaptive target size for T1.
@@ -367,12 +371,21 @@ struct ArcState {
     b2: VecDeque<BlockNumber>,
     loc: HashMap<BlockNumber, ArcList>,
     resident: HashMap<BlockNumber, Vec<u8>>,
+    /// Blocks that have been written and need flush accounting.
+    /// We keep write-through semantics today, but intentionally track dirty
+    /// metadata so sync/eviction paths are exercised for future write-back mode.
+    dirty: HashSet<BlockNumber>,
+    /// Dirty block payloads evicted before an explicit `sync`.
+    /// These must be flushed even if the block is no longer resident.
+    pending_flush: Vec<(BlockNumber, Vec<u8>)>,
     /// Monotonic hit counter (resident data found).
     hits: u64,
     /// Monotonic miss counter (device read required).
     misses: u64,
     /// Monotonic eviction counter (resident block displaced).
     evictions: u64,
+    /// Monotonic dirty flush counter (dirty blocks written during sync/eviction).
+    dirty_flushes: u64,
 }
 
 impl ArcState {
@@ -386,9 +399,12 @@ impl ArcState {
             b2: VecDeque::new(),
             loc: HashMap::new(),
             resident: HashMap::new(),
+            dirty: HashSet::new(),
+            pending_flush: Vec::new(),
             hits: 0,
             misses: 0,
             evictions: 0,
+            dirty_flushes: 0,
         }
     }
 
@@ -405,11 +421,13 @@ impl ArcState {
             hits: self.hits,
             misses: self.misses,
             evictions: self.evictions,
+            dirty_flushes: self.dirty_flushes,
             t1_len: self.t1.len(),
             t2_len: self.t2.len(),
             b1_len: self.b1.len(),
             b2_len: self.b2.len(),
             resident: self.resident_len(),
+            dirty_blocks: self.dirty.len(),
             capacity: self.capacity,
             p: self.p,
         }
@@ -421,6 +439,17 @@ impl ArcState {
             return true;
         }
         false
+    }
+
+    fn evict_resident(&mut self, victim: BlockNumber) {
+        if let Some(bytes) = self.resident.remove(&victim) {
+            if self.is_dirty(victim) {
+                self.pending_flush.push((victim, bytes));
+                self.clear_dirty(victim);
+            }
+        } else {
+            self.clear_dirty(victim);
+        }
     }
 
     fn touch_mru(&mut self, key: BlockNumber) {
@@ -457,13 +486,13 @@ impl ArcState {
         {
             if let Some(victim) = self.t1.pop_front() {
                 self.loc.insert(victim, ArcList::B1);
-                let _ = self.resident.remove(&victim);
+                self.evict_resident(victim);
                 self.b1.push_back(victim);
                 self.evictions += 1;
             }
         } else if let Some(victim) = self.t2.pop_front() {
             self.loc.insert(victim, ArcList::B2);
-            let _ = self.resident.remove(&victim);
+            self.evict_resident(victim);
             self.b2.push_back(victim);
             self.evictions += 1;
         }
@@ -532,7 +561,7 @@ impl ArcState {
                 self.replace(key);
             } else if let Some(victim) = self.t1.pop_front() {
                 let _ = self.loc.remove(&victim);
-                let _ = self.resident.remove(&victim);
+                self.evict_resident(victim);
                 self.evictions += 1;
             }
         } else if l1_len < self.capacity && total_len >= self.capacity {
@@ -545,13 +574,57 @@ impl ArcState {
         self.t1.push_back(key);
         self.loc.insert(key, ArcList::T1);
     }
+
+    /// Mark a block as dirty (written but not yet flushed to disk).
+    fn mark_dirty(&mut self, block: BlockNumber) {
+        self.dirty.insert(block);
+    }
+
+    /// Clear the dirty flag for a block (after flushing to disk).
+    fn clear_dirty(&mut self, block: BlockNumber) {
+        self.dirty.remove(&block);
+    }
+
+    /// Check if a block is dirty.
+    fn is_dirty(&self, block: BlockNumber) -> bool {
+        self.dirty.contains(&block)
+    }
+
+    /// Return list of dirty blocks that need flushing.
+    fn dirty_blocks(&self) -> Vec<BlockNumber> {
+        self.dirty.iter().copied().collect()
+    }
+
+    fn take_pending_flush(&mut self) -> Vec<(BlockNumber, Vec<u8>)> {
+        std::mem::take(&mut self.pending_flush)
+    }
+
+    fn take_dirty_and_pending_flushes(&mut self) -> Vec<(BlockNumber, Vec<u8>)> {
+        let mut flushes = self.take_pending_flush();
+        let mut queued = HashSet::with_capacity(flushes.len());
+        for (block, _) in &flushes {
+            queued.insert(*block);
+        }
+
+        for block in self.dirty_blocks() {
+            if queued.contains(&block) {
+                continue;
+            }
+            if let Some(data) = self.resident.get(&block).cloned() {
+                flushes.push((block, data));
+                queued.insert(block);
+            }
+        }
+        flushes
+    }
 }
 
 /// ARC-cached wrapper around a [`BlockDevice`].
 ///
 /// Current behavior:
 /// - read caching of whole blocks
-/// - write-through (writes update cache and the underlying device immediately)
+/// - default write-through (writes update cache and the underlying device immediately)
+/// - optional write-back mode via [`ArcCache::new_with_policy`]
 ///
 /// # Concurrency design
 ///
@@ -573,15 +646,33 @@ impl ArcState {
 /// single-lock design keeps the implementation simple and correct as a
 /// baseline.
 ///
-/// TODO: add write-back, dirty eviction, and background flush integration.
+/// TODO: replace write-through with deferred write-back and async background flushing.
 #[derive(Debug)]
 pub struct ArcCache<D: BlockDevice> {
     inner: D,
     state: Mutex<ArcState>,
+    write_policy: ArcWritePolicy,
+}
+
+/// Write policy for [`ArcCache`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArcWritePolicy {
+    /// Always write to the underlying device immediately.
+    WriteThrough,
+    /// Keep writes in cache until sync; dirty evictions still flush immediately.
+    WriteBack,
 }
 
 impl<D: BlockDevice> ArcCache<D> {
     pub fn new(inner: D, capacity_blocks: usize) -> Result<Self> {
+        Self::new_with_policy(inner, capacity_blocks, ArcWritePolicy::WriteThrough)
+    }
+
+    pub fn new_with_policy(
+        inner: D,
+        capacity_blocks: usize,
+        write_policy: ArcWritePolicy,
+    ) -> Result<Self> {
         if capacity_blocks == 0 {
             return Err(FfsError::Format(
                 "ArcCache capacity_blocks must be > 0".to_owned(),
@@ -590,6 +681,7 @@ impl<D: BlockDevice> ArcCache<D> {
         Ok(Self {
             inner,
             state: Mutex::new(ArcState::new(capacity_blocks)),
+            write_policy,
         })
     }
 
@@ -605,6 +697,45 @@ impl<D: BlockDevice> ArcCache<D> {
     #[must_use]
     pub fn metrics(&self) -> CacheMetrics {
         self.state.lock().snapshot_metrics()
+    }
+
+    #[must_use]
+    pub fn write_policy(&self) -> ArcWritePolicy {
+        self.write_policy
+    }
+
+    fn flush_blocks(&self, cx: &Cx, flushes: &[(BlockNumber, Vec<u8>)]) -> Result<()> {
+        for (block, data) in flushes {
+            cx_checkpoint(cx)?;
+            self.inner.write_block(cx, *block, data)?;
+        }
+        Ok(())
+    }
+
+    fn flush_pending_evictions(
+        &self,
+        cx: &Cx,
+        pending_flush: Vec<(BlockNumber, Vec<u8>)>,
+    ) -> Result<()> {
+        if pending_flush.is_empty() {
+            return Ok(());
+        }
+
+        if let Err(err) = self.flush_blocks(cx, &pending_flush) {
+            // Restore the pending queue on failure so callers can retry.
+            let mut guard = self.state.lock();
+            for (block, _) in &pending_flush {
+                guard.mark_dirty(*block);
+            }
+            guard.pending_flush.extend(pending_flush);
+            drop(guard);
+            return Err(err);
+        }
+
+        let mut guard = self.state.lock();
+        guard.dirty_flushes += pending_flush.len() as u64;
+        drop(guard);
+        Ok(())
     }
 }
 
@@ -632,12 +763,18 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
             guard.on_miss_or_ghost_hit(block);
             guard.resident.insert(block, buf.as_slice().to_vec());
         }
+        let pending_flush = guard.take_pending_flush();
         drop(guard);
+        self.flush_pending_evictions(cx, pending_flush)?;
         Ok(buf)
     }
 
     fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
-        self.inner.write_block(cx, block, data)?;
+        if matches!(self.write_policy, ArcWritePolicy::WriteThrough) {
+            self.inner.write_block(cx, block, data)?;
+        } else {
+            cx_checkpoint(cx)?;
+        }
         let mut guard = self.state.lock();
         if guard.resident.contains_key(&block) {
             // Block already cached — just update data and touch for recency.
@@ -647,7 +784,10 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
             guard.on_miss_or_ghost_hit(block);
             guard.resident.insert(block, data.to_vec());
         }
+        guard.mark_dirty(block);
+        let pending_flush = guard.take_pending_flush();
         drop(guard);
+        self.flush_pending_evictions(cx, pending_flush)?;
         Ok(())
     }
 
@@ -660,13 +800,64 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
     }
 
     fn sync(&self, cx: &Cx) -> Result<()> {
+        // Flush any dirty blocks before syncing the underlying device.
+        // Even in write-through mode we keep dirty/eviction accounting active
+        // so write-back paths are validated continuously.
+        self.flush_dirty(cx)?;
         self.inner.sync(cx)
+    }
+}
+
+impl<D: BlockDevice> ArcCache<D> {
+    /// Flush all dirty blocks to the underlying device.
+    ///
+    /// Current write path still writes through immediately, but we also keep
+    /// dirty metadata so sync/eviction paths remain exercised and ready for
+    /// future deferred write-back mode.
+    ///
+    /// Returns Ok(()) if all dirty blocks were successfully flushed.
+    pub fn flush_dirty(&self, cx: &Cx) -> Result<()> {
+        cx_checkpoint(cx)?;
+
+        // Collect all dirty payloads (resident + evicted pending) under lock.
+        let flushes = {
+            let mut guard = self.state.lock();
+            guard.take_dirty_and_pending_flushes()
+        };
+
+        if let Err(err) = self.flush_blocks(cx, &flushes) {
+            // Restore flush state on failure so retry logic can recover.
+            let mut guard = self.state.lock();
+            for (block, _) in &flushes {
+                guard.mark_dirty(*block);
+            }
+            guard.pending_flush.extend(flushes);
+            drop(guard);
+            return Err(err);
+        }
+
+        if !flushes.is_empty() {
+            let mut guard = self.state.lock();
+            for (block, _) in &flushes {
+                guard.clear_dirty(*block);
+            }
+            guard.dirty_flushes += flushes.len() as u64;
+        }
+
+        Ok(())
+    }
+
+    /// Return the number of currently dirty blocks.
+    #[must_use]
+    pub fn dirty_count(&self) -> usize {
+        self.state.lock().dirty.len()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn arc_access(state: &mut ArcState, key: BlockNumber) {
         if state.resident.contains_key(&key) {
@@ -751,6 +942,55 @@ mod tests {
 
         fn sync(&self, _cx: &Cx) -> Result<()> {
             Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingBlockDevice<D: BlockDevice> {
+        inner: D,
+        writes: Mutex<Vec<BlockNumber>>,
+        sync_calls: AtomicUsize,
+    }
+
+    impl<D: BlockDevice> CountingBlockDevice<D> {
+        fn new(inner: D) -> Self {
+            Self {
+                inner,
+                writes: Mutex::new(Vec::new()),
+                sync_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn write_count(&self) -> usize {
+            self.writes.lock().len()
+        }
+
+        fn sync_count(&self) -> usize {
+            self.sync_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl<D: BlockDevice> BlockDevice for CountingBlockDevice<D> {
+        fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
+            self.inner.read_block(cx, block)
+        }
+
+        fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
+            self.writes.lock().push(block);
+            self.inner.write_block(cx, block, data)
+        }
+
+        fn block_size(&self) -> u32 {
+            self.inner.block_size()
+        }
+
+        fn block_count(&self) -> u64 {
+            self.inner.block_count()
+        }
+
+        fn sync(&self, cx: &Cx) -> Result<()> {
+            self.sync_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.sync(cx)
         }
     }
 
@@ -865,6 +1105,58 @@ mod tests {
         let _ = cache.read_block(&cx, BlockNumber(2)).expect("read2");
         let guard = cache.state.lock();
         assert_eq!(guard.resident.len(), 2);
+        drop(guard);
+    }
+
+    #[test]
+    fn arc_cache_sync_flushes_and_clears_dirty_tracking() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 4);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let counted = CountingBlockDevice::new(dev);
+        let cache = ArcCache::new(counted, 2).expect("cache");
+
+        cache
+            .write_block(&cx, BlockNumber(0), &[9_u8; 4096])
+            .expect("write");
+        assert_eq!(cache.dirty_count(), 1);
+        assert_eq!(cache.inner().write_count(), 1);
+
+        cache.sync(&cx).expect("sync");
+        assert_eq!(cache.dirty_count(), 0);
+        assert_eq!(cache.inner().write_count(), 2);
+        assert_eq!(cache.inner().sync_count(), 1);
+
+        // Second sync should not rewrite flushed data.
+        cache.sync(&cx).expect("sync again");
+        assert_eq!(cache.inner().write_count(), 2);
+        assert_eq!(cache.inner().sync_count(), 2);
+    }
+
+    #[test]
+    fn arc_cache_evicts_dirty_blocks_via_pending_flush() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 4);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let counted = CountingBlockDevice::new(dev);
+        let cache = ArcCache::new(counted, 1).expect("cache");
+
+        cache
+            .write_block(&cx, BlockNumber(0), &[1_u8; 4096])
+            .expect("write0");
+        assert_eq!(cache.inner().write_count(), 1);
+        assert_eq!(cache.dirty_count(), 1);
+
+        cache
+            .write_block(&cx, BlockNumber(1), &[2_u8; 4096])
+            .expect("write1");
+
+        // write1 (write-through) + pending eviction flush for dirty block0.
+        assert_eq!(cache.inner().write_count(), 3);
+        let guard = cache.state.lock();
+        assert!(guard.pending_flush.is_empty());
+        assert!(!guard.dirty.contains(&BlockNumber(0)));
+        assert!(guard.dirty.contains(&BlockNumber(1)));
         drop(guard);
     }
 

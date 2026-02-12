@@ -64,10 +64,10 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` complete.
 
 ### 0.5 `ffs-ondisk` btrfs (Parsing + Mapping + Tree Primitives)
 
-- [~] Expand `BtrfsSuperblock` parsing (include `sys_chunk_array` bootstrap mapping)
-- [ ] Implement logical->physical mapping for single-device images (sys_chunk only, initial scope)
-- [ ] Implement node read/parse helpers (header + item table bounds checking)
-- [ ] Implement initial tree-walk primitive for read-only discovery (root -> items iterator)
+- [x] Expand `BtrfsSuperblock` parsing (include `sys_chunk_array` bootstrap mapping) — `parse_sys_chunk_array` and `BtrfsChunk`/`BtrfsStripe` landed in ffs-ondisk
+- [x] Implement logical->physical mapping for single-device images (sys_chunk only, initial scope) — `map_logical_to_physical` in ffs-ondisk::btrfs
+- [x] Implement node read/parse helpers (header + item table bounds checking) — `BtrfsNode`, `parse_leaf_items`, `parse_internal_items` in ffs-ondisk
+- [x] Implement initial tree-walk primitive for read-only discovery (root -> items iterator) — `walk_tree` in ffs-btrfs with cycle and duplicate-node detection
 
 ### 0.6 `ffs-block` (Image-Backed I/O + Cache)
 
@@ -83,7 +83,7 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` complete.
 
 - [x] Switch `ffs-cli inspect` to use `ffs-block` (no 128KB probe reads)
 - [x] Add `ffs-core` helpers: detect/open image via `ffs-block`, returning parsed superblock + geometry
-- [ ] Add harness vectors for new ext4/btrfs parsing functionality and update parity counts
+- [x] Add harness vectors for ext4/btrfs parsing functionality — ext4 superblock, group desc, inode, dir block; btrfs superblock, sys_chunk mapping, leaf node fixtures with conformance tests
 
 ### 0.8 Performance and Regression Gates
 
