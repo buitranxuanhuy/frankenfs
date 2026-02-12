@@ -6,3 +6,6 @@ legacy_ext4_and_btrfs_code/
 
 # bv (beads viewer) local config and caches
 .bv/
+
+# macOS AppleDouble / resource fork files
+._*
