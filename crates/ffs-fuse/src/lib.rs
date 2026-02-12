@@ -15,6 +15,8 @@ use fuser::{
 };
 use std::ffi::OsStr;
 use std::os::raw::c_int;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
@@ -299,11 +301,18 @@ impl Filesystem for FrankenFuse {
         }) {
             Ok(entries) => {
                 for entry in &entries {
+                    #[cfg(unix)]
+                    let name = OsStr::from_bytes(&entry.name);
+                    #[cfg(not(unix))]
+                    let owned_name = entry.name_str();
+                    #[cfg(not(unix))]
+                    let name = OsStr::new(&owned_name);
+
                     let full = reply.add(
                         entry.ino.0,
                         i64::try_from(entry.offset).unwrap_or(i64::MAX),
                         to_fuser_file_type(entry.kind),
-                        OsStr::new(&entry.name_str()),
+                        name,
                     );
                     if full {
                         break;

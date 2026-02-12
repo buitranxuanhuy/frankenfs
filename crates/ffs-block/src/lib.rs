@@ -1160,6 +1160,73 @@ mod tests {
         drop(guard);
     }
 
+    #[test]
+    fn arc_cache_default_policy_is_write_through() {
+        let mem = MemoryByteDevice::new(4096 * 2);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let cache = ArcCache::new(dev, 1).expect("cache");
+        assert_eq!(cache.write_policy(), ArcWritePolicy::WriteThrough);
+    }
+
+    #[test]
+    fn arc_cache_write_back_defers_direct_write_until_sync() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 2);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let counted = CountingBlockDevice::new(dev);
+        let cache =
+            ArcCache::new_with_policy(counted, 2, ArcWritePolicy::WriteBack).expect("cache");
+
+        cache
+            .write_block(&cx, BlockNumber(0), &[7_u8; 4096])
+            .expect("write");
+        assert_eq!(cache.inner().write_count(), 0);
+        assert_eq!(cache.dirty_count(), 1);
+
+        // Read must hit cache before sync.
+        let read = cache.read_block(&cx, BlockNumber(0)).expect("read");
+        assert_eq!(read.as_slice(), &[7_u8; 4096]);
+        assert_eq!(cache.inner().write_count(), 0);
+
+        cache.sync(&cx).expect("sync");
+        assert_eq!(cache.inner().write_count(), 1);
+        assert_eq!(cache.inner().sync_count(), 1);
+        assert_eq!(cache.dirty_count(), 0);
+
+        cache.sync(&cx).expect("sync again");
+        assert_eq!(cache.inner().write_count(), 1);
+    }
+
+    #[test]
+    fn arc_cache_write_back_flushes_dirty_evictions() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 4);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let counted = CountingBlockDevice::new(dev);
+        let cache =
+            ArcCache::new_with_policy(counted, 1, ArcWritePolicy::WriteBack).expect("cache");
+
+        cache
+            .write_block(&cx, BlockNumber(0), &[1_u8; 4096])
+            .expect("write0");
+        assert_eq!(cache.inner().write_count(), 0);
+
+        cache
+            .write_block(&cx, BlockNumber(1), &[2_u8; 4096])
+            .expect("write1");
+
+        // Dirty block0 evicted and flushed, block1 still dirty and resident.
+        assert_eq!(cache.inner().write_count(), 1);
+        assert_eq!(cache.dirty_count(), 1);
+
+        let read0 = cache.read_block(&cx, BlockNumber(0)).expect("read0");
+        assert_eq!(read0.as_slice(), &[1_u8; 4096]);
+
+        cache.sync(&cx).expect("sync");
+        assert_eq!(cache.inner().write_count(), 2);
+        assert_eq!(cache.dirty_count(), 0);
+    }
+
     // ── CacheMetrics tests ──────────────────────────────────────────────
 
     #[test]

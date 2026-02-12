@@ -3,15 +3,16 @@
 use anyhow::{Context, Result, bail};
 use asupersync::{Budget, Cx};
 use clap::{Parser, Subcommand};
-use ffs_block::{BlockDevice, ByteBlockDevice, FileByteDevice};
+use ffs_block::{BlockDevice, ByteBlockDevice, ByteDevice, FileByteDevice};
 use ffs_core::{FsFlavor, FsOps, OpenFs, detect_filesystem_at_path};
 use ffs_fuse::MountOptions;
 use ffs_harness::ParityReport;
 use ffs_repair::scrub::{
     BlockValidator, BtrfsSuperblockValidator, CompositeValidator, Ext4SuperblockValidator,
-    Scrubber, Severity, ZeroCheckValidator,
+    ScrubReport, Scrubber, Severity, ZeroCheckValidator,
 };
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 // ── Production Cx acquisition ───────────────────────────────────────────────
@@ -212,6 +213,7 @@ fn mount_cmd(image_path: &PathBuf, mountpoint: &PathBuf, allow_other: bool) -> R
 struct ScrubOutput {
     blocks_scanned: u64,
     blocks_corrupt: u64,
+    blocks_error_or_higher: u64,
     blocks_io_error: u64,
     findings: Vec<ScrubFindingOutput>,
 }
@@ -224,6 +226,47 @@ struct ScrubFindingOutput {
     detail: String,
 }
 
+fn choose_btrfs_scrub_block_size(image_len: u64, nodesize: u32, sectorsize: u32) -> Result<u32> {
+    if nodesize == 0 || !nodesize.is_power_of_two() {
+        bail!("invalid btrfs nodesize={nodesize}; expected non-zero power-of-two");
+    }
+
+    // Btrfs superblock region is 4 KiB; scrub block size must hold it.
+    let min_block_size = if sectorsize.is_power_of_two() {
+        sectorsize.max(4096)
+    } else {
+        4096
+    };
+
+    if min_block_size > nodesize {
+        bail!(
+            "invalid btrfs geometry: sectorsize={sectorsize} nodesize={nodesize} (expected sectorsize <= nodesize)"
+        );
+    }
+
+    let mut candidate = nodesize;
+    while candidate >= min_block_size {
+        if image_len % u64::from(candidate) == 0 {
+            return Ok(candidate);
+        }
+        candidate /= 2;
+    }
+
+    bail!(
+        "image length is not aligned to any supported btrfs scrub block size: len_bytes={image_len}, nodesize={nodesize}, sectorsize={sectorsize}"
+    )
+}
+
+fn count_blocks_at_severity_or_higher(report: &ScrubReport, min: Severity) -> u64 {
+    report
+        .findings
+        .iter()
+        .filter(|finding| finding.severity >= min)
+        .map(|finding| finding.block.0)
+        .collect::<BTreeSet<_>>()
+        .len() as u64
+}
+
 fn scrub_cmd(path: &PathBuf, json: bool) -> Result<()> {
     let cx = cli_cx();
 
@@ -231,13 +274,21 @@ fn scrub_cmd(path: &PathBuf, json: bool) -> Result<()> {
     let flavor = detect_filesystem_at_path(&cx, path)
         .with_context(|| format!("failed to detect ext4/btrfs metadata in {}", path.display()))?;
 
-    let block_size = match &flavor {
-        FsFlavor::Ext4(sb) => sb.block_size,
-        FsFlavor::Btrfs(sb) => sb.nodesize,
-    };
-
     let byte_dev = FileByteDevice::open(path)
         .with_context(|| format!("failed to open image: {}", path.display()))?;
+    let image_len = byte_dev.len_bytes();
+
+    let block_size = match &flavor {
+        FsFlavor::Ext4(sb) => sb.block_size,
+        FsFlavor::Btrfs(sb) => choose_btrfs_scrub_block_size(image_len, sb.nodesize, sb.sectorsize)
+            .with_context(|| {
+                format!(
+                    "failed to derive aligned btrfs scrub block size (len_bytes={image_len}, nodesize={}, sectorsize={})",
+                    sb.nodesize, sb.sectorsize
+                )
+            })?,
+    };
+
     let block_dev = ByteBlockDevice::new(byte_dev, block_size)
         .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
 
@@ -268,9 +319,12 @@ fn scrub_cmd(path: &PathBuf, json: bool) -> Result<()> {
         .scrub_all(&cx)
         .with_context(|| "scrub failed")?;
 
+    let blocks_error_or_higher = count_blocks_at_severity_or_higher(&report, Severity::Error);
+
     let output = ScrubOutput {
         blocks_scanned: report.blocks_scanned,
         blocks_corrupt: report.blocks_corrupt,
+        blocks_error_or_higher,
         blocks_io_error: report.blocks_io_error,
         findings: report
             .findings
@@ -291,7 +345,14 @@ fn scrub_cmd(path: &PathBuf, json: bool) -> Result<()> {
         );
     } else {
         println!("FrankenFS Scrub Report");
-        println!("{report}");
+        println!(
+            "scanned {} blocks: {} corrupt, {} error+, {} io_errors, {} findings",
+            output.blocks_scanned,
+            output.blocks_corrupt,
+            output.blocks_error_or_higher,
+            output.blocks_io_error,
+            output.findings.len(),
+        );
         if !report.findings.is_empty() {
             println!();
             for f in &report.findings {

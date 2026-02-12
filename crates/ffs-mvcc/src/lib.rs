@@ -411,6 +411,7 @@ impl<D: BlockDevice> MvccBlockDevice<D> {
     /// The `store` is shared across all devices/transactions that
     /// participate in the same MVCC group.
     pub fn new(base: D, store: Arc<RwLock<MvccStore>>, snapshot: Snapshot) -> Self {
+        store.write().register_snapshot(snapshot);
         Self {
             base,
             store,
@@ -434,6 +435,17 @@ impl<D: BlockDevice> MvccBlockDevice<D> {
     #[must_use]
     pub fn base(&self) -> &D {
         &self.base
+    }
+}
+
+impl<D: BlockDevice> Drop for MvccBlockDevice<D> {
+    fn drop(&mut self) {
+        let released = self.store.write().release_snapshot(self.snapshot);
+        debug_assert!(
+            released,
+            "mvcc snapshot was not registered or already released: {:?}",
+            self.snapshot
+        );
     }
 }
 
@@ -661,6 +673,22 @@ mod tests {
 
         assert_eq!(dev.block_size(), 4096);
         assert_eq!(dev.block_count(), 128);
+    }
+
+    #[test]
+    fn mvcc_device_registers_and_releases_snapshot_lifetime() {
+        let store = Arc::new(RwLock::new(MvccStore::new()));
+        let snap = store.read().current_snapshot();
+        assert_eq!(store.read().active_snapshot_count(), 0);
+
+        {
+            let base = MemBlockDevice::new(512, 4);
+            let dev = MvccBlockDevice::new(base, Arc::clone(&store), snap);
+            assert_eq!(dev.snapshot(), snap);
+            assert_eq!(store.read().active_snapshot_count(), 1);
+        }
+
+        assert_eq!(store.read().active_snapshot_count(), 0);
     }
 
     // ── Deterministic concurrency tests (bd-hrv) ─────────────────────────
