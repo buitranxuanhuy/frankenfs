@@ -81,6 +81,10 @@ enum InspectOutput {
         inodes_count: u32,
         blocks_count: u64,
         volume_name: String,
+        free_blocks_total: u64,
+        free_inodes_total: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        free_space_mismatch: Option<FreeSpaceMismatch>,
     },
     Btrfs {
         sectorsize: u32,
@@ -88,6 +92,13 @@ enum InspectOutput {
         generation: u64,
         label: String,
     },
+}
+
+/// Optional field indicating a mismatch between bitmap and group descriptor counts.
+#[derive(Debug, Serialize)]
+struct FreeSpaceMismatch {
+    gd_free_blocks: u64,
+    gd_free_inodes: u64,
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -119,18 +130,39 @@ fn inspect(path: &PathBuf, json: bool) -> Result<()> {
     let flavor = detect_filesystem_at_path(&cx, path)
         .with_context(|| format!("failed to detect ext4/btrfs metadata in {}", path.display()))?;
 
-    let output = match flavor {
-        FsFlavor::Ext4(sb) => InspectOutput::Ext4 {
-            block_size: sb.block_size,
-            inodes_count: sb.inodes_count,
-            blocks_count: sb.blocks_count,
-            volume_name: sb.volume_name,
-        },
+    let output = match &flavor {
+        FsFlavor::Ext4(sb) => {
+            // Open the filesystem to read bitmaps for free space
+            let open_fs = OpenFs::open(&cx, path)
+                .with_context(|| format!("failed to open ext4 image: {}", path.display()))?;
+            let summary = open_fs
+                .free_space_summary(&cx)
+                .context("failed to compute free space summary")?;
+
+            let mismatch = if summary.blocks_mismatch || summary.inodes_mismatch {
+                Some(FreeSpaceMismatch {
+                    gd_free_blocks: summary.gd_free_blocks_total,
+                    gd_free_inodes: summary.gd_free_inodes_total,
+                })
+            } else {
+                None
+            };
+
+            InspectOutput::Ext4 {
+                block_size: sb.block_size,
+                inodes_count: sb.inodes_count,
+                blocks_count: sb.blocks_count,
+                volume_name: sb.volume_name.clone(),
+                free_blocks_total: summary.free_blocks_total,
+                free_inodes_total: summary.free_inodes_total,
+                free_space_mismatch: mismatch,
+            }
+        }
         FsFlavor::Btrfs(sb) => InspectOutput::Btrfs {
             sectorsize: sb.sectorsize,
             nodesize: sb.nodesize,
             generation: sb.generation,
-            label: sb.label,
+            label: sb.label.clone(),
         },
     };
 
@@ -147,12 +179,23 @@ fn inspect(path: &PathBuf, json: bool) -> Result<()> {
                 inodes_count,
                 blocks_count,
                 volume_name,
+                free_blocks_total,
+                free_inodes_total,
+                free_space_mismatch,
             } => {
                 println!("filesystem: ext4");
                 println!("block_size: {block_size}");
                 println!("inodes_count: {inodes_count}");
                 println!("blocks_count: {blocks_count}");
                 println!("volume_name: {volume_name}");
+                println!("free_blocks: {free_blocks_total}");
+                println!("free_inodes: {free_inodes_total}");
+                if let Some(mismatch) = free_space_mismatch {
+                    println!(
+                        "WARNING: mismatch with group descriptors (gd_free_blocks={}, gd_free_inodes={})",
+                        mismatch.gd_free_blocks, mismatch.gd_free_inodes
+                    );
+                }
             }
             InspectOutput::Btrfs {
                 sectorsize,
