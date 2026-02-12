@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use asupersync::{Cx, RaptorQConfig};
+use ffs_alloc::{FsGeometry, bitmap_count_free};
 use ffs_block::{
     BlockBuf, BlockDevice, ByteDevice, FileByteDevice, read_btrfs_superblock_region,
     read_ext4_superblock_region,
@@ -36,6 +37,26 @@ pub enum DetectionError {
     UnsupportedImage,
     #[error("I/O error while probing image: {0}")]
     Io(#[from] FfsError),
+}
+
+/// Summary of ext4 free space from bitmap analysis.
+///
+/// Contains both the bitmap-derived counts and the group descriptor cached
+/// values, allowing detection of inconsistencies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ext4FreeSpaceSummary {
+    /// Total free blocks derived from bitmap analysis.
+    pub free_blocks_total: u64,
+    /// Total free inodes derived from bitmap analysis.
+    pub free_inodes_total: u64,
+    /// Total free blocks from group descriptor cached values.
+    pub gd_free_blocks_total: u64,
+    /// Total free inodes from group descriptor cached values.
+    pub gd_free_inodes_total: u64,
+    /// True if bitmap count differs from group descriptor count.
+    pub blocks_mismatch: bool,
+    /// True if bitmap count differs from group descriptor count.
+    pub inodes_mismatch: bool,
 }
 
 pub fn detect_filesystem(image: &[u8]) -> Result<FsFlavor, DetectionError> {
@@ -578,6 +599,131 @@ impl OpenFs {
             .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
         let inode = self.read_inode(cx, ino)?;
         Ok(inode_to_attr(sb, ino, &inode))
+    }
+
+    // ── Bitmap reading (ext4 free-space inspection) ───────────────────
+
+    /// Read the block allocation bitmap for a group.
+    ///
+    /// Returns the raw bitmap bytes. The bitmap has one bit per block in the
+    /// group. A 0 bit indicates a free block, a 1 bit indicates an allocated
+    /// block.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FfsError::Format` if this is not an ext4 filesystem.
+    pub fn read_block_bitmap(&self, cx: &Cx, group: GroupNumber) -> Result<Vec<u8>, FfsError> {
+        let _sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let gd = self.read_group_desc(cx, group)?;
+
+        // Read the bitmap block
+        self.read_block_vec(cx, BlockNumber(gd.block_bitmap))
+    }
+
+    /// Read the inode allocation bitmap for a group.
+    ///
+    /// Returns the raw bitmap bytes. The bitmap has one bit per inode in the
+    /// group. A 0 bit indicates a free inode, a 1 bit indicates an allocated
+    /// inode.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FfsError::Format` if this is not an ext4 filesystem.
+    pub fn read_inode_bitmap(&self, cx: &Cx, group: GroupNumber) -> Result<Vec<u8>, FfsError> {
+        let _sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let gd = self.read_group_desc(cx, group)?;
+
+        // Read the bitmap block
+        self.read_block_vec(cx, BlockNumber(gd.inode_bitmap))
+    }
+
+    /// Count free blocks in a specific group by reading and analyzing the bitmap.
+    ///
+    /// This reads the block bitmap from disk and counts zero bits (free blocks).
+    /// For the last group, only the bits corresponding to actual blocks are
+    /// counted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FfsError::Format` if this is not an ext4 filesystem.
+    pub fn count_free_blocks_in_group(&self, cx: &Cx, group: GroupNumber) -> Result<u32, FfsError> {
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+
+        let geo = FsGeometry::from_superblock(sb);
+        let blocks_in_group = geo.blocks_in_group(group);
+
+        let bitmap = self.read_block_bitmap(cx, group)?;
+        Ok(bitmap_count_free(&bitmap, blocks_in_group))
+    }
+
+    /// Count free inodes in a specific group by reading and analyzing the bitmap.
+    ///
+    /// This reads the inode bitmap from disk and counts zero bits (free inodes).
+    ///
+    /// # Errors
+    ///
+    /// Returns `FfsError::Format` if this is not an ext4 filesystem.
+    pub fn count_free_inodes_in_group(&self, cx: &Cx, group: GroupNumber) -> Result<u32, FfsError> {
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+
+        let bitmap = self.read_inode_bitmap(cx, group)?;
+        Ok(bitmap_count_free(&bitmap, sb.inodes_per_group))
+    }
+
+    /// Compute a free-space summary for the entire ext4 filesystem.
+    ///
+    /// Iterates over all groups, reading bitmaps and counting free blocks
+    /// and inodes. Also compares against the group descriptor cached values
+    /// to detect potential inconsistencies.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FfsError::Format` if this is not an ext4 filesystem.
+    pub fn free_space_summary(&self, cx: &Cx) -> Result<Ext4FreeSpaceSummary, FfsError> {
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+
+        let geo = FsGeometry::from_superblock(sb);
+        let group_count = geo.group_count;
+
+        let mut total_free_blocks: u64 = 0;
+        let mut total_free_inodes: u64 = 0;
+        let mut gd_free_blocks: u64 = 0;
+        let mut gd_free_inodes: u64 = 0;
+
+        for group_idx in 0..group_count {
+            let group = GroupNumber(group_idx);
+
+            // Count from bitmaps
+            let free_blocks = self.count_free_blocks_in_group(cx, group)?;
+            let free_inodes = self.count_free_inodes_in_group(cx, group)?;
+
+            total_free_blocks += u64::from(free_blocks);
+            total_free_inodes += u64::from(free_inodes);
+
+            // Get group descriptor values for comparison
+            let gd = self.read_group_desc(cx, group)?;
+            gd_free_blocks += u64::from(gd.free_blocks_count);
+            gd_free_inodes += u64::from(gd.free_inodes_count);
+        }
+
+        Ok(Ext4FreeSpaceSummary {
+            free_blocks_total: total_free_blocks,
+            free_inodes_total: total_free_inodes,
+            gd_free_blocks_total: gd_free_blocks,
+            gd_free_inodes_total: gd_free_inodes,
+            blocks_mismatch: total_free_blocks != gd_free_blocks,
+            inodes_mismatch: total_free_inodes != gd_free_inodes,
+        })
     }
 
     // ── Extent mapping via device ─────────────────────────────────────
