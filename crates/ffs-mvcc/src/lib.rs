@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+pub mod persist;
+pub mod wal;
+
 use asupersync::Cx;
 use ffs_block::{BlockBuf, BlockDevice};
 use ffs_error::FfsError;

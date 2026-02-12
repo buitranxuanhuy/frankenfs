@@ -508,6 +508,7 @@ name = "ffs-core"
 version = "0.1.0"
 dependencies = [
  "asupersync",
+ "ffs-alloc",
  "ffs-block",
  "ffs-btrfs",
  "ffs-error",
@@ -626,11 +627,13 @@ name = "ffs-mvcc"
 version = "0.1.0"
 dependencies = [
  "asupersync",
+ "crc32c",
  "ffs-block",
  "ffs-error",
  "ffs-types",
  "parking_lot",
  "serde",
+ "tempfile",
  "thiserror",
 ]
 
