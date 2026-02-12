@@ -1,0 +1,326 @@
+==============================================
+btrfs Fixture Generation
+==============================================
+Start time: 2026-02-12T16:12:13-05:00
+Repository: /data/projects/frankenfs
+With content: false
+
+=== Tool Versions ===
+mkfs.btrfs:
+mkfs.btrfs, part of btrfs-progs v6.16
+
+btrfs:
+btrfs-progs v6.16
+
+dd: dd (uutils coreutils) 0.2.2
+sha256sum: sha256sum (uutils coreutils) 0.2.2
+
+=== Phase 1: Creating Images ===
+
+=== Creating btrfs_small (256 MiB) ===
+
+  [1/3] Creating empty image...
+256+0 records in
+256+0 records out
+268435456 bytes (268 MB, 256 MiB) copied, 0.254293 s, 1.1 GB/s
+
+  [2/3] Formatting as btrfs...
+btrfs-progs v6.16
+See https://btrfs.readthedocs.io for more information.
+
+Label:              btrfs_small
+UUID:               7fda4dd8-3fbf-46d6-9837-87741506e37f
+Node size:          16384
+Sector size:        4096	(CPU page size: 4096)
+Filesystem size:    256.00MiB
+Block group profiles:
+  Data:             single            8.00MiB
+  Metadata:         DUP              32.00MiB
+  System:           DUP               8.00MiB
+SSD detected:       no
+Zoned device:       no
+Features:           extref, skinny-metadata, no-holes, free-space-tree
+Checksum:           crc32c
+Number of devices:  1
+Devices:
+   ID        SIZE  PATH                                 
+    1   256.00MiB  tests/fixtures/images/btrfs_small.img
+
+
+  [3/3] Skipping content population (use --with-content for full fixtures)
+
+  Image complete: tests/fixtures/images/btrfs_small.img
+-rw-rw-r--+ 1 ubuntu ubuntu 256M Feb 12 16:12 tests/fixtures/images/btrfs_small.img
+
+=== Creating btrfs_medium (512 MiB) ===
+Extra options: -O no-holes
+
+  [1/3] Creating empty image...
+512+0 records in
+512+0 records out
+536870912 bytes (537 MB, 512 MiB) copied, 0.477987 s, 1.1 GB/s
+
+  [2/3] Formatting as btrfs...
+ERROR: unrecognized filesystem feature ' no-holes'
+==============================================
+btrfs Fixture Generation
+==============================================
+Start time: 2026-02-12T16:12:40-05:00
+Repository: /data/projects/frankenfs
+With content: false
+
+=== Tool Versions ===
+mkfs.btrfs:
+mkfs.btrfs, part of btrfs-progs v6.16
+
+btrfs:
+btrfs-progs v6.16
+
+dd: dd (uutils coreutils) 0.2.2
+sha256sum: sha256sum (uutils coreutils) 0.2.2
+
+=== Phase 1: Creating Images ===
+
+=== Creating btrfs_small (256 MiB) ===
+
+  [1/3] Creating empty image...
+256+0 records in
+256+0 records out
+268435456 bytes (268 MB, 256 MiB) copied, 0.221334 s, 1.2 GB/s
+
+  [2/3] Formatting as btrfs...
+btrfs-progs v6.16
+See https://btrfs.readthedocs.io for more information.
+
+Label:              btrfs_small
+UUID:               e7bb2a82-2349-4b66-b19a-ec82ed71e432
+Node size:          16384
+Sector size:        4096	(CPU page size: 4096)
+Filesystem size:    256.00MiB
+Block group profiles:
+  Data:             single            8.00MiB
+  Metadata:         DUP              32.00MiB
+  System:           DUP               8.00MiB
+SSD detected:       no
+Zoned device:       no
+Features:           extref, skinny-metadata, no-holes, free-space-tree
+Checksum:           crc32c
+Number of devices:  1
+Devices:
+   ID        SIZE  PATH                                 
+    1   256.00MiB  tests/fixtures/images/btrfs_small.img
+
+
+  [3/3] Skipping content population (use --with-content for full fixtures)
+
+  Image complete: tests/fixtures/images/btrfs_small.img
+-rw-rw-r--+ 1 ubuntu ubuntu 256M Feb 12 16:12 tests/fixtures/images/btrfs_small.img
+
+=== Creating btrfs_medium (512 MiB) ===
+Extra options: -O quota
+
+  [1/3] Creating empty image...
+512+0 records in
+512+0 records out
+536870912 bytes (537 MB, 512 MiB) copied, 0.442415 s, 1.2 GB/s
+
+  [2/3] Formatting as btrfs...
+ERROR: unrecognized filesystem feature ' quota'
+==============================================
+btrfs Fixture Generation
+==============================================
+Start time: 2026-02-12T16:13:18-05:00
+Repository: /data/projects/frankenfs
+With content: false
+
+=== Tool Versions ===
+mkfs.btrfs:
+mkfs.btrfs, part of btrfs-progs v6.16
+
+btrfs:
+btrfs-progs v6.16
+
+dd: dd (uutils coreutils) 0.2.2
+sha256sum: sha256sum (uutils coreutils) 0.2.2
+
+=== Phase 1: Creating Images ===
+
+=== Creating btrfs_small (256 MiB) ===
+
+  [1/3] Creating empty image...
+256+0 records in
+256+0 records out
+268435456 bytes (268 MB, 256 MiB) copied, 0.229387 s, 1.2 GB/s
+
+  [2/3] Formatting as btrfs...
+btrfs-progs v6.16
+See https://btrfs.readthedocs.io for more information.
+
+Label:              btrfs_small
+UUID:               e1dcb45e-f33d-49bf-8e31-d05db90c2626
+Node size:          16384
+Sector size:        4096	(CPU page size: 4096)
+Filesystem size:    256.00MiB
+Block group profiles:
+  Data:             single            8.00MiB
+  Metadata:         DUP              32.00MiB
+  System:           DUP               8.00MiB
+SSD detected:       no
+Zoned device:       no
+Features:           extref, skinny-metadata, no-holes, free-space-tree
+Checksum:           crc32c
+Number of devices:  1
+Devices:
+   ID        SIZE  PATH                                 
+    1   256.00MiB  tests/fixtures/images/btrfs_small.img
+
+
+  [3/3] Skipping content population (use --with-content for full fixtures)
+
+  Image complete: tests/fixtures/images/btrfs_small.img
+-rw-rw-r--+ 1 ubuntu ubuntu 256M Feb 12 16:13 tests/fixtures/images/btrfs_small.img
+
+=== Creating btrfs_medium (512 MiB) ===
+
+  [1/3] Creating empty image...
+512+0 records in
+512+0 records out
+536870912 bytes (537 MB, 512 MiB) copied, 0.438247 s, 1.2 GB/s
+
+  [2/3] Formatting as btrfs...
+btrfs-progs v6.16
+See https://btrfs.readthedocs.io for more information.
+
+Label:              btrfs_medium
+UUID:               1810851b-b106-4ed3-b331-e54bc8ba14ee
+Node size:          16384
+Sector size:        4096	(CPU page size: 4096)
+Filesystem size:    512.00MiB
+Block group profiles:
+  Data:             single            8.00MiB
+  Metadata:         DUP              32.00MiB
+  System:           DUP               8.00MiB
+SSD detected:       no
+Zoned device:       no
+Features:           extref, skinny-metadata, no-holes, free-space-tree
+Checksum:           crc32c
+Number of devices:  1
+Devices:
+   ID        SIZE  PATH                                  
+    1   512.00MiB  tests/fixtures/images/btrfs_medium.img
+
+
+  [3/3] Skipping content population (use --with-content for full fixtures)
+
+  Image complete: tests/fixtures/images/btrfs_medium.img
+-rw-rw-r--+ 1 ubuntu ubuntu 512M Feb 12 16:13 tests/fixtures/images/btrfs_medium.img
+
+=== Creating btrfs_large (1024 MiB) ===
+
+  [1/3] Creating empty image...
+1065353216 bytes (1.1 GB, 1016 MiB) copied, 1.0016 s, 1.1 GB/s
+1024+0 records in
+1024+0 records out
+1073741824 bytes (1.1 GB, 1.0 GiB) copied, 1.00865 s, 1.1 GB/s
+
+  [2/3] Formatting as btrfs...
+btrfs-progs v6.16
+See https://btrfs.readthedocs.io for more information.
+
+Label:              btrfs_large
+UUID:               b055ad7d-8ff3-4559-b99f-33ea0d6d2f1f
+Node size:          16384
+Sector size:        4096	(CPU page size: 4096)
+Filesystem size:    1.00GiB
+Block group profiles:
+  Data:             single            8.00MiB
+  Metadata:         DUP              51.19MiB
+  System:           DUP               8.00MiB
+SSD detected:       no
+Zoned device:       no
+Features:           extref, skinny-metadata, no-holes, free-space-tree
+Checksum:           crc32c
+Number of devices:  1
+Devices:
+   ID        SIZE  PATH                                 
+    1     1.00GiB  tests/fixtures/images/btrfs_large.img
+
+
+  [3/3] Skipping content population (use --with-content for full fixtures)
+
+  Image complete: tests/fixtures/images/btrfs_large.img
+-rw-rw-r--+ 1 ubuntu ubuntu 1.0G Feb 12 16:13 tests/fixtures/images/btrfs_large.img
+
+=== Phase 2: Building FrankenFS CLI ===
+
+    Finished `release` profile [optimized] target(s) in 0.09s
+
+=== Phase 3: Generating Golden Outputs ===
+
+Generating: tests/fixtures/golden/btrfs_large.json
+  Size: 116 bytes
+  Preview: {
+  "filesystem": "btrfs",
+  "sectorsize": 4096,
+  "nodesize": 16384,
+  "generation": 8,
+  "label": "btrfs_large"
+}...
+
+Generating: tests/fixtures/golden/btrfs_medium.json
+  Size: 117 bytes
+  Preview: {
+  "filesystem": "btrfs",
+  "sectorsize": 4096,
+  "nodesize": 16384,
+  "generation": 8,
+  "label": "btrfs_medium"
+}...
+
+Generating: tests/fixtures/golden/btrfs_small.json
+  Size: 116 bytes
+  Preview: {
+  "filesystem": "btrfs",
+  "sectorsize": 4096,
+  "nodesize": 16384,
+  "generation": 8,
+  "label": "btrfs_small"
+}...
+
+=== Phase 4: Updating Checksums ===
+
+Checksums:
+486164f56af39c211df28f68ba9ed3cea1fdba30b8a73d2a98832196cf82f952  ext4_large.json
+8514098fdc89c5c5014c054f2577bca12fbf844d760fe9c44039cbb88f425042  ext4_medium.json
+124f6068d5788e3ac5b6b0c541d0736316085111301d6f90fc3cd7d04bedc491  ext4_small.json
+9361852960ffd2823b6720aa47b94d8fb1b841e9f6eaf71fb0ed3ff8baaa8666  btrfs_large.json
+8714d0ce5a82c9145e9ba52f8541ccc4aa7788383f582904d42dfb463124c92f  btrfs_medium.json
+8196e08976f22ec99226358c3e3eb8b93fd654130a61301cd0263c34d9bb3872  btrfs_small.json
+
+=== Verification ===
+
+ext4_large.json: OK
+ext4_medium.json: OK
+ext4_small.json: OK
+btrfs_large.json: OK
+btrfs_medium.json: OK
+btrfs_small.json: OK
+
+All checksums verified successfully.
+
+==============================================
+Generation Complete
+==============================================
+End time: 2026-02-12T16:13:23-05:00
+
+Artifacts created:
+  - /data/projects/frankenfs/tests/fixtures/images/btrfs_large.img (1.0G)
+  - /data/projects/frankenfs/tests/fixtures/images/btrfs_medium.img (512M)
+  - /data/projects/frankenfs/tests/fixtures/images/btrfs_small.img (256M)
+  - /data/projects/frankenfs/tests/fixtures/golden/btrfs_large.json (116 bytes)
+  - /data/projects/frankenfs/tests/fixtures/golden/btrfs_medium.json (117 bytes)
+  - /data/projects/frankenfs/tests/fixtures/golden/btrfs_small.json (116 bytes)
+  - /data/projects/frankenfs/tests/fixtures/golden/checksums.txt (updated)
+  - /data/projects/frankenfs/tests/fixtures/golden/btrfs_generation.log
+
+To verify: ( cd tests/fixtures/golden && sha256sum -c checksums.txt )

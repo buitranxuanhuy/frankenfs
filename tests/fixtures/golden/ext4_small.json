@@ -1,0 +1,7 @@
+{
+  "filesystem": "ext4",
+  "block_size": 4096,
+  "inodes_count": 4096,
+  "blocks_count": 4096,
+  "volume_name": "ext4_small"
+}

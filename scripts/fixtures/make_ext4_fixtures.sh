@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+# make_ext4_fixtures.sh - Generate ext4 golden fixture images
+#
+# This script creates reproducible ext4 filesystem images for conformance testing.
+# It uses debugfs for rootless population (no sudo required for basic content).
+#
+# Usage: ./scripts/fixtures/make_ext4_fixtures.sh
+#
+# Output:
+#   tests/fixtures/images/ext4_small.img   (16 MiB)
+#   tests/fixtures/images/ext4_medium.img  (64 MiB)
+#   tests/fixtures/images/ext4_large.img   (128 MiB)
+#   tests/fixtures/golden/ext4_*.json      (inspect output)
+#   tests/fixtures/golden/checksums.txt    (SHA-256 verification)
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# Navigate to repo root
+cd "$(dirname "$0")/../.."
+REPO_ROOT="$(pwd)"
+
+# Paths
+IMAGES_DIR="tests/fixtures/images"
+GOLDEN_DIR="tests/fixtures/golden"
+LOG_FILE="${GOLDEN_DIR}/generation.log"
+
+# Ensure directories exist
+mkdir -p "$IMAGES_DIR" "$GOLDEN_DIR"
+
+# Start logging
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+echo "=============================================="
+echo "ext4 Fixture Generation"
+echo "=============================================="
+echo "Start time: $(date -Iseconds)"
+echo "Repository: $REPO_ROOT"
+echo ""
+
+# Print tool versions
+echo "=== Tool Versions ==="
+echo "mkfs.ext4:"
+mkfs.ext4 -V 2>&1 | head -2
+echo ""
+echo "debugfs:"
+debugfs -V 2>&1 | head -2
+echo ""
+echo "dd: $(dd --version 2>&1 | head -1)"
+echo "sha256sum: $(sha256sum --version 2>&1 | head -1)"
+echo ""
+
+# Function to create an ext4 image
+create_image() {
+    local name="$1"
+    local size_mb="$2"
+    local features="$3"
+    local img_path="${IMAGES_DIR}/${name}.img"
+
+    echo "=== Creating $name ($size_mb MiB) ==="
+    echo "Features: $features"
+    echo ""
+
+    # Create zero-filled image
+    echo "  [1/4] Creating empty image..."
+    dd if=/dev/zero of="$img_path" bs=1M count="$size_mb" status=progress 2>&1
+    echo ""
+
+    # Format as ext4
+    echo "  [2/4] Formatting as ext4..."
+    mkfs.ext4 -F -O "$features" -L "$name" "$img_path" 2>&1
+    echo ""
+
+    # Populate with known content using debugfs
+    echo "  [3/4] Populating with test content..."
+    populate_image "$img_path" "$name"
+    echo ""
+
+    echo "  [4/4] Image complete: $img_path"
+    ls -lh "$img_path"
+    echo ""
+}
+
+# Function to populate image with known content using debugfs
+populate_image() {
+    local img_path="$1"
+    local name="$2"
+
+    # Create temporary files for content
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    trap "rm -rf $tmp_dir" RETURN
+
+    # README.txt content
+    cat > "$tmp_dir/README.txt" << 'EOF'
+FrankenFS Test Fixture
+======================
+This filesystem image was created for conformance testing.
+It contains a known directory structure for validation.
+
+Created by: scripts/fixtures/make_ext4_fixtures.sh
+EOF
+
+    # Binary file (256 bytes of deterministic pattern)
+    dd if=/dev/zero bs=256 count=1 2>/dev/null | tr '\0' '\xFF' > "$tmp_dir/file1.bin"
+
+    # Text file
+    cat > "$tmp_dir/file2.txt" << 'EOF'
+Nested text file for testing directory traversal.
+Line 2
+Line 3
+EOF
+
+    # Use debugfs to populate the filesystem
+    debugfs -w "$img_path" << DEBUGFS_CMDS
+mkdir dir1
+mkdir dir1/dir2
+write $tmp_dir/README.txt README.txt
+write $tmp_dir/file1.bin dir1/file1.bin
+write $tmp_dir/file2.txt dir1/dir2/file2.txt
+symlink symlink dir1/file1.bin
+ls -l /
+ls -l /dir1
+ls -l /dir1/dir2
+DEBUGFS_CMDS
+
+    echo "  Content structure:"
+    debugfs -R "ls -l /" "$img_path" 2>/dev/null || true
+}
+
+# Create three images with different feature combinations
+echo "=== Phase 1: Creating Images ==="
+echo ""
+
+# Small: minimal features (extent + filetype required by FrankenFS V1)
+create_image "ext4_small" 16 "extent,filetype"
+
+# Medium: add dir_index (htree directories)
+create_image "ext4_medium" 64 "extent,filetype,dir_index"
+
+# Large: add sparse_super (optimized superblock placement)
+create_image "ext4_large" 128 "extent,filetype,dir_index,sparse_super"
+
+echo "=== Phase 2: Building FrankenFS CLI ==="
+echo ""
+cargo build -p ffs-cli --release 2>&1
+
+echo ""
+echo "=== Phase 3: Generating Golden Outputs ==="
+echo ""
+
+for img in "$IMAGES_DIR"/ext4_*.img; do
+    name=$(basename "$img" .img)
+    golden="${GOLDEN_DIR}/${name}.json"
+
+    echo "Generating: $golden"
+    # Redirect stderr to hide cargo build output, capture only JSON
+    cargo run -p ffs-cli --release -- inspect "$img" --json 2>/dev/null > "$golden"
+
+    # Show summary
+    echo "  Size: $(wc -c < "$golden") bytes"
+    echo "  Preview: $(head -c 200 "$golden")..."
+    echo ""
+done
+
+echo "=== Phase 4: Creating Checksums ==="
+echo ""
+
+cd "$GOLDEN_DIR"
+sha256sum ext4_*.json > checksums.txt
+echo "Checksums:"
+cat checksums.txt
+echo ""
+
+echo "=== Verification ==="
+echo ""
+if sha256sum -c checksums.txt; then
+    echo ""
+    echo "All checksums verified successfully."
+else
+    echo ""
+    echo "ERROR: Checksum verification failed!"
+    exit 1
+fi
+
+echo ""
+echo "=============================================="
+echo "Generation Complete"
+echo "=============================================="
+echo "End time: $(date -Iseconds)"
+echo ""
+echo "Artifacts created:"
+for f in "$REPO_ROOT/$IMAGES_DIR"/ext4_*.img; do
+    echo "  - $f ($(du -h "$f" | cut -f1))"
+done
+for f in "$REPO_ROOT/$GOLDEN_DIR"/ext4_*.json; do
+    echo "  - $f ($(wc -c < "$f") bytes)"
+done
+echo "  - $REPO_ROOT/$GOLDEN_DIR/checksums.txt"
+echo "  - $REPO_ROOT/$GOLDEN_DIR/generation.log"
+echo ""
+echo "To verify: ( cd $GOLDEN_DIR && sha256sum -c checksums.txt )"

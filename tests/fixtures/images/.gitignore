@@ -1,0 +1,5 @@
+# Fixture images are regenerated, not committed (too large)
+*.img
+
+# Keep this .gitignore
+!.gitignore

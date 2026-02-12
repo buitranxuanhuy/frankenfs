@@ -1,0 +1,7 @@
+{
+  "filesystem": "ext4",
+  "block_size": 4096,
+  "inodes_count": 16384,
+  "blocks_count": 16384,
+  "volume_name": "ext4_medium"
+}
