@@ -6,12 +6,12 @@
 
 | Domain | Implemented | Total Tracked | Coverage |
 |--------|-------------|---------------|----------|
-| ext4 metadata parsing | 9 | 19 | 47.4% |
+| ext4 metadata parsing | 10 | 19 | 52.6% |
 | btrfs metadata parsing | 7 | 20 | 35.0% |
 | MVCC/COW core | 4 | 14 | 28.6% |
 | FUSE surface | 6 | 12 | 50.0% |
 | self-healing durability policy | 3 | 10 | 30.0% |
-| **Overall** | **29** | **75** | **38.7%** |
+| **Overall** | **30** | **75** | **40.0%** |
 
 > **Canonical source:** The `ParityReport::current()` function in `ffs-harness` is the
 > authoritative source for implemented/total counts. This table MUST match those
@@ -31,6 +31,7 @@
 | ext4 directory entry parsing | `fs/ext4/dir.c` | ✅ | Implemented in `ffs-ondisk` |
 | ext4 inode device read | `fs/ext4/inode.c` | ✅ | `OpenFs::read_inode` via `ByteDevice` |
 | ext4 path resolution | `fs/ext4/namei.c` | ✅ | `OpenFs::resolve_path` |
+| ext4 bitmap free space reading | `fs/ext4/balloc.c` | ✅ | `OpenFs::free_space_summary`, bitmap-derived free block/inode counts |
 | ext4 journal replay parity | `fs/ext4/ext4_jbd2.c` | 🟡 | Phase 1 implemented in `ffs-journal` (descriptor/commit/revoke replay + tests); full mount-path integration and complete parity still pending |
 | ext4 allocator parity | `fs/ext4/mballoc.c` | ❌ | Not yet implemented |
 | ext4 orphan recovery parity | `fs/ext4/orphan.c` | ❌ | Not yet implemented |
