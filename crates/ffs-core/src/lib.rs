@@ -4770,6 +4770,219 @@ mod tests {
         image
     }
 
+    fn write_btrfs_leaf_item(
+        image: &mut [u8],
+        leaf_off: usize,
+        idx: usize,
+        objectid: u64,
+        item_type: u8,
+        key_offset: u64,
+        data_offset: u32,
+        data_size: u32,
+    ) {
+        let item_off = leaf_off + 101 + idx * 25;
+        image[item_off..item_off + 8].copy_from_slice(&objectid.to_le_bytes());
+        image[item_off + 8] = item_type;
+        image[item_off + 9..item_off + 17].copy_from_slice(&key_offset.to_le_bytes());
+        image[item_off + 17..item_off + 21].copy_from_slice(&data_offset.to_le_bytes());
+        image[item_off + 21..item_off + 25].copy_from_slice(&data_size.to_le_bytes());
+    }
+
+    fn encode_btrfs_inode_item(mode: u32, size: u64, nbytes: u64, nlink: u32) -> [u8; 160] {
+        let mut inode = [0_u8; 160];
+        inode[0..8].copy_from_slice(&1_u64.to_le_bytes()); // generation
+        inode[8..16].copy_from_slice(&1_u64.to_le_bytes()); // transid
+        inode[16..24].copy_from_slice(&size.to_le_bytes());
+        inode[24..32].copy_from_slice(&nbytes.to_le_bytes());
+        inode[40..44].copy_from_slice(&nlink.to_le_bytes());
+        inode[44..48].copy_from_slice(&1000_u32.to_le_bytes()); // uid
+        inode[48..52].copy_from_slice(&1000_u32.to_le_bytes()); // gid
+        inode[52..56].copy_from_slice(&mode.to_le_bytes());
+        // atime / ctime / mtime / otime
+        inode[112..120].copy_from_slice(&10_u64.to_le_bytes());
+        inode[124..132].copy_from_slice(&10_u64.to_le_bytes());
+        inode[136..144].copy_from_slice(&10_u64.to_le_bytes());
+        inode[148..156].copy_from_slice(&10_u64.to_le_bytes());
+        inode
+    }
+
+    fn encode_btrfs_dir_index_entry(name: &[u8], child_objectid: u64, file_type: u8) -> Vec<u8> {
+        let mut entry = vec![0_u8; 30 + name.len()];
+        entry[0..8].copy_from_slice(&child_objectid.to_le_bytes());
+        entry[8] = BTRFS_ITEM_INODE_ITEM;
+        entry[9..17].copy_from_slice(&0_u64.to_le_bytes());
+        entry[17..25].copy_from_slice(&1_u64.to_le_bytes()); // transid
+        entry[25..27].copy_from_slice(&0_u16.to_le_bytes()); // data_len
+        entry[27..29].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        entry[29] = file_type;
+        entry[30..30 + name.len()].copy_from_slice(name);
+        entry
+    }
+
+    fn encode_btrfs_extent_regular(disk_bytenr: u64, num_bytes: u64) -> [u8; 53] {
+        let mut extent = [0_u8; 53];
+        extent[0..8].copy_from_slice(&1_u64.to_le_bytes()); // generation
+        extent[8..16].copy_from_slice(&num_bytes.to_le_bytes()); // ram_bytes
+        extent[20] = BTRFS_FILE_EXTENT_REG;
+        extent[21..29].copy_from_slice(&disk_bytenr.to_le_bytes());
+        extent[29..37].copy_from_slice(&num_bytes.to_le_bytes()); // disk_num_bytes
+        extent[37..45].copy_from_slice(&0_u64.to_le_bytes()); // extent offset
+        extent[45..53].copy_from_slice(&num_bytes.to_le_bytes());
+        extent
+    }
+
+    /// Build a minimal btrfs image with ROOT_TREE + FS_TREE content sufficient
+    /// for read-only `FsOps` operations (`getattr/lookup/readdir/read`).
+    #[allow(clippy::cast_possible_truncation)]
+    fn build_btrfs_fsops_image() -> Vec<u8> {
+        let image_size: usize = 512 * 1024;
+        let mut image = vec![0_u8; image_size];
+        let sb_off = BTRFS_SUPER_INFO_OFFSET;
+
+        let root_tree_logical = 0x4_000_u64;
+        let fs_tree_logical = 0x8_000_u64;
+        let file_data_logical = 0x12_000_u64;
+        let file_bytes = b"hello from btrfs fsops";
+
+        image[sb_off + 0x40..sb_off + 0x48].copy_from_slice(&BTRFS_MAGIC.to_le_bytes()); // magic
+        image[sb_off + 0x48..sb_off + 0x50].copy_from_slice(&1_u64.to_le_bytes()); // generation
+        image[sb_off + 0x50..sb_off + 0x58].copy_from_slice(&root_tree_logical.to_le_bytes()); // root tree bytenr
+        image[sb_off + 0x58..sb_off + 0x60].copy_from_slice(&0_u64.to_le_bytes()); // chunk_root unused
+        image[sb_off + 0x70..sb_off + 0x78].copy_from_slice(&(image_size as u64).to_le_bytes());
+        image[sb_off + 0x80..sb_off + 0x88].copy_from_slice(&256_u64.to_le_bytes()); // root_dir_objectid
+        image[sb_off + 0x88..sb_off + 0x90].copy_from_slice(&1_u64.to_le_bytes()); // num_devices
+        image[sb_off + 0x90..sb_off + 0x94].copy_from_slice(&4096_u32.to_le_bytes()); // sectorsize
+        image[sb_off + 0x94..sb_off + 0x98].copy_from_slice(&4096_u32.to_le_bytes()); // nodesize
+        image[sb_off + 0x9C..sb_off + 0xA0].copy_from_slice(&4096_u32.to_le_bytes()); // stripesize
+        image[sb_off + 0xC6] = 0; // root_level
+
+        // sys_chunk_array: one identity chunk [0, image_size) → [0, image_size)
+        let mut chunk_array = Vec::new();
+        chunk_array.extend_from_slice(&256_u64.to_le_bytes());
+        chunk_array.push(228_u8); // CHUNK_ITEM
+        chunk_array.extend_from_slice(&0_u64.to_le_bytes()); // logical start
+        chunk_array.extend_from_slice(&(image_size as u64).to_le_bytes()); // length
+        chunk_array.extend_from_slice(&2_u64.to_le_bytes()); // owner
+        chunk_array.extend_from_slice(&0x1_0000_u64.to_le_bytes()); // stripe_len
+        chunk_array.extend_from_slice(&2_u64.to_le_bytes()); // chunk type
+        chunk_array.extend_from_slice(&4096_u32.to_le_bytes()); // io_align
+        chunk_array.extend_from_slice(&4096_u32.to_le_bytes()); // io_width
+        chunk_array.extend_from_slice(&4096_u32.to_le_bytes()); // sector_size
+        chunk_array.extend_from_slice(&1_u16.to_le_bytes()); // num_stripes
+        chunk_array.extend_from_slice(&0_u16.to_le_bytes()); // sub_stripes
+        chunk_array.extend_from_slice(&1_u64.to_le_bytes()); // devid
+        chunk_array.extend_from_slice(&0_u64.to_le_bytes()); // physical offset (identity)
+        chunk_array.extend_from_slice(&[0_u8; 16]); // dev_uuid
+
+        image[sb_off + 0xA0..sb_off + 0xA4].copy_from_slice(&(chunk_array.len() as u32).to_le_bytes());
+        let array_start = sb_off + 0x32B;
+        image[array_start..array_start + chunk_array.len()].copy_from_slice(&chunk_array);
+
+        // Root tree leaf with one ROOT_ITEM for FS_TREE.
+        let root_leaf = root_tree_logical as usize;
+        image[root_leaf + 0x30..root_leaf + 0x38].copy_from_slice(&root_tree_logical.to_le_bytes());
+        image[root_leaf + 0x50..root_leaf + 0x58].copy_from_slice(&1_u64.to_le_bytes());
+        image[root_leaf + 0x58..root_leaf + 0x60].copy_from_slice(&1_u64.to_le_bytes()); // ROOT_TREE owner
+        image[root_leaf + 0x60..root_leaf + 0x64].copy_from_slice(&1_u32.to_le_bytes()); // nritems
+        image[root_leaf + 0x64] = 0; // leaf
+
+        let root_item_offset: u32 = 3000;
+        let root_item_size: u32 = 239;
+        write_btrfs_leaf_item(
+            &mut image,
+            root_leaf,
+            0,
+            BTRFS_FS_TREE_OBJECTID,
+            BTRFS_ITEM_ROOT_ITEM,
+            0,
+            root_item_offset,
+            root_item_size,
+        );
+        let mut root_item = vec![0_u8; root_item_size as usize];
+        root_item[176..184].copy_from_slice(&fs_tree_logical.to_le_bytes()); // bytenr
+        root_item[root_item.len() - 1] = 0; // level
+        let root_data_off = root_leaf + root_item_offset as usize;
+        image[root_data_off..root_data_off + root_item.len()].copy_from_slice(&root_item);
+
+        // FS tree leaf with: inode(256), dir_index(hello.txt), inode(257), extent_data(257).
+        let fs_leaf = fs_tree_logical as usize;
+        image[fs_leaf + 0x30..fs_leaf + 0x38].copy_from_slice(&fs_tree_logical.to_le_bytes());
+        image[fs_leaf + 0x50..fs_leaf + 0x58].copy_from_slice(&1_u64.to_le_bytes());
+        image[fs_leaf + 0x58..fs_leaf + 0x60].copy_from_slice(&5_u64.to_le_bytes()); // FS_TREE owner
+        image[fs_leaf + 0x60..fs_leaf + 0x64].copy_from_slice(&4_u32.to_le_bytes());
+        image[fs_leaf + 0x64] = 0;
+
+        let root_inode = encode_btrfs_inode_item(0o040755, 4096, 4096, 2);
+        let file_inode = encode_btrfs_inode_item(
+            0o100644,
+            file_bytes.len() as u64,
+            file_bytes.len() as u64,
+            1,
+        );
+        let dir_index = encode_btrfs_dir_index_entry(b"hello.txt", 257, BTRFS_FT_REG_FILE);
+        let extent = encode_btrfs_extent_regular(file_data_logical, file_bytes.len() as u64);
+
+        let root_inode_off: u32 = 3200;
+        let dir_index_off: u32 = 3060;
+        let file_inode_off: u32 = 2860;
+        let extent_off: u32 = 2780;
+
+        write_btrfs_leaf_item(
+            &mut image,
+            fs_leaf,
+            0,
+            256,
+            BTRFS_ITEM_INODE_ITEM,
+            0,
+            root_inode_off,
+            root_inode.len() as u32,
+        );
+        write_btrfs_leaf_item(
+            &mut image,
+            fs_leaf,
+            1,
+            256,
+            BTRFS_ITEM_DIR_INDEX,
+            1,
+            dir_index_off,
+            dir_index.len() as u32,
+        );
+        write_btrfs_leaf_item(
+            &mut image,
+            fs_leaf,
+            2,
+            257,
+            BTRFS_ITEM_INODE_ITEM,
+            0,
+            file_inode_off,
+            file_inode.len() as u32,
+        );
+        write_btrfs_leaf_item(
+            &mut image,
+            fs_leaf,
+            3,
+            257,
+            BTRFS_ITEM_EXTENT_DATA,
+            0,
+            extent_off,
+            extent.len() as u32,
+        );
+
+        image[fs_leaf + root_inode_off as usize..fs_leaf + root_inode_off as usize + root_inode.len()]
+            .copy_from_slice(&root_inode);
+        image[fs_leaf + dir_index_off as usize..fs_leaf + dir_index_off as usize + dir_index.len()]
+            .copy_from_slice(&dir_index);
+        image[fs_leaf + file_inode_off as usize..fs_leaf + file_inode_off as usize + file_inode.len()]
+            .copy_from_slice(&file_inode);
+        image[fs_leaf + extent_off as usize..fs_leaf + extent_off as usize + extent.len()]
+            .copy_from_slice(&extent);
+
+        let file_data_off = file_data_logical as usize;
+        image[file_data_off..file_data_off + file_bytes.len()].copy_from_slice(file_bytes);
+
+        image
+    }
+
     #[test]
     fn open_fs_from_btrfs_image() {
         let image = build_btrfs_image();
