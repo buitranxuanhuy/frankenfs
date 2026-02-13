@@ -15,6 +15,281 @@ pub struct BtrfsLeafEntry {
     pub data: Vec<u8>,
 }
 
+/// btrfs objectid for the root tree.
+pub const BTRFS_ROOT_TREE_OBJECTID: u64 = 1;
+/// btrfs objectid for the default filesystem tree.
+pub const BTRFS_FS_TREE_OBJECTID: u64 = 5;
+
+/// btrfs item type constants used by the read-only VFS path.
+pub const BTRFS_ITEM_INODE_ITEM: u8 = 1;
+pub const BTRFS_ITEM_DIR_ITEM: u8 = 84;
+pub const BTRFS_ITEM_DIR_INDEX: u8 = 96;
+pub const BTRFS_ITEM_EXTENT_DATA: u8 = 108;
+pub const BTRFS_ITEM_ROOT_ITEM: u8 = 132;
+
+/// Directory entry type values stored in btrfs dir items.
+pub const BTRFS_FT_UNKNOWN: u8 = 0;
+pub const BTRFS_FT_REG_FILE: u8 = 1;
+pub const BTRFS_FT_DIR: u8 = 2;
+pub const BTRFS_FT_CHRDEV: u8 = 3;
+pub const BTRFS_FT_BLKDEV: u8 = 4;
+pub const BTRFS_FT_FIFO: u8 = 5;
+pub const BTRFS_FT_SOCK: u8 = 6;
+pub const BTRFS_FT_SYMLINK: u8 = 7;
+
+/// File extent type values in EXTENT_DATA payloads.
+pub const BTRFS_FILE_EXTENT_INLINE: u8 = 0;
+pub const BTRFS_FILE_EXTENT_REG: u8 = 1;
+pub const BTRFS_FILE_EXTENT_PREALLOC: u8 = 2;
+
+/// Parsed subset of `btrfs_root_item` needed for tree bootstrapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BtrfsRootItem {
+    /// Logical address of the tree root block (`bytenr`).
+    pub bytenr: u64,
+    /// Root tree level (`0` for leaf roots).
+    pub level: u8,
+}
+
+/// Parsed subset of `btrfs_inode_item` needed for read-only VFS operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BtrfsInodeItem {
+    pub size: u64,
+    pub nbytes: u64,
+    pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
+    pub rdev: u64,
+    pub atime_sec: u64,
+    pub atime_nsec: u32,
+    pub ctime_sec: u64,
+    pub ctime_nsec: u32,
+    pub mtime_sec: u64,
+    pub mtime_nsec: u32,
+    pub otime_sec: u64,
+    pub otime_nsec: u32,
+}
+
+/// One decoded directory entry from DIR_ITEM / DIR_INDEX payload bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BtrfsDirItem {
+    pub child_objectid: u64,
+    pub child_key_type: u8,
+    pub child_key_offset: u64,
+    pub file_type: u8,
+    pub name: Vec<u8>,
+}
+
+/// Parsed EXTENT_DATA payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BtrfsExtentData {
+    /// Inline extent payload bytes.
+    Inline {
+        data: Vec<u8>,
+    },
+    /// Regular or preallocated extent that references on-disk bytes.
+    ///
+    /// `disk_bytenr` is a logical bytenr in btrfs address space.
+    Regular {
+        extent_type: u8,
+        disk_bytenr: u64,
+        disk_num_bytes: u64,
+        extent_offset: u64,
+        num_bytes: u64,
+    },
+}
+
+fn read_exact<const N: usize>(data: &[u8], off: usize, field: &'static str) -> Result<[u8; N], ParseError> {
+    let end = off.checked_add(N).ok_or(ParseError::InvalidField {
+        field,
+        reason: "offset overflow",
+    })?;
+    let Some(slice) = data.get(off..end) else {
+        return Err(ParseError::InsufficientData {
+            needed: end,
+            offset: off,
+            actual: data.len(),
+        });
+    };
+    let mut out = [0_u8; N];
+    out.copy_from_slice(slice);
+    Ok(out)
+}
+
+fn read_u16(data: &[u8], off: usize, field: &'static str) -> Result<u16, ParseError> {
+    Ok(u16::from_le_bytes(read_exact::<2>(data, off, field)?))
+}
+
+fn read_u32(data: &[u8], off: usize, field: &'static str) -> Result<u32, ParseError> {
+    Ok(u32::from_le_bytes(read_exact::<4>(data, off, field)?))
+}
+
+fn read_u64(data: &[u8], off: usize, field: &'static str) -> Result<u64, ParseError> {
+    Ok(u64::from_le_bytes(read_exact::<8>(data, off, field)?))
+}
+
+/// Parse the subset of `btrfs_root_item` needed to find the FS tree root.
+///
+/// Layout assumption (stable for the supported on-disk variants):
+/// - `bytenr` at offset 176
+/// - `level` in the final byte of the item payload
+pub fn parse_root_item(data: &[u8]) -> Result<BtrfsRootItem, ParseError> {
+    if data.len() < 184 {
+        return Err(ParseError::InsufficientData {
+            needed: 184,
+            offset: 0,
+            actual: data.len(),
+        });
+    }
+
+    let bytenr = read_u64(data, 176, "root_item.bytenr")?;
+    let level = *data.last().ok_or(ParseError::InsufficientData {
+        needed: 1,
+        offset: 0,
+        actual: data.len(),
+    })?;
+
+    if bytenr == 0 {
+        return Err(ParseError::InvalidField {
+            field: "root_item.bytenr",
+            reason: "must be non-zero",
+        });
+    }
+
+    Ok(BtrfsRootItem { bytenr, level })
+}
+
+/// Parse the subset of `btrfs_inode_item` needed for read-only VFS operations.
+pub fn parse_inode_item(data: &[u8]) -> Result<BtrfsInodeItem, ParseError> {
+    if data.len() < 160 {
+        return Err(ParseError::InsufficientData {
+            needed: 160,
+            offset: 0,
+            actual: data.len(),
+        });
+    }
+
+    Ok(BtrfsInodeItem {
+        size: read_u64(data, 16, "inode_item.size")?,
+        nbytes: read_u64(data, 24, "inode_item.nbytes")?,
+        nlink: read_u32(data, 40, "inode_item.nlink")?,
+        uid: read_u32(data, 44, "inode_item.uid")?,
+        gid: read_u32(data, 48, "inode_item.gid")?,
+        mode: read_u32(data, 52, "inode_item.mode")?,
+        rdev: read_u64(data, 56, "inode_item.rdev")?,
+        atime_sec: read_u64(data, 112, "inode_item.atime_sec")?,
+        atime_nsec: read_u32(data, 120, "inode_item.atime_nsec")?,
+        ctime_sec: read_u64(data, 124, "inode_item.ctime_sec")?,
+        ctime_nsec: read_u32(data, 132, "inode_item.ctime_nsec")?,
+        mtime_sec: read_u64(data, 136, "inode_item.mtime_sec")?,
+        mtime_nsec: read_u32(data, 144, "inode_item.mtime_nsec")?,
+        otime_sec: read_u64(data, 148, "inode_item.otime_sec")?,
+        otime_nsec: read_u32(data, 156, "inode_item.otime_nsec")?,
+    })
+}
+
+/// Parse one or more directory entries from a DIR_ITEM or DIR_INDEX payload.
+pub fn parse_dir_items(data: &[u8]) -> Result<Vec<BtrfsDirItem>, ParseError> {
+    const HEADER: usize = 30; // disk_key(17) + transid(8) + data_len(2) + name_len(2) + type(1)
+
+    let mut out = Vec::new();
+    let mut cur = 0_usize;
+    while cur < data.len() {
+        if cur + HEADER > data.len() {
+            return Err(ParseError::InsufficientData {
+                needed: HEADER,
+                offset: cur,
+                actual: data.len() - cur,
+            });
+        }
+
+        let child_objectid = read_u64(data, cur, "dir_item.location.objectid")?;
+        let child_key_type = data[cur + 8];
+        let child_key_offset = read_u64(data, cur + 9, "dir_item.location.offset")?;
+        // transid at +17..+25 (currently unused in VFS path)
+        let _transid = read_u64(data, cur + 17, "dir_item.transid")?;
+        let data_len = usize::from(read_u16(data, cur + 25, "dir_item.data_len")?);
+        let name_len = usize::from(read_u16(data, cur + 27, "dir_item.name_len")?);
+        let file_type = data[cur + 29];
+
+        let name_start = cur + HEADER;
+        let name_end = name_start
+            .checked_add(name_len)
+            .ok_or(ParseError::InvalidField {
+                field: "dir_item.name_len",
+                reason: "overflow",
+            })?;
+        let payload_end = name_end
+            .checked_add(data_len)
+            .ok_or(ParseError::InvalidField {
+                field: "dir_item.data_len",
+                reason: "overflow",
+            })?;
+
+        if payload_end > data.len() {
+            return Err(ParseError::InsufficientData {
+                needed: payload_end,
+                offset: cur,
+                actual: data.len(),
+            });
+        }
+
+        out.push(BtrfsDirItem {
+            child_objectid,
+            child_key_type,
+            child_key_offset,
+            file_type,
+            name: data[name_start..name_end].to_vec(),
+        });
+
+        cur = payload_end;
+    }
+
+    Ok(out)
+}
+
+/// Parse an EXTENT_DATA payload for regular or inline extents.
+pub fn parse_extent_data(data: &[u8]) -> Result<BtrfsExtentData, ParseError> {
+    const FIXED: usize = 21; // generation(8) + ram_bytes(8) + compression(1) + encryption(1) + other_encoding(2) + type(1)
+
+    if data.len() < FIXED {
+        return Err(ParseError::InsufficientData {
+            needed: FIXED,
+            offset: 0,
+            actual: data.len(),
+        });
+    }
+
+    let extent_type = data[20];
+    match extent_type {
+        BTRFS_FILE_EXTENT_INLINE => Ok(BtrfsExtentData::Inline {
+            data: data[FIXED..].to_vec(),
+        }),
+        BTRFS_FILE_EXTENT_REG | BTRFS_FILE_EXTENT_PREALLOC => {
+            // disk_bytenr + disk_num_bytes + extent_offset + num_bytes
+            if data.len() < FIXED + 32 {
+                return Err(ParseError::InsufficientData {
+                    needed: FIXED + 32,
+                    offset: 0,
+                    actual: data.len(),
+                });
+            }
+            Ok(BtrfsExtentData::Regular {
+                extent_type,
+                disk_bytenr: read_u64(data, 21, "extent_data.disk_bytenr")?,
+                disk_num_bytes: read_u64(data, 29, "extent_data.disk_num_bytes")?,
+                extent_offset: read_u64(data, 37, "extent_data.offset")?,
+                num_bytes: read_u64(data, 45, "extent_data.num_bytes")?,
+            })
+        }
+        _ => Err(ParseError::InvalidField {
+            field: "extent_data.type",
+            reason: "unsupported extent type",
+        }),
+    }
+}
+
 /// Walk a btrfs tree from `root_logical` down to all leaves, collecting items.
 ///
 /// `read_physical` reads `nodesize` bytes at the given physical byte offset.

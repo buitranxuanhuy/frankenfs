@@ -6,7 +6,14 @@ use ffs_block::{
     BlockBuf, BlockDevice, ByteDevice, FileByteDevice, read_btrfs_superblock_region,
     read_ext4_superblock_region,
 };
-use ffs_btrfs::{BtrfsLeafEntry, walk_tree};
+use ffs_btrfs::{
+    BTRFS_FILE_EXTENT_PREALLOC, BTRFS_FILE_EXTENT_REG, BTRFS_FS_TREE_OBJECTID,
+    BTRFS_FT_BLKDEV, BTRFS_FT_CHRDEV, BTRFS_FT_DIR, BTRFS_FT_FIFO, BTRFS_FT_REG_FILE,
+    BTRFS_FT_SOCK, BTRFS_FT_SYMLINK, BTRFS_ITEM_DIR_INDEX, BTRFS_ITEM_DIR_ITEM,
+    BTRFS_ITEM_EXTENT_DATA, BTRFS_ITEM_INODE_ITEM, BTRFS_ITEM_ROOT_ITEM, BtrfsExtentData,
+    BtrfsInodeItem, BtrfsLeafEntry, map_logical_to_physical, parse_dir_items, parse_extent_data,
+    parse_inode_item, parse_root_item, walk_tree,
+};
 use ffs_error::FfsError;
 use ffs_journal::{JournalRegion, ReplayOutcome, replay_jbd2};
 use ffs_mvcc::{CommitError, MvccStore, Transaction};
@@ -21,7 +28,7 @@ use ffs_types::{
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::path::Path;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::info;
 
@@ -550,6 +557,392 @@ impl OpenFs {
             .btrfs_superblock()
             .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?;
         self.walk_btrfs_tree(cx, sb.root)
+    }
+
+    /// Translate the FUSE/root-facing inode number to the btrfs objectid.
+    ///
+    /// For btrfs we treat inode `1` as an alias for the superblock's
+    /// `root_dir_objectid` so root getattr/readdir/lookup calls can work
+    /// through the VFS root inode contract.
+    fn btrfs_canonical_inode(&self, ino: InodeNumber) -> Result<u64, FfsError> {
+        let sb = self
+            .btrfs_superblock()
+            .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?;
+        if ino.0 == 1 {
+            Ok(sb.root_dir_objectid)
+        } else {
+            Ok(ino.0)
+        }
+    }
+
+    /// Resolve and walk the default filesystem tree (`FS_TREE`).
+    fn walk_btrfs_fs_tree(&self, cx: &Cx) -> Result<Vec<BtrfsLeafEntry>, FfsError> {
+        let root_items = self.walk_btrfs_root_tree(cx)?;
+        let fs_tree_root = root_items
+            .iter()
+            .find(|item| {
+                item.key.objectid == BTRFS_FS_TREE_OBJECTID && item.key.item_type == BTRFS_ITEM_ROOT_ITEM
+            })
+            .ok_or_else(|| {
+                FfsError::NotFound(format!(
+                    "btrfs ROOT_ITEM for FS_TREE objectid {}",
+                    BTRFS_FS_TREE_OBJECTID
+                ))
+            })?;
+
+        let root_item = parse_root_item(&fs_tree_root.data).map_err(|e| parse_to_ffs_error(&e))?;
+        self.walk_btrfs_tree(cx, root_item.bytenr)
+    }
+
+    fn btrfs_timespec(sec: u64, nsec: u32) -> SystemTime {
+        let clamped_nsec = nsec.min(999_999_999);
+        UNIX_EPOCH + Duration::new(sec, clamped_nsec)
+    }
+
+    fn btrfs_mode_to_file_type(mode: u32) -> FileType {
+        match mode & 0o170000 {
+            0o040000 => FileType::Directory,
+            0o120000 => FileType::Symlink,
+            0o060000 => FileType::BlockDevice,
+            0o020000 => FileType::CharDevice,
+            0o010000 => FileType::Fifo,
+            0o140000 => FileType::Socket,
+            _ => FileType::RegularFile,
+        }
+    }
+
+    fn btrfs_dir_type_to_file_type(dir_type: u8) -> FileType {
+        match dir_type {
+            BTRFS_FT_REG_FILE => FileType::RegularFile,
+            BTRFS_FT_DIR => FileType::Directory,
+            BTRFS_FT_SYMLINK => FileType::Symlink,
+            BTRFS_FT_BLKDEV => FileType::BlockDevice,
+            BTRFS_FT_CHRDEV => FileType::CharDevice,
+            BTRFS_FT_FIFO => FileType::Fifo,
+            BTRFS_FT_SOCK => FileType::Socket,
+            _ => FileType::RegularFile,
+        }
+    }
+
+    fn btrfs_inode_attr_from_item(
+        &self,
+        ino: InodeNumber,
+        inode: BtrfsInodeItem,
+    ) -> Result<InodeAttr, FfsError> {
+        let sb = self
+            .btrfs_superblock()
+            .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?;
+        let blocks = inode.nbytes.div_ceil(512);
+        let rdev = u32::try_from(inode.rdev).unwrap_or(u32::MAX);
+        Ok(InodeAttr {
+            ino,
+            size: inode.size,
+            blocks,
+            atime: Self::btrfs_timespec(inode.atime_sec, inode.atime_nsec),
+            mtime: Self::btrfs_timespec(inode.mtime_sec, inode.mtime_nsec),
+            ctime: Self::btrfs_timespec(inode.ctime_sec, inode.ctime_nsec),
+            crtime: Self::btrfs_timespec(inode.otime_sec, inode.otime_nsec),
+            kind: Self::btrfs_mode_to_file_type(inode.mode),
+            perm: (inode.mode & 0o7777) as u16,
+            nlink: inode.nlink,
+            uid: inode.uid,
+            gid: inode.gid,
+            rdev,
+            blksize: sb.sectorsize,
+        })
+    }
+
+    fn btrfs_find_inode_item<'a>(
+        items: &'a [BtrfsLeafEntry],
+        objectid: u64,
+    ) -> Result<&'a BtrfsLeafEntry, FfsError> {
+        items
+            .iter()
+            .find(|item| item.key.objectid == objectid && item.key.item_type == BTRFS_ITEM_INODE_ITEM)
+            .ok_or_else(|| FfsError::NotFound(format!("btrfs inode objectid {objectid}")))
+    }
+
+    fn btrfs_read_inode_attr(&self, cx: &Cx, ino: InodeNumber) -> Result<InodeAttr, FfsError> {
+        let canonical = self.btrfs_canonical_inode(ino)?;
+        let items = self.walk_btrfs_fs_tree(cx)?;
+        let inode_item = Self::btrfs_find_inode_item(&items, canonical)?;
+        let inode = parse_inode_item(&inode_item.data).map_err(|e| parse_to_ffs_error(&e))?;
+        self.btrfs_inode_attr_from_item(ino, inode)
+    }
+
+    fn btrfs_lookup_child(
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        name: &[u8],
+    ) -> Result<InodeAttr, FfsError> {
+        let parent_attr = self.btrfs_read_inode_attr(cx, parent)?;
+        if parent_attr.kind != FileType::Directory {
+            return Err(FfsError::NotDirectory);
+        }
+
+        let canonical_parent = self.btrfs_canonical_inode(parent)?;
+        let items = self.walk_btrfs_fs_tree(cx)?;
+
+        for preferred_item_type in [BTRFS_ITEM_DIR_ITEM, BTRFS_ITEM_DIR_INDEX] {
+            for item in &items {
+                if item.key.objectid != canonical_parent || item.key.item_type != preferred_item_type {
+                    continue;
+                }
+                let dir_items = parse_dir_items(&item.data).map_err(|e| parse_to_ffs_error(&e))?;
+                for dir_item in dir_items {
+                    if dir_item.name == name {
+                        let child_ino = InodeNumber(dir_item.child_objectid);
+                        return self.btrfs_read_inode_attr(cx, child_ino);
+                    }
+                }
+            }
+        }
+
+        Err(FfsError::NotFound(String::from_utf8_lossy(name).into_owned()))
+    }
+
+    fn btrfs_readdir_entries(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+    ) -> Result<Vec<(u64, DirEntry)>, FfsError> {
+        let dir_attr = self.btrfs_read_inode_attr(cx, ino)?;
+        if dir_attr.kind != FileType::Directory {
+            return Err(FfsError::NotDirectory);
+        }
+
+        let canonical_dir = self.btrfs_canonical_inode(ino)?;
+        let items = self.walk_btrfs_fs_tree(cx)?;
+        let mut rows: Vec<(u64, DirEntry)> = Vec::new();
+
+        for item in &items {
+            if item.key.objectid != canonical_dir {
+                continue;
+            }
+            if item.key.item_type != BTRFS_ITEM_DIR_INDEX && item.key.item_type != BTRFS_ITEM_DIR_ITEM {
+                continue;
+            }
+
+            let parsed = parse_dir_items(&item.data).map_err(|e| parse_to_ffs_error(&e))?;
+            for (idx, dir_item) in parsed.into_iter().enumerate() {
+                let local_idx = u64::try_from(idx).map_err(|_| FfsError::Corruption {
+                    block: 0,
+                    detail: "directory index conversion overflow".into(),
+                })?;
+                // Prefer DIR_INDEX ordering when available. DIR_ITEM entries get
+                // a high-bit bias so they naturally sort after DIR_INDEX.
+                let base = if item.key.item_type == BTRFS_ITEM_DIR_INDEX {
+                    item.key.offset
+                } else {
+                    item.key.offset | (1_u64 << 63)
+                };
+
+                rows.push((
+                    base.saturating_add(local_idx),
+                    DirEntry {
+                        ino: InodeNumber(dir_item.child_objectid),
+                        offset: 0,
+                        kind: Self::btrfs_dir_type_to_file_type(dir_item.file_type),
+                        name: dir_item.name,
+                    },
+                ));
+            }
+        }
+
+        rows.sort_by_key(|(k, _)| *k);
+
+        // Remove duplicate names (DIR_ITEM and DIR_INDEX can both describe
+        // the same entry). Keep first-by-sort-key for stable pagination.
+        let mut deduped: Vec<(u64, DirEntry)> = Vec::new();
+        for row in rows {
+            if deduped.iter().any(|(_, existing)| existing.name == row.1.name) {
+                continue;
+            }
+            deduped.push(row);
+        }
+
+        // Add synthetic "." and ".." for VFS compatibility.
+        let dot = DirEntry {
+            ino,
+            offset: 0,
+            kind: FileType::Directory,
+            name: b".".to_vec(),
+        };
+        let dotdot = DirEntry {
+            ino,
+            offset: 0,
+            kind: FileType::Directory,
+            name: b"..".to_vec(),
+        };
+
+        let mut out = Vec::with_capacity(deduped.len() + 2);
+        out.push((0, dot));
+        out.push((1, dotdot));
+        out.extend(deduped);
+        Ok(out)
+    }
+
+    fn btrfs_logical_chunk_end(&self, logical: u64) -> Result<u64, FfsError> {
+        let ctx = self
+            .btrfs_context()
+            .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?;
+        for chunk in &ctx.chunks {
+            let end = chunk
+                .key
+                .offset
+                .checked_add(chunk.length)
+                .ok_or_else(|| FfsError::Corruption {
+                    block: logical,
+                    detail: "btrfs chunk logical range overflow".into(),
+                })?;
+            if logical >= chunk.key.offset && logical < end {
+                return Ok(end);
+            }
+        }
+        Err(FfsError::Corruption {
+            block: logical,
+            detail: "logical bytenr not covered by any btrfs chunk".into(),
+        })
+    }
+
+    fn btrfs_read_logical_into(&self, cx: &Cx, mut logical: u64, mut out: &mut [u8]) -> Result<(), FfsError> {
+        let ctx = self
+            .btrfs_context()
+            .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?;
+
+        while !out.is_empty() {
+            let mapping = map_logical_to_physical(&ctx.chunks, logical)
+                .map_err(|e| parse_to_ffs_error(&e))?
+                .ok_or_else(|| FfsError::Corruption {
+                    block: logical,
+                    detail: "logical bytenr not mapped to physical bytenr".into(),
+                })?;
+            let chunk_end = self.btrfs_logical_chunk_end(logical)?;
+            let span_u64 = chunk_end.saturating_sub(logical);
+            let span = usize::try_from(span_u64).unwrap_or(usize::MAX).min(out.len());
+
+            let (head, tail) = out.split_at_mut(span);
+            self.dev
+                .read_exact_at(cx, ByteOffset(mapping.physical), head)
+                .map_err(FfsError::from)?;
+            logical = logical.saturating_add(span as u64);
+            out = tail;
+        }
+
+        Ok(())
+    }
+
+    fn btrfs_read_file(&self, cx: &Cx, ino: InodeNumber, offset: u64, size: u32) -> Result<Vec<u8>, FfsError> {
+        let canonical = self.btrfs_canonical_inode(ino)?;
+        let items = self.walk_btrfs_fs_tree(cx)?;
+        let inode_entry = Self::btrfs_find_inode_item(&items, canonical)?;
+        let inode = parse_inode_item(&inode_entry.data).map_err(|e| parse_to_ffs_error(&e))?;
+
+        if Self::btrfs_mode_to_file_type(inode.mode) == FileType::Directory {
+            return Err(FfsError::IsDirectory);
+        }
+
+        if offset >= inode.size {
+            return Ok(Vec::new());
+        }
+
+        let to_read = usize::try_from((inode.size - offset).min(u64::from(size))).unwrap_or(size as usize);
+        let mut out = vec![0_u8; to_read];
+        let read_end = offset.saturating_add(to_read as u64);
+
+        let mut extents: Vec<(u64, BtrfsExtentData)> = items
+            .iter()
+            .filter(|item| item.key.objectid == canonical && item.key.item_type == BTRFS_ITEM_EXTENT_DATA)
+            .map(|item| {
+                parse_extent_data(&item.data)
+                    .map(|parsed| (item.key.offset, parsed))
+                    .map_err(|e| parse_to_ffs_error(&e))
+            })
+            .collect::<Result<_, _>>()?;
+        extents.sort_by_key(|(logical, _)| *logical);
+
+        for (logical_start, extent) in extents {
+            match extent {
+                BtrfsExtentData::Inline { data } => {
+                    let extent_len = u64::try_from(data.len()).map_err(|_| FfsError::Corruption {
+                        block: 0,
+                        detail: "inline extent length overflow".into(),
+                    })?;
+                    let extent_end = logical_start.saturating_add(extent_len);
+                    let overlap_start = logical_start.max(offset);
+                    let overlap_end = extent_end.min(read_end);
+                    if overlap_start >= overlap_end {
+                        continue;
+                    }
+
+                    let src_start = usize::try_from(overlap_start - logical_start).map_err(|_| {
+                        FfsError::Corruption {
+                            block: 0,
+                            detail: "inline source offset overflow".into(),
+                        }
+                    })?;
+                    let dst_start = usize::try_from(overlap_start - offset).map_err(|_| FfsError::Corruption {
+                        block: 0,
+                        detail: "inline destination offset overflow".into(),
+                    })?;
+                    let copy_len = usize::try_from(overlap_end - overlap_start).map_err(|_| FfsError::Corruption {
+                        block: 0,
+                        detail: "inline copy length overflow".into(),
+                    })?;
+                    out[dst_start..dst_start + copy_len]
+                        .copy_from_slice(&data[src_start..src_start + copy_len]);
+                }
+                BtrfsExtentData::Regular {
+                    extent_type,
+                    disk_bytenr,
+                    extent_offset,
+                    num_bytes,
+                    ..
+                } => {
+                    let extent_end = logical_start.saturating_add(num_bytes);
+                    let overlap_start = logical_start.max(offset);
+                    let overlap_end = extent_end.min(read_end);
+                    if overlap_start >= overlap_end {
+                        continue;
+                    }
+
+                    // Preallocated extents have no initialized data yet.
+                    if extent_type == BTRFS_FILE_EXTENT_PREALLOC {
+                        continue;
+                    }
+                    if extent_type != BTRFS_FILE_EXTENT_REG {
+                        return Err(FfsError::Format(format!(
+                            "unsupported btrfs extent type {extent_type}"
+                        )));
+                    }
+
+                    let extent_delta = overlap_start - logical_start;
+                    let source_logical = disk_bytenr
+                        .checked_add(extent_offset)
+                        .and_then(|x| x.checked_add(extent_delta))
+                        .ok_or_else(|| FfsError::Corruption {
+                            block: disk_bytenr,
+                            detail: "extent source logical overflow".into(),
+                        })?;
+                    let dst_start = usize::try_from(overlap_start - offset).map_err(|_| FfsError::Corruption {
+                        block: 0,
+                        detail: "extent destination offset overflow".into(),
+                    })?;
+                    let copy_len = usize::try_from(overlap_end - overlap_start).map_err(|_| FfsError::Corruption {
+                        block: 0,
+                        detail: "extent copy length overflow".into(),
+                    })?;
+                    self.btrfs_read_logical_into(
+                        cx,
+                        source_logical,
+                        &mut out[dst_start..dst_start + copy_len],
+                    )?;
+                }
+            }
+        }
+
+        Ok(out)
     }
 
     /// Read a group descriptor via the device.
@@ -1671,44 +2064,68 @@ impl FsOps for Ext4FsOps {
 
 impl FsOps for OpenFs {
     fn getattr(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<InodeAttr> {
-        self.read_inode_attr(cx, ino)
+        match &self.flavor {
+            FsFlavor::Ext4(_) => self.read_inode_attr(cx, ino),
+            FsFlavor::Btrfs(_) => self.btrfs_read_inode_attr(cx, ino),
+        }
     }
 
     fn lookup(&self, cx: &Cx, parent: InodeNumber, name: &OsStr) -> ffs_error::Result<InodeAttr> {
-        let parent_inode = self.read_inode(cx, parent)?;
-        if !parent_inode.is_dir() {
-            return Err(FfsError::NotDirectory);
+        match &self.flavor {
+            FsFlavor::Ext4(_) => {
+                let parent_inode = self.read_inode(cx, parent)?;
+                if !parent_inode.is_dir() {
+                    return Err(FfsError::NotDirectory);
+                }
+
+                let name_bytes = name.as_encoded_bytes();
+                let entry = self
+                    .lookup_name(cx, &parent_inode, name_bytes)?
+                    .ok_or_else(|| FfsError::NotFound(name.to_string_lossy().into_owned()))?;
+
+                let child_ino = InodeNumber(u64::from(entry.inode));
+                self.read_inode_attr(cx, child_ino)
+            }
+            FsFlavor::Btrfs(_) => self.btrfs_lookup_child(cx, parent, name.as_encoded_bytes()),
         }
-
-        let name_bytes = name.as_encoded_bytes();
-        let entry = self
-            .lookup_name(cx, &parent_inode, name_bytes)?
-            .ok_or_else(|| FfsError::NotFound(name.to_string_lossy().into_owned()))?;
-
-        let child_ino = InodeNumber(u64::from(entry.inode));
-        self.read_inode_attr(cx, child_ino)
     }
 
     fn readdir(&self, cx: &Cx, ino: InodeNumber, offset: u64) -> ffs_error::Result<Vec<DirEntry>> {
-        let inode = self.read_inode(cx, ino)?;
-        if !inode.is_dir() {
-            return Err(FfsError::NotDirectory);
+        match &self.flavor {
+            FsFlavor::Ext4(_) => {
+                let inode = self.read_inode(cx, ino)?;
+                if !inode.is_dir() {
+                    return Err(FfsError::NotDirectory);
+                }
+
+                let raw_entries = self.read_dir(cx, &inode)?;
+                let entries: Vec<DirEntry> = raw_entries
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(idx, _)| (*idx as u64) >= offset)
+                    .map(|(idx, e)| DirEntry {
+                        ino: InodeNumber(u64::from(e.inode)),
+                        offset: (idx as u64) + 1,
+                        kind: dir_entry_file_type(e.file_type),
+                        name: e.name,
+                    })
+                    .collect();
+                Ok(entries)
+            }
+            FsFlavor::Btrfs(_) => {
+                let rows = self.btrfs_readdir_entries(cx, ino)?;
+                let entries = rows
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(idx, _)| (*idx as u64) >= offset)
+                    .map(|(idx, (_, mut e))| {
+                        e.offset = (idx as u64) + 1;
+                        e
+                    })
+                    .collect();
+                Ok(entries)
+            }
         }
-
-        let raw_entries = self.read_dir(cx, &inode)?;
-        let entries: Vec<DirEntry> = raw_entries
-            .into_iter()
-            .enumerate()
-            .filter(|(idx, _)| (*idx as u64) >= offset)
-            .map(|(idx, e)| DirEntry {
-                ino: InodeNumber(u64::from(e.inode)),
-                offset: (idx as u64) + 1,
-                kind: dir_entry_file_type(e.file_type),
-                name: e.name,
-            })
-            .collect();
-
-        Ok(entries)
     }
 
     fn read(
@@ -1718,25 +2135,49 @@ impl FsOps for OpenFs {
         offset: u64,
         size: u32,
     ) -> ffs_error::Result<Vec<u8>> {
-        self.read_file(cx, ino, offset, size)
+        match &self.flavor {
+            FsFlavor::Ext4(_) => self.read_file(cx, ino, offset, size),
+            FsFlavor::Btrfs(_) => self.btrfs_read_file(cx, ino, offset, size),
+        }
     }
 
     fn readlink(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<Vec<u8>> {
-        let inode = self.read_inode(cx, ino)?;
-        self.read_symlink(cx, &inode)
+        match &self.flavor {
+            FsFlavor::Ext4(_) => {
+                let inode = self.read_inode(cx, ino)?;
+                self.read_symlink(cx, &inode)
+            }
+            FsFlavor::Btrfs(_) => {
+                let attr = self.btrfs_read_inode_attr(cx, ino)?;
+                if attr.kind != FileType::Symlink {
+                    return Err(FfsError::Format("not a symlink".into()));
+                }
+                let read_size = u32::try_from(attr.size).unwrap_or(u32::MAX);
+                let mut target = self.btrfs_read_file(cx, ino, 0, read_size)?;
+                if let Some(nul) = target.iter().position(|b| *b == 0) {
+                    target.truncate(nul);
+                }
+                Ok(target)
+            }
+        }
     }
 
     fn listxattr(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<Vec<String>> {
-        let inode = self.read_inode(cx, ino)?;
-        let mut xattrs =
-            ffs_ondisk::parse_ibody_xattrs(&inode).map_err(|e| parse_to_ffs_error(&e))?;
-        if inode.file_acl != 0 {
-            let block_data = self.read_block_vec(cx, BlockNumber(inode.file_acl))?;
-            let block_xattrs =
-                ffs_ondisk::parse_xattr_block(&block_data).map_err(|e| parse_to_ffs_error(&e))?;
-            xattrs.extend(block_xattrs);
+        match &self.flavor {
+            FsFlavor::Ext4(_) => {
+                let inode = self.read_inode(cx, ino)?;
+                let mut xattrs =
+                    ffs_ondisk::parse_ibody_xattrs(&inode).map_err(|e| parse_to_ffs_error(&e))?;
+                if inode.file_acl != 0 {
+                    let block_data = self.read_block_vec(cx, BlockNumber(inode.file_acl))?;
+                    let block_xattrs = ffs_ondisk::parse_xattr_block(&block_data)
+                        .map_err(|e| parse_to_ffs_error(&e))?;
+                    xattrs.extend(block_xattrs);
+                }
+                Ok(xattrs.iter().map(Ext4Xattr::full_name).collect())
+            }
+            FsFlavor::Btrfs(_) => Ok(Vec::new()),
         }
-        Ok(xattrs.iter().map(Ext4Xattr::full_name).collect())
     }
 
     fn getxattr(
@@ -1745,19 +2186,27 @@ impl FsOps for OpenFs {
         ino: InodeNumber,
         name: &str,
     ) -> ffs_error::Result<Option<Vec<u8>>> {
-        let inode = self.read_inode(cx, ino)?;
-        let mut xattrs =
-            ffs_ondisk::parse_ibody_xattrs(&inode).map_err(|e| parse_to_ffs_error(&e))?;
-        if inode.file_acl != 0 {
-            let block_data = self.read_block_vec(cx, BlockNumber(inode.file_acl))?;
-            let block_xattrs =
-                ffs_ondisk::parse_xattr_block(&block_data).map_err(|e| parse_to_ffs_error(&e))?;
-            xattrs.extend(block_xattrs);
+        match &self.flavor {
+            FsFlavor::Ext4(_) => {
+                let inode = self.read_inode(cx, ino)?;
+                let mut xattrs =
+                    ffs_ondisk::parse_ibody_xattrs(&inode).map_err(|e| parse_to_ffs_error(&e))?;
+                if inode.file_acl != 0 {
+                    let block_data = self.read_block_vec(cx, BlockNumber(inode.file_acl))?;
+                    let block_xattrs = ffs_ondisk::parse_xattr_block(&block_data)
+                        .map_err(|e| parse_to_ffs_error(&e))?;
+                    xattrs.extend(block_xattrs);
+                }
+                Ok(xattrs
+                    .into_iter()
+                    .find(|x| x.full_name() == name)
+                    .map(|x| x.value))
+            }
+            FsFlavor::Btrfs(_) => {
+                let _ = (cx, ino, name);
+                Ok(None)
+            }
         }
-        Ok(xattrs
-            .into_iter()
-            .find(|x| x.full_name() == name)
-            .map(|x| x.value))
     }
 }
 
