@@ -15,6 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
+use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use ffs_block::BlockDevice;
@@ -46,6 +47,67 @@ pub struct GroupConfig {
     pub source_first_block: BlockNumber,
     /// Number of source (data) blocks in this group.
     pub source_block_count: u32,
+}
+
+/// Refresh policy for repair symbol regeneration after writes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RefreshPolicy {
+    /// Refresh immediately on every write to the group.
+    Eager,
+    /// Refresh on scrub (or when staleness budget is exceeded).
+    Lazy { max_staleness: Duration },
+    /// Switch eager/lazy behavior based on corruption posterior.
+    Adaptive {
+        /// Posterior threshold above which eager refresh is used.
+        risk_threshold: f64,
+        /// Maximum allowed dirty age before forced refresh.
+        max_staleness: Duration,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshMode {
+    Recovery,
+    EagerWrite,
+    LazyScrub,
+    AdaptiveEagerWrite,
+    AdaptiveLazyScrub,
+    StalenessTimeout,
+}
+
+impl RefreshMode {
+    #[must_use]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Recovery => "recovery",
+            Self::EagerWrite => "eager_write",
+            Self::LazyScrub => "lazy_scrub",
+            Self::AdaptiveEagerWrite => "adaptive_eager_write",
+            Self::AdaptiveLazyScrub => "adaptive_lazy_scrub",
+            Self::StalenessTimeout => "staleness_timeout",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GroupRefreshState {
+    dirty: bool,
+    dirty_since: Option<Instant>,
+    policy: RefreshPolicy,
+    last_refresh: Instant,
+}
+
+impl GroupRefreshState {
+    #[must_use]
+    fn new(policy: RefreshPolicy) -> Self {
+        let now = Instant::now();
+        Self {
+            dirty: false,
+            dirty_since: None,
+            policy,
+            last_refresh: now,
+        }
+    }
 }
 
 // ── Recovery report ───────────────────────────────────────────────────────
@@ -125,6 +187,8 @@ pub struct ScrubWithRecovery<'a, W: Write> {
     metadata_groups: BTreeSet<u32>,
     /// Latest adaptive decisions keyed by group number.
     policy_decisions: BTreeMap<u32, OverheadDecision>,
+    /// Per-group refresh protocol state (dirty tracking + policy).
+    refresh_states: BTreeMap<u32, GroupRefreshState>,
 }
 
 impl<'a, W: Write> ScrubWithRecovery<'a, W> {
@@ -145,6 +209,22 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
         ledger_writer: W,
         repair_symbol_count: u32,
     ) -> Self {
+        let metadata_groups = BTreeSet::from([0_u32]);
+        let refresh_states = groups
+            .iter()
+            .map(|group_cfg| {
+                let group = group_cfg.layout.group.0;
+                let policy = if metadata_groups.contains(&group) {
+                    RefreshPolicy::Eager
+                } else {
+                    RefreshPolicy::Lazy {
+                        max_staleness: Duration::from_secs(30),
+                    }
+                };
+                (group, GroupRefreshState::new(policy))
+            })
+            .collect();
+
         Self {
             device,
             validator,
@@ -153,8 +233,9 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             ledger: EvidenceLedger::new(ledger_writer),
             repair_symbol_count,
             adaptive_overhead: None,
-            metadata_groups: BTreeSet::from([0_u32]),
+            metadata_groups,
             policy_decisions: BTreeMap::new(),
+            refresh_states,
         }
     }
 
@@ -172,7 +253,27 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
         I: IntoIterator<Item = GroupNumber>,
     {
         self.metadata_groups = groups.into_iter().map(|group| group.0).collect();
+        self.apply_default_refresh_policies();
         self
+    }
+
+    /// Override refresh policy for a single block group.
+    #[must_use]
+    pub fn with_group_refresh_policy(mut self, group: GroupNumber, policy: RefreshPolicy) -> Self {
+        self.refresh_states
+            .entry(group.0)
+            .and_modify(|state| state.policy = policy)
+            .or_insert_with(|| GroupRefreshState::new(policy));
+        self
+    }
+
+    /// Notify the refresh policy that a write dirtied `group`.
+    ///
+    /// Eager/adaptive-eager policies will immediately refresh symbols.
+    pub fn on_group_write(&mut self, cx: &Cx, group: GroupNumber) -> Result<()> {
+        self.mark_group_dirty(group)?;
+        self.maybe_refresh_dirty_group(cx, group, true)?;
+        Ok(())
     }
 
     /// Run the full scrub-and-recover pipeline.
@@ -195,6 +296,7 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             "scrub complete"
         );
         self.update_adaptive_policy(&report)?;
+        self.refresh_dirty_groups(cx)?;
 
         if report.is_clean() {
             info!("scrub_and_recover: no corruption found");
@@ -245,6 +347,176 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
     }
 
     // ── Internal helpers ──────────────────────────────────────────────
+
+    fn apply_default_refresh_policies(&mut self) {
+        for group_cfg in &self.groups {
+            let group = group_cfg.layout.group.0;
+            let policy = if self.metadata_groups.contains(&group) {
+                RefreshPolicy::Eager
+            } else {
+                RefreshPolicy::Lazy {
+                    max_staleness: Duration::from_secs(30),
+                }
+            };
+            self.refresh_states
+                .entry(group)
+                .and_modify(|state| state.policy = policy)
+                .or_insert_with(|| GroupRefreshState::new(policy));
+        }
+    }
+
+    #[must_use]
+    fn find_group_config(&self, group: GroupNumber) -> Option<GroupConfig> {
+        self.groups
+            .iter()
+            .copied()
+            .find(|cfg| cfg.layout.group == group)
+    }
+
+    fn mark_group_dirty(&mut self, group: GroupNumber) -> Result<()> {
+        let state = self
+            .refresh_states
+            .get_mut(&group.0)
+            .ok_or_else(|| FfsError::Format(format!("group {} not configured", group.0)))?;
+        if !state.dirty {
+            state.dirty = true;
+            state.dirty_since = Some(Instant::now());
+        }
+        debug!(
+            target: "ffs::repair::refresh",
+            group = group.0,
+            policy = ?state.policy,
+            dirty = state.dirty,
+            "refresh_group_marked_dirty"
+        );
+        Ok(())
+    }
+
+    fn refresh_dirty_groups(&mut self, cx: &Cx) -> Result<()> {
+        let dirty_groups: Vec<GroupNumber> = self
+            .refresh_states
+            .iter()
+            .filter_map(|(group, state)| state.dirty.then_some(GroupNumber(*group)))
+            .collect();
+        for group in dirty_groups {
+            self.maybe_refresh_dirty_group(cx, group, false)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn maybe_refresh_dirty_group(
+        &mut self,
+        cx: &Cx,
+        group: GroupNumber,
+        write_trigger: bool,
+    ) -> Result<()> {
+        let group_cfg = self
+            .find_group_config(group)
+            .ok_or_else(|| FfsError::Format(format!("group {} not configured", group.0)))?;
+
+        let Some(state) = self.refresh_states.get(&group.0) else {
+            return Ok(());
+        };
+        if !state.dirty {
+            return Ok(());
+        }
+        let dirty_since = state.dirty_since.unwrap_or_else(Instant::now);
+        let policy = state.policy;
+        let dirty_age = Instant::now().saturating_duration_since(dirty_since);
+        let decision = self.policy_decisions.get(&group.0).copied();
+
+        trace!(
+            target: "ffs::repair::refresh",
+            group = group.0,
+            policy = ?policy,
+            dirty = state.dirty,
+            dirty_since_ms = dirty_age.as_millis(),
+            last_refresh_ms = Instant::now()
+                .saturating_duration_since(state.last_refresh)
+                .as_millis(),
+            "refresh_policy_evaluated"
+        );
+
+        let refresh_mode = match policy {
+            RefreshPolicy::Eager => Some(RefreshMode::EagerWrite),
+            RefreshPolicy::Lazy { max_staleness } => {
+                if write_trigger {
+                    if dirty_age >= max_staleness {
+                        warn!(
+                            target: "ffs::repair::refresh",
+                            group = group.0,
+                            dirty_age_ms = dirty_age.as_millis(),
+                            max_staleness_ms = max_staleness.as_millis(),
+                            "refresh_staleness_timeout_triggered"
+                        );
+                        Some(RefreshMode::StalenessTimeout)
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(RefreshMode::LazyScrub)
+                }
+            }
+            RefreshPolicy::Adaptive {
+                risk_threshold,
+                max_staleness,
+            } => {
+                let posterior = decision.map_or_else(
+                    || {
+                        self.adaptive_overhead
+                            .map_or(0.0, |autopilot| autopilot.posterior_mean())
+                    },
+                    |d| d.corruption_posterior,
+                );
+                debug!(
+                    target: "ffs::repair::refresh",
+                    group = group.0,
+                    policy = ?policy,
+                    risk_threshold,
+                    posterior_mean = posterior,
+                    max_staleness_ms = max_staleness.as_millis(),
+                    "adaptive_refresh_policy_resolved"
+                );
+                if posterior >= risk_threshold {
+                    if write_trigger {
+                        Some(RefreshMode::AdaptiveEagerWrite)
+                    } else {
+                        Some(RefreshMode::AdaptiveLazyScrub)
+                    }
+                } else if write_trigger {
+                    if dirty_age >= max_staleness {
+                        warn!(
+                            target: "ffs::repair::refresh",
+                            group = group.0,
+                            dirty_age_ms = dirty_age.as_millis(),
+                            max_staleness_ms = max_staleness.as_millis(),
+                            "refresh_staleness_timeout_triggered"
+                        );
+                        Some(RefreshMode::StalenessTimeout)
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(RefreshMode::AdaptiveLazyScrub)
+                }
+            }
+        };
+
+        if let Some(mode) = refresh_mode {
+            let refresh_symbol_count = self.selected_refresh_symbol_count(&group_cfg);
+            if refresh_symbol_count == 0 {
+                return Ok(());
+            }
+            self.refresh_symbols(cx, &group_cfg, refresh_symbol_count, mode)?;
+            if let Some(state) = self.refresh_states.get_mut(&group.0) {
+                state.dirty = false;
+                state.dirty_since = None;
+                state.last_refresh = Instant::now();
+            }
+        }
+        Ok(())
+    }
 
     fn update_adaptive_policy(&mut self, report: &ScrubReport) -> Result<()> {
         self.policy_decisions.clear();
@@ -393,7 +665,12 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
                 // Refresh symbols after successful recovery.
                 let refresh_symbol_count = self.selected_refresh_symbol_count(group_cfg);
                 if refresh_symbol_count > 0 {
-                    match self.refresh_symbols(cx, group_cfg, refresh_symbol_count) {
+                    match self.refresh_symbols(
+                        cx,
+                        group_cfg,
+                        refresh_symbol_count,
+                        RefreshMode::Recovery,
+                    ) {
                         Ok(()) => {
                             symbols_refreshed = true;
                             info!(group = group_num.0, "repair symbols refreshed");
@@ -563,6 +840,7 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
         cx: &Cx,
         group_cfg: &GroupConfig,
         repair_symbol_count: u32,
+        mode: RefreshMode,
     ) -> Result<()> {
         let group_num = group_cfg.layout.group;
         let storage = RepairGroupStorage::new(self.device, group_cfg.layout);
@@ -584,7 +862,9 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
         }
 
         debug!(
+            target: "ffs::repair::refresh",
             group = group_num.0,
+            refresh_mode = mode.as_str(),
             previous_generation = old_gen,
             requested_symbols = repair_symbol_count,
             effective_symbols = effective_symbol_count,
@@ -621,6 +901,15 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
         };
         storage.write_group_desc_ext(cx, &new_desc)?;
 
+        info!(
+            target: "ffs::repair::refresh",
+            group = group_num.0,
+            refresh_mode = mode.as_str(),
+            symbols_generated,
+            generation_before = old_gen,
+            generation_after = new_gen,
+            "refresh_symbols_applied"
+        );
         trace!(
             group = group_num.0,
             new_generation = new_gen,
@@ -842,6 +1131,27 @@ mod tests {
             .write_repair_symbols(cx, &symbols, 1)
             .expect("write repair symbols");
         symbols.len()
+    }
+
+    fn read_generation(cx: &Cx, device: &MemBlockDevice, layout: RepairGroupLayout) -> u64 {
+        let storage = RepairGroupStorage::new(device, layout);
+        storage
+            .read_group_desc_ext(cx)
+            .expect("read group desc")
+            .repair_generation
+    }
+
+    fn policy_decision_stub(symbols_selected: u32, corruption_posterior: f64) -> OverheadDecision {
+        OverheadDecision {
+            overhead_ratio: 0.05,
+            corruption_posterior,
+            posterior_alpha: 1.0,
+            posterior_beta: 100.0,
+            risk_bound: 1e-6,
+            expected_loss: 10.0,
+            symbols_selected,
+            metadata_group: false,
+        }
     }
 
     /// Validator that flags specific block numbers as corrupt.
@@ -1245,6 +1555,210 @@ mod tests {
     }
 
     #[test]
+    fn eager_policy_refreshes_symbols_on_write() {
+        let cx = Cx::for_testing();
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+        let source_first = BlockNumber(0);
+        let source_count = 8;
+
+        write_source_blocks(&cx, &device, source_first, source_count);
+        bootstrap_storage(&cx, &device, layout, source_first, source_count, 4);
+        let generation_before = read_generation(&cx, &device, layout);
+
+        let validator = CorruptBlockValidator::new(vec![]);
+        let group_cfg = GroupConfig {
+            layout,
+            source_first_block: source_first,
+            source_block_count: source_count,
+        };
+        let mut ledger_buf = Vec::new();
+        let mut pipeline = ScrubWithRecovery::new(
+            &device,
+            &validator,
+            test_uuid(),
+            vec![group_cfg],
+            &mut ledger_buf,
+            4,
+        )
+        .with_group_refresh_policy(GroupNumber(0), RefreshPolicy::Eager);
+
+        pipeline
+            .on_group_write(&cx, GroupNumber(0))
+            .expect("eager refresh");
+
+        let generation_after = read_generation(&cx, &device, layout);
+        assert_eq!(generation_after, generation_before + 1);
+    }
+
+    #[test]
+    fn lazy_policy_refreshes_on_next_scrub_cycle() {
+        let cx = Cx::for_testing();
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+        let source_first = BlockNumber(0);
+        let source_count = 8;
+
+        write_source_blocks(&cx, &device, source_first, source_count);
+        bootstrap_storage(&cx, &device, layout, source_first, source_count, 4);
+        let generation_before = read_generation(&cx, &device, layout);
+
+        let validator = CorruptBlockValidator::new(vec![]);
+        let group_cfg = GroupConfig {
+            layout,
+            source_first_block: source_first,
+            source_block_count: source_count,
+        };
+        let mut ledger_buf = Vec::new();
+        let mut pipeline = ScrubWithRecovery::new(
+            &device,
+            &validator,
+            test_uuid(),
+            vec![group_cfg],
+            &mut ledger_buf,
+            4,
+        )
+        .with_group_refresh_policy(
+            GroupNumber(0),
+            RefreshPolicy::Lazy {
+                max_staleness: Duration::from_secs(30),
+            },
+        );
+
+        pipeline
+            .on_group_write(&cx, GroupNumber(0))
+            .expect("mark dirty");
+        let generation_after_write = read_generation(&cx, &device, layout);
+        assert_eq!(generation_after_write, generation_before);
+
+        let _report = pipeline.scrub_and_recover(&cx).expect("scrub");
+        let generation_after_scrub = read_generation(&cx, &device, layout);
+        assert_eq!(generation_after_scrub, generation_before + 1);
+    }
+
+    #[test]
+    fn adaptive_policy_switches_eager_based_on_posterior() {
+        let cx = Cx::for_testing();
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+        let source_first = BlockNumber(0);
+        let source_count = 8;
+
+        write_source_blocks(&cx, &device, source_first, source_count);
+        bootstrap_storage(&cx, &device, layout, source_first, source_count, 4);
+        let generation_before = read_generation(&cx, &device, layout);
+
+        let validator = CorruptBlockValidator::new(vec![]);
+        let group_cfg = GroupConfig {
+            layout,
+            source_first_block: source_first,
+            source_block_count: source_count,
+        };
+        let mut ledger_buf = Vec::new();
+        let mut pipeline = ScrubWithRecovery::new(
+            &device,
+            &validator,
+            test_uuid(),
+            vec![group_cfg],
+            &mut ledger_buf,
+            4,
+        )
+        .with_group_refresh_policy(
+            GroupNumber(0),
+            RefreshPolicy::Adaptive {
+                risk_threshold: 0.05,
+                max_staleness: Duration::from_secs(30),
+            },
+        );
+
+        pipeline
+            .policy_decisions
+            .insert(0, policy_decision_stub(4, 0.01));
+        pipeline
+            .on_group_write(&cx, GroupNumber(0))
+            .expect("adaptive low-risk write");
+        assert_eq!(read_generation(&cx, &device, layout), generation_before);
+        assert!(
+            pipeline
+                .refresh_states
+                .get(&0)
+                .expect("refresh state")
+                .dirty
+        );
+
+        pipeline
+            .policy_decisions
+            .insert(0, policy_decision_stub(4, 0.2));
+        pipeline
+            .on_group_write(&cx, GroupNumber(0))
+            .expect("adaptive high-risk write");
+        assert_eq!(read_generation(&cx, &device, layout), generation_before + 1);
+        assert!(
+            !pipeline
+                .refresh_states
+                .get(&0)
+                .expect("refresh state")
+                .dirty
+        );
+    }
+
+    #[test]
+    fn staleness_timeout_forces_refresh() {
+        let cx = Cx::for_testing();
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+        let source_first = BlockNumber(0);
+        let source_count = 8;
+
+        write_source_blocks(&cx, &device, source_first, source_count);
+        bootstrap_storage(&cx, &device, layout, source_first, source_count, 4);
+        let generation_before = read_generation(&cx, &device, layout);
+
+        let validator = CorruptBlockValidator::new(vec![]);
+        let group_cfg = GroupConfig {
+            layout,
+            source_first_block: source_first,
+            source_block_count: source_count,
+        };
+        let mut ledger_buf = Vec::new();
+        let mut pipeline = ScrubWithRecovery::new(
+            &device,
+            &validator,
+            test_uuid(),
+            vec![group_cfg],
+            &mut ledger_buf,
+            4,
+        )
+        .with_group_refresh_policy(
+            GroupNumber(0),
+            RefreshPolicy::Lazy {
+                max_staleness: Duration::from_millis(5),
+            },
+        );
+
+        pipeline
+            .on_group_write(&cx, GroupNumber(0))
+            .expect("mark dirty");
+        if let Some(state) = pipeline.refresh_states.get_mut(&0) {
+            state.dirty = true;
+            state.dirty_since = Instant::now().checked_sub(Duration::from_millis(25));
+        }
+        pipeline
+            .on_group_write(&cx, GroupNumber(0))
+            .expect("force stale refresh");
+
+        assert_eq!(read_generation(&cx, &device, layout), generation_before + 1);
+    }
+
+    #[test]
     fn adaptive_policy_logs_decision_on_clean_scrub() {
         let cx = Cx::for_testing();
         let block_size = 256;
@@ -1344,8 +1858,7 @@ mod tests {
             .unwrap_or_else(|| {
                 records
                     .iter()
-                    .filter_map(|record| record.policy.as_ref())
-                    .next()
+                    .find_map(|record| record.policy.as_ref())
                     .expect("policy detail")
             });
 

@@ -281,33 +281,41 @@ impl DegradationFsm {
         let mut state = self.current.lock();
         let prev = state.level;
 
-        if observed > prev {
-            // Escalate immediately.
-            state.level = observed;
-            state.recovery_count = 0;
-            state.transition_count += 1;
-        } else if observed < prev {
-            // Require sustained improvement before de-escalating.
-            state.recovery_count += 1;
-            if state.recovery_count >= self.recovery_samples {
+        match observed.cmp(&prev) {
+            std::cmp::Ordering::Greater => {
+                // Escalate immediately.
                 state.level = observed;
                 state.recovery_count = 0;
                 state.transition_count += 1;
             }
-        } else {
-            state.recovery_count = 0;
+            std::cmp::Ordering::Less => {
+                // Require sustained improvement before de-escalating.
+                state.recovery_count += 1;
+                if state.recovery_count >= self.recovery_samples {
+                    state.level = observed;
+                    state.recovery_count = 0;
+                    state.transition_count += 1;
+                }
+            }
+            std::cmp::Ordering::Equal => {
+                state.recovery_count = 0;
+            }
         }
 
         let new = state.level;
         drop(state);
 
         // Notify policies with current headroom (regardless of transition).
-        let policies = self.policies.lock();
-        for policy in policies.iter() {
-            policy.apply(headroom);
+        {
+            let policies = self.policies.lock();
+            for policy in policies.iter() {
+                policy.apply(headroom);
+            }
         }
 
-        if new != prev {
+        if new == prev {
+            None
+        } else {
             info!(
                 target: "ffs::backpressure",
                 from = prev.label(),
@@ -321,8 +329,6 @@ impl DegradationFsm {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 headroom: (headroom * 1000.0) as u32,
             })
-        } else {
-            None
         }
     }
 }
@@ -334,7 +340,8 @@ impl std::fmt::Debug for DegradationFsm {
             .field("level", &state.level)
             .field("recovery_count", &state.recovery_count)
             .field("transitions", &state.transition_count)
-            .finish()
+            .field("recovery_samples", &self.recovery_samples)
+            .finish_non_exhaustive()
     }
 }
 
@@ -495,7 +502,7 @@ impl std::fmt::Debug for PressureMonitor {
             .field("budget", &self.budget)
             .field("fsm", &self.fsm)
             .field("samples", &self.sample_count())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -9857,5 +9864,231 @@ mod tests {
     fn cx_without_pressure_returns_none() {
         let cx = Cx::for_testing();
         assert!(cx.pressure().is_none());
+    }
+
+    // ── Backpressure and degradation FSM tests ──────────────────────────
+
+    #[test]
+    fn degradation_level_ordering() {
+        assert!(DegradationLevel::Normal < DegradationLevel::Warning);
+        assert!(DegradationLevel::Warning < DegradationLevel::Degraded);
+        assert!(DegradationLevel::Degraded < DegradationLevel::Critical);
+        assert!(DegradationLevel::Critical < DegradationLevel::Emergency);
+    }
+
+    #[test]
+    fn degradation_level_from_raw() {
+        assert_eq!(DegradationLevel::from_raw(0), DegradationLevel::Normal);
+        assert_eq!(DegradationLevel::from_raw(1), DegradationLevel::Warning);
+        assert_eq!(DegradationLevel::from_raw(2), DegradationLevel::Degraded);
+        assert_eq!(DegradationLevel::from_raw(3), DegradationLevel::Critical);
+        assert_eq!(DegradationLevel::from_raw(4), DegradationLevel::Emergency);
+        assert_eq!(DegradationLevel::from_raw(99), DegradationLevel::Emergency);
+    }
+
+    #[test]
+    fn degradation_level_policy_flags() {
+        assert!(!DegradationLevel::Normal.should_pause_background());
+        assert!(DegradationLevel::Warning.should_pause_background());
+        assert!(DegradationLevel::Degraded.should_reduce_cache());
+        assert!(!DegradationLevel::Warning.should_reduce_cache());
+        assert!(DegradationLevel::Critical.should_throttle_writes());
+        assert!(!DegradationLevel::Degraded.should_throttle_writes());
+        assert!(DegradationLevel::Emergency.should_read_only());
+        assert!(!DegradationLevel::Critical.should_read_only());
+    }
+
+    #[test]
+    fn fsm_escalates_immediately() {
+        let pressure = Arc::new(SystemPressure::new());
+        let fsm = DegradationFsm::new(Arc::clone(&pressure), 3);
+
+        assert_eq!(fsm.level(), DegradationLevel::Normal);
+
+        // Drop to critical headroom — should escalate immediately.
+        pressure.set_headroom(0.1);
+        let transition = fsm.tick();
+        assert!(transition.is_some());
+        let t = transition.unwrap();
+        assert_eq!(t.from, DegradationLevel::Normal);
+        assert_eq!(t.to, DegradationLevel::Critical);
+        assert_eq!(fsm.level(), DegradationLevel::Critical);
+    }
+
+    #[test]
+    fn fsm_requires_sustained_recovery() {
+        let pressure = Arc::new(SystemPressure::new());
+        let fsm = DegradationFsm::new(Arc::clone(&pressure), 3);
+
+        // Escalate to critical.
+        pressure.set_headroom(0.1);
+        fsm.tick();
+        assert_eq!(fsm.level(), DegradationLevel::Critical);
+
+        // Recover to normal headroom — should NOT de-escalate after 1 tick.
+        pressure.set_headroom(0.8);
+        assert!(fsm.tick().is_none());
+        assert_eq!(fsm.level(), DegradationLevel::Critical);
+
+        // 2nd recovery tick.
+        assert!(fsm.tick().is_none());
+        assert_eq!(fsm.level(), DegradationLevel::Critical);
+
+        // 3rd recovery tick — now de-escalation happens.
+        let transition = fsm.tick();
+        assert!(transition.is_some());
+        assert_eq!(fsm.level(), DegradationLevel::Normal);
+    }
+
+    #[test]
+    fn fsm_recovery_resets_on_pressure_return() {
+        let pressure = Arc::new(SystemPressure::new());
+        let fsm = DegradationFsm::new(Arc::clone(&pressure), 3);
+
+        // Escalate.
+        pressure.set_headroom(0.1);
+        fsm.tick();
+
+        // Start recovering.
+        pressure.set_headroom(0.8);
+        fsm.tick(); // recovery_count = 1
+        fsm.tick(); // recovery_count = 2
+
+        // Pressure returns before recovery completes.
+        pressure.set_headroom(0.1);
+        fsm.tick();
+        assert_eq!(fsm.level(), DegradationLevel::Critical);
+
+        // Must restart recovery from scratch.
+        pressure.set_headroom(0.8);
+        fsm.tick();
+        fsm.tick();
+        assert_eq!(fsm.level(), DegradationLevel::Critical); // still not recovered
+        fsm.tick();
+        assert_eq!(fsm.level(), DegradationLevel::Normal); // now recovered
+    }
+
+    #[test]
+    fn fsm_notifies_policies() {
+        let pressure = Arc::new(SystemPressure::new());
+        let fsm = DegradationFsm::new(Arc::clone(&pressure), 1);
+
+        let policy = Arc::new(TestPolicy::new("test"));
+        fsm.add_policy(Arc::clone(&policy) as Arc<dyn DegradationPolicy>);
+
+        pressure.set_headroom(0.4);
+        fsm.tick();
+
+        // Policy should have received the headroom update.
+        assert!((policy.last_headroom() - 0.4).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn fsm_transition_count() {
+        let pressure = Arc::new(SystemPressure::new());
+        let fsm = DegradationFsm::new(Arc::clone(&pressure), 1);
+
+        assert_eq!(fsm.transition_count(), 0);
+
+        // Escalate.
+        pressure.set_headroom(0.1);
+        fsm.tick();
+        assert_eq!(fsm.transition_count(), 1);
+
+        // De-escalate (recovery_samples=1 so one tick suffices).
+        pressure.set_headroom(0.8);
+        fsm.tick();
+        assert_eq!(fsm.transition_count(), 2);
+    }
+
+    #[test]
+    fn backpressure_gate_normal_proceeds() {
+        let pressure = Arc::new(SystemPressure::with_headroom(0.8));
+        let fsm = Arc::new(DegradationFsm::new(pressure, 3));
+        let gate = BackpressureGate::new(fsm);
+
+        assert_eq!(gate.check(RequestOp::Read), BackpressureDecision::Proceed);
+        assert_eq!(gate.check(RequestOp::Write), BackpressureDecision::Proceed);
+        assert_eq!(gate.check(RequestOp::Lookup), BackpressureDecision::Proceed);
+        assert_eq!(gate.check(RequestOp::Create), BackpressureDecision::Proceed);
+    }
+
+    #[test]
+    fn backpressure_gate_emergency_sheds_writes() {
+        let pressure = Arc::new(SystemPressure::with_headroom(0.02));
+        let fsm = Arc::new(DegradationFsm::new(Arc::clone(&pressure), 1));
+        // Tick to pick up emergency level.
+        fsm.tick();
+        let gate = BackpressureGate::new(fsm);
+
+        assert_eq!(gate.check(RequestOp::Read), BackpressureDecision::Proceed);
+        assert_eq!(gate.check(RequestOp::Lookup), BackpressureDecision::Proceed);
+        assert_eq!(gate.check(RequestOp::Write), BackpressureDecision::Shed);
+        assert_eq!(gate.check(RequestOp::Create), BackpressureDecision::Shed);
+        assert_eq!(gate.check(RequestOp::Mkdir), BackpressureDecision::Shed);
+        assert_eq!(gate.check(RequestOp::Unlink), BackpressureDecision::Shed);
+    }
+
+    #[test]
+    fn backpressure_gate_degraded_throttles_writes() {
+        let pressure = Arc::new(SystemPressure::with_headroom(0.2));
+        let fsm = Arc::new(DegradationFsm::new(Arc::clone(&pressure), 1));
+        fsm.tick();
+        let gate = BackpressureGate::new(fsm);
+
+        assert_eq!(gate.check(RequestOp::Read), BackpressureDecision::Proceed);
+        assert_eq!(gate.check(RequestOp::Write), BackpressureDecision::Throttle);
+    }
+
+    #[test]
+    fn pressure_monitor_samples_and_ticks() {
+        let pressure = Arc::new(SystemPressure::new());
+        let monitor = PressureMonitor::new(pressure, 3);
+
+        assert_eq!(monitor.sample_count(), 0);
+        monitor.sample();
+        assert_eq!(monitor.sample_count(), 1);
+
+        // Level should be valid.
+        let level = monitor.level();
+        assert!(level <= DegradationLevel::Emergency);
+    }
+
+    #[test]
+    fn pressure_monitor_gate_integration() {
+        let pressure = Arc::new(SystemPressure::with_headroom(0.02));
+        let monitor = PressureMonitor::new(Arc::clone(&pressure), 1);
+
+        // Tick to propagate pressure into FSM.
+        // Note: sample() reads /proc/loadavg which may override our headroom,
+        // so we manually set it after the sample.
+        monitor.sample();
+        pressure.set_headroom(0.02);
+        monitor.fsm().tick();
+
+        let gate = monitor.gate();
+        assert_eq!(gate.check(RequestOp::Write), BackpressureDecision::Shed);
+        assert_eq!(gate.check(RequestOp::Read), BackpressureDecision::Proceed);
+    }
+
+    #[test]
+    fn request_op_is_write() {
+        assert!(!RequestOp::Getattr.is_write());
+        assert!(!RequestOp::Read.is_write());
+        assert!(!RequestOp::Lookup.is_write());
+        assert!(!RequestOp::Readdir.is_write());
+        assert!(!RequestOp::Readlink.is_write());
+        assert!(!RequestOp::Open.is_write());
+        assert!(!RequestOp::Opendir.is_write());
+        assert!(!RequestOp::Getxattr.is_write());
+        assert!(!RequestOp::Listxattr.is_write());
+
+        assert!(RequestOp::Create.is_write());
+        assert!(RequestOp::Mkdir.is_write());
+        assert!(RequestOp::Unlink.is_write());
+        assert!(RequestOp::Rmdir.is_write());
+        assert!(RequestOp::Rename.is_write());
+        assert!(RequestOp::Setattr.is_write());
+        assert!(RequestOp::Write.is_write());
     }
 }
