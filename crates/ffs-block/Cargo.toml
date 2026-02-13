@@ -11,6 +11,7 @@ ffs-types = { workspace = true }
 ffs-error = { workspace = true }
 asupersync = { workspace = true }
 parking_lot = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

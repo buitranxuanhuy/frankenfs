@@ -188,6 +188,26 @@ pub fn read_le_u64(data: &[u8], offset: usize) -> Result<u64, ParseError> {
     ]))
 }
 
+/// Write a little-endian u16 at `offset` in `data`.
+///
+/// # Panics
+///
+/// Panics if `offset + 2 > data.len()`.
+#[inline]
+pub fn write_le_u16(data: &mut [u8], offset: usize, val: u16) {
+    data[offset..offset + 2].copy_from_slice(&val.to_le_bytes());
+}
+
+/// Write a little-endian u32 at `offset` in `data`.
+///
+/// # Panics
+///
+/// Panics if `offset + 4 > data.len()`.
+#[inline]
+pub fn write_le_u32(data: &mut [u8], offset: usize, val: u32) {
+    data[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
+}
+
 #[inline]
 pub fn read_fixed<const N: usize>(data: &[u8], offset: usize) -> Result<[u8; N], ParseError> {
     let bytes = ensure_slice(data, offset, N)?;

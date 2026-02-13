@@ -11,6 +11,15 @@ use serde::{Deserialize, Serialize};
 const EXT4_EXTENT_MAGIC: u16 = 0xF30A;
 const EXT_INIT_MAX_LEN: u16 = 1_u16 << 15;
 
+// ── ext4 superblock state flags ──────────────────────────────────────────
+
+/// Filesystem was cleanly unmounted.
+pub const EXT4_VALID_FS: u16 = 0x0001;
+/// Filesystem has errors detected.
+pub const EXT4_ERROR_FS: u16 = 0x0002;
+/// Filesystem is being recovered from an orphan list.
+pub const EXT4_ORPHAN_FS: u16 = 0x0004;
+
 // ── ext4 feature flags ─────────────────────────────────────────────────────
 
 /// ext4 compatible feature flags (`s_feature_compat`).
@@ -1069,6 +1078,53 @@ impl Ext4GroupDesc {
     }
 }
 
+impl Ext4GroupDesc {
+    /// Serialize this group descriptor into a raw byte buffer.
+    ///
+    /// The buffer must be at least `desc_size` bytes. Only the fields parsed by
+    /// [`Ext4GroupDesc::parse_from_bytes`] are written; any remaining bytes in
+    /// the buffer are left unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `buf` is shorter than `desc_size`.
+    pub fn write_to_bytes(&self, buf: &mut [u8], desc_size: u16) -> Result<(), ParseError> {
+        use ffs_types::{write_le_u16, write_le_u32};
+        let ds = usize::from(desc_size);
+        if buf.len() < ds {
+            return Err(ParseError::InsufficientData {
+                needed: ds,
+                offset: 0,
+                actual: buf.len(),
+            });
+        }
+        #[expect(clippy::cast_possible_truncation)]
+        {
+            write_le_u32(buf, 0x00, self.block_bitmap as u32);
+            write_le_u32(buf, 0x04, self.inode_bitmap as u32);
+            write_le_u32(buf, 0x08, self.inode_table as u32);
+            write_le_u16(buf, 0x0C, self.free_blocks_count as u16);
+            write_le_u16(buf, 0x0E, self.free_inodes_count as u16);
+            write_le_u16(buf, 0x10, self.used_dirs_count as u16);
+            write_le_u16(buf, 0x12, self.flags);
+            write_le_u16(buf, 0x1C, self.itable_unused as u16);
+            write_le_u16(buf, 0x1E, self.checksum);
+        }
+
+        if ds >= 64 {
+            write_le_u32(buf, 0x20, (self.block_bitmap >> 32) as u32);
+            write_le_u32(buf, 0x24, (self.inode_bitmap >> 32) as u32);
+            write_le_u32(buf, 0x28, (self.inode_table >> 32) as u32);
+            write_le_u16(buf, 0x2C, (self.free_blocks_count >> 16) as u16);
+            write_le_u16(buf, 0x2E, (self.free_inodes_count >> 16) as u16);
+            write_le_u16(buf, 0x30, (self.used_dirs_count >> 16) as u16);
+            write_le_u16(buf, 0x32, (self.itable_unused >> 16) as u16);
+        }
+
+        Ok(())
+    }
+}
+
 // ── Checksum verification helpers ────────────────────────────────────────────
 
 /// Offset of `bg_checksum` within a group descriptor (2 bytes).
@@ -1119,6 +1175,32 @@ pub fn verify_group_desc_checksum(
         });
     }
     Ok(())
+}
+
+/// Compute and write the CRC32C checksum for a group descriptor buffer.
+///
+/// Overwrites the 2-byte checksum at offset 0x1E in `raw_gd`.
+#[allow(clippy::cast_possible_truncation)]
+pub fn stamp_group_desc_checksum(
+    raw_gd: &mut [u8],
+    csum_seed: u32,
+    group_number: u32,
+    desc_size: u16,
+) {
+    use ffs_types::write_le_u16;
+    let ds = usize::from(desc_size);
+    if raw_gd.len() < ds || ds < GD_CHECKSUM_OFFSET + 2 {
+        return;
+    }
+    let le_group = group_number.to_le_bytes();
+    let mut csum = crc32c::crc32c_append(csum_seed, &le_group);
+    csum = crc32c::crc32c_append(csum, &raw_gd[..GD_CHECKSUM_OFFSET]);
+    csum = crc32c::crc32c_append(csum, &[0, 0]);
+    let after_csum = GD_CHECKSUM_OFFSET + 2;
+    if after_csum < ds {
+        csum = crc32c::crc32c_append(csum, &raw_gd[after_csum..ds]);
+    }
+    write_le_u16(raw_gd, GD_CHECKSUM_OFFSET, (csum & 0xFFFF) as u16);
 }
 
 /// Offset of `i_checksum_lo` within an ext4 inode (osd2 area, 2 bytes).
@@ -4081,6 +4163,81 @@ mod tests {
         assert_eq!(parsed64.free_inodes_count, 0x000b_u32 | (5_u32 << 16));
         assert_eq!(parsed64.used_dirs_count, 0x000c_u32 | (6_u32 << 16));
         assert_eq!(parsed64.itable_unused, 0x0063_u32 | (7_u32 << 16));
+    }
+
+    #[test]
+    fn group_desc_write_to_bytes_roundtrip_32() {
+        let gd = Ext4GroupDesc {
+            block_bitmap: 123,
+            inode_bitmap: 456,
+            inode_table: 789,
+            free_blocks_count: 42,
+            free_inodes_count: 17,
+            used_dirs_count: 5,
+            itable_unused: 99,
+            flags: 0x0003,
+            checksum: 0xABCD,
+        };
+        let mut buf = [0_u8; 32];
+        gd.write_to_bytes(&mut buf, 32).unwrap();
+        let parsed = Ext4GroupDesc::parse_from_bytes(&buf, 32).unwrap();
+        assert_eq!(parsed.block_bitmap, gd.block_bitmap);
+        assert_eq!(parsed.inode_bitmap, gd.inode_bitmap);
+        assert_eq!(parsed.inode_table, gd.inode_table);
+        assert_eq!(parsed.free_blocks_count, gd.free_blocks_count);
+        assert_eq!(parsed.free_inodes_count, gd.free_inodes_count);
+        assert_eq!(parsed.used_dirs_count, gd.used_dirs_count);
+        assert_eq!(parsed.itable_unused, gd.itable_unused);
+        assert_eq!(parsed.flags, gd.flags);
+        assert_eq!(parsed.checksum, gd.checksum);
+    }
+
+    #[test]
+    fn group_desc_write_to_bytes_roundtrip_64() {
+        let gd = Ext4GroupDesc {
+            block_bitmap: (1_u64 << 32) | 0x7b,
+            inode_bitmap: (2_u64 << 32) | 0x01c8,
+            inode_table: (3_u64 << 32) | 0x0315,
+            free_blocks_count: (4 << 16) | 0x2a,
+            free_inodes_count: (5 << 16) | 0x11,
+            used_dirs_count: (6 << 16) | 0x05,
+            itable_unused: (7 << 16) | 0x63,
+            flags: 0x0003,
+            checksum: 0xABCD,
+        };
+        let mut buf = [0_u8; 64];
+        gd.write_to_bytes(&mut buf, 64).unwrap();
+        let parsed = Ext4GroupDesc::parse_from_bytes(&buf, 64).unwrap();
+        assert_eq!(parsed.block_bitmap, gd.block_bitmap);
+        assert_eq!(parsed.inode_bitmap, gd.inode_bitmap);
+        assert_eq!(parsed.inode_table, gd.inode_table);
+        assert_eq!(parsed.free_blocks_count, gd.free_blocks_count);
+        assert_eq!(parsed.free_inodes_count, gd.free_inodes_count);
+        assert_eq!(parsed.used_dirs_count, gd.used_dirs_count);
+        assert_eq!(parsed.itable_unused, gd.itable_unused);
+    }
+
+    #[test]
+    fn stamp_group_desc_checksum_matches_verify() {
+        let gd = Ext4GroupDesc {
+            block_bitmap: 100,
+            inode_bitmap: 200,
+            inode_table: 300,
+            free_blocks_count: 50,
+            free_inodes_count: 25,
+            used_dirs_count: 3,
+            itable_unused: 0,
+            flags: 0,
+            checksum: 0,
+        };
+        let mut buf = [0_u8; 32];
+        gd.write_to_bytes(&mut buf, 32).unwrap();
+
+        let csum_seed = 0x1234_5678_u32;
+        stamp_group_desc_checksum(&mut buf, csum_seed, 0, 32);
+
+        // Verify should now pass.
+        verify_group_desc_checksum(&buf, csum_seed, 0, 32).expect("checksum should verify");
     }
 
     #[test]

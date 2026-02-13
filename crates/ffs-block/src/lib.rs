@@ -12,12 +12,16 @@ use ffs_types::{
     EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE,
 };
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+use tracing::{debug, error, info, trace, warn};
 
 #[inline]
 fn cx_checkpoint(cx: &Cx) -> Result<()> {
@@ -180,6 +184,20 @@ pub trait BlockDevice: Send + Sync {
     fn sync(&self, cx: &Cx) -> Result<()>;
 }
 
+/// Cache-specific operations used by write-back control paths.
+pub trait BlockCache: BlockDevice {
+    /// Mark a block clean after it has been durably flushed.
+    fn mark_clean(&self, block: BlockNumber);
+
+    /// Return dirty blocks ordered from oldest to newest dirty mark.
+    fn dirty_blocks_oldest_first(&self) -> Vec<BlockNumber>;
+
+    /// Evict a block from the cache.
+    ///
+    /// Implementations must panic if the target block is dirty.
+    fn evict(&self, block: BlockNumber);
+}
+
 #[derive(Debug)]
 pub struct ByteBlockDevice<D: ByteDevice> {
     inner: D,
@@ -317,7 +335,7 @@ pub struct CacheMetrics {
     pub misses: u64,
     /// Number of resident blocks evicted to make room for new entries.
     pub evictions: u64,
-    /// Number of dirty flushes (dirty blocks written during sync/eviction).
+    /// Number of dirty flushes (dirty blocks written during sync/retry paths).
     pub dirty_flushes: u64,
     /// Current number of blocks in the T1 (recently accessed) list.
     pub t1_len: usize,
@@ -331,6 +349,12 @@ pub struct CacheMetrics {
     pub resident: usize,
     /// Current number of dirty (modified but not yet flushed) blocks.
     pub dirty_blocks: usize,
+    /// Total bytes represented by dirty blocks.
+    pub dirty_bytes: usize,
+    /// Age of the oldest dirty block in write-order ticks.
+    ///
+    /// This is a logical clock (not wall time), incremented per dirty-mark.
+    pub oldest_dirty_age_ticks: Option<u64>,
     /// Maximum cache capacity in blocks.
     pub capacity: usize,
     /// Current adaptive target size for T1.
@@ -350,6 +374,16 @@ impl CacheMetrics {
             self.hits as f64 / total as f64
         }
     }
+
+    /// Dirty block ratio in the range [0.0, 1.0].
+    #[must_use]
+    pub fn dirty_ratio(&self) -> f64 {
+        if self.capacity == 0 {
+            0.0
+        } else {
+            self.dirty_blocks as f64 / self.capacity as f64
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -358,6 +392,67 @@ enum ArcList {
     T2,
     B1,
     B2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirtyEntry {
+    seq: u64,
+    bytes: usize,
+}
+
+/// Ordered tracking of dirty blocks with deterministic age semantics.
+#[derive(Debug, Default)]
+struct DirtyTracker {
+    next_seq: u64,
+    by_block: HashMap<BlockNumber, DirtyEntry>,
+    by_age: BTreeSet<(u64, BlockNumber)>,
+    dirty_bytes: usize,
+}
+
+impl DirtyTracker {
+    fn mark_dirty(&mut self, block: BlockNumber, bytes: usize) {
+        if let Some(prev) = self.by_block.remove(&block) {
+            let _ = self.by_age.remove(&(prev.seq, block));
+            self.dirty_bytes = self.dirty_bytes.saturating_sub(prev.bytes);
+        }
+
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        let entry = DirtyEntry { seq, bytes };
+        self.by_block.insert(block, entry);
+        self.by_age.insert((seq, block));
+        self.dirty_bytes = self.dirty_bytes.saturating_add(bytes);
+    }
+
+    fn clear_dirty(&mut self, block: BlockNumber) {
+        if let Some(entry) = self.by_block.remove(&block) {
+            let _ = self.by_age.remove(&(entry.seq, block));
+            self.dirty_bytes = self.dirty_bytes.saturating_sub(entry.bytes);
+        }
+    }
+
+    fn is_dirty(&self, block: BlockNumber) -> bool {
+        self.by_block.contains_key(&block)
+    }
+
+    fn dirty_count(&self) -> usize {
+        self.by_block.len()
+    }
+
+    fn dirty_bytes(&self) -> usize {
+        self.dirty_bytes
+    }
+
+    fn oldest_dirty_age_ticks(&self) -> Option<u64> {
+        self.by_age
+            .iter()
+            .next()
+            .map(|(oldest_seq, _)| self.next_seq.saturating_sub(*oldest_seq))
+    }
+
+    fn dirty_blocks_oldest_first(&self) -> Vec<BlockNumber> {
+        self.by_age.iter().map(|(_, block)| *block).collect()
+    }
 }
 
 #[derive(Debug)]
@@ -371,12 +466,9 @@ struct ArcState {
     b2: VecDeque<BlockNumber>,
     loc: HashMap<BlockNumber, ArcList>,
     resident: HashMap<BlockNumber, Vec<u8>>,
-    /// Blocks that have been written and need flush accounting.
-    /// We keep write-through semantics today, but intentionally track dirty
-    /// metadata so sync/eviction paths are exercised for future write-back mode.
-    dirty: HashSet<BlockNumber>,
-    /// Dirty block payloads evicted before an explicit `sync`.
-    /// These must be flushed even if the block is no longer resident.
+    /// Ordered dirty block tracking for write-back and durability accounting.
+    dirty: DirtyTracker,
+    /// Dirty payloads queued for retry after a failed flush attempt.
     pending_flush: Vec<(BlockNumber, Vec<u8>)>,
     /// Monotonic hit counter (resident data found).
     hits: u64,
@@ -384,7 +476,7 @@ struct ArcState {
     misses: u64,
     /// Monotonic eviction counter (resident block displaced).
     evictions: u64,
-    /// Monotonic dirty flush counter (dirty blocks written during sync/eviction).
+    /// Monotonic dirty flush counter (dirty blocks written during sync/retry paths).
     dirty_flushes: u64,
 }
 
@@ -399,7 +491,7 @@ impl ArcState {
             b2: VecDeque::new(),
             loc: HashMap::new(),
             resident: HashMap::new(),
-            dirty: HashSet::new(),
+            dirty: DirtyTracker::default(),
             pending_flush: Vec::new(),
             hits: 0,
             misses: 0,
@@ -427,7 +519,9 @@ impl ArcState {
             b1_len: self.b1.len(),
             b2_len: self.b2.len(),
             resident: self.resident_len(),
-            dirty_blocks: self.dirty.len(),
+            dirty_blocks: self.dirty.dirty_count(),
+            dirty_bytes: self.dirty.dirty_bytes(),
+            oldest_dirty_age_ticks: self.dirty.oldest_dirty_age_ticks(),
             capacity: self.capacity,
             p: self.p,
         }
@@ -442,14 +536,22 @@ impl ArcState {
     }
 
     fn evict_resident(&mut self, victim: BlockNumber) {
-        if let Some(bytes) = self.resident.remove(&victim) {
-            if self.is_dirty(victim) {
-                self.pending_flush.push((victim, bytes));
-                self.clear_dirty(victim);
-            }
-        } else {
-            self.clear_dirty(victim);
+        if self.is_dirty(victim) {
+            let metrics = self.snapshot_metrics();
+            warn!(
+                event = "dirty_evict_attempt",
+                block = victim.0,
+                dirty_blocks = metrics.dirty_blocks,
+                dirty_bytes = metrics.dirty_bytes,
+                dirty_ratio = metrics.dirty_ratio(),
+                oldest_dirty_age_ticks = metrics.oldest_dirty_age_ticks.unwrap_or(0),
+                "dirty block cannot be evicted before flush"
+            );
+            panic!("dirty block {} cannot be evicted before flush", victim.0);
         }
+        let _ = self.resident.remove(&victim);
+        self.clear_dirty(victim);
+        trace!(event = "cache_evict_clean", block = victim.0);
     }
 
     fn touch_mru(&mut self, key: BlockNumber) {
@@ -576,23 +678,23 @@ impl ArcState {
     }
 
     /// Mark a block as dirty (written but not yet flushed to disk).
-    fn mark_dirty(&mut self, block: BlockNumber) {
-        self.dirty.insert(block);
+    fn mark_dirty(&mut self, block: BlockNumber, bytes: usize) {
+        self.dirty.mark_dirty(block, bytes);
     }
 
     /// Clear the dirty flag for a block (after flushing to disk).
     fn clear_dirty(&mut self, block: BlockNumber) {
-        self.dirty.remove(&block);
+        self.dirty.clear_dirty(block);
     }
 
     /// Check if a block is dirty.
     fn is_dirty(&self, block: BlockNumber) -> bool {
-        self.dirty.contains(&block)
+        self.dirty.is_dirty(block)
     }
 
     /// Return list of dirty blocks that need flushing.
     fn dirty_blocks(&self) -> Vec<BlockNumber> {
-        self.dirty.iter().copied().collect()
+        self.dirty.dirty_blocks_oldest_first()
     }
 
     fn take_pending_flush(&mut self) -> Vec<(BlockNumber, Vec<u8>)> {
@@ -615,6 +717,51 @@ impl ArcState {
                 queued.insert(block);
             }
         }
+        flushes
+    }
+
+    fn take_dirty_and_pending_flushes_limited(
+        &mut self,
+        limit: usize,
+    ) -> Vec<(BlockNumber, Vec<u8>)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let pending = self.take_pending_flush();
+        let mut flushes = Vec::with_capacity(limit.min(pending.len()));
+        let mut overflow_pending = Vec::new();
+
+        for item in pending {
+            if flushes.len() < limit {
+                flushes.push(item);
+            } else {
+                overflow_pending.push(item);
+            }
+        }
+
+        if !overflow_pending.is_empty() {
+            self.pending_flush.extend(overflow_pending);
+        }
+
+        let mut queued = HashSet::with_capacity(flushes.len());
+        for (block, _) in &flushes {
+            queued.insert(*block);
+        }
+
+        for block in self.dirty_blocks() {
+            if flushes.len() >= limit {
+                break;
+            }
+            if queued.contains(&block) {
+                continue;
+            }
+            if let Some(data) = self.resident.get(&block).cloned() {
+                flushes.push((block, data));
+                queued.insert(block);
+            }
+        }
+
         flushes
     }
 }
@@ -659,8 +806,87 @@ pub struct ArcCache<D: BlockDevice> {
 pub enum ArcWritePolicy {
     /// Always write to the underlying device immediately.
     WriteThrough,
-    /// Keep writes in cache until sync; dirty evictions still flush immediately.
+    /// Keep writes in cache until sync; dirty blocks cannot be evicted.
     WriteBack,
+}
+
+/// Default dirty-ratio threshold where aggressive flush is preferred.
+pub const DIRTY_HIGH_WATERMARK: f64 = 0.80;
+/// Default dirty-ratio threshold where new writes are backpressured.
+pub const DIRTY_CRITICAL_WATERMARK: f64 = 0.95;
+
+/// Runtime configuration for background dirty flushing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FlushDaemonConfig {
+    /// Sleep interval between flush cycles.
+    pub interval: Duration,
+    /// Maximum number of dirty blocks to flush per non-aggressive cycle.
+    pub batch_size: usize,
+    /// Dirty ratio threshold that triggers aggressive full flush.
+    pub high_watermark: f64,
+    /// Dirty ratio threshold that blocks writes until flushed below high watermark.
+    pub critical_watermark: f64,
+}
+
+impl Default for FlushDaemonConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(5),
+            batch_size: 256,
+            high_watermark: DIRTY_HIGH_WATERMARK,
+            critical_watermark: DIRTY_CRITICAL_WATERMARK,
+        }
+    }
+}
+
+impl FlushDaemonConfig {
+    fn validate(self) -> Result<Self> {
+        if self.interval.is_zero() {
+            return Err(FfsError::Format(
+                "flush daemon interval must be > 0".to_owned(),
+            ));
+        }
+        if self.batch_size == 0 {
+            return Err(FfsError::Format(
+                "flush daemon batch_size must be > 0".to_owned(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.high_watermark)
+            || !(0.0..=1.0).contains(&self.critical_watermark)
+            || self.high_watermark >= self.critical_watermark
+        {
+            return Err(FfsError::Format(
+                "flush daemon watermarks must satisfy 0<=high<critical<=1".to_owned(),
+            ));
+        }
+        Ok(self)
+    }
+}
+
+/// Handle for a running background flush daemon.
+#[derive(Debug)]
+pub struct FlushDaemon {
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl FlushDaemon {
+    /// Request shutdown and block until the daemon exits.
+    pub fn shutdown(mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for FlushDaemon {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
 }
 
 impl<D: BlockDevice> ArcCache<D> {
@@ -704,6 +930,109 @@ impl<D: BlockDevice> ArcCache<D> {
         self.write_policy
     }
 
+    /// Spawn a background thread that periodically flushes dirty blocks.
+    ///
+    /// The daemon flushes oldest dirty blocks first using `batch_size`, unless
+    /// dirty ratio exceeds `high_watermark`, in which case it flushes all dirty
+    /// blocks aggressively. On shutdown it performs a final full flush.
+    pub fn start_flush_daemon(self: &Arc<Self>, config: FlushDaemonConfig) -> Result<FlushDaemon>
+    where
+        D: 'static,
+    {
+        let config = config.validate()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let cache = Arc::clone(self);
+        let stop_flag = Arc::clone(&stop);
+
+        let join = thread::Builder::new()
+            .name("ffs-flush-daemon".to_owned())
+            .spawn(move || {
+                // Daemon uses a long-lived context for periodic background work.
+                let cx = Cx::for_testing();
+                let mut cycle_seq = 0_u64;
+
+                loop {
+                    if stop_flag.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    thread::sleep(config.interval);
+                    cycle_seq = cycle_seq.saturating_add(1);
+
+                    let metrics = cache.metrics();
+                    let dirty_ratio = metrics.dirty_ratio();
+                    trace!(
+                        event = "flush_daemon_tick",
+                        cycle_seq,
+                        dirty_blocks = metrics.dirty_blocks,
+                        dirty_bytes = metrics.dirty_bytes,
+                        dirty_ratio,
+                        oldest_dirty_age_ticks = metrics.oldest_dirty_age_ticks.unwrap_or(0)
+                    );
+
+                    if metrics.dirty_blocks == 0 {
+                        trace!(
+                            event = "flush_daemon_sleep",
+                            cycle_seq,
+                            interval_ms = config.interval.as_millis()
+                        );
+                        continue;
+                    }
+
+                    let flush_res = if dirty_ratio > config.high_watermark {
+                        if dirty_ratio > config.critical_watermark {
+                            warn!(
+                                event = "flush_backpressure_critical",
+                                cycle_seq,
+                                dirty_ratio,
+                                critical_watermark = config.critical_watermark
+                            );
+                        } else {
+                            warn!(
+                                event = "flush_backpressure_high",
+                                cycle_seq,
+                                dirty_ratio,
+                                high_watermark = config.high_watermark
+                            );
+                        }
+                        cache.flush_dirty(&cx).map(|()| metrics.dirty_blocks)
+                    } else {
+                        cache.flush_dirty_batch(&cx, config.batch_size)
+                    };
+
+                    if let Err(err) = flush_res {
+                        error!(
+                            event = "flush_batch_failed",
+                            cycle_seq,
+                            error = %err,
+                            attempted_blocks = metrics.dirty_blocks,
+                            attempted_bytes = metrics.dirty_bytes
+                        );
+                    }
+
+                    trace!(
+                        event = "flush_daemon_sleep",
+                        cycle_seq,
+                        interval_ms = config.interval.as_millis()
+                    );
+                }
+
+                if let Err(err) = cache.flush_dirty(&cx) {
+                    error!(
+                        event = "flush_shutdown_failed",
+                        error = %err,
+                        remaining_dirty_blocks = cache.dirty_count()
+                    );
+                }
+            })
+            .map_err(FfsError::from)?;
+
+        Ok(FlushDaemon {
+            stop,
+            join: Some(join),
+        })
+    }
+
     fn flush_blocks(&self, cx: &Cx, flushes: &[(BlockNumber, Vec<u8>)]) -> Result<()> {
         for (block, data) in flushes {
             cx_checkpoint(cx)?;
@@ -721,19 +1050,31 @@ impl<D: BlockDevice> ArcCache<D> {
             return Ok(());
         }
 
+        debug!(
+            event = "pending_flush_batch_start",
+            blocks = pending_flush.len(),
+            "flushing pending dirty evictions"
+        );
+
         if let Err(err) = self.flush_blocks(cx, &pending_flush) {
             // Restore the pending queue on failure so callers can retry.
             let mut guard = self.state.lock();
-            for (block, _) in &pending_flush {
-                guard.mark_dirty(*block);
+            for (block, data) in &pending_flush {
+                guard.mark_dirty(*block, data.len());
             }
             guard.pending_flush.extend(pending_flush);
             drop(guard);
+            error!(event = "pending_flush_batch_failed", error = %err);
             return Err(err);
         }
 
         let mut guard = self.state.lock();
         guard.dirty_flushes += pending_flush.len() as u64;
+        info!(
+            event = "pending_flush_batch_complete",
+            blocks = pending_flush.len(),
+            dirty_flushes = guard.dirty_flushes
+        );
         drop(guard);
         Ok(())
     }
@@ -775,6 +1116,8 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
         } else {
             cx_checkpoint(cx)?;
         }
+
+        let mut enforce_backpressure = false;
         let mut guard = self.state.lock();
         if guard.resident.contains_key(&block) {
             // Block already cached — just update data and touch for recency.
@@ -784,10 +1127,60 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
             guard.on_miss_or_ghost_hit(block);
             guard.resident.insert(block, data.to_vec());
         }
-        guard.mark_dirty(block);
+
+        if matches!(self.write_policy, ArcWritePolicy::WriteBack) {
+            guard.mark_dirty(block, data.len());
+        } else {
+            guard.clear_dirty(block);
+        }
+
+        let metrics = guard.snapshot_metrics();
+        trace!(
+            event = "cache_write",
+            block = block.0,
+            bytes = data.len(),
+            write_policy = ?self.write_policy,
+            dirty_blocks = metrics.dirty_blocks,
+            dirty_bytes = metrics.dirty_bytes,
+            dirty_ratio = metrics.dirty_ratio(),
+            oldest_dirty_age_ticks = metrics.oldest_dirty_age_ticks.unwrap_or(0)
+        );
+
+        if matches!(self.write_policy, ArcWritePolicy::WriteBack) {
+            let dirty_ratio = metrics.dirty_ratio();
+            if dirty_ratio > DIRTY_CRITICAL_WATERMARK {
+                enforce_backpressure = true;
+                warn!(
+                    event = "flush_backpressure_critical",
+                    block = block.0,
+                    dirty_ratio,
+                    critical_watermark = DIRTY_CRITICAL_WATERMARK
+                );
+            } else if dirty_ratio > DIRTY_HIGH_WATERMARK {
+                warn!(
+                    event = "flush_backpressure_high",
+                    block = block.0,
+                    dirty_ratio,
+                    high_watermark = DIRTY_HIGH_WATERMARK
+                );
+            }
+        }
+
         let pending_flush = guard.take_pending_flush();
         drop(guard);
         self.flush_pending_evictions(cx, pending_flush)?;
+
+        if enforce_backpressure {
+            // Block writers by synchronously draining until we're back under high watermark.
+            loop {
+                let dirty_ratio = self.metrics().dirty_ratio();
+                if dirty_ratio <= DIRTY_HIGH_WATERMARK {
+                    break;
+                }
+                self.flush_dirty(cx)?;
+            }
+        }
+
         Ok(())
     }
 
@@ -800,20 +1193,144 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
     }
 
     fn sync(&self, cx: &Cx) -> Result<()> {
-        // Flush any dirty blocks before syncing the underlying device.
-        // Even in write-through mode we keep dirty/eviction accounting active
-        // so write-back paths are validated continuously.
+        // Flush any deferred dirty blocks before syncing the underlying device.
         self.flush_dirty(cx)?;
         self.inner.sync(cx)
     }
 }
 
+impl<D: BlockDevice> BlockCache for ArcCache<D> {
+    fn mark_clean(&self, block: BlockNumber) {
+        let mut guard = self.state.lock();
+        guard.clear_dirty(block);
+        let metrics = guard.snapshot_metrics();
+        drop(guard);
+        trace!(
+            event = "mark_clean",
+            block = block.0,
+            dirty_blocks = metrics.dirty_blocks,
+            dirty_bytes = metrics.dirty_bytes
+        );
+    }
+
+    fn dirty_blocks_oldest_first(&self) -> Vec<BlockNumber> {
+        self.state.lock().dirty_blocks()
+    }
+
+    fn evict(&self, block: BlockNumber) {
+        let mut guard = self.state.lock();
+        if guard.is_dirty(block) {
+            let metrics = guard.snapshot_metrics();
+            warn!(
+                event = "dirty_evict_attempt",
+                block = block.0,
+                dirty_blocks = metrics.dirty_blocks,
+                dirty_bytes = metrics.dirty_bytes,
+                dirty_ratio = metrics.dirty_ratio(),
+                oldest_dirty_age_ticks = metrics.oldest_dirty_age_ticks.unwrap_or(0),
+                "dirty block cannot be evicted before flush"
+            );
+            panic!("dirty block {} cannot be evicted before flush", block.0);
+        }
+
+        let mut removed = false;
+        removed |= ArcState::remove_from_list(&mut guard.t1, block);
+        removed |= ArcState::remove_from_list(&mut guard.t2, block);
+        removed |= ArcState::remove_from_list(&mut guard.b1, block);
+        removed |= ArcState::remove_from_list(&mut guard.b2, block);
+        removed |= guard.resident.remove(&block).is_some();
+        guard.clear_dirty(block);
+        let _ = guard.loc.remove(&block);
+
+        let evicted = if removed {
+            guard.evictions += 1;
+            true
+        } else {
+            false
+        };
+        drop(guard);
+
+        if evicted {
+            trace!(event = "cache_evict_clean", block = block.0);
+        }
+    }
+}
+
 impl<D: BlockDevice> ArcCache<D> {
+    /// Flush at most `max_blocks` dirty blocks in oldest-first order.
+    ///
+    /// Returns the number of blocks flushed in this batch.
+    pub fn flush_dirty_batch(&self, cx: &Cx, max_blocks: usize) -> Result<usize> {
+        cx_checkpoint(cx)?;
+        if max_blocks == 0 {
+            return Ok(0);
+        }
+
+        let (flushes, pre_metrics) = {
+            let mut guard = self.state.lock();
+            let metrics = guard.snapshot_metrics();
+            let flushes = guard.take_dirty_and_pending_flushes_limited(max_blocks);
+            drop(guard);
+            (flushes, metrics)
+        };
+
+        if flushes.is_empty() {
+            return Ok(0);
+        }
+
+        let flush_bytes: usize = flushes.iter().map(|(_, data)| data.len()).sum();
+        debug!(
+            event = "flush_batch_start",
+            batch_len = flushes.len(),
+            oldest_block = flushes.first().map_or(0, |(b, _)| b.0),
+            oldest_dirty_age_ticks = pre_metrics.oldest_dirty_age_ticks.unwrap_or(0),
+            policy = ?self.write_policy,
+            attempted_bytes = flush_bytes
+        );
+
+        let started = Instant::now();
+        if let Err(err) = self.flush_blocks(cx, &flushes) {
+            let attempted_blocks = flushes.len();
+            let mut guard = self.state.lock();
+            for (block, data) in &flushes {
+                guard.mark_dirty(*block, data.len());
+            }
+            guard.pending_flush.extend(flushes);
+            drop(guard);
+            error!(
+                event = "flush_batch_failed",
+                error = %err,
+                attempted_blocks,
+                duration_ms = started.elapsed().as_millis(),
+                attempted_bytes = flush_bytes
+            );
+            return Err(err);
+        }
+
+        let mut guard = self.state.lock();
+        for (block, _) in &flushes {
+            guard.clear_dirty(*block);
+        }
+        guard.dirty_flushes += flushes.len() as u64;
+        let metrics = guard.snapshot_metrics();
+        drop(guard);
+        info!(
+            event = "flush_batch_complete",
+            flushed_blocks = flushes.len(),
+            flushed_bytes = flush_bytes,
+            duration_ms = started.elapsed().as_millis(),
+            remaining_dirty_blocks = metrics.dirty_blocks,
+            remaining_dirty_ratio = metrics.dirty_ratio()
+        );
+
+        Ok(flushes.len())
+    }
+
     /// Flush all dirty blocks to the underlying device.
     ///
-    /// Current write path still writes through immediately, but we also keep
-    /// dirty metadata so sync/eviction paths remain exercised and ready for
-    /// future deferred write-back mode.
+    /// Write-through mode should normally have zero dirty blocks; write-back
+    /// mode accumulates dirty blocks until this method (or a future daemon)
+    /// flushes them durably.
     ///
     /// Returns Ok(()) if all dirty blocks were successfully flushed.
     pub fn flush_dirty(&self, cx: &Cx) -> Result<()> {
@@ -825,24 +1342,50 @@ impl<D: BlockDevice> ArcCache<D> {
             guard.take_dirty_and_pending_flushes()
         };
 
+        if flushes.is_empty() {
+            return Ok(());
+        }
+
+        let flush_bytes: usize = flushes.iter().map(|(_, data)| data.len()).sum();
+        debug!(
+            event = "flush_dirty_start",
+            blocks = flushes.len(),
+            bytes = flush_bytes
+        );
+
+        let started = Instant::now();
         if let Err(err) = self.flush_blocks(cx, &flushes) {
             // Restore flush state on failure so retry logic can recover.
             let mut guard = self.state.lock();
-            for (block, _) in &flushes {
-                guard.mark_dirty(*block);
+            for (block, data) in &flushes {
+                guard.mark_dirty(*block, data.len());
             }
             guard.pending_flush.extend(flushes);
             drop(guard);
+            error!(
+                event = "flush_dirty_failed",
+                error = %err,
+                duration_ms = started.elapsed().as_millis()
+            );
             return Err(err);
         }
 
-        if !flushes.is_empty() {
-            let mut guard = self.state.lock();
-            for (block, _) in &flushes {
-                guard.clear_dirty(*block);
-            }
-            guard.dirty_flushes += flushes.len() as u64;
+        let mut guard = self.state.lock();
+        for (block, _) in &flushes {
+            guard.clear_dirty(*block);
         }
+        guard.dirty_flushes += flushes.len() as u64;
+        let metrics = guard.snapshot_metrics();
+        info!(
+            event = "flush_dirty_complete",
+            blocks = flushes.len(),
+            bytes = flush_bytes,
+            duration_ms = started.elapsed().as_millis(),
+            dirty_flushes = guard.dirty_flushes,
+            remaining_dirty_blocks = metrics.dirty_blocks,
+            remaining_dirty_bytes = metrics.dirty_bytes,
+            remaining_dirty_ratio = metrics.dirty_ratio()
+        );
 
         Ok(())
     }
@@ -850,7 +1393,13 @@ impl<D: BlockDevice> ArcCache<D> {
     /// Return the number of currently dirty blocks.
     #[must_use]
     pub fn dirty_count(&self) -> usize {
-        self.state.lock().dirty.len()
+        self.state.lock().dirty.dirty_count()
+    }
+
+    /// Return dirty blocks in oldest-first order.
+    #[must_use]
+    pub fn dirty_blocks_oldest_first(&self) -> Vec<BlockNumber> {
+        self.state.lock().dirty_blocks()
     }
 }
 
@@ -963,6 +1512,10 @@ mod tests {
 
         fn write_count(&self) -> usize {
             self.writes.lock().len()
+        }
+
+        fn write_sequence(&self) -> Vec<BlockNumber> {
+            self.writes.lock().clone()
         }
 
         fn sync_count(&self) -> usize {
@@ -1114,50 +1667,59 @@ mod tests {
         let mem = MemoryByteDevice::new(4096 * 4);
         let dev = ByteBlockDevice::new(mem, 4096).expect("device");
         let counted = CountingBlockDevice::new(dev);
-        let cache = ArcCache::new(counted, 2).expect("cache");
+        let cache =
+            ArcCache::new_with_policy(counted, 2, ArcWritePolicy::WriteBack).expect("cache");
 
         cache
             .write_block(&cx, BlockNumber(0), &[9_u8; 4096])
             .expect("write");
         assert_eq!(cache.dirty_count(), 1);
-        assert_eq!(cache.inner().write_count(), 1);
+        assert_eq!(cache.inner().write_count(), 0);
 
         cache.sync(&cx).expect("sync");
         assert_eq!(cache.dirty_count(), 0);
-        assert_eq!(cache.inner().write_count(), 2);
+        assert_eq!(cache.inner().write_count(), 1);
         assert_eq!(cache.inner().sync_count(), 1);
 
         // Second sync should not rewrite flushed data.
         cache.sync(&cx).expect("sync again");
-        assert_eq!(cache.inner().write_count(), 2);
+        assert_eq!(cache.inner().write_count(), 1);
         assert_eq!(cache.inner().sync_count(), 2);
     }
 
     #[test]
-    fn arc_cache_evicts_dirty_blocks_via_pending_flush() {
+    #[should_panic(expected = "cannot be evicted before flush")]
+    fn arc_cache_explicit_evict_panics_for_dirty_block() {
         let cx = Cx::for_testing();
         let mem = MemoryByteDevice::new(4096 * 4);
         let dev = ByteBlockDevice::new(mem, 4096).expect("device");
         let counted = CountingBlockDevice::new(dev);
-        let cache = ArcCache::new(counted, 1).expect("cache");
+        let cache =
+            ArcCache::new_with_policy(counted, 2, ArcWritePolicy::WriteBack).expect("cache");
 
         cache
             .write_block(&cx, BlockNumber(0), &[1_u8; 4096])
             .expect("write0");
-        assert_eq!(cache.inner().write_count(), 1);
         assert_eq!(cache.dirty_count(), 1);
 
-        cache
-            .write_block(&cx, BlockNumber(1), &[2_u8; 4096])
-            .expect("write1");
+        cache.evict(BlockNumber(0));
+    }
 
-        // write1 (write-through) + pending eviction flush for dirty block0.
-        assert_eq!(cache.inner().write_count(), 3);
-        let guard = cache.state.lock();
-        assert!(guard.pending_flush.is_empty());
-        assert!(!guard.dirty.contains(&BlockNumber(0)));
-        assert!(guard.dirty.contains(&BlockNumber(1)));
-        drop(guard);
+    #[test]
+    fn arc_cache_explicit_evict_succeeds_for_clean_block() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 4);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let cache = ArcCache::new(dev, 2).expect("cache");
+
+        cache
+            .write_block(&cx, BlockNumber(0), &[1_u8; 4096])
+            .expect("write0");
+        assert_eq!(cache.dirty_count(), 0);
+
+        cache.evict(BlockNumber(0));
+        let metrics = cache.metrics();
+        assert_eq!(metrics.resident, 0);
     }
 
     #[test]
@@ -1166,6 +1728,20 @@ mod tests {
         let dev = ByteBlockDevice::new(mem, 4096).expect("device");
         let cache = ArcCache::new(dev, 1).expect("cache");
         assert_eq!(cache.write_policy(), ArcWritePolicy::WriteThrough);
+    }
+
+    #[test]
+    fn arc_cache_write_through_keeps_dirty_tracker_clean() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 2);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let cache = ArcCache::new(dev, 1).expect("cache");
+
+        cache
+            .write_block(&cx, BlockNumber(0), &[5_u8; 4096])
+            .expect("write");
+        assert_eq!(cache.dirty_count(), 0);
+        assert!(cache.dirty_blocks_oldest_first().is_empty());
     }
 
     #[test]
@@ -1198,7 +1774,7 @@ mod tests {
     }
 
     #[test]
-    fn arc_cache_write_back_flushes_dirty_evictions() {
+    fn arc_cache_write_back_replacement_succeeds_after_critical_backpressure_flush() {
         let cx = Cx::for_testing();
         let mem = MemoryByteDevice::new(4096 * 4);
         let dev = ByteBlockDevice::new(mem, 4096).expect("device");
@@ -1209,22 +1785,202 @@ mod tests {
         cache
             .write_block(&cx, BlockNumber(0), &[1_u8; 4096])
             .expect("write0");
-        assert_eq!(cache.inner().write_count(), 0);
+        // Capacity=1, so ratio is 1.0 and critical backpressure flushes immediately.
+        assert_eq!(cache.inner().write_count(), 1);
+        assert_eq!(cache.dirty_count(), 0);
 
+        // Replacement is now safe because previous dirty block is already clean.
         cache
             .write_block(&cx, BlockNumber(1), &[2_u8; 4096])
             .expect("write1");
-
-        // Dirty block0 evicted and flushed, block1 still dirty and resident.
-        assert_eq!(cache.inner().write_count(), 1);
-        assert_eq!(cache.dirty_count(), 1);
-
-        let read0 = cache.read_block(&cx, BlockNumber(0)).expect("read0");
-        assert_eq!(read0.as_slice(), &[1_u8; 4096]);
-
-        cache.sync(&cx).expect("sync");
         assert_eq!(cache.inner().write_count(), 2);
         assert_eq!(cache.dirty_count(), 0);
+    }
+
+    #[test]
+    fn arc_cache_dirty_blocks_order_oldest_first_and_rewrite_moves_to_tail() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 8);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let counted = CountingBlockDevice::new(dev);
+        let cache =
+            ArcCache::new_with_policy(counted, 3, ArcWritePolicy::WriteBack).expect("cache");
+
+        cache
+            .write_block(&cx, BlockNumber(0), &[1_u8; 4096])
+            .expect("write0");
+        cache
+            .write_block(&cx, BlockNumber(1), &[2_u8; 4096])
+            .expect("write1");
+        assert_eq!(
+            cache.dirty_blocks_oldest_first(),
+            vec![BlockNumber(0), BlockNumber(1)]
+        );
+
+        // Re-writing block 0 should move it to the newest position.
+        cache
+            .write_block(&cx, BlockNumber(0), &[3_u8; 4096])
+            .expect("rewrite0");
+        assert_eq!(
+            cache.dirty_blocks_oldest_first(),
+            vec![BlockNumber(1), BlockNumber(0)]
+        );
+
+        let metrics = cache.metrics();
+        assert_eq!(metrics.dirty_blocks, 2);
+        assert_eq!(metrics.dirty_bytes, 4096 * 2);
+        assert!(metrics.oldest_dirty_age_ticks.is_some());
+        assert!((metrics.dirty_ratio() - (2.0 / 3.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn arc_cache_write_back_critical_ratio_triggers_backpressure_flush() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 8);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let counted = CountingBlockDevice::new(dev);
+        let cache =
+            ArcCache::new_with_policy(counted, 2, ArcWritePolicy::WriteBack).expect("cache");
+
+        cache
+            .write_block(&cx, BlockNumber(0), &[1_u8; 4096])
+            .expect("write0");
+        assert_eq!(cache.dirty_count(), 1);
+        assert_eq!(cache.inner().write_count(), 0);
+
+        // Capacity=2 and write-back: second write drives dirty_ratio to 1.0,
+        // which should trigger critical backpressure + synchronous flush.
+        cache
+            .write_block(&cx, BlockNumber(1), &[2_u8; 4096])
+            .expect("write1");
+        assert_eq!(cache.dirty_count(), 0);
+        assert_eq!(cache.inner().write_count(), 2);
+
+        // Further writes continue after backpressure relief.
+        cache
+            .write_block(&cx, BlockNumber(2), &[3_u8; 4096])
+            .expect("write2");
+    }
+
+    #[test]
+    fn flush_daemon_batch_flushes_oldest_first() {
+        use std::sync::Arc as StdArc;
+
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 16);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let counted = CountingBlockDevice::new(dev);
+        let cache = StdArc::new(
+            ArcCache::new_with_policy(counted, 8, ArcWritePolicy::WriteBack).expect("cache"),
+        );
+
+        cache
+            .write_block(&cx, BlockNumber(1), &[1_u8; 4096])
+            .expect("write1");
+        cache
+            .write_block(&cx, BlockNumber(2), &[2_u8; 4096])
+            .expect("write2");
+        cache
+            .write_block(&cx, BlockNumber(3), &[3_u8; 4096])
+            .expect("write3");
+        assert_eq!(
+            cache.dirty_blocks_oldest_first(),
+            vec![BlockNumber(1), BlockNumber(2), BlockNumber(3)]
+        );
+
+        let daemon = cache
+            .start_flush_daemon(FlushDaemonConfig {
+                interval: Duration::from_millis(10),
+                batch_size: 1,
+                high_watermark: 0.99,
+                critical_watermark: 1.0,
+            })
+            .expect("start daemon");
+
+        for _ in 0..80 {
+            if cache.dirty_count() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        daemon.shutdown();
+
+        assert_eq!(cache.dirty_count(), 0);
+        let writes = cache.inner().write_sequence();
+        assert!(writes.starts_with(&[BlockNumber(1), BlockNumber(2), BlockNumber(3)]));
+        assert_eq!(cache.inner().write_count(), 3);
+    }
+
+    #[test]
+    fn flush_daemon_shutdown_flushes_all_dirty_blocks() {
+        use std::sync::Arc as StdArc;
+
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 32);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let counted = CountingBlockDevice::new(dev);
+        let cache = StdArc::new(
+            ArcCache::new_with_policy(counted, 16, ArcWritePolicy::WriteBack).expect("cache"),
+        );
+        let daemon = cache
+            .start_flush_daemon(FlushDaemonConfig {
+                interval: Duration::from_millis(5),
+                batch_size: 4,
+                ..FlushDaemonConfig::default()
+            })
+            .expect("start daemon");
+
+        for i in 0..6_u64 {
+            cache
+                .write_block(&cx, BlockNumber(i), &[1_u8; 4096])
+                .expect("write");
+        }
+        assert!(cache.dirty_count() > 0);
+
+        daemon.shutdown();
+        assert_eq!(cache.dirty_count(), 0);
+        assert_eq!(cache.inner().write_count(), 6);
+    }
+
+    #[test]
+    fn flush_daemon_flushes_1000_blocks_within_two_intervals() {
+        use std::sync::Arc as StdArc;
+
+        let cx = Cx::for_testing();
+        let interval = Duration::from_millis(20);
+        let mem = MemoryByteDevice::new(4096 * 1500);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let counted = CountingBlockDevice::new(dev);
+        let cache = StdArc::new(
+            ArcCache::new_with_policy(counted, 1200, ArcWritePolicy::WriteBack).expect("cache"),
+        );
+        let daemon = cache
+            .start_flush_daemon(FlushDaemonConfig {
+                interval,
+                batch_size: 256,
+                ..FlushDaemonConfig::default()
+            })
+            .expect("start daemon");
+
+        for i in 0..1000_u64 {
+            let fill = u8::try_from(i & 0xFF).expect("u8");
+            cache
+                .write_block(&cx, BlockNumber(i), &vec![fill; 4096])
+                .expect("write");
+        }
+        assert_eq!(cache.dirty_count(), 1000);
+
+        let deadline = Instant::now() + interval.saturating_mul(2) + Duration::from_millis(30);
+        while Instant::now() < deadline {
+            if cache.dirty_count() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        daemon.shutdown();
+
+        assert_eq!(cache.dirty_count(), 0);
+        assert_eq!(cache.inner().write_count(), 1000);
     }
 
     // ── CacheMetrics tests ──────────────────────────────────────────────
@@ -1241,6 +1997,10 @@ mod tests {
         assert_eq!(m.b1_len, 0);
         assert_eq!(m.b2_len, 0);
         assert_eq!(m.resident, 0);
+        assert_eq!(m.dirty_blocks, 0);
+        assert_eq!(m.dirty_bytes, 0);
+        assert_eq!(m.oldest_dirty_age_ticks, None);
+        assert!(m.dirty_ratio().abs() < f64::EPSILON);
         assert_eq!(m.capacity, 4);
         assert_eq!(m.p, 0);
         assert!(m.hit_ratio().abs() < f64::EPSILON);

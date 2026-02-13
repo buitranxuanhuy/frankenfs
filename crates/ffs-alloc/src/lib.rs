@@ -279,6 +279,134 @@ impl FsGeometry {
     }
 }
 
+// ── On-disk persistence context ─────────────────────────────────────────────
+
+/// Context needed to persist allocator accounting changes to disk.
+///
+/// When provided to allocation/free operations, group descriptor counters are
+/// written back to the device after bitmap updates, keeping on-disk metadata
+/// self-consistent.
+#[derive(Debug, Clone)]
+pub struct PersistCtx {
+    /// Block number of the first group descriptor table block.
+    /// Group descriptors are packed contiguously starting here.
+    pub gdt_block: BlockNumber,
+    /// On-disk group descriptor size (32 or 64).
+    pub desc_size: u16,
+    /// Whether metadata_csum is enabled (triggers checksum stamping).
+    pub has_metadata_csum: bool,
+    /// CRC32C seed for metadata_csum (from superblock).
+    pub csum_seed: u32,
+}
+
+/// Determine which relative block offsets within a group are reserved metadata
+/// and must never be allocated as data blocks.
+///
+/// Returns a sorted `Vec` of relative block offsets within the group that are
+/// occupied by: the superblock copy, the group descriptor table, the block
+/// bitmap, the inode bitmap, and the inode table.
+#[must_use]
+pub fn reserved_blocks_in_group(
+    geo: &FsGeometry,
+    groups: &[GroupStats],
+    group: GroupNumber,
+) -> Vec<u32> {
+    let gidx = group.0 as usize;
+    if gidx >= groups.len() {
+        return Vec::new();
+    }
+
+    let gs = &groups[gidx];
+    let group_start =
+        u64::from(geo.first_data_block) + u64::from(group.0) * u64::from(geo.blocks_per_group);
+    let blocks_in_group = geo.blocks_in_group(group);
+    let mut reserved = Vec::new();
+
+    // Helper: convert absolute block to relative offset in this group,
+    // and add to reserved if it falls within the group.
+    let mut add_abs = |abs: u64| {
+        if abs >= group_start {
+            let rel = abs - group_start;
+            if rel < u64::from(blocks_in_group) {
+                #[expect(clippy::cast_possible_truncation)]
+                reserved.push(rel as u32);
+            }
+        }
+    };
+
+    // Block bitmap, inode bitmap.
+    add_abs(gs.block_bitmap_block.0);
+    add_abs(gs.inode_bitmap_block.0);
+
+    // Inode table spans multiple blocks.
+    if geo.inodes_per_group > 0 && geo.inode_size > 0 {
+        let inode_table_blocks = (u64::from(geo.inodes_per_group) * u64::from(geo.inode_size))
+            .div_ceil(u64::from(geo.block_size));
+        for i in 0..inode_table_blocks {
+            add_abs(gs.inode_table_block.0 + i);
+        }
+    }
+
+    reserved.sort_unstable();
+    reserved.dedup();
+    reserved
+}
+
+/// Check if a relative block offset in a group is reserved.
+#[must_use]
+fn is_reserved(reserved: &[u32], rel_block: u32) -> bool {
+    reserved.binary_search(&rel_block).is_ok()
+}
+
+/// Persist a group descriptor's counter fields back to the on-disk GDT.
+///
+/// Reads the GDT block containing `group`, patches the free_blocks/inodes/dirs
+/// fields, recomputes the checksum (if enabled), and writes the block back.
+fn persist_group_desc(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    pctx: &PersistCtx,
+    group: GroupNumber,
+    stats: &GroupStats,
+) -> Result<()> {
+    let ds = usize::from(pctx.desc_size);
+    let descs_per_block = dev.block_size() as usize / ds;
+    let gdt_block_idx = group.0 as usize / descs_per_block;
+    let offset_in_block = (group.0 as usize % descs_per_block) * ds;
+
+    let block_num = BlockNumber(pctx.gdt_block.0 + gdt_block_idx as u64);
+    let raw = dev.read_block(cx, block_num)?;
+    let mut buf = raw.as_slice().to_vec();
+
+    // Build a temporary Ext4GroupDesc with updated counters and serialize.
+    // Read existing descriptor to preserve fields we don't track.
+    let existing = Ext4GroupDesc::parse_from_bytes(&buf[offset_in_block..], pctx.desc_size)
+        .map_err(|e| FfsError::Format(format!("GDT parse: {e}")))?;
+
+    let updated = Ext4GroupDesc {
+        free_blocks_count: stats.free_blocks,
+        free_inodes_count: stats.free_inodes,
+        used_dirs_count: stats.used_dirs,
+        ..existing
+    };
+
+    updated
+        .write_to_bytes(&mut buf[offset_in_block..], pctx.desc_size)
+        .map_err(|e| FfsError::Format(format!("GDT write: {e}")))?;
+
+    if pctx.has_metadata_csum {
+        ffs_ondisk::ext4::stamp_group_desc_checksum(
+            &mut buf[offset_in_block..offset_in_block + ds],
+            pctx.csum_seed,
+            group.0,
+            pctx.desc_size,
+        );
+    }
+
+    dev.write_block(cx, block_num, &buf)?;
+    Ok(())
+}
+
 // ── Block allocator ─────────────────────────────────────────────────────────
 
 /// Allocate `count` contiguous blocks, using `hint` for goal-directed placement.
@@ -431,6 +559,211 @@ pub fn free_blocks(
 
     dev.write_block(cx, gs.block_bitmap_block, &bitmap)?;
     groups[gidx].free_blocks += count;
+    Ok(())
+}
+
+// ── Persistent block allocator ──────────────────────────────────────────────
+
+/// Allocate `count` contiguous data blocks with full on-disk accounting.
+///
+/// Like [`alloc_blocks`], but additionally:
+/// - Skips reserved metadata blocks (bitmaps, inode tables, GDT blocks).
+/// - Writes updated group descriptor counters back to the device.
+///
+/// Returns the total number of free blocks delta for the caller to update
+/// superblock counters at commit time.
+pub fn alloc_blocks_persist(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    geo: &FsGeometry,
+    groups: &mut [GroupStats],
+    count: u32,
+    hint: &AllocHint,
+    pctx: &PersistCtx,
+) -> Result<BlockAlloc> {
+    cx_checkpoint(cx)?;
+
+    if count == 0 {
+        return Err(FfsError::Format("cannot allocate 0 blocks".into()));
+    }
+
+    let goal_group = hint
+        .goal_group
+        .or_else(|| hint.goal_block.map(|b| geo.absolute_to_group_block(b).0))
+        .unwrap_or(GroupNumber(0));
+
+    // Try goal group first.
+    if let Some(alloc) = try_alloc_safe(cx, dev, geo, groups, goal_group, count, hint, pctx)? {
+        return Ok(alloc);
+    }
+
+    // Try nearby groups (within 8 groups of goal).
+    for delta in 1..=8u32 {
+        for dir in [1i64, -1i64] {
+            let g = i64::from(goal_group.0) + dir * i64::from(delta);
+            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            if g >= 0 && (g as u32) < geo.group_count {
+                let group = GroupNumber(g as u32);
+                if let Some(alloc) = try_alloc_safe(cx, dev, geo, groups, group, count, hint, pctx)?
+                {
+                    return Ok(alloc);
+                }
+            }
+        }
+    }
+
+    // Scan all groups.
+    for g in 0..geo.group_count {
+        let group = GroupNumber(g);
+        if group == goal_group {
+            continue;
+        }
+        if let Some(alloc) = try_alloc_safe(cx, dev, geo, groups, group, count, hint, pctx)? {
+            return Ok(alloc);
+        }
+    }
+
+    Err(FfsError::NoSpace)
+}
+
+/// Try to allocate `count` blocks in a group, skipping reserved blocks and
+/// persisting group descriptor updates.
+#[expect(clippy::too_many_arguments)]
+fn try_alloc_safe(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    geo: &FsGeometry,
+    groups: &mut [GroupStats],
+    group: GroupNumber,
+    count: u32,
+    hint: &AllocHint,
+    pctx: &PersistCtx,
+) -> Result<Option<BlockAlloc>> {
+    let gidx = group.0 as usize;
+    if gidx >= groups.len() {
+        return Ok(None);
+    }
+
+    if groups[gidx].free_blocks < count {
+        return Ok(None);
+    }
+
+    let blocks_in_group = geo.blocks_in_group(group);
+    let reserved = reserved_blocks_in_group(geo, groups, group);
+
+    let bitmap_buf = dev.read_block(cx, groups[gidx].block_bitmap_block)?;
+    let mut bitmap = bitmap_buf.as_slice().to_vec();
+
+    // Ensure all reserved blocks are marked as allocated in the bitmap.
+    for &r in &reserved {
+        bitmap_set(&mut bitmap, r);
+    }
+
+    let start = hint.goal_block.map_or(0, |goal| {
+        let (g, off) = geo.absolute_to_group_block(goal);
+        if g == group { off } else { 0 }
+    });
+
+    // Find free blocks, respecting reserved bits now set in the bitmap.
+    let found = if count == 1 {
+        bitmap_find_free(&bitmap, blocks_in_group, start).map(|idx| (idx, 1))
+    } else {
+        bitmap_find_contiguous(&bitmap, blocks_in_group, count).map(|idx| (idx, count))
+    };
+
+    if let Some((rel_start, alloc_count)) = found {
+        // Verify no allocated block is reserved.
+        for i in rel_start..rel_start + alloc_count {
+            if is_reserved(&reserved, i) {
+                return Err(FfsError::Corruption {
+                    block: geo.group_block_to_absolute(group, i).0,
+                    detail: "alloc would overlap reserved metadata block".into(),
+                });
+            }
+        }
+
+        // Mark blocks as allocated.
+        for i in rel_start..rel_start + alloc_count {
+            bitmap_set(&mut bitmap, i);
+        }
+
+        dev.write_block(cx, groups[gidx].block_bitmap_block, &bitmap)?;
+        groups[gidx].free_blocks -= alloc_count;
+
+        // Persist group descriptor.
+        persist_group_desc(cx, dev, pctx, group, &groups[gidx])?;
+
+        let abs_start = geo.group_block_to_absolute(group, rel_start);
+        Ok(Some(BlockAlloc {
+            start: abs_start,
+            count: alloc_count,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Free `count` contiguous blocks with full on-disk accounting.
+///
+/// Like [`free_blocks`], but additionally:
+/// - Validates that freed blocks are not reserved metadata.
+/// - Validates that freed blocks are currently allocated.
+/// - Writes updated group descriptor counters back to the device.
+pub fn free_blocks_persist(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    geo: &FsGeometry,
+    groups: &mut [GroupStats],
+    start: BlockNumber,
+    count: u32,
+    pctx: &PersistCtx,
+) -> Result<()> {
+    cx_checkpoint(cx)?;
+
+    let (group, rel_start) = geo.absolute_to_group_block(start);
+    let gidx = group.0 as usize;
+    if gidx >= groups.len() {
+        return Err(FfsError::Corruption {
+            block: start.0,
+            detail: "free_blocks_persist: group out of range".into(),
+        });
+    }
+
+    let reserved = reserved_blocks_in_group(geo, groups, group);
+
+    // Validate none of the blocks being freed are reserved.
+    for i in rel_start..rel_start + count {
+        if is_reserved(&reserved, i) {
+            return Err(FfsError::Corruption {
+                block: geo.group_block_to_absolute(group, i).0,
+                detail: "attempt to free reserved metadata block".into(),
+            });
+        }
+    }
+
+    let bitmap_buf = dev.read_block(cx, groups[gidx].block_bitmap_block)?;
+    let mut bitmap = bitmap_buf.as_slice().to_vec();
+
+    // Validate all blocks are currently allocated (double-free detection).
+    for i in rel_start..rel_start + count {
+        if !bitmap_get(&bitmap, i) {
+            return Err(FfsError::Corruption {
+                block: geo.group_block_to_absolute(group, i).0,
+                detail: "double-free: block already free in bitmap".into(),
+            });
+        }
+    }
+
+    for i in rel_start..rel_start + count {
+        bitmap_clear(&mut bitmap, i);
+    }
+
+    dev.write_block(cx, groups[gidx].block_bitmap_block, &bitmap)?;
+    groups[gidx].free_blocks += count;
+
+    // Persist group descriptor.
+    persist_group_desc(cx, dev, pctx, group, &groups[gidx])?;
+
     Ok(())
 }
 
@@ -938,5 +1271,237 @@ mod tests {
         let a2 = alloc_blocks(&cx, &dev, &geo, &mut groups, 1, &AllocHint::default()).unwrap();
         // Second allocation should get the next free block.
         assert_eq!(a2.start.0, a1.start.0 + 1);
+    }
+
+    // ── Reserved block tests ───────────────────────────────────────────
+
+    #[test]
+    fn reserved_blocks_includes_bitmaps_and_inode_table() {
+        let geo = make_geometry();
+        let groups = make_groups(&geo);
+
+        // Group 0: bitmap at relative 1, inode bitmap at 2, inode table at 3.
+        // Inode table: 2048 inodes * 256 bytes / 4096 bytes = 128 blocks.
+        let reserved = reserved_blocks_in_group(&geo, &groups, GroupNumber(0));
+
+        // Should contain bitmap block (rel 1), inode bitmap (rel 2),
+        // and inode table blocks (rel 3..3+128).
+        assert!(reserved.contains(&1), "block bitmap should be reserved");
+        assert!(reserved.contains(&2), "inode bitmap should be reserved");
+        assert!(
+            reserved.contains(&3),
+            "inode table start should be reserved"
+        );
+        assert!(
+            reserved.contains(&130),
+            "inode table end (3+127) should be reserved"
+        );
+        assert!(
+            !reserved.contains(&131),
+            "block after inode table should NOT be reserved"
+        );
+        // Total: 1 (block bitmap) + 1 (inode bitmap) + 128 (inode table) = 130
+        assert_eq!(reserved.len(), 130);
+    }
+
+    // ── Persistent allocator tests ─────────────────────────────────────
+
+    fn make_persist_ctx() -> PersistCtx {
+        PersistCtx {
+            gdt_block: BlockNumber(50), // arbitrary GDT location
+            desc_size: 32,
+            has_metadata_csum: false,
+            csum_seed: 0,
+        }
+    }
+
+    fn seed_gdt_block(dev: &MemBlockDevice, pctx: &PersistCtx, groups: &[GroupStats]) {
+        // Write a GDT block with group descriptors packed at desc_size intervals.
+        let block_size = dev.block_size() as usize;
+        let ds = usize::from(pctx.desc_size);
+        let mut buf = vec![0u8; block_size];
+        for (i, gs) in groups.iter().enumerate() {
+            let offset = i * ds;
+            if offset + ds > block_size {
+                break;
+            }
+            let gd = Ext4GroupDesc {
+                block_bitmap: gs.block_bitmap_block.0,
+                inode_bitmap: gs.inode_bitmap_block.0,
+                inode_table: gs.inode_table_block.0,
+                free_blocks_count: gs.free_blocks,
+                free_inodes_count: gs.free_inodes,
+                used_dirs_count: gs.used_dirs,
+                itable_unused: 0,
+                flags: gs.flags,
+                checksum: 0,
+            };
+            gd.write_to_bytes(&mut buf[offset..], pctx.desc_size)
+                .unwrap();
+        }
+        let cx = test_cx();
+        dev.write_block(&cx, pctx.gdt_block, &buf).unwrap();
+    }
+
+    #[test]
+    fn alloc_persist_skips_reserved_and_updates_gdt() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let pctx = make_persist_ctx();
+        seed_gdt_block(&dev, &pctx, &groups);
+
+        let alloc = alloc_blocks_persist(
+            &cx,
+            &dev,
+            &geo,
+            &mut groups,
+            1,
+            &AllocHint::default(),
+            &pctx,
+        )
+        .unwrap();
+
+        // The first non-reserved block in group 0 should be allocated.
+        // Reserved blocks: 1,2,3..130 (bitmap+inode bitmap+inode table).
+        // Block 0 is free and not reserved, so it should be allocated first.
+        assert_eq!(alloc.start, BlockNumber(0));
+
+        // In-memory stats should be decremented.
+        assert_eq!(groups[0].free_blocks, 8191);
+
+        // On-disk GDT should also be updated.
+        let gdt_raw = dev.read_block(&cx, pctx.gdt_block).unwrap();
+        let gd = Ext4GroupDesc::parse_from_bytes(gdt_raw.as_slice(), pctx.desc_size).unwrap();
+        assert_eq!(gd.free_blocks_count, 8191);
+    }
+
+    #[test]
+    fn alloc_persist_never_allocates_reserved_metadata() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let pctx = make_persist_ctx();
+        seed_gdt_block(&dev, &pctx, &groups);
+
+        // Pre-mark block 0 as allocated in the bitmap so the allocator
+        // must skip it and find the next non-reserved free block.
+        let mut bitmap = vec![0u8; 4096];
+        bitmap_set(&mut bitmap, 0);
+        dev.write_block(&cx, groups[0].block_bitmap_block, &bitmap)
+            .unwrap();
+
+        let alloc = alloc_blocks_persist(
+            &cx,
+            &dev,
+            &geo,
+            &mut groups,
+            1,
+            &AllocHint::default(),
+            &pctx,
+        )
+        .unwrap();
+
+        // Blocks 1..130 are reserved (bitmap, inode bitmap, inode table).
+        // The allocator should skip them and return block 131.
+        let reserved = reserved_blocks_in_group(&geo, &groups, GroupNumber(0));
+        let (_, rel) = geo.absolute_to_group_block(alloc.start);
+        assert!(
+            !is_reserved(&reserved, rel),
+            "allocated block {} (rel {}) is reserved",
+            alloc.start.0,
+            rel
+        );
+        assert_eq!(rel, 131, "should allocate first non-reserved free block");
+    }
+
+    #[test]
+    fn free_persist_detects_double_free() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let pctx = make_persist_ctx();
+        seed_gdt_block(&dev, &pctx, &groups);
+
+        // Allocate a block.
+        let alloc = alloc_blocks_persist(
+            &cx,
+            &dev,
+            &geo,
+            &mut groups,
+            1,
+            &AllocHint::default(),
+            &pctx,
+        )
+        .unwrap();
+
+        // Free it.
+        free_blocks_persist(&cx, &dev, &geo, &mut groups, alloc.start, 1, &pctx).unwrap();
+
+        // Double-free should fail.
+        let result = free_blocks_persist(&cx, &dev, &geo, &mut groups, alloc.start, 1, &pctx);
+        assert!(result.is_err(), "double-free should return error");
+    }
+
+    #[test]
+    fn free_persist_rejects_reserved_block() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let pctx = make_persist_ctx();
+        seed_gdt_block(&dev, &pctx, &groups);
+
+        // Try to free the block bitmap block (reserved).
+        let bitmap_block = groups[0].block_bitmap_block;
+        let result = free_blocks_persist(&cx, &dev, &geo, &mut groups, bitmap_block, 1, &pctx);
+        assert!(
+            result.is_err(),
+            "freeing a reserved metadata block should fail"
+        );
+    }
+
+    #[test]
+    fn alloc_and_free_persist_roundtrip() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let pctx = make_persist_ctx();
+        seed_gdt_block(&dev, &pctx, &groups);
+
+        let original_free = groups[0].free_blocks;
+
+        let alloc = alloc_blocks_persist(
+            &cx,
+            &dev,
+            &geo,
+            &mut groups,
+            3,
+            &AllocHint::default(),
+            &pctx,
+        )
+        .unwrap();
+        assert_eq!(groups[0].free_blocks, original_free - 3);
+
+        free_blocks_persist(
+            &cx,
+            &dev,
+            &geo,
+            &mut groups,
+            alloc.start,
+            alloc.count,
+            &pctx,
+        )
+        .unwrap();
+        assert_eq!(groups[0].free_blocks, original_free);
+
+        // Verify on-disk GDT matches.
+        let gdt_raw = dev.read_block(&cx, pctx.gdt_block).unwrap();
+        let gd = Ext4GroupDesc::parse_from_bytes(gdt_raw.as_slice(), pctx.desc_size).unwrap();
+        assert_eq!(gd.free_blocks_count, original_free);
     }
 }
