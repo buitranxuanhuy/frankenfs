@@ -817,7 +817,7 @@ impl ArcState {
         self.dirty.dirty_blocks_oldest_first()
     }
 
-    fn stage_txn_write(&mut self, txn_id: TxnId, block: BlockNumber, data: Vec<u8>) -> Result<()> {
+    fn stage_txn_write(&mut self, txn_id: TxnId, block: BlockNumber, data: &[u8]) -> Result<()> {
         if let Some(owner) = self.staged_block_owner.get(&block).copied()
             && owner != txn_id
         {
@@ -827,10 +827,11 @@ impl ArcState {
             )));
         }
 
+        let payload = data.to_vec();
         self.staged_txn_writes
             .entry(txn_id)
             .or_default()
-            .insert(block, data.clone());
+            .insert(block, payload);
         self.staged_block_owner.insert(block, txn_id);
         self.mark_dirty(block, data.len(), txn_id, None, DirtyState::InFlight);
         trace!(
@@ -1205,7 +1206,7 @@ impl<D: BlockDevice> ArcCache<D> {
         }
 
         let mut guard = self.state.lock();
-        guard.stage_txn_write(txn_id, block, data.to_vec())
+        guard.stage_txn_write(txn_id, block, data)
     }
 
     /// Commit all staged writes for `txn_id` and mark them flushable.
@@ -1301,17 +1302,20 @@ impl<D: BlockDevice> ArcCache<D> {
     /// Returns the number of discarded staged blocks.
     #[must_use]
     pub fn abort_staged_txn(&self, txn_id: TxnId) -> usize {
-        let mut guard = self.state.lock();
-        let staged = guard.take_staged_txn(txn_id);
-        let discarded_blocks = staged.len();
-        for block in staged.keys() {
-            let is_same_txn_inflight = guard.dirty.entry(*block).is_some_and(|entry| {
-                entry.txn_id == txn_id && matches!(entry.state, DirtyState::InFlight)
-            });
-            if is_same_txn_inflight {
-                guard.clear_dirty(*block);
+        let discarded_blocks = {
+            let mut guard = self.state.lock();
+            let staged = guard.take_staged_txn(txn_id);
+            let discarded_blocks = staged.len();
+            for block in staged.keys() {
+                let is_same_txn_inflight = guard.dirty.entry(*block).is_some_and(|entry| {
+                    entry.txn_id == txn_id && matches!(entry.state, DirtyState::InFlight)
+                });
+                if is_same_txn_inflight {
+                    guard.clear_dirty(*block);
+                }
             }
-        }
+            discarded_blocks
+        };
         if discarded_blocks > 0 {
             warn!(
                 event = "mvcc_discard_aborted_dirty",
