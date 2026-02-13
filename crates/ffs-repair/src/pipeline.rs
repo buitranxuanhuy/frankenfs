@@ -23,14 +23,12 @@ use ffs_types::{BlockNumber, GroupNumber};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, trace, warn};
 
-use crate::codec::{encode_group, EncodedGroup};
-use crate::evidence::{
-    CorruptionDetail, EvidenceLedger, EvidenceRecord, SymbolRefreshDetail,
-};
+use crate::codec::{EncodedGroup, encode_group};
+use crate::evidence::{CorruptionDetail, EvidenceLedger, EvidenceRecord, SymbolRefreshDetail};
 use crate::recovery::{
     GroupRecoveryOrchestrator, RecoveryAttemptResult, RecoveryDecoderStats, RecoveryOutcome,
 };
-use crate::scrub::{BlockValidator, Scrubber, ScrubReport, Severity};
+use crate::scrub::{BlockValidator, ScrubReport, Scrubber, Severity};
 use crate::storage::{RepairGroupLayout, RepairGroupStorage};
 use crate::symbol::RepairGroupDescExt;
 
@@ -189,17 +187,20 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
         let mut total_unrecoverable: usize = 0;
 
         for (group_cfg, corrupt_blocks) in &grouped_corrupt {
-            let summary = self.recover_group(cx, group_cfg, corrupt_blocks,
-                &mut block_outcomes, &mut total_recovered, &mut total_unrecoverable)?;
+            let summary = self.recover_group(
+                cx,
+                group_cfg,
+                corrupt_blocks,
+                &mut block_outcomes,
+                &mut total_recovered,
+                &mut total_unrecoverable,
+            )?;
             group_summaries.push(summary);
         }
 
         Ok(RecoveryReport {
             blocks_scanned: report.blocks_scanned,
-            total_corrupt: grouped_corrupt
-                .iter()
-                .map(|(_, blocks)| blocks.len())
-                .sum(),
+            total_corrupt: grouped_corrupt.iter().map(|(_, blocks)| blocks.len()).sum(),
             total_recovered,
             total_unrecoverable,
             block_outcomes,
@@ -279,7 +280,11 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             RecoveryOutcome::Partial => {
                 warn!(
                     group = group_num.0,
-                    reason = recovery_result.evidence.reason.as_deref().unwrap_or("unknown"),
+                    reason = recovery_result
+                        .evidence
+                        .reason
+                        .as_deref()
+                        .unwrap_or("unknown"),
                     "partial recovery"
                 );
                 for block in &recovery_result.repaired_blocks {
@@ -288,8 +293,11 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
                 *total_recovered += recovery_result.repaired_blocks.len();
 
                 // Mark remaining corrupt blocks as unrecoverable.
-                let repaired_set: std::collections::BTreeSet<u64> =
-                    recovery_result.repaired_blocks.iter().map(|b| b.0).collect();
+                let repaired_set: std::collections::BTreeSet<u64> = recovery_result
+                    .repaired_blocks
+                    .iter()
+                    .map(|b| b.0)
+                    .collect();
                 for block in corrupt_blocks {
                     if !repaired_set.contains(&block.0) {
                         block_outcomes.insert(block.0, BlockOutcome::Unrecoverable);
@@ -300,7 +308,11 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             RecoveryOutcome::Failed => {
                 error!(
                     group = group_num.0,
-                    reason = recovery_result.evidence.reason.as_deref().unwrap_or("unknown"),
+                    reason = recovery_result
+                        .evidence
+                        .reason
+                        .as_deref()
+                        .unwrap_or("unknown"),
                     "recovery failed"
                 );
                 for block in corrupt_blocks {
@@ -314,8 +326,7 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             group: group_num.0,
             corrupt_count: corrupt_blocks.len(),
             recovered_count: recovery_result.repaired_blocks.len(),
-            unrecoverable_count: corrupt_blocks.len()
-                - recovery_result.repaired_blocks.len(),
+            unrecoverable_count: corrupt_blocks.len() - recovery_result.repaired_blocks.len(),
             symbols_refreshed,
             decoder_stats: Some(recovery_result.evidence.decoder_stats),
         })
@@ -324,10 +335,7 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
     /// Group corrupt block numbers by their owning group configuration.
     ///
     /// Blocks that don't fall into any configured group are logged and skipped.
-    fn group_corrupt_blocks(
-        &self,
-        report: &ScrubReport,
-    ) -> Vec<(GroupConfig, Vec<BlockNumber>)> {
+    fn group_corrupt_blocks(&self, report: &ScrubReport) -> Vec<(GroupConfig, Vec<BlockNumber>)> {
         // Only consider Error-or-above severity findings.
         let corrupt_blocks: Vec<BlockNumber> = report
             .findings
@@ -452,8 +460,7 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             .into_iter()
             .map(|s| (s.esi, s.data))
             .collect();
-        let symbols_generated =
-            u32::try_from(symbols.len()).unwrap_or(u32::MAX);
+        let symbols_generated = u32::try_from(symbols.len()).unwrap_or(u32::MAX);
 
         storage.write_repair_symbols(cx, &symbols, new_gen)?;
 
@@ -660,8 +667,7 @@ mod tests {
 
         let storage = RepairGroupStorage::new(device, layout);
         let desc = RepairGroupDescExt {
-            transfer_length: u64::from(encoded.source_block_count)
-                * u64::from(encoded.symbol_size),
+            transfer_length: u64::from(encoded.source_block_count) * u64::from(encoded.symbol_size),
             symbol_size: u16::try_from(encoded.symbol_size).expect("symbol_size fits u16"),
             source_block_count: u16::try_from(encoded.source_block_count)
                 .expect("source_block_count fits u16"),

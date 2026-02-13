@@ -9,6 +9,7 @@ use ffs_core::{
 };
 use ffs_fuse::MountOptions;
 use ffs_harness::ParityReport;
+use ffs_repair::evidence::{self, EvidenceEventType, EvidenceRecord};
 use ffs_repair::scrub::{
     BlockValidator, BtrfsSuperblockValidator, CompositeValidator, Ext4SuperblockValidator,
     ScrubReport, Scrubber, Severity, ZeroCheckValidator,
@@ -71,6 +72,20 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Display the repair evidence ledger (JSONL).
+    Evidence {
+        /// Path to the evidence ledger file.
+        ledger: PathBuf,
+        /// Output in JSON format (array of records).
+        #[arg(long)]
+        json: bool,
+        /// Filter by event type (e.g., corruption_detected, repair_succeeded).
+        #[arg(long)]
+        event_type: Option<String>,
+        /// Show only the last N records.
+        #[arg(long)]
+        tail: Option<usize>,
+    },
 }
 
 // ── Serializable outputs ────────────────────────────────────────────────────
@@ -132,6 +147,12 @@ fn run() -> Result<()> {
         } => mount_cmd(&image, &mountpoint, allow_other),
         Command::Scrub { image, json } => scrub_cmd(&image, json),
         Command::Parity { json } => parity(json),
+        Command::Evidence {
+            ledger,
+            json,
+            event_type,
+            tail,
+        } => evidence_cmd(&ledger, json, event_type.as_deref(), tail),
     }
 }
 
@@ -466,6 +487,139 @@ fn scrub_cmd(path: &PathBuf, json: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn evidence_cmd(
+    path: &PathBuf,
+    json: bool,
+    event_type_filter: Option<&str>,
+    tail: Option<usize>,
+) -> Result<()> {
+    let data = std::fs::read(path)
+        .with_context(|| format!("failed to read evidence ledger: {}", path.display()))?;
+
+    let mut records = evidence::parse_evidence_ledger(&data);
+
+    // Filter by event type if requested.
+    if let Some(filter) = event_type_filter {
+        records.retain(|r| {
+            let type_str = serde_json::to_value(r.event_type)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from));
+            type_str.as_deref() == Some(filter)
+        });
+    }
+
+    // Tail: keep only the last N records.
+    if let Some(n) = tail {
+        if records.len() > n {
+            records.drain(..records.len() - n);
+        }
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&records).context("serialize evidence records")?
+        );
+    } else {
+        if records.is_empty() {
+            println!("No evidence records found.");
+            return Ok(());
+        }
+        println!("FrankenFS Evidence Ledger ({} records)", records.len());
+        println!();
+        for record in &records {
+            print_evidence_record(record);
+        }
+    }
+
+    Ok(())
+}
+
+fn print_evidence_record(record: &EvidenceRecord) {
+    let ts_secs = record.timestamp_ns / 1_000_000_000;
+    let ts_nanos = record.timestamp_ns % 1_000_000_000;
+    let event = serde_json::to_value(record.event_type)
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_else(|| format!("{:?}", record.event_type));
+
+    print!(
+        "  [{ts_secs}.{ts_nanos:09}] {event:<24} group={}",
+        record.block_group
+    );
+
+    if let Some((start, end)) = record.block_range {
+        print!(" blocks={start}..{end}");
+    }
+
+    match record.event_type {
+        EvidenceEventType::CorruptionDetected => {
+            if let Some(ref c) = record.corruption {
+                print!(
+                    " blocks_affected={} kind={} severity={}",
+                    c.blocks_affected, c.corruption_kind, c.severity
+                );
+            }
+        }
+        EvidenceEventType::RepairAttempted
+        | EvidenceEventType::RepairSucceeded
+        | EvidenceEventType::RepairFailed => {
+            if let Some(ref r) = record.repair {
+                print!(
+                    " corrupt={} symbols={}/{} verify={}",
+                    r.corrupt_count, r.symbols_used, r.symbols_available, r.verify_pass
+                );
+                if let Some(ref reason) = r.reason {
+                    print!(" reason=\"{reason}\"");
+                }
+            }
+        }
+        EvidenceEventType::ScrubCycleComplete => {
+            if let Some(ref s) = record.scrub_cycle {
+                print!(
+                    " scanned={} corrupt={} io_errors={} findings={}",
+                    s.blocks_scanned, s.blocks_corrupt, s.blocks_io_error, s.findings_count
+                );
+            }
+        }
+        EvidenceEventType::PolicyDecision => {
+            if let Some(ref p) = record.policy {
+                print!(
+                    " posterior={:.4} overhead={:.3} risk_bound={:.1e} decision=\"{}\"",
+                    p.corruption_posterior, p.overhead_ratio, p.risk_bound, p.decision
+                );
+            }
+        }
+        EvidenceEventType::SymbolRefresh => {
+            if let Some(ref s) = record.symbol_refresh {
+                print!(
+                    " gen={}→{} symbols={}",
+                    s.previous_generation, s.new_generation, s.symbols_generated
+                );
+            }
+        }
+        EvidenceEventType::WalRecovery => {
+            if let Some(ref w) = record.wal_recovery {
+                print!(
+                    " commits={} versions={} discarded={} valid={}/{}",
+                    w.commits_replayed,
+                    w.versions_replayed,
+                    w.records_discarded,
+                    w.wal_valid_bytes,
+                    w.wal_total_bytes
+                );
+                if w.used_checkpoint {
+                    if let Some(seq) = w.checkpoint_commit_seq {
+                        print!(" checkpoint_seq={seq}");
+                    }
+                }
+            }
+        }
+    }
+
+    println!();
 }
 
 fn parity(json: bool) -> Result<()> {

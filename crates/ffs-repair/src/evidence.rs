@@ -55,6 +55,8 @@ pub enum EvidenceEventType {
     PolicyDecision,
     /// Repair symbols were regenerated for a block group.
     SymbolRefresh,
+    /// WAL recovery completed (replay after crash or restart).
+    WalRecovery,
 }
 
 // ── Detail structs ──────────────────────────────────────────────────────────
@@ -129,6 +131,29 @@ pub struct SymbolRefreshDetail {
     pub symbols_generated: u32,
 }
 
+/// Detail payload for WAL recovery events.
+///
+/// Emitted when a persistent MVCC store replays its WAL on startup.
+/// Captures enough detail to audit crash recovery behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalRecoveryDetail {
+    /// Number of commit records successfully replayed.
+    pub commits_replayed: u64,
+    /// Number of individual block versions restored.
+    pub versions_replayed: u64,
+    /// Number of WAL records discarded (corrupt CRC or truncated tail).
+    pub records_discarded: u64,
+    /// Byte offset where valid WAL data ends.
+    pub wal_valid_bytes: u64,
+    /// Total WAL file size in bytes.
+    pub wal_total_bytes: u64,
+    /// Whether a checkpoint was loaded before WAL replay.
+    pub used_checkpoint: bool,
+    /// Highest commit sequence restored from checkpoint, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_commit_seq: Option<u64>,
+}
+
 // ── Evidence record ─────────────────────────────────────────────────────────
 
 /// A single evidence record in the JSONL ledger.
@@ -162,6 +187,9 @@ pub struct EvidenceRecord {
     /// Symbol refresh detail (present when `event_type` is `SymbolRefresh`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol_refresh: Option<SymbolRefreshDetail>,
+    /// WAL recovery detail (present when `event_type` is `WalRecovery`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wal_recovery: Option<WalRecoveryDetail>,
 }
 
 impl EvidenceRecord {
@@ -176,6 +204,7 @@ impl EvidenceRecord {
             scrub_cycle: None,
             policy: None,
             symbol_refresh: None,
+            wal_recovery: None,
         }
     }
 
@@ -232,6 +261,14 @@ impl EvidenceRecord {
     pub fn symbol_refresh(block_group: u32, detail: SymbolRefreshDetail) -> Self {
         let mut r = Self::base(EvidenceEventType::SymbolRefresh, block_group);
         r.symbol_refresh = Some(detail);
+        r
+    }
+
+    /// Create a WAL-recovery evidence record.
+    #[must_use]
+    pub fn wal_recovery(detail: WalRecoveryDetail) -> Self {
+        let mut r = Self::base(EvidenceEventType::WalRecovery, 0);
+        r.wal_recovery = Some(detail);
         r
     }
 
@@ -651,5 +688,44 @@ mod tests {
         assert!(!json.contains("\"policy\""));
         assert!(!json.contains("\"symbol_refresh\""));
         assert!(!json.contains("\"block_range\""));
+        assert!(!json.contains("\"wal_recovery\""));
+    }
+
+    #[test]
+    fn wal_recovery_round_trip() {
+        let detail = WalRecoveryDetail {
+            commits_replayed: 42,
+            versions_replayed: 128,
+            records_discarded: 1,
+            wal_valid_bytes: 65536,
+            wal_total_bytes: 65600,
+            used_checkpoint: true,
+            checkpoint_commit_seq: Some(30),
+        };
+        let record = EvidenceRecord::wal_recovery(detail.clone()).with_timestamp(9_000_000);
+        let json = record.to_json().expect("serialize");
+        let parsed = EvidenceRecord::from_json(&json).expect("deserialize");
+        assert_eq!(parsed.event_type, EvidenceEventType::WalRecovery);
+        assert_eq!(parsed.block_group, 0);
+        assert_eq!(parsed.wal_recovery, Some(detail));
+        assert!(parsed.corruption.is_none());
+        assert!(parsed.repair.is_none());
+    }
+
+    #[test]
+    fn wal_recovery_no_checkpoint() {
+        let detail = WalRecoveryDetail {
+            commits_replayed: 5,
+            versions_replayed: 10,
+            records_discarded: 0,
+            wal_valid_bytes: 1024,
+            wal_total_bytes: 1024,
+            used_checkpoint: false,
+            checkpoint_commit_seq: None,
+        };
+        let record = EvidenceRecord::wal_recovery(detail).with_timestamp(10_000_000);
+        let json = record.to_json().expect("serialize");
+        // checkpoint_commit_seq should be omitted from JSON
+        assert!(!json.contains("checkpoint_commit_seq"));
     }
 }
