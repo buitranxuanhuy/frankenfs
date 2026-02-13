@@ -49,7 +49,7 @@
 | MVCC snapshot visibility | FrankenFS spec §3 | ✅ | Implemented in `ffs-mvcc` |
 | MVCC commit sequencing | FrankenFS spec §3 | ✅ | Implemented in `ffs-mvcc` |
 | FCW conflict detection | FrankenFS spec §3 | ✅ | Implemented in `ffs-mvcc` |
-| version retention policy | FrankenFS spec §3 | ✅ | Current in-memory retention |
+| version retention policy | FrankenFS spec §3 | ✅ | In-memory retention with `VersionData::Identical` dedup (zero-copy for unchanged blocks), configurable `CompressionPolicy` (dedup + max chain length cap), watermark-safe pruning in `ffs-mvcc::compression` |
 | COW block rewrite path | FrankenFS spec §3 | ✅ | Allocation-backed COW rewrite path implemented in `ffs-mvcc` (`write_cow`, logical→physical mapping visibility, deferred-free + watermark GC integration) |
 | durability policy model | FrankenFS spec §4 | ✅ | Bayesian expected-loss selector |
 | asupersync config mapping | FrankenFS spec §4 | ✅ | `RaptorQConfig` mapping implemented |
