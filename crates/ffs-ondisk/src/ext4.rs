@@ -426,6 +426,7 @@ pub struct Ext4Superblock {
     // ── Journal ──────────────────────────────────────────────────────────
     pub journal_inum: u32,
     pub journal_dev: u32,
+    pub last_orphan: u32,
     pub journal_uuid: [u8; 16],
 
     // ── Htree directory hashing ──────────────────────────────────────────
@@ -549,6 +550,7 @@ impl Ext4Superblock {
             // Journal
             journal_inum: read_le_u32(region, 0xE0)?,
             journal_dev: read_le_u32(region, 0xE4)?,
+            last_orphan: read_le_u32(region, 0xE8)?,
             journal_uuid: read_fixed::<16>(region, 0xD0)?,
 
             // Htree directory hashing
@@ -3982,6 +3984,7 @@ mod tests {
         sb[0x4C..0x50].copy_from_slice(&1_u32.to_le_bytes()); // rev_level=DYNAMIC
         sb[0x54..0x58].copy_from_slice(&11_u32.to_le_bytes()); // first_ino
         sb[0xE0..0xE4].copy_from_slice(&8_u32.to_le_bytes()); // journal_inum
+        sb[0xE8..0xEC].copy_from_slice(&12_u32.to_le_bytes()); // last_orphan
         sb[0xEC..0xF0].copy_from_slice(&0xDEAD_BEEF_u32.to_le_bytes()); // hash_seed[0]
         sb[0xFC] = 1; // def_hash_version=HalfMD4
         sb[0x174] = 4; // log_groups_per_flex
@@ -3993,6 +3996,7 @@ mod tests {
         assert_eq!(parsed.rev_level, 1);
         assert_eq!(parsed.first_ino, 11);
         assert_eq!(parsed.journal_inum, 8);
+        assert_eq!(parsed.last_orphan, 12);
         assert_eq!(parsed.hash_seed[0], 0xDEAD_BEEF);
         assert_eq!(parsed.def_hash_version, 1);
         assert_eq!(parsed.log_groups_per_flex, 4);

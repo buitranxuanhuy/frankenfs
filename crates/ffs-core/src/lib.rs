@@ -26,6 +26,7 @@ use ffs_types::{
 };
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
@@ -65,6 +66,22 @@ pub struct Ext4FreeSpaceSummary {
     pub blocks_mismatch: bool,
     /// True if bitmap count differs from group descriptor count.
     pub inodes_mismatch: bool,
+}
+
+/// Safe traversal result for the ext4 orphan inode list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ext4OrphanList {
+    /// Raw orphan-list head from the ext4 superblock (`s_last_orphan`).
+    pub head: u32,
+    /// Traversed inode numbers in on-disk chain order.
+    pub inodes: Vec<InodeNumber>,
+}
+
+impl Ext4OrphanList {
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.inodes.len()
+    }
 }
 
 pub fn detect_filesystem(image: &[u8]) -> Result<FsFlavor, DetectionError> {
@@ -232,6 +249,12 @@ pub struct OpenFs {
     /// Writes stage versions here; reads check here before falling back to device.
     mvcc_store: Arc<RwLock<MvccStore>>,
 }
+
+// Compile-time assertion: OpenFs must be Send + Sync for multi-threaded FUSE dispatch.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    let _ = assert_send_sync::<OpenFs>;
+};
 
 impl std::fmt::Debug for OpenFs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1654,6 +1677,51 @@ impl OpenFs {
             .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
         let inode = self.read_inode(cx, ino)?;
         Ok(inode_to_attr(sb, ino, &inode))
+    }
+
+    /// Traverse the ext4 orphan inode list (`s_last_orphan` + inode `dtime` links).
+    ///
+    /// This is read-only diagnostic behavior: traversal validates bounds and
+    /// detects cycles but does not mutate image state.
+    pub fn read_ext4_orphan_list(&self, cx: &Cx) -> Result<Ext4OrphanList, FfsError> {
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+
+        let head = sb.last_orphan;
+        let mut next = head;
+        let mut seen = BTreeSet::new();
+        let mut inodes = Vec::new();
+        let max_inodes = usize::try_from(sb.inodes_count)
+            .map_err(|_| FfsError::InvalidGeometry("inodes_count does not fit usize".to_owned()))?;
+
+        while next != 0 {
+            if next > sb.inodes_count {
+                return Err(FfsError::InvalidGeometry(format!(
+                    "ext4 orphan inode {next} out of range (inodes_count={})",
+                    sb.inodes_count
+                )));
+            }
+            if !seen.insert(next) {
+                return Err(FfsError::Corruption {
+                    block: 0,
+                    detail: format!("ext4 orphan list cycle detected at inode {next}"),
+                });
+            }
+            if inodes.len() >= max_inodes {
+                return Err(FfsError::Corruption {
+                    block: 0,
+                    detail: "ext4 orphan list exceeds inode count bound".to_owned(),
+                });
+            }
+
+            let ino = InodeNumber(u64::from(next));
+            inodes.push(ino);
+            let inode = self.read_inode(cx, ino)?;
+            next = inode.dtime;
+        }
+
+        Ok(Ext4OrphanList { head, inodes })
     }
 
     // ── Bitmap reading (ext4 free-space inspection) ───────────────────
@@ -4174,6 +4242,47 @@ mod tests {
     }
 
     #[test]
+    fn read_ext4_orphan_list_traverses_chain() {
+        let image = build_ext4_image_with_orphan_chain(&[11, 12, 13]);
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let orphans = fs.read_ext4_orphan_list(&cx).unwrap();
+        assert_eq!(orphans.head, 11);
+        assert_eq!(
+            orphans.inodes,
+            vec![InodeNumber(11), InodeNumber(12), InodeNumber(13)]
+        );
+        assert_eq!(orphans.count(), 3);
+    }
+
+    #[test]
+    fn read_ext4_orphan_list_detects_cycle() {
+        let mut image = build_ext4_image_with_orphan_chain(&[11, 12]);
+        set_test_inode_dtime(&mut image, 12, 11);
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let err = fs.read_ext4_orphan_list(&cx).unwrap_err();
+        assert!(matches!(err, FfsError::Corruption { .. }));
+    }
+
+    #[test]
+    fn read_ext4_orphan_list_rejects_out_of_range_head() {
+        let mut image = build_ext4_image_with_extents();
+        let sb_off = EXT4_SUPERBLOCK_OFFSET;
+        image[sb_off + 0xE8..sb_off + 0xEC].copy_from_slice(&129_u32.to_le_bytes());
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let err = fs.read_ext4_orphan_list(&cx).unwrap_err();
+        assert!(matches!(err, FfsError::InvalidGeometry(_)));
+    }
+
+    #[test]
     fn open_fs_rejects_external_journal_device() {
         let mut image = build_ext4_image_with_inode();
         let sb_off = EXT4_SUPERBLOCK_OFFSET;
@@ -4446,6 +4555,25 @@ mod tests {
         let j_commit = 22 * 4096;
         write_jbd2_header(&mut image[j_commit..j_commit + 4096], 2, 1);
 
+        image
+    }
+
+    fn set_test_inode_dtime(image: &mut [u8], ino: u32, next: u32) {
+        assert!(ino > 0, "inode numbers are 1-based");
+        let inode_index = usize::try_from(ino.saturating_sub(1)).expect("inode index should fit");
+        let inode_off = 4 * 4096 + inode_index * 256;
+        image[inode_off + 0x14..inode_off + 0x18].copy_from_slice(&next.to_le_bytes());
+    }
+
+    fn build_ext4_image_with_orphan_chain(chain: &[u32]) -> Vec<u8> {
+        let mut image = build_ext4_image_with_extents();
+        let sb_off = EXT4_SUPERBLOCK_OFFSET;
+        let head = chain.first().copied().unwrap_or(0);
+        image[sb_off + 0xE8..sb_off + 0xEC].copy_from_slice(&head.to_le_bytes());
+        for (idx, ino) in chain.iter().copied().enumerate() {
+            let next = chain.get(idx + 1).copied().unwrap_or(0);
+            set_test_inode_dtime(&mut image, ino, next);
+        }
         image
     }
 
@@ -6301,7 +6429,7 @@ mod tests {
         let sb_off = BTRFS_SUPER_INFO_OFFSET;
 
         let root_tree_logical = 0x4_000_u64;
-        let fs_tree_logical = 0x10_000_u64; // use a bigger gap
+        let fs_tree_logical = 0x20_000_u64; // past superblock at 0x10000
 
         // Superblock
         image[sb_off + 0x40..sb_off + 0x48].copy_from_slice(&BTRFS_MAGIC.to_le_bytes());
@@ -6638,6 +6766,40 @@ mod tests {
         // InodeNumber(257) is a regular file
         let err = ops.readdir(&cx, InodeNumber(257), 0).unwrap_err();
         assert_eq!(err.to_errno(), libc::ENOTDIR);
+    }
+
+    // ── Send+Sync and concurrency tests ──────────────────────────────────
+
+    #[test]
+    fn open_fs_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<OpenFs>();
+    }
+
+    #[test]
+    fn concurrent_read_ops_no_deadlock() {
+        let image = build_btrfs_fsops_image();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = std::sync::Arc::new(
+            OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap(),
+        );
+
+        std::thread::scope(|s| {
+            for _ in 0..10 {
+                let fs = std::sync::Arc::clone(&fs);
+                s.spawn(move || {
+                    let cx = Cx::for_testing();
+                    let ops: &dyn FsOps = fs.as_ref();
+                    for _ in 0..50 {
+                        let _ = ops.getattr(&cx, InodeNumber(1));
+                        let _ = ops.readdir(&cx, InodeNumber(1), 0);
+                        let _ = ops.read(&cx, InodeNumber(257), 0, 4096);
+                        let _ = ops.lookup(&cx, InodeNumber(1), std::ffi::OsStr::new("hello.txt"));
+                    }
+                });
+            }
+        });
     }
 
     // ── DurabilityAutopilot tests ────────────────────────────────────────

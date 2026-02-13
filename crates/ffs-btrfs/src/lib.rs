@@ -453,6 +453,47 @@ pub enum BtrfsCowNode {
     },
 }
 
+/// Block lifecycle interface for btrfs COW mutation planning.
+///
+/// The in-memory tree uses this to allocate new node addresses and to
+/// report nodes that became unreachable after a successful mutation.
+pub trait BtrfsAllocator: std::fmt::Debug {
+    fn alloc_block(&mut self) -> Result<u64, BtrfsMutationError>;
+    fn defer_free(&mut self, block: u64);
+}
+
+/// Default in-memory allocator used by `InMemoryCowBtrfsTree`.
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryBtrfsAllocator {
+    next_block: u64,
+    deferred: Vec<u64>,
+}
+
+impl InMemoryBtrfsAllocator {
+    #[must_use]
+    pub fn with_start(next_block: u64) -> Self {
+        Self {
+            next_block,
+            deferred: Vec::new(),
+        }
+    }
+}
+
+impl BtrfsAllocator for InMemoryBtrfsAllocator {
+    fn alloc_block(&mut self) -> Result<u64, BtrfsMutationError> {
+        let block = self.next_block;
+        self.next_block = self
+            .next_block
+            .checked_add(1)
+            .ok_or(BtrfsMutationError::AddressOverflow)?;
+        Ok(block)
+    }
+
+    fn defer_free(&mut self, block: u64) {
+        self.deferred.push(block);
+    }
+}
+
 /// COW B-tree mutation interface used by write-path planning code.
 pub trait BtrfsBTree {
     fn insert(&mut self, key: BtrfsKey, item: &[u8]) -> Result<u64, BtrfsMutationError>;
@@ -479,12 +520,13 @@ struct DeleteResult {
 
 /// In-memory COW btrfs B-tree. Every mutation allocates new nodes and advances
 /// the root pointer, keeping previously-addressed nodes immutable.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct InMemoryCowBtrfsTree {
     max_items: usize,
     min_items: usize,
     root: u64,
-    next_block: u64,
+    allocator: Box<dyn BtrfsAllocator>,
+    deferred_frees: Vec<u64>,
     nodes: BTreeMap<u64, BtrfsCowNode>,
 }
 
@@ -493,6 +535,14 @@ impl InMemoryCowBtrfsTree {
     ///
     /// `max_items` must be >= 3 to allow split/merge behavior.
     pub fn new(max_items: usize) -> Result<Self, BtrfsMutationError> {
+        Self::with_allocator(max_items, Box::new(InMemoryBtrfsAllocator::with_start(2)))
+    }
+
+    /// Create a COW B-tree with a custom block allocator.
+    pub fn with_allocator(
+        max_items: usize,
+        allocator: Box<dyn BtrfsAllocator>,
+    ) -> Result<Self, BtrfsMutationError> {
         if max_items < 3 {
             return Err(BtrfsMutationError::InvalidConfig("max_items must be >= 3"));
         }
@@ -503,7 +553,8 @@ impl InMemoryCowBtrfsTree {
             max_items,
             min_items: max_items / 2,
             root,
-            next_block: 2,
+            allocator,
+            deferred_frees: Vec::new(),
             nodes,
         })
     }
@@ -520,6 +571,12 @@ impl InMemoryCowBtrfsTree {
             .get(&block)
             .cloned()
             .ok_or(BtrfsMutationError::MissingNode(block))
+    }
+
+    /// List of blocks marked for deferred free during successful mutations.
+    #[must_use]
+    pub fn deferred_free_blocks(&self) -> &[u64] {
+        &self.deferred_frees
     }
 
     /// Return tree height (`1` for a leaf root).
@@ -545,13 +602,16 @@ impl InMemoryCowBtrfsTree {
     }
 
     fn alloc_node(&mut self, node: BtrfsCowNode) -> Result<u64, BtrfsMutationError> {
-        let block = self.next_block;
-        self.next_block = self
-            .next_block
-            .checked_add(1)
-            .ok_or(BtrfsMutationError::AddressOverflow)?;
+        let block = self.allocator.alloc_block()?;
         self.nodes.insert(block, node);
+        trace!(block, "btrfs_cow_alloc_node");
         Ok(block)
+    }
+
+    fn retire_node(&mut self, block: u64) {
+        self.allocator.defer_free(block);
+        self.deferred_frees.push(block);
+        trace!(block, "btrfs_cow_defer_free");
     }
 
     fn child_slot(keys: &[BtrfsKey], key: &BtrfsKey) -> usize {
@@ -603,12 +663,16 @@ impl InMemoryCowBtrfsTree {
         allow_replace: bool,
     ) -> Result<InsertResult, BtrfsMutationError> {
         let node = self.node_ref(node_id)?.clone();
-        match node {
+        let result = match node {
             BtrfsCowNode::Leaf { items } => self.insert_into_leaf(items, entry, allow_replace),
             BtrfsCowNode::Internal { keys, children } => {
                 self.insert_into_internal(keys, children, entry, allow_replace)
             }
+        };
+        if result.is_ok() {
+            self.retire_node(node_id);
         }
+        result
     }
 
     fn insert_into_leaf(
@@ -946,10 +1010,14 @@ impl InMemoryCowBtrfsTree {
         if child_idx > 0 {
             let left_keys = self.node_key_count(children[child_idx - 1])?;
             if left_keys > self.min_items {
+                let old_left = children[child_idx - 1];
+                let old_child = children[child_idx];
                 let (new_left, new_child) =
                     self.rotate_from_left(children[child_idx - 1], children[child_idx])?;
                 children[child_idx - 1] = new_left;
                 children[child_idx] = new_child;
+                self.retire_node(old_left);
+                self.retire_node(old_child);
                 debug!(
                     child_idx,
                     left_keys, child_keys, "btrfs_cow_delete_borrow_left"
@@ -961,10 +1029,14 @@ impl InMemoryCowBtrfsTree {
         if child_idx + 1 < children.len() {
             let right_keys = self.node_key_count(children[child_idx + 1])?;
             if right_keys > self.min_items {
+                let old_child = children[child_idx];
+                let old_right = children[child_idx + 1];
                 let (new_child, new_right) =
                     self.rotate_from_right(children[child_idx], children[child_idx + 1])?;
                 children[child_idx] = new_child;
                 children[child_idx + 1] = new_right;
+                self.retire_node(old_child);
+                self.retire_node(old_right);
                 debug!(
                     child_idx,
                     right_keys, child_keys, "btrfs_cow_delete_borrow_right"
@@ -974,14 +1046,22 @@ impl InMemoryCowBtrfsTree {
         }
 
         if child_idx > 0 {
+            let old_left = children[child_idx - 1];
+            let old_child = children[child_idx];
             let merged = self.merge_adjacent_nodes(children[child_idx - 1], children[child_idx])?;
             children[child_idx - 1] = merged;
             children.remove(child_idx);
+            self.retire_node(old_left);
+            self.retire_node(old_child);
             debug!(merged_child = child_idx - 1, "btrfs_cow_delete_merge_left");
         } else {
+            let old_child = children[child_idx];
+            let old_right = children[child_idx + 1];
             let merged = self.merge_adjacent_nodes(children[child_idx], children[child_idx + 1])?;
             children[child_idx] = merged;
             children.remove(child_idx + 1);
+            self.retire_node(old_child);
+            self.retire_node(old_right);
             debug!(merged_child = child_idx, "btrfs_cow_delete_merge_right");
         }
         Ok(())
@@ -1010,6 +1090,7 @@ impl InMemoryCowBtrfsTree {
                 }
                 items.remove(idx);
                 let new_id = self.alloc_node(BtrfsCowNode::Leaf { items })?;
+                self.retire_node(node_id);
                 Ok(DeleteResult {
                     node_id: new_id,
                     deleted: true,
@@ -1032,6 +1113,7 @@ impl InMemoryCowBtrfsTree {
                 children[idx] = child_result.node_id;
                 self.rebalance_child(&mut children, idx)?;
                 let new_id = self.alloc_internal_node(children)?;
+                self.retire_node(node_id);
                 Ok(DeleteResult {
                     node_id: new_id,
                     deleted: true,
@@ -1054,7 +1136,9 @@ impl InMemoryCowBtrfsTree {
                     "internal node must have children",
                 ));
             };
+            let old_root = self.root;
             self.root = *child;
+            self.retire_node(old_root);
         }
         Ok(())
     }
@@ -1614,6 +1698,23 @@ mod tests {
             snapshot
         );
         tree.validate_invariants().expect("invariants");
+    }
+
+    #[test]
+    fn cow_mutations_record_deferred_node_frees() {
+        let mut tree = InMemoryCowBtrfsTree::new(3).expect("tree");
+        tree.insert(test_key(1), b"a").expect("insert 1");
+        assert!(
+            !tree.deferred_free_blocks().is_empty(),
+            "initial mutation should retire prior root"
+        );
+        let deferred_before_delete = tree.deferred_free_blocks().len();
+        tree.insert(test_key(2), b"b").expect("insert 2");
+        tree.delete(&test_key(2)).expect("delete 2");
+        assert!(
+            tree.deferred_free_blocks().len() > deferred_before_delete,
+            "delete path should retire replaced COW nodes"
+        );
     }
 
     #[test]

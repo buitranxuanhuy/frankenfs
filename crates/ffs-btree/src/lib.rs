@@ -18,6 +18,7 @@ use ffs_block::BlockDevice;
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::{Ext4Extent, Ext4ExtentHeader, Ext4ExtentIndex};
 use ffs_types::BlockNumber;
+use tracing::{debug, error, trace};
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -275,6 +276,13 @@ pub fn insert(
 ) -> Result<()> {
     let (header, _) = parse_header(root_bytes)?;
     validate_header(&header, ROOT_MAX_ENTRIES)?;
+    trace!(
+        logical_start = extent.logical_block,
+        len = u32::from(actual_len(extent.raw_len)),
+        physical_block = extent.physical_start,
+        tree_depth = header.depth,
+        "extent_insert"
+    );
 
     if header.depth == 0 {
         // Leaf root: try to insert directly.
@@ -368,8 +376,19 @@ fn insert_descend(
 
         // Allocate new block for right half.
         let new_block = alloc.alloc_block(cx)?;
+        trace!(
+            new_block_num = new_block.0,
+            purpose = "leaf_split",
+            "extent_block_alloc"
+        );
         let right_data = serialize_leaf_block(block_size, &right_extents);
         dev.write_block(cx, new_block, &right_data)?;
+        debug!(
+            old_node = block,
+            new_node = new_block.0,
+            separator_key = right_extents[0].logical_block,
+            "extent_leaf_split"
+        );
 
         // Return new index entry pointing to the right half.
         Ok(Some(Ext4ExtentIndex {
@@ -406,8 +425,19 @@ fn insert_descend(
                 dev.write_block(cx, BlockNumber(block), &left_data)?;
 
                 let new_block = alloc.alloc_block(cx)?;
+                trace!(
+                    new_block_num = new_block.0,
+                    purpose = "index_split",
+                    "extent_block_alloc"
+                );
                 let right_data = serialize_index_block(block_size, depth, &right_indexes);
                 dev.write_block(cx, new_block, &right_data)?;
+                debug!(
+                    old_node = block,
+                    new_node = new_block.0,
+                    separator_key = right_indexes[0].logical_block,
+                    "extent_index_split"
+                );
 
                 Ok(Some(Ext4ExtentIndex {
                     logical_block: right_indexes[0].logical_block,
@@ -436,10 +466,20 @@ fn grow_root_leaf(
     let right = &all_extents[mid..];
 
     let left_block = alloc.alloc_block(cx)?;
+    trace!(
+        new_block_num = left_block.0,
+        purpose = "root_grow_leaf_left",
+        "extent_block_alloc"
+    );
     let left_data = serialize_leaf_block(block_size, left);
     dev.write_block(cx, left_block, &left_data)?;
 
     let right_block = alloc.alloc_block(cx)?;
+    trace!(
+        new_block_num = right_block.0,
+        purpose = "root_grow_leaf_right",
+        "extent_block_alloc"
+    );
     let right_data = serialize_leaf_block(block_size, right);
     dev.write_block(cx, right_block, &right_data)?;
 
@@ -462,6 +502,12 @@ fn grow_root_leaf(
         generation: 0,
     };
     write_index_root(root_bytes, &header, &indexes);
+    debug!(
+        old_node = "inode_root",
+        new_node = format!("{},{}", left_block.0, right_block.0),
+        separator_key = right[0].logical_block,
+        "extent_root_split_leaf"
+    );
     Ok(())
 }
 
@@ -480,10 +526,20 @@ fn grow_root_index(
     let right = &all_indexes[mid..];
 
     let left_block = alloc.alloc_block(cx)?;
+    trace!(
+        new_block_num = left_block.0,
+        purpose = "root_grow_index_left",
+        "extent_block_alloc"
+    );
     let left_data = serialize_index_block(block_size, header.depth, left);
     dev.write_block(cx, left_block, &left_data)?;
 
     let right_block = alloc.alloc_block(cx)?;
+    trace!(
+        new_block_num = right_block.0,
+        purpose = "root_grow_index_right",
+        "extent_block_alloc"
+    );
     let right_data = serialize_index_block(block_size, header.depth, right);
     dev.write_block(cx, right_block, &right_data)?;
 
@@ -506,6 +562,12 @@ fn grow_root_index(
         generation: 0,
     };
     write_index_root(root_bytes, &new_header, &new_indexes);
+    debug!(
+        old_node = "inode_root",
+        new_node = format!("{},{}", left_block.0, right_block.0),
+        separator_key = right[0].logical_block,
+        "extent_root_split_index"
+    );
     Ok(())
 }
 
@@ -516,39 +578,111 @@ fn grow_root_index(
 /// Extents that partially overlap the range are trimmed. Extents fully within
 /// the range are removed entirely. Returns the list of physical block ranges
 /// that were freed (the caller is responsible for deallocating them).
+#[expect(clippy::cast_possible_truncation)]
 pub fn delete_range(
     cx: &Cx,
     dev: &dyn BlockDevice,
     root_bytes: &mut [u8; 60],
     logical_start: u32,
     count: u32,
+    alloc: &mut dyn BlockAllocator,
 ) -> Result<Vec<FreedRange>> {
     let logical_end = logical_start.saturating_add(count);
     let (header, _) = parse_header(root_bytes)?;
     validate_header(&header, ROOT_MAX_ENTRIES)?;
+    trace!(
+        logical_start,
+        count,
+        tree_depth = header.depth,
+        "extent_delete_start"
+    );
 
     if header.depth == 0 {
         let extents = parse_leaf_entries(root_bytes, &header)?;
         let (remaining, freed) = trim_extents(extents, logical_start, logical_end);
         write_leaf_root(root_bytes, &header, &remaining);
+        trace!(
+            logical_start,
+            count,
+            freed_blocks_count = freed.len(),
+            "extent_delete_done"
+        );
         return Ok(freed);
     }
 
-    // For multi-level trees, we need to descend and modify leaf nodes.
-    let indexes = parse_index_entries(root_bytes, &header)?;
+    // Multi-level tree: descend, collapse empty children, and refresh separators.
+    let mut indexes = parse_index_entries(root_bytes, &header)?;
     let mut all_freed = Vec::new();
 
-    for idx in &indexes {
-        let freed = delete_range_subtree(
+    let mut idx_pos = 0;
+    while idx_pos < indexes.len() {
+        let child_block = indexes[idx_pos].leaf_block;
+        let child_result = delete_range_subtree(
             cx,
             dev,
-            idx.leaf_block,
+            child_block,
             header.depth - 1,
             logical_start,
             logical_end,
+            alloc,
         )?;
-        all_freed.extend(freed);
+        all_freed.extend(child_result.freed_ranges);
+
+        if child_result.empty {
+            trace!(
+                freed_block_num = child_block,
+                reason = "empty_subtree",
+                "extent_block_free"
+            );
+            alloc.free_block(cx, BlockNumber(child_block))?;
+            debug!(
+                merged_nodes = 1_u8,
+                resulting_node = "root",
+                "extent_delete_collapse_empty_child"
+            );
+            indexes.remove(idx_pos);
+            continue;
+        }
+
+        if let Some(new_first) = child_result.first_logical {
+            indexes[idx_pos].logical_block = new_first;
+        }
+        idx_pos += 1;
     }
+
+    if indexes.is_empty() {
+        let empty_header = Ext4ExtentHeader {
+            magic: EXT4_EXTENT_MAGIC,
+            entries: 0,
+            max_entries: ROOT_MAX_ENTRIES,
+            depth: 0,
+            generation: header.generation,
+        };
+        write_leaf_root(root_bytes, &empty_header, &[]);
+        trace!(
+            logical_start,
+            count,
+            freed_blocks_count = all_freed.len(),
+            "extent_delete_done"
+        );
+        return Ok(all_freed);
+    }
+
+    let new_header = Ext4ExtentHeader {
+        magic: EXT4_EXTENT_MAGIC,
+        entries: indexes.len() as u16,
+        max_entries: ROOT_MAX_ENTRIES,
+        depth: header.depth,
+        generation: header.generation,
+    };
+    write_index_root(root_bytes, &new_header, &indexes);
+    maybe_shrink_root(cx, dev, root_bytes, alloc)?;
+    trace!(
+        logical_start,
+        count,
+        freed_blocks_count = all_freed.len(),
+        "extent_delete_done"
+    );
 
     Ok(all_freed)
 }
@@ -567,7 +701,8 @@ fn delete_range_subtree(
     depth: u16,
     logical_start: u32,
     logical_end: u32,
-) -> Result<Vec<FreedRange>> {
+    alloc: &mut dyn BlockAllocator,
+) -> Result<DeleteSubtreeResult> {
     cx_checkpoint(cx)?;
 
     let buf = dev.read_block(cx, BlockNumber(block))?;
@@ -576,28 +711,144 @@ fn delete_range_subtree(
     let max = max_entries_external(block_size);
     let (header, _) = parse_header(data)?;
     validate_header(&header, max)?;
+    if header.depth != depth {
+        return Err(FfsError::Corruption {
+            block,
+            detail: format!(
+                "delete: depth mismatch: expected {depth}, got {}",
+                header.depth
+            ),
+        });
+    }
 
     if depth == 0 {
         let extents = parse_leaf_entries(data, &header)?;
         let (remaining, freed) = trim_extents(extents, logical_start, logical_end);
         let new_data = serialize_leaf_block(block_size, &remaining);
         dev.write_block(cx, BlockNumber(block), &new_data)?;
-        Ok(freed)
+        Ok(DeleteSubtreeResult {
+            freed_ranges: freed,
+            first_logical: remaining.first().map(|ext| ext.logical_block),
+            empty: remaining.is_empty(),
+        })
     } else {
-        let indexes = parse_index_entries(data, &header)?;
+        let mut indexes = parse_index_entries(data, &header)?;
         let mut all_freed = Vec::new();
-        for idx in &indexes {
-            let freed = delete_range_subtree(
+        let mut idx_pos = 0;
+        while idx_pos < indexes.len() {
+            let child_block = indexes[idx_pos].leaf_block;
+            let child_result = delete_range_subtree(
                 cx,
                 dev,
-                idx.leaf_block,
+                child_block,
                 depth - 1,
                 logical_start,
                 logical_end,
+                alloc,
             )?;
-            all_freed.extend(freed);
+            all_freed.extend(child_result.freed_ranges);
+
+            if child_result.empty {
+                trace!(
+                    freed_block_num = child_block,
+                    reason = "empty_subtree",
+                    "extent_block_free"
+                );
+                alloc.free_block(cx, BlockNumber(child_block))?;
+                debug!(
+                    merged_nodes = 1_u8,
+                    resulting_node = block,
+                    "extent_delete_collapse_empty_child"
+                );
+                indexes.remove(idx_pos);
+                continue;
+            }
+
+            if let Some(new_first) = child_result.first_logical {
+                indexes[idx_pos].logical_block = new_first;
+            }
+            idx_pos += 1;
         }
-        Ok(all_freed)
+
+        if !indexes.is_empty() {
+            let new_data = serialize_index_block(block_size, depth, &indexes);
+            dev.write_block(cx, BlockNumber(block), &new_data)?;
+        }
+
+        Ok(DeleteSubtreeResult {
+            freed_ranges: all_freed,
+            first_logical: indexes.first().map(|idx| idx.logical_block),
+            empty: indexes.is_empty(),
+        })
+    }
+}
+
+struct DeleteSubtreeResult {
+    freed_ranges: Vec<FreedRange>,
+    first_logical: Option<u32>,
+    empty: bool,
+}
+
+#[expect(clippy::cast_possible_truncation)]
+fn maybe_shrink_root(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    root_bytes: &mut [u8; 60],
+    alloc: &mut dyn BlockAllocator,
+) -> Result<()> {
+    loop {
+        let (root_header, _) = parse_header(root_bytes)?;
+        validate_header(&root_header, ROOT_MAX_ENTRIES)?;
+        if root_header.depth == 0 || root_header.entries != 1 {
+            return Ok(());
+        }
+
+        let root_indexes = parse_index_entries(root_bytes, &root_header)?;
+        let only_child = root_indexes[0].leaf_block;
+
+        let child_buf = dev.read_block(cx, BlockNumber(only_child))?;
+        let child_data = child_buf.as_slice();
+        let child_max = max_entries_external(dev.block_size());
+        let (child_header, _) = parse_header(child_data)?;
+        validate_header(&child_header, child_max)?;
+
+        if child_header.depth + 1 != root_header.depth || child_header.entries > ROOT_MAX_ENTRIES {
+            return Ok(());
+        }
+
+        if child_header.depth == 0 {
+            let child_extents = parse_leaf_entries(child_data, &child_header)?;
+            let new_header = Ext4ExtentHeader {
+                magic: EXT4_EXTENT_MAGIC,
+                entries: child_extents.len() as u16,
+                max_entries: ROOT_MAX_ENTRIES,
+                depth: 0,
+                generation: root_header.generation,
+            };
+            write_leaf_root(root_bytes, &new_header, &child_extents);
+        } else {
+            let child_indexes = parse_index_entries(child_data, &child_header)?;
+            let new_header = Ext4ExtentHeader {
+                magic: EXT4_EXTENT_MAGIC,
+                entries: child_indexes.len() as u16,
+                max_entries: ROOT_MAX_ENTRIES,
+                depth: child_header.depth,
+                generation: root_header.generation,
+            };
+            write_index_root(root_bytes, &new_header, &child_indexes);
+        }
+
+        trace!(
+            freed_block_num = only_child,
+            reason = "root_shrink",
+            "extent_block_free"
+        );
+        alloc.free_block(cx, BlockNumber(only_child))?;
+        debug!(
+            merged_nodes = 1_u8,
+            resulting_node = "inode_root",
+            "extent_root_shrink"
+        );
     }
 }
 
@@ -715,6 +966,12 @@ fn parse_header(data: &[u8]) -> Result<(Ext4ExtentHeader, usize)> {
 
 fn validate_header(header: &Ext4ExtentHeader, max_allowed: u16) -> Result<()> {
     if header.magic != EXT4_EXTENT_MAGIC {
+        error!(
+            invariant = "header.magic",
+            expected = EXT4_EXTENT_MAGIC,
+            got = header.magic,
+            "extent_invariant_violation"
+        );
         return Err(FfsError::Corruption {
             block: 0,
             detail: format!(
@@ -724,6 +981,12 @@ fn validate_header(header: &Ext4ExtentHeader, max_allowed: u16) -> Result<()> {
         });
     }
     if header.entries > header.max_entries {
+        error!(
+            invariant = "header.entries<=header.max_entries",
+            entries = header.entries,
+            max_entries = header.max_entries,
+            "extent_invariant_violation"
+        );
         return Err(FfsError::Corruption {
             block: 0,
             detail: format!(
@@ -733,6 +996,12 @@ fn validate_header(header: &Ext4ExtentHeader, max_allowed: u16) -> Result<()> {
         });
     }
     if header.max_entries > max_allowed {
+        error!(
+            invariant = "header.max_entries<=max_allowed",
+            header_max_entries = header.max_entries,
+            max_allowed,
+            "extent_invariant_violation"
+        );
         return Err(FfsError::Corruption {
             block: 0,
             detail: format!(
@@ -960,7 +1229,8 @@ fn write_index_entry(buf: &mut [u8], idx: &Ext4ExtentIndex) {
 mod tests {
     use super::*;
     use ffs_block::BlockBuf;
-    use std::collections::HashMap;
+    use proptest::prelude::*;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex;
 
     /// In-memory block device for testing.
@@ -1010,11 +1280,19 @@ mod tests {
     /// Simple sequential block allocator.
     struct SeqAllocator {
         next: u64,
+        freed: Vec<u64>,
     }
 
     impl SeqAllocator {
         fn new(start: u64) -> Self {
-            Self { next: start }
+            Self {
+                next: start,
+                freed: Vec::new(),
+            }
+        }
+
+        fn freed_blocks(&self) -> &[u64] {
+            &self.freed
         }
     }
 
@@ -1025,7 +1303,8 @@ mod tests {
             Ok(bn)
         }
 
-        fn free_block(&mut self, _cx: &Cx, _block: BlockNumber) -> Result<()> {
+        fn free_block(&mut self, _cx: &Cx, block: BlockNumber) -> Result<()> {
+            self.freed.push(block.0);
             Ok(())
         }
     }
@@ -1045,6 +1324,106 @@ mod tests {
 
     fn test_cx() -> Cx {
         Cx::for_testing()
+    }
+
+    fn assert_sorted_non_overlapping(extents: &[Ext4Extent]) {
+        for pair in extents.windows(2) {
+            let left = pair[0];
+            let right = pair[1];
+            let left_end = left
+                .logical_block
+                .saturating_add(u32::from(left.actual_len()));
+            assert!(
+                left.logical_block < right.logical_block,
+                "extents out of order"
+            );
+            assert!(left_end <= right.logical_block, "extents overlap");
+        }
+    }
+
+    fn subtree_first_logical(
+        cx: &Cx,
+        dev: &MemBlockDevice,
+        block: u64,
+        expected_depth: u16,
+    ) -> Result<Option<u32>> {
+        let buf = dev.read_block(cx, BlockNumber(block))?;
+        let data = buf.as_slice();
+        let max = max_entries_external(dev.block_size());
+        let (header, _) = parse_header(data)?;
+        validate_header(&header, max)?;
+
+        if header.depth != expected_depth {
+            return Err(FfsError::Corruption {
+                block,
+                detail: format!(
+                    "test invariant depth mismatch: expected {expected_depth}, got {}",
+                    header.depth
+                ),
+            });
+        }
+
+        if expected_depth == 0 {
+            let extents = parse_leaf_entries(data, &header)?;
+            assert_sorted_non_overlapping(&extents);
+            Ok(extents.first().map(|ext| ext.logical_block))
+        } else {
+            let indexes = parse_index_entries(data, &header)?;
+            let mut previous = None;
+            for idx in &indexes {
+                if let Some(prev) = previous {
+                    assert!(prev < idx.logical_block, "index entries are not sorted");
+                }
+                let child_first =
+                    subtree_first_logical(cx, dev, idx.leaf_block, expected_depth - 1)?;
+                assert_eq!(
+                    child_first,
+                    Some(idx.logical_block),
+                    "separator key mismatch at block {}",
+                    idx.leaf_block
+                );
+                previous = Some(idx.logical_block);
+            }
+            Ok(indexes.first().map(|idx| idx.logical_block))
+        }
+    }
+
+    fn assert_tree_invariants(cx: &Cx, dev: &MemBlockDevice, root: &[u8; 60]) -> Result<()> {
+        let (root_header, _) = parse_header(root)?;
+        validate_header(&root_header, ROOT_MAX_ENTRIES)?;
+        if root_header.depth == 0 {
+            let root_extents = parse_leaf_entries(root, &root_header)?;
+            assert_sorted_non_overlapping(&root_extents);
+        } else {
+            let root_indexes = parse_index_entries(root, &root_header)?;
+            let mut previous = None;
+            for idx in &root_indexes {
+                if let Some(prev) = previous {
+                    assert!(
+                        prev < idx.logical_block,
+                        "root index entries are not sorted"
+                    );
+                }
+                let child_first =
+                    subtree_first_logical(cx, dev, idx.leaf_block, root_header.depth - 1)?;
+                assert_eq!(
+                    child_first,
+                    Some(idx.logical_block),
+                    "root separator key mismatch at child block {}",
+                    idx.leaf_block
+                );
+                previous = Some(idx.logical_block);
+            }
+        }
+
+        let mut walked = Vec::new();
+        let count = walk(cx, dev, root, &mut |ext| {
+            walked.push(*ext);
+            Ok(())
+        })?;
+        assert_eq!(count, walked.len(), "walk count mismatch");
+        assert_sorted_non_overlapping(&walked);
+        Ok(())
     }
 
     #[test]
@@ -1214,7 +1593,7 @@ mod tests {
         };
         insert(&cx, &dev, &mut root, ext, &mut alloc).unwrap();
 
-        let freed = delete_range(&cx, &dev, &mut root, 10, 5).unwrap();
+        let freed = delete_range(&cx, &dev, &mut root, 10, 5, &mut alloc).unwrap();
         assert_eq!(freed.len(), 1);
         assert_eq!(freed[0].physical_start, 200);
         assert_eq!(freed[0].count, 5);
@@ -1239,7 +1618,7 @@ mod tests {
         insert(&cx, &dev, &mut root, ext, &mut alloc).unwrap();
 
         // Delete blocks 5-9 (trim right portion).
-        let freed = delete_range(&cx, &dev, &mut root, 5, 5).unwrap();
+        let freed = delete_range(&cx, &dev, &mut root, 5, 5, &mut alloc).unwrap();
         assert_eq!(freed.len(), 1);
         assert_eq!(freed[0].physical_start, 505);
         assert_eq!(freed[0].count, 5);
@@ -1274,7 +1653,7 @@ mod tests {
         insert(&cx, &dev, &mut root, ext, &mut alloc).unwrap();
 
         // Delete blocks 10-14 (trim left portion).
-        let freed = delete_range(&cx, &dev, &mut root, 10, 5).unwrap();
+        let freed = delete_range(&cx, &dev, &mut root, 10, 5, &mut alloc).unwrap();
         assert_eq!(freed.len(), 1);
         assert_eq!(freed[0].physical_start, 500);
         assert_eq!(freed[0].count, 5);
@@ -1431,7 +1810,7 @@ mod tests {
         insert(&cx, &dev, &mut root, ext, &mut alloc).unwrap();
 
         // Delete blocks 5-14 (hole punch in middle).
-        let freed = delete_range(&cx, &dev, &mut root, 5, 10).unwrap();
+        let freed = delete_range(&cx, &dev, &mut root, 5, 10, &mut alloc).unwrap();
         assert_eq!(freed.len(), 1);
         assert_eq!(freed[0].physical_start, 505);
         assert_eq!(freed[0].count, 10);
@@ -1460,6 +1839,154 @@ mod tests {
                 assert_eq!(extent.physical_start, 515);
             }
             _ => panic!("expected right portion"),
+        }
+    }
+
+    #[test]
+    fn delete_range_updates_parent_separator_when_child_front_changes() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let mut root = make_root();
+        let mut alloc = SeqAllocator::new(100);
+
+        for logical in [0_u32, 10, 20, 30, 40] {
+            let ext = Ext4Extent {
+                logical_block: logical,
+                raw_len: 5,
+                physical_start: 10_000 + u64::from(logical),
+            };
+            insert(&cx, &dev, &mut root, ext, &mut alloc).unwrap();
+        }
+
+        let (before_header, _) = parse_header(&root).unwrap();
+        assert_eq!(before_header.depth, 1);
+        let before_indexes = parse_index_entries(&root, &before_header).unwrap();
+        assert_eq!(before_indexes.len(), 2);
+        assert_eq!(before_indexes[1].logical_block, 20);
+
+        // Remove the first extent in the second leaf; separator should advance to 30.
+        delete_range(&cx, &dev, &mut root, 20, 5, &mut alloc).unwrap();
+
+        let (after_header, _) = parse_header(&root).unwrap();
+        assert_eq!(after_header.depth, 1);
+        let after_indexes = parse_index_entries(&root, &after_header).unwrap();
+        assert_eq!(after_indexes.len(), 2);
+        assert_eq!(after_indexes[1].logical_block, 30);
+        assert!(alloc.freed_blocks().is_empty());
+
+        let removed = search(&cx, &dev, &root, 20).unwrap();
+        assert!(matches!(removed, SearchResult::Hole { .. }));
+        let kept = search(&cx, &dev, &root, 30).unwrap();
+        assert!(matches!(kept, SearchResult::Found { .. }));
+        assert_tree_invariants(&cx, &dev, &root).unwrap();
+    }
+
+    #[test]
+    fn delete_range_empties_leaf_and_shrinks_root_freeing_metadata_blocks() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let mut root = make_root();
+        let mut alloc = SeqAllocator::new(100);
+
+        for logical in [0_u32, 10, 20, 30, 40] {
+            let ext = Ext4Extent {
+                logical_block: logical,
+                raw_len: 5,
+                physical_start: 20_000 + u64::from(logical),
+            };
+            insert(&cx, &dev, &mut root, ext, &mut alloc).unwrap();
+        }
+
+        delete_range(&cx, &dev, &mut root, 20, 30, &mut alloc).unwrap();
+
+        let (header, _) = parse_header(&root).unwrap();
+        assert_eq!(header.depth, 0);
+        let root_extents = parse_leaf_entries(&root, &header).unwrap();
+        assert_eq!(root_extents.len(), 2);
+        assert_eq!(root_extents[0].logical_block, 0);
+        assert_eq!(root_extents[1].logical_block, 10);
+        assert_eq!(alloc.freed_blocks().len(), 2);
+        assert!(alloc.freed_blocks().contains(&100));
+        assert!(alloc.freed_blocks().contains(&101));
+
+        let deleted = search(&cx, &dev, &root, 20).unwrap();
+        assert!(matches!(deleted, SearchResult::Hole { .. }));
+        assert_tree_invariants(&cx, &dev, &root).unwrap();
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn mutation_sequences_preserve_sorted_non_overlapping_tree(
+            insert_keys in proptest::collection::vec(0_u16..300_u16, 1..80),
+            delete_ranges in proptest::collection::vec((0_u16..600_u16, 1_u16..25_u16), 0..80),
+        ) {
+            let cx = test_cx();
+            let dev = MemBlockDevice::new(4096);
+            let mut root = make_root();
+            let mut alloc = SeqAllocator::new(10_000);
+            let mut model = BTreeMap::<u32, u64>::new();
+
+            for key in insert_keys {
+                let logical = u32::from(key) * 2;
+                if model.contains_key(&logical) {
+                    continue;
+                }
+                let physical = 1_000_000 + u64::from(logical);
+                let ext = Ext4Extent {
+                    logical_block: logical,
+                    raw_len: 1,
+                    physical_start: physical,
+                };
+                insert(&cx, &dev, &mut root, ext, &mut alloc).unwrap();
+                model.insert(logical, physical);
+            }
+
+            for (start, count) in delete_ranges {
+                let delete_start = u32::from(start);
+                let delete_end = delete_start.saturating_add(u32::from(count));
+                delete_range(&cx, &dev, &mut root, delete_start, u32::from(count), &mut alloc).unwrap();
+                model.retain(|logical, _| *logical < delete_start || *logical >= delete_end);
+                assert_tree_invariants(&cx, &dev, &root).unwrap();
+            }
+
+            let mut walked = Vec::new();
+            walk(&cx, &dev, &root, &mut |ext| {
+                walked.push(*ext);
+                Ok(())
+            })
+            .unwrap();
+            prop_assert_eq!(walked.len(), model.len());
+            for extent in walked {
+                prop_assert_eq!(extent.actual_len(), 1);
+                prop_assert_eq!(
+                    model.get(&extent.logical_block).copied(),
+                    Some(extent.physical_start)
+                );
+            }
+
+            for probe in 0_u32..600 {
+                let result = search(&cx, &dev, &root, probe).unwrap();
+                if let Some(expected_physical) = model.get(&probe).copied() {
+                    match result {
+                        SearchResult::Found {
+                            extent,
+                            offset_in_extent,
+                        } => {
+                            prop_assert_eq!(offset_in_extent, 0);
+                            prop_assert_eq!(extent.logical_block, probe);
+                            prop_assert_eq!(extent.actual_len(), 1);
+                            prop_assert_eq!(extent.physical_start, expected_physical);
+                        }
+                        SearchResult::Hole { .. } => {
+                            prop_assert!(false, "reference model expected mapped block at {probe}");
+                        }
+                    }
+                } else if !matches!(result, SearchResult::Hole { .. }) {
+                    prop_assert!(false, "reference model expected hole at {probe}");
+                }
+            }
         }
     }
 }

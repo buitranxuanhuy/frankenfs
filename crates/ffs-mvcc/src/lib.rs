@@ -1,10 +1,12 @@
 #![forbid(unsafe_code)]
 
+pub mod compression;
 pub mod persist;
 pub mod sharded;
 pub mod wal;
 
 use asupersync::Cx;
+use compression::{CompressionPolicy, CompressionStats, VersionData};
 use ffs_block::{BlockBuf, BlockDevice};
 use ffs_error::{FfsError, Result as FfsResult};
 use ffs_types::{BlockNumber, CommitSeq, Snapshot, TxnId};
@@ -21,7 +23,15 @@ pub struct BlockVersion {
     pub block: BlockNumber,
     pub commit_seq: CommitSeq,
     pub writer: TxnId,
-    pub bytes: Vec<u8>,
+    pub data: VersionData,
+}
+
+impl BlockVersion {
+    /// Convenience: get inline bytes if this is a Full version, None for Identical.
+    #[must_use]
+    pub fn bytes_inline(&self) -> Option<&[u8]> {
+        self.data.as_bytes()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,7 +215,7 @@ pub(crate) struct CommittedTxnRecord {
     pub(crate) read_set: BTreeMap<BlockNumber, CommitSeq>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MvccStore {
     next_txn: u64,
     next_commit: u64,
@@ -226,6 +236,14 @@ pub struct MvccStore {
     /// Recent committed transactions retained for SSI antidependency
     /// checking.  Pruned by `prune_ssi_log`.
     ssi_log: Vec<CommittedTxnRecord>,
+    /// Version chain compression policy.
+    compression_policy: CompressionPolicy,
+}
+
+impl Default for MvccStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MvccStore {
@@ -238,7 +256,51 @@ impl MvccStore {
             physical_versions: BTreeMap::new(),
             active_snapshots: BTreeMap::new(),
             ssi_log: Vec::new(),
+            compression_policy: CompressionPolicy::default(),
         }
+    }
+
+    /// Create a store with a custom compression policy.
+    #[must_use]
+    pub fn with_compression_policy(policy: CompressionPolicy) -> Self {
+        Self {
+            compression_policy: policy,
+            ..Self::new()
+        }
+    }
+
+    /// Returns the current compression policy.
+    #[must_use]
+    pub fn compression_policy(&self) -> &CompressionPolicy {
+        &self.compression_policy
+    }
+
+    /// Compute compression statistics across all version chains.
+    #[must_use]
+    pub fn compression_stats(&self) -> CompressionStats {
+        let mut stats = CompressionStats::default();
+        for versions in self.versions.values() {
+            for version in versions {
+                match &version.data {
+                    VersionData::Full(bytes) => {
+                        stats.full_versions += 1;
+                        stats.bytes_stored += bytes.len();
+                    }
+                    VersionData::Identical => {
+                        stats.identical_versions += 1;
+                        // Estimate bytes saved: use the resolved data size
+                        if let Some(bytes) = compression::resolve_data_with(
+                            versions,
+                            versions.iter().position(|v| std::ptr::eq(v, version)).unwrap_or(0),
+                            |v| &v.data,
+                        ) {
+                            stats.bytes_saved += bytes.len();
+                        }
+                    }
+                }
+            }
+        }
+        stats
     }
 
     #[must_use]
@@ -342,14 +404,26 @@ impl MvccStore {
 
         let commit_seq = CommitSeq(self.next_commit);
         self.next_commit = self.next_commit.saturating_add(1);
+        let dedup_enabled = self.compression_policy.dedup_identical;
+        let chain_cap = self.compression_policy.max_chain_length;
 
         for (block, bytes) in writes {
+            let version_data = if dedup_enabled {
+                self.maybe_dedup(block, &bytes)
+            } else {
+                VersionData::Full(bytes)
+            };
+
             self.versions.entry(block).or_default().push(BlockVersion {
                 block,
                 commit_seq,
                 writer: txn_id,
-                bytes,
+                data: version_data,
             });
+
+            if let Some(cap) = chain_cap {
+                self.enforce_chain_cap(block, cap);
+            }
 
             if let Some(intent) = cow_writes.get(&block) {
                 self.physical_versions
@@ -414,15 +488,27 @@ impl MvccStore {
 
         let commit_seq = CommitSeq(self.next_commit);
         self.next_commit = self.next_commit.saturating_add(1);
+        let dedup_enabled = self.compression_policy.dedup_identical;
+        let chain_cap = self.compression_policy.max_chain_length;
 
         let write_keys: BTreeSet<BlockNumber> = writes.keys().copied().collect();
         for (block, bytes) in writes {
+            let version_data = if dedup_enabled {
+                self.maybe_dedup(block, &bytes)
+            } else {
+                VersionData::Full(bytes)
+            };
+
             self.versions.entry(block).or_default().push(BlockVersion {
                 block,
                 commit_seq,
                 writer: txn_id,
-                bytes,
+                data: version_data,
             });
+
+            if let Some(cap) = chain_cap {
+                self.enforce_chain_cap(block, cap);
+            }
 
             if let Some(intent) = cow_writes.get(&block) {
                 self.physical_versions
@@ -447,6 +533,73 @@ impl MvccStore {
 
         let deferred = Self::collect_cow_deferred_frees(&cow_writes, cow_orphans);
         Ok((commit_seq, deferred))
+    }
+
+    /// Check if `new_bytes` are identical to the latest version for `block`.
+    /// If so, return `VersionData::Identical` (dedup); otherwise `VersionData::Full`.
+    fn maybe_dedup(&self, block: BlockNumber, new_bytes: &[u8]) -> VersionData {
+        if let Some(versions) = self.versions.get(&block) {
+            if let Some(last) = versions.last() {
+                // Resolve the latest version's data (might itself be Identical).
+                if let Some(existing) = compression::resolve_data_with(
+                    versions,
+                    versions.len() - 1,
+                    |v| &v.data,
+                ) {
+                    if existing == new_bytes {
+                        trace!(
+                            block = block.0,
+                            chain_len = versions.len(),
+                            bytes_saved = new_bytes.len(),
+                            "version_dedup: identical to previous"
+                        );
+                        return VersionData::Identical;
+                    }
+                }
+            }
+        }
+        VersionData::Full(new_bytes.to_vec())
+    }
+
+    /// Enforce chain length cap for a block by pruning the oldest versions.
+    /// Always keeps at least 1 version. Ensures the first remaining version
+    /// is `Full` (not `Identical`) so the chain remains resolvable.
+    fn enforce_chain_cap(&mut self, block: BlockNumber, max_len: usize) {
+        let max_len = max_len.max(1);
+        if let Some(versions) = self.versions.get_mut(&block) {
+            if versions.len() > max_len {
+                let trim = versions.len() - max_len;
+                versions.drain(0..trim);
+                // Ensure the new head is Full (resolvable).
+                if let Some(head) = versions.first_mut() {
+                    if head.data.is_identical() {
+                        // Walk forward to find the first Full, then copy its data to head.
+                        // This should be rare since dedup only marks consecutive identical.
+                        let resolved = compression::resolve_data_with(
+                            versions,
+                            0,
+                            |v| &v.data,
+                        );
+                        // resolve_data_with at index 0 on Identical returns None (malformed).
+                        // Fix by resolving from later in the chain.
+                        if resolved.is_none() {
+                            // Walk forward for the first Full.
+                            if let Some(full_data) = versions.iter()
+                                .find_map(|v| v.data.as_bytes().map(|b| b.to_vec()))
+                            {
+                                versions[0].data = VersionData::Full(full_data);
+                            }
+                        }
+                    }
+                }
+                trace!(
+                    block = block.0,
+                    trimmed = trim,
+                    remaining = versions.len(),
+                    "chain_cap_enforced"
+                );
+            }
+        }
     }
 
     fn collect_cow_deferred_frees(
@@ -483,11 +636,10 @@ impl MvccStore {
     #[must_use]
     pub fn read_visible(&self, block: BlockNumber, snapshot: Snapshot) -> Option<&[u8]> {
         self.versions.get(&block).and_then(|versions| {
-            versions
+            let idx = versions
                 .iter()
-                .rev()
-                .find(|v| v.commit_seq <= snapshot.high)
-                .map(|v| v.bytes.as_slice())
+                .rposition(|v| v.commit_seq <= snapshot.high)?;
+            compression::resolve_data_with(versions, idx, |v| &v.data)
         })
     }
 

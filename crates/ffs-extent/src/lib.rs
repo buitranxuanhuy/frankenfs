@@ -259,7 +259,16 @@ pub fn truncate_extents(
 
         if ext_start >= new_logical_end {
             // Fully beyond truncation point: remove and free all blocks.
-            let freed = ffs_btree::delete_range(cx, dev, root_bytes, ext_start, ext_len)?;
+            let freed = {
+                let mut tree_alloc = GroupBlockAllocator {
+                    cx,
+                    dev,
+                    geo,
+                    groups,
+                    hint: AllocHint::default(),
+                };
+                ffs_btree::delete_range(cx, dev, root_bytes, ext_start, ext_len, &mut tree_alloc)?
+            };
             for f in &freed {
                 ffs_alloc::free_blocks(
                     cx,
@@ -276,7 +285,23 @@ pub fn truncate_extents(
             let keep_len = new_logical_end - ext_start;
             let remove_start = ext_start + keep_len;
             let remove_count = ext_end - new_logical_end;
-            let freed = ffs_btree::delete_range(cx, dev, root_bytes, remove_start, remove_count)?;
+            let freed = {
+                let mut tree_alloc = GroupBlockAllocator {
+                    cx,
+                    dev,
+                    geo,
+                    groups,
+                    hint: AllocHint::default(),
+                };
+                ffs_btree::delete_range(
+                    cx,
+                    dev,
+                    root_bytes,
+                    remove_start,
+                    remove_count,
+                    &mut tree_alloc,
+                )?
+            };
             for f in &freed {
                 ffs_alloc::free_blocks(
                     cx,
@@ -312,7 +337,16 @@ pub fn punch_hole(
 ) -> Result<u64> {
     cx_checkpoint(cx)?;
 
-    let freed_ranges = ffs_btree::delete_range(cx, dev, root_bytes, logical_start, count)?;
+    let freed_ranges = {
+        let mut tree_alloc = GroupBlockAllocator {
+            cx,
+            dev,
+            geo,
+            groups,
+            hint: AllocHint::default(),
+        };
+        ffs_btree::delete_range(cx, dev, root_bytes, logical_start, count, &mut tree_alloc)?
+    };
     let mut total_freed = 0u64;
 
     for f in &freed_ranges {
@@ -369,12 +403,6 @@ pub fn mark_written(
         let ext_len = u32::from(ext.actual_len());
         let ext_end = ext.logical_block.saturating_add(ext_len);
 
-        // All branches start by removing the old extent.
-        ffs_btree::delete_range(cx, dev, root_bytes, ext.logical_block, ext_len)?;
-
-        // Build replacement extents based on overlap type.
-        let replacements = split_for_mark_written(&ext, logical_start, range_end, ext_end, count);
-
         let mut tree_alloc = GroupBlockAllocator {
             cx,
             dev,
@@ -382,6 +410,20 @@ pub fn mark_written(
             groups,
             hint: AllocHint::default(),
         };
+
+        // All branches start by removing the old extent.
+        ffs_btree::delete_range(
+            cx,
+            dev,
+            root_bytes,
+            ext.logical_block,
+            ext_len,
+            &mut tree_alloc,
+        )?;
+
+        // Build replacement extents based on overlap type.
+        let replacements = split_for_mark_written(&ext, logical_start, range_end, ext_end, count);
+
         for replacement in replacements {
             ffs_btree::insert(cx, dev, root_bytes, replacement, &mut tree_alloc)?;
         }

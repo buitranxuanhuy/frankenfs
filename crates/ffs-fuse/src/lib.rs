@@ -17,10 +17,12 @@ use std::ffi::OsStr;
 use std::os::raw::c_int;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use thiserror::Error;
-use tracing::warn;
+use tracing::{info, trace, warn};
 
 /// Default TTL for cached attributes and entries.
 ///
@@ -35,6 +37,47 @@ pub enum FuseError {
     InvalidMountpoint(String),
     #[error("mount I/O error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+// ── FUSE error context ─────────────────────────────────────────────────────
+
+/// Structured error context for FUSE operation failures.
+///
+/// Captures the operation name, inode, optional offset, and the underlying
+/// error. Used to produce consistent, structured tracing for every FUSE
+/// error reply.
+pub struct FuseErrorContext<'a> {
+    pub error: &'a FfsError,
+    pub operation: &'static str,
+    pub ino: u64,
+    pub offset: Option<u64>,
+}
+
+impl FuseErrorContext<'_> {
+    /// Log this error context via tracing and return the errno for the reply.
+    pub fn log_and_errno(&self) -> c_int {
+        let errno = self.error.to_errno();
+        // ENOENT on lookup is normal — log at trace instead of warn.
+        if errno == libc::ENOENT {
+            trace!(
+                op = self.operation,
+                ino = self.ino,
+                errno,
+                error = %self.error,
+                "FUSE op returned ENOENT"
+            );
+        } else {
+            warn!(
+                op = self.operation,
+                ino = self.ino,
+                offset = self.offset,
+                errno,
+                error = %self.error,
+                "FUSE op failed"
+            );
+        }
+        errno
+    }
 }
 
 // ── Type conversions ────────────────────────────────────────────────────────
@@ -80,6 +123,13 @@ pub struct MountOptions {
     pub read_only: bool,
     pub allow_other: bool,
     pub auto_unmount: bool,
+    /// Number of worker threads for FUSE dispatch.
+    ///
+    /// Currently fuser 0.16 processes requests sequentially; this field
+    /// is reserved for future multi-threaded dispatch (e.g. via
+    /// `Session::run()` clones or a fuser upgrade). A value of 0 means
+    /// "use default" (min(num_cpus, 8) when multi-threading is enabled).
+    pub worker_threads: usize,
 }
 
 impl Default for MountOptions {
@@ -88,7 +138,139 @@ impl Default for MountOptions {
             read_only: true,
             allow_other: false,
             auto_unmount: true,
+            worker_threads: 0,
         }
+    }
+}
+
+impl MountOptions {
+    /// Resolved thread count.
+    ///
+    /// `worker_threads == 0` means "auto": `min(available_parallelism, 8)`.
+    /// Non-zero values are returned as-is (clamped to at least 1).
+    #[must_use]
+    pub fn resolved_thread_count(&self) -> usize {
+        if self.worker_threads == 0 {
+            std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(8)
+        } else {
+            self.worker_threads.max(1)
+        }
+    }
+}
+
+// ── Cache-line padding ──────────────────────────────────────────────────────
+
+/// Pad a value to 64 bytes to avoid false sharing between hot counters
+/// updated on different CPU cores.
+#[repr(C, align(64))]
+pub struct CacheLinePadded<T>(pub T);
+
+impl<T: std::fmt::Debug> std::fmt::Debug for CacheLinePadded<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+// ── Atomic metrics ──────────────────────────────────────────────────────────
+
+/// Lock-free per-mount request counters.
+///
+/// Each counter sits on its own cache line (64 B) so cores updating
+/// different counters never invalidate each other's L1 lines.
+#[repr(C)]
+pub struct AtomicMetrics {
+    pub requests_total: CacheLinePadded<AtomicU64>,
+    pub requests_ok: CacheLinePadded<AtomicU64>,
+    pub requests_err: CacheLinePadded<AtomicU64>,
+    pub bytes_read: CacheLinePadded<AtomicU64>,
+}
+
+impl AtomicMetrics {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            requests_total: CacheLinePadded(AtomicU64::new(0)),
+            requests_ok: CacheLinePadded(AtomicU64::new(0)),
+            requests_err: CacheLinePadded(AtomicU64::new(0)),
+            bytes_read: CacheLinePadded(AtomicU64::new(0)),
+        }
+    }
+
+    fn record_ok(&self) {
+        self.requests_total.0.fetch_add(1, Ordering::Relaxed);
+        self.requests_ok.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_err(&self) {
+        self.requests_total.0.fetch_add(1, Ordering::Relaxed);
+        self.requests_err.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_bytes_read(&self, n: u64) {
+        self.bytes_read.0.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Snapshot of all counters (for diagnostics / reporting).
+    #[must_use]
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            requests_total: self.requests_total.0.load(Ordering::Relaxed),
+            requests_ok: self.requests_ok.0.load(Ordering::Relaxed),
+            requests_err: self.requests_err.0.load(Ordering::Relaxed),
+            bytes_read: self.bytes_read.0.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Default for AtomicMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for AtomicMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = self.snapshot();
+        f.debug_struct("AtomicMetrics")
+            .field("requests_total", &s.requests_total)
+            .field("requests_ok", &s.requests_ok)
+            .field("requests_err", &s.requests_err)
+            .field("bytes_read", &s.bytes_read)
+            .finish()
+    }
+}
+
+/// Point-in-time snapshot of metrics (all plain `u64`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetricsSnapshot {
+    pub requests_total: u64,
+    pub requests_ok: u64,
+    pub requests_err: u64,
+    pub bytes_read: u64,
+}
+
+// ── Shared FUSE inner state ─────────────────────────────────────────────────
+
+/// Thread-safe shared state for the FUSE backend.
+///
+/// All fields are `Send + Sync`:
+/// - `ops` delegates to `FsOps` which is `Send + Sync` by trait bound.
+/// - `metrics` uses atomic counters with cache-line padding.
+/// - `thread_count` is immutable after mount.
+struct FuseInner {
+    ops: Arc<dyn FsOps>,
+    metrics: Arc<AtomicMetrics>,
+    thread_count: usize,
+}
+
+impl std::fmt::Debug for FuseInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FuseInner")
+            .field("metrics", &self.metrics)
+            .field("thread_count", &self.thread_count)
+            .finish_non_exhaustive()
     }
 }
 
@@ -96,12 +278,19 @@ impl Default for MountOptions {
 
 /// FUSE adapter that delegates all operations to a [`FsOps`] implementation.
 ///
-/// Unimplemented operations return `ENOSYS` via fuser's default method
-/// implementations. Only `getattr`, `lookup`, `readdir`, `open`, `opendir`,
-/// `read`, `readlink`, `listxattr`, and `getxattr` are overridden.
+/// Internally wraps all state in `Arc<FuseInner>` so it is `Send + Sync`
+/// and ready for multi-threaded FUSE dispatch.  All `FsOps` calls go
+/// through `self.inner.ops` (which is `Arc<dyn FsOps>`), and lock-free
+/// [`AtomicMetrics`] are updated on every request.
 pub struct FrankenFuse {
-    ops: Box<dyn FsOps>,
+    inner: Arc<FuseInner>,
 }
+
+// Compile-time assertions: FrankenFuse must be Send + Sync.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    let _ = assert_send_sync::<FrankenFuse>;
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum XattrReplyPlan {
@@ -112,9 +301,39 @@ enum XattrReplyPlan {
 
 impl FrankenFuse {
     /// Create a new FUSE adapter wrapping the given `FsOps` implementation.
+    ///
+    /// Uses default thread count (auto-detected).
     #[must_use]
     pub fn new(ops: Box<dyn FsOps>) -> Self {
-        Self { ops }
+        Self::with_options(ops, &MountOptions::default())
+    }
+
+    /// Create a new FUSE adapter with explicit mount options.
+    ///
+    /// The resolved `thread_count` is logged at info level.
+    #[must_use]
+    pub fn with_options(ops: Box<dyn FsOps>, options: &MountOptions) -> Self {
+        let thread_count = options.resolved_thread_count();
+        info!(thread_count, "FrankenFuse initialized");
+        Self {
+            inner: Arc::new(FuseInner {
+                ops: Arc::from(ops),
+                metrics: Arc::new(AtomicMetrics::new()),
+                thread_count,
+            }),
+        }
+    }
+
+    /// Get a reference to the shared metrics.
+    #[must_use]
+    pub fn metrics(&self) -> &AtomicMetrics {
+        &self.inner.metrics
+    }
+
+    /// Configured thread count.
+    #[must_use]
+    pub fn thread_count(&self) -> usize {
+        self.inner.thread_count
     }
 
     /// Create a `Cx` for a FUSE request.
@@ -125,24 +344,24 @@ impl FrankenFuse {
         Cx::for_request()
     }
 
-    fn reply_error_attr(err: &FfsError, reply: ReplyAttr) {
-        reply.error(err.to_errno());
+    fn reply_error_attr(ctx: &FuseErrorContext<'_>, reply: ReplyAttr) {
+        reply.error(ctx.log_and_errno());
     }
 
-    fn reply_error_entry(err: &FfsError, reply: ReplyEntry) {
-        reply.error(err.to_errno());
+    fn reply_error_entry(ctx: &FuseErrorContext<'_>, reply: ReplyEntry) {
+        reply.error(ctx.log_and_errno());
     }
 
-    fn reply_error_data(err: &FfsError, reply: ReplyData) {
-        reply.error(err.to_errno());
+    fn reply_error_data(ctx: &FuseErrorContext<'_>, reply: ReplyData) {
+        reply.error(ctx.log_and_errno());
     }
 
-    fn reply_error_dir(err: &FfsError, reply: ReplyDirectory) {
-        reply.error(err.to_errno());
+    fn reply_error_dir(ctx: &FuseErrorContext<'_>, reply: ReplyDirectory) {
+        reply.error(ctx.log_and_errno());
     }
 
-    fn reply_error_xattr(err: &FfsError, reply: ReplyXattr) {
-        reply.error(err.to_errno());
+    fn reply_error_xattr(ctx: &FuseErrorContext<'_>, reply: ReplyXattr) {
+        reply.error(ctx.log_and_errno());
     }
 
     fn classify_xattr_reply(size: u32, payload_len: usize) -> XattrReplyPlan {
@@ -186,15 +405,25 @@ impl FrankenFuse {
     where
         F: FnOnce(&Cx) -> ffs_error::Result<T>,
     {
-        let scope = self.ops.begin_request_scope(cx, op)?;
+        let scope = self.inner.ops.begin_request_scope(cx, op)?;
         let op_result = f(cx);
-        let end_result = self.ops.end_request_scope(cx, op, scope);
+        let end_result = self.inner.ops.end_request_scope(cx, op, scope);
 
         match (op_result, end_result) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Ok(_), Err(end_err)) => Err(end_err),
-            (Err(op_err), Ok(())) => Err(op_err),
+            (Ok(value), Ok(())) => {
+                self.inner.metrics.record_ok();
+                Ok(value)
+            }
+            (Ok(_), Err(end_err)) => {
+                self.inner.metrics.record_err();
+                Err(end_err)
+            }
+            (Err(op_err), Ok(())) => {
+                self.inner.metrics.record_err();
+                Err(op_err)
+            }
             (Err(op_err), Err(end_err)) => {
+                self.inner.metrics.record_err();
                 warn!(?op, error = %end_err, "request scope cleanup failed after operation error");
                 Err(op_err)
             }
@@ -212,12 +441,19 @@ impl Filesystem for FrankenFuse {
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         let cx = Self::cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Getattr, |cx| {
-            self.ops.getattr(cx, InodeNumber(ino))
+            self.inner.ops.getattr(cx, InodeNumber(ino))
         }) {
             Ok(attr) => reply.attr(&ATTR_TTL, &to_file_attr(&attr)),
             Err(e) => {
-                warn!(ino, error = %e, "getattr failed");
-                Self::reply_error_attr(&e, reply);
+                Self::reply_error_attr(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "getattr",
+                        ino,
+                        offset: None,
+                    },
+                    reply,
+                );
             }
         }
     }
@@ -225,15 +461,19 @@ impl Filesystem for FrankenFuse {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let cx = Self::cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Lookup, |cx| {
-            self.ops.lookup(cx, InodeNumber(parent), name)
+            self.inner.ops.lookup(cx, InodeNumber(parent), name)
         }) {
             Ok(attr) => reply.entry(&ATTR_TTL, &to_file_attr(&attr), 0),
             Err(e) => {
-                // ENOENT is expected for missing entries — don't warn for that.
-                if e.to_errno() != libc::ENOENT {
-                    warn!(parent, ?name, error = %e, "lookup failed");
-                }
-                Self::reply_error_entry(&e, reply);
+                Self::reply_error_entry(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "lookup",
+                        ino: parent,
+                        offset: None,
+                    },
+                    reply,
+                );
             }
         }
     }
@@ -244,8 +484,13 @@ impl Filesystem for FrankenFuse {
             // Stateless open: we don't track file handles.
             Ok(()) => reply.opened(0, 0),
             Err(e) => {
-                warn!(ino, error = %e, "open failed");
-                reply.error(e.to_errno());
+                let ctx = FuseErrorContext {
+                    error: &e,
+                    operation: "open",
+                    ino,
+                    offset: None,
+                };
+                reply.error(ctx.log_and_errno());
             }
         }
     }
@@ -255,8 +500,13 @@ impl Filesystem for FrankenFuse {
         match self.with_request_scope(&cx, RequestOp::Opendir, |_cx| Ok(())) {
             Ok(()) => reply.opened(0, 0),
             Err(e) => {
-                warn!(ino, error = %e, "opendir failed");
-                reply.error(e.to_errno());
+                let ctx = FuseErrorContext {
+                    error: &e,
+                    operation: "opendir",
+                    ino,
+                    offset: None,
+                };
+                reply.error(ctx.log_and_errno());
             }
         }
     }
@@ -276,12 +526,24 @@ impl Filesystem for FrankenFuse {
         // Clamp negative offsets to 0 (shouldn't happen in practice).
         let byte_offset = u64::try_from(offset).unwrap_or(0);
         match self.with_request_scope(&cx, RequestOp::Read, |cx| {
-            self.ops.read(cx, InodeNumber(ino), byte_offset, size)
+            self.inner.ops.read(cx, InodeNumber(ino), byte_offset, size)
         }) {
-            Ok(data) => reply.data(&data),
+            Ok(data) => {
+                self.inner
+                    .metrics
+                    .record_bytes_read(u64::try_from(data.len()).unwrap_or(u64::MAX));
+                reply.data(&data);
+            }
             Err(e) => {
-                warn!(ino, offset, size, error = %e, "read failed");
-                Self::reply_error_data(&e, reply);
+                Self::reply_error_data(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "read",
+                        ino,
+                        offset: Some(byte_offset),
+                    },
+                    reply,
+                );
             }
         }
     }
@@ -297,7 +559,7 @@ impl Filesystem for FrankenFuse {
         let cx = Self::cx_for_request();
         let fs_offset = u64::try_from(offset).unwrap_or(0);
         match self.with_request_scope(&cx, RequestOp::Readdir, |cx| {
-            self.ops.readdir(cx, InodeNumber(ino), fs_offset)
+            self.inner.ops.readdir(cx, InodeNumber(ino), fs_offset)
         }) {
             Ok(entries) => {
                 for entry in &entries {
@@ -321,8 +583,15 @@ impl Filesystem for FrankenFuse {
                 reply.ok();
             }
             Err(e) => {
-                warn!(ino, offset, error = %e, "readdir failed");
-                Self::reply_error_dir(&e, reply);
+                Self::reply_error_dir(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "readdir",
+                        ino,
+                        offset: Some(fs_offset),
+                    },
+                    reply,
+                );
             }
         }
     }
@@ -330,12 +599,19 @@ impl Filesystem for FrankenFuse {
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
         let cx = Self::cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Readlink, |cx| {
-            self.ops.readlink(cx, InodeNumber(ino))
+            self.inner.ops.readlink(cx, InodeNumber(ino))
         }) {
             Ok(target) => reply.data(&target),
             Err(e) => {
-                warn!(ino, error = %e, "readlink failed");
-                Self::reply_error_data(&e, reply);
+                Self::reply_error_data(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "readlink",
+                        ino,
+                        offset: None,
+                    },
+                    reply,
+                );
             }
         }
     }
@@ -354,13 +630,20 @@ impl Filesystem for FrankenFuse {
         };
         let cx = Self::cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Getxattr, |cx| {
-            self.ops.getxattr(cx, InodeNumber(ino), name)
+            self.inner.ops.getxattr(cx, InodeNumber(ino), name)
         }) {
             Ok(Some(value)) => Self::reply_xattr_payload(size, &value, reply),
             Ok(None) => reply.error(Self::missing_xattr_errno()),
             Err(e) => {
-                warn!(ino, xattr = name, error = %e, "getxattr failed");
-                Self::reply_error_xattr(&e, reply);
+                Self::reply_error_xattr(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "getxattr",
+                        ino,
+                        offset: None,
+                    },
+                    reply,
+                );
             }
         }
     }
@@ -368,15 +651,22 @@ impl Filesystem for FrankenFuse {
     fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
         let cx = Self::cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Listxattr, |cx| {
-            self.ops.listxattr(cx, InodeNumber(ino))
+            self.inner.ops.listxattr(cx, InodeNumber(ino))
         }) {
             Ok(names) => {
                 let payload = Self::encode_xattr_names(&names);
                 Self::reply_xattr_payload(size, &payload, reply);
             }
             Err(e) => {
-                warn!(ino, error = %e, "listxattr failed");
-                Self::reply_error_xattr(&e, reply);
+                Self::reply_error_xattr(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "listxattr",
+                        ino,
+                        offset: None,
+                    },
+                    reply,
+                );
             }
         }
     }
@@ -421,7 +711,7 @@ pub fn mount(
         ));
     }
     let fuse_opts = build_mount_options(options);
-    let fs = FrankenFuse::new(ops);
+    let fs = FrankenFuse::with_options(ops, options);
     fuser::mount2(fs, mountpoint, &fuse_opts)?;
     Ok(())
 }
@@ -441,9 +731,195 @@ pub fn mount_background(
         ));
     }
     let fuse_opts = build_mount_options(options);
-    let fs = FrankenFuse::new(ops);
+    let fs = FrankenFuse::with_options(ops, options);
     let session = fuser::spawn_mount2(fs, mountpoint, &fuse_opts)?;
     Ok(session)
+}
+
+// ── Mount lifecycle ─────────────────────────────────────────────────────────
+
+/// Configuration for a managed mount with lifecycle control.
+#[derive(Debug, Clone)]
+pub struct MountConfig {
+    /// Base mount options (RO, allow_other, threads, etc.).
+    pub options: MountOptions,
+    /// Grace period for in-flight requests during unmount.
+    pub unmount_timeout: Duration,
+}
+
+impl Default for MountConfig {
+    fn default() -> Self {
+        Self {
+            options: MountOptions::default(),
+            unmount_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Handle for a live FUSE mount with lifecycle control.
+///
+/// Dropping the handle triggers a clean unmount.  Call [`wait`] to block
+/// until external shutdown (Ctrl+C / programmatic `shutdown()`).
+///
+/// # Signal Handling
+///
+/// `MountHandle` exposes a shared `shutdown` flag (`Arc<AtomicBool>`).
+/// The CLI (or any owner) should wire SIGTERM / SIGINT handlers that set
+/// this flag.  [`wait`] polls the flag and triggers unmount when set.
+/// The `AutoUnmount` fuser option provides a safety net: the kernel
+/// unmounts the filesystem if the process exits without a clean unmount.
+pub struct MountHandle {
+    session: Option<fuser::BackgroundSession>,
+    mountpoint: PathBuf,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    metrics: Arc<AtomicMetrics>,
+    config: MountConfig,
+}
+
+impl MountHandle {
+    /// The mountpoint path.
+    #[must_use]
+    pub fn mountpoint(&self) -> &Path {
+        &self.mountpoint
+    }
+
+    /// Shared shutdown flag.
+    ///
+    /// Set this to `true` (from a signal handler or another thread) to
+    /// trigger a graceful unmount.
+    #[must_use]
+    pub fn shutdown_flag(&self) -> &Arc<std::sync::atomic::AtomicBool> {
+        &self.shutdown
+    }
+
+    /// Get a snapshot of the mount metrics.
+    #[must_use]
+    pub fn metrics_snapshot(&self) -> MetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    /// Block until the shutdown flag is set, then unmount cleanly.
+    ///
+    /// Returns the final metrics snapshot.
+    #[must_use]
+    pub fn wait(mut self) -> MetricsSnapshot {
+        info!(mountpoint = %self.mountpoint.display(), "waiting for shutdown signal");
+        while !self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        info!(mountpoint = %self.mountpoint.display(), "shutdown signal received");
+        self.do_unmount()
+    }
+
+    /// Trigger a graceful unmount.
+    ///
+    /// Returns the final metrics snapshot.
+    #[must_use]
+    pub fn unmount(mut self) -> MetricsSnapshot {
+        self.do_unmount()
+    }
+
+    fn do_unmount(&mut self) -> MetricsSnapshot {
+        let snap = self.metrics.snapshot();
+        if let Some(session) = self.session.take() {
+            info!(
+                mountpoint = %self.mountpoint.display(),
+                requests_total = snap.requests_total,
+                requests_ok = snap.requests_ok,
+                requests_err = snap.requests_err,
+                bytes_read = snap.bytes_read,
+                "unmounting FUSE filesystem"
+            );
+            // Dropping the BackgroundSession triggers FUSE unmount.
+            drop(session);
+            info!(mountpoint = %self.mountpoint.display(), "unmount complete");
+        }
+        snap
+    }
+}
+
+impl Drop for MountHandle {
+    fn drop(&mut self) {
+        if self.session.is_some() {
+            self.do_unmount();
+        }
+    }
+}
+
+impl std::fmt::Debug for MountHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MountHandle")
+            .field("mountpoint", &self.mountpoint)
+            .field("active", &self.session.is_some())
+            .field(
+                "shutdown",
+                &self.shutdown.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .field("metrics", &self.metrics.snapshot())
+            .field("unmount_timeout", &self.config.unmount_timeout)
+            .finish()
+    }
+}
+
+/// Mount a FrankenFS filesystem with full lifecycle control.
+///
+/// Returns a [`MountHandle`] that can be used to wait for signals,
+/// query metrics, and trigger a clean unmount.
+///
+/// # Example
+/// ```no_run
+/// # use ffs_fuse::{MountConfig, mount_managed};
+/// # fn example(ops: Box<dyn ffs_core::FsOps>) {
+/// let handle = mount_managed(ops, "/mnt/ffs", &MountConfig::default()).unwrap();
+/// // Wire Ctrl+C to the shutdown flag (e.g. via ctrlc crate):
+/// let flag = handle.shutdown_flag().clone();
+/// // ... register signal handler that sets `flag.store(true, ...)` ...
+/// let stats = handle.wait();
+/// println!("served {} requests", stats.requests_total);
+/// # }
+/// ```
+pub fn mount_managed(
+    ops: Box<dyn FsOps>,
+    mountpoint: impl AsRef<Path>,
+    config: &MountConfig,
+) -> Result<MountHandle, FuseError> {
+    let mountpoint = mountpoint.as_ref();
+    if mountpoint.as_os_str().is_empty() {
+        return Err(FuseError::InvalidMountpoint(
+            "mountpoint cannot be empty".to_owned(),
+        ));
+    }
+    if !mountpoint.exists() {
+        return Err(FuseError::InvalidMountpoint(format!(
+            "mountpoint does not exist: {}",
+            mountpoint.display()
+        )));
+    }
+
+    let thread_count = config.options.resolved_thread_count();
+    info!(
+        mountpoint = %mountpoint.display(),
+        thread_count,
+        read_only = config.options.read_only,
+        unmount_timeout_secs = config.unmount_timeout.as_secs(),
+        "mounting FrankenFS"
+    );
+
+    let fuse_opts = build_mount_options(&config.options);
+    let fs = FrankenFuse::with_options(ops, &config.options);
+    let metrics_ref = Arc::clone(&fs.inner.metrics);
+
+    let session = fuser::spawn_mount2(fs, mountpoint, &fuse_opts)?;
+
+    info!(mountpoint = %mountpoint.display(), "FUSE mount active");
+
+    Ok(MountHandle {
+        session: Some(session),
+        mountpoint: mountpoint.to_owned(),
+        shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        metrics: metrics_ref,
+        config: config.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -453,6 +929,42 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::SystemTime;
+
+    /// Minimal FsOps stub for tests that don't need real filesystem behavior.
+    struct StubFs;
+    impl FsOps for StubFs {
+        fn getattr(&self, _cx: &Cx, _ino: InodeNumber) -> ffs_error::Result<InodeAttr> {
+            Err(FfsError::NotFound("stub".into()))
+        }
+        fn lookup(
+            &self,
+            _cx: &Cx,
+            _parent: InodeNumber,
+            _name: &OsStr,
+        ) -> ffs_error::Result<InodeAttr> {
+            Err(FfsError::NotFound("stub".into()))
+        }
+        fn readdir(
+            &self,
+            _cx: &Cx,
+            _ino: InodeNumber,
+            _offset: u64,
+        ) -> ffs_error::Result<Vec<FfsDirEntry>> {
+            Ok(vec![])
+        }
+        fn read(
+            &self,
+            _cx: &Cx,
+            _ino: InodeNumber,
+            _offset: u64,
+            _size: u32,
+        ) -> ffs_error::Result<Vec<u8>> {
+            Ok(vec![])
+        }
+        fn readlink(&self, _cx: &Cx, _ino: InodeNumber) -> ffs_error::Result<Vec<u8>> {
+            Ok(vec![])
+        }
+    }
 
     #[test]
     fn file_type_conversion_roundtrip() {
@@ -563,40 +1075,6 @@ mod tests {
 
     #[test]
     fn franken_fuse_construction() {
-        struct StubFs;
-        impl FsOps for StubFs {
-            fn getattr(&self, _cx: &Cx, _ino: InodeNumber) -> ffs_error::Result<InodeAttr> {
-                Err(FfsError::NotFound("stub".into()))
-            }
-            fn lookup(
-                &self,
-                _cx: &Cx,
-                _parent: InodeNumber,
-                _name: &OsStr,
-            ) -> ffs_error::Result<InodeAttr> {
-                Err(FfsError::NotFound("stub".into()))
-            }
-            fn readdir(
-                &self,
-                _cx: &Cx,
-                _ino: InodeNumber,
-                _offset: u64,
-            ) -> ffs_error::Result<Vec<FfsDirEntry>> {
-                Ok(vec![])
-            }
-            fn read(
-                &self,
-                _cx: &Cx,
-                _ino: InodeNumber,
-                _offset: u64,
-                _size: u32,
-            ) -> ffs_error::Result<Vec<u8>> {
-                Ok(vec![])
-            }
-            fn readlink(&self, _cx: &Cx, _ino: InodeNumber) -> ffs_error::Result<Vec<u8>> {
-                Ok(vec![])
-            }
-        }
         let _fuse = FrankenFuse::new(Box::new(StubFs));
         // Verify the Cx creation helper works.
         let _cx = FrankenFuse::cx_for_request();
@@ -845,5 +1323,357 @@ mod tests {
                 HookEvent::End(RequestOp::Getattr)
             ]
         );
+    }
+
+    #[test]
+    fn fuse_error_context_returns_correct_errno() {
+        let cases: Vec<(FfsError, libc::c_int)> = vec![
+            (FfsError::NotFound("test".into()), libc::ENOENT),
+            (FfsError::PermissionDenied, libc::EACCES),
+            (FfsError::IsDirectory, libc::EISDIR),
+            (FfsError::NotDirectory, libc::ENOTDIR),
+            (FfsError::ReadOnly, libc::EROFS),
+            (FfsError::NoSpace, libc::ENOSPC),
+            (FfsError::NameTooLong, libc::ENAMETOOLONG),
+            (FfsError::NotEmpty, libc::ENOTEMPTY),
+            (FfsError::Exists, libc::EEXIST),
+            (FfsError::Cancelled, libc::EINTR),
+            (FfsError::MvccConflict { tx: 1, block: 2 }, libc::EAGAIN),
+            (
+                FfsError::Corruption {
+                    block: 0,
+                    detail: "bad csum".into(),
+                },
+                libc::EIO,
+            ),
+            (FfsError::Format("bad".into()), libc::EINVAL),
+            (
+                FfsError::UnsupportedFeature("ENCRYPT".into()),
+                libc::EOPNOTSUPP,
+            ),
+            (FfsError::RepairFailed("irrecoverable".into()), libc::EIO),
+        ];
+
+        for (error, expected) in &cases {
+            let ctx = FuseErrorContext {
+                error,
+                operation: "test_op",
+                ino: 42,
+                offset: None,
+            };
+            assert_eq!(ctx.log_and_errno(), *expected, "wrong errno for {error:?}",);
+        }
+    }
+
+    #[test]
+    fn fuse_error_context_with_offset() {
+        let error = FfsError::NotFound("file.txt".into());
+        let ctx = FuseErrorContext {
+            error: &error,
+            operation: "read",
+            ino: 100,
+            offset: Some(4096),
+        };
+        assert_eq!(ctx.log_and_errno(), libc::ENOENT);
+    }
+
+    // ── Thread safety tests ──────────────────────────────────────────────
+
+    #[test]
+    fn franken_fuse_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<FrankenFuse>();
+        assert_send_sync::<FuseInner>();
+        assert_send_sync::<AtomicMetrics>();
+    }
+
+    #[test]
+    fn mount_options_resolved_thread_count() {
+        let mut opts = MountOptions::default();
+        assert_eq!(opts.worker_threads, 0);
+        // Auto resolution gives at least 1.
+        assert!(opts.resolved_thread_count() >= 1);
+        assert!(opts.resolved_thread_count() <= 8);
+
+        opts.worker_threads = 4;
+        assert_eq!(opts.resolved_thread_count(), 4);
+    }
+
+    #[test]
+    fn franken_fuse_with_options_sets_thread_count() {
+        let opts = MountOptions {
+            worker_threads: 6,
+            ..MountOptions::default()
+        };
+        let fuse = FrankenFuse::with_options(Box::new(StubFs), &opts);
+        assert_eq!(fuse.thread_count(), 6);
+    }
+
+    #[test]
+    fn atomic_metrics_snapshot_initially_zero() {
+        let m = AtomicMetrics::new();
+        let s = m.snapshot();
+        assert_eq!(s.requests_total, 0);
+        assert_eq!(s.requests_ok, 0);
+        assert_eq!(s.requests_err, 0);
+        assert_eq!(s.bytes_read, 0);
+    }
+
+    #[test]
+    fn atomic_metrics_record_ok_and_err() {
+        let m = AtomicMetrics::new();
+        m.record_ok();
+        m.record_ok();
+        m.record_err();
+        m.record_bytes_read(1024);
+        let s = m.snapshot();
+        assert_eq!(s.requests_total, 3);
+        assert_eq!(s.requests_ok, 2);
+        assert_eq!(s.requests_err, 1);
+        assert_eq!(s.bytes_read, 1024);
+    }
+
+    #[test]
+    fn cache_line_padded_alignment() {
+        let padded = CacheLinePadded(AtomicU64::new(0));
+        let ptr = std::ptr::addr_of!(padded) as usize;
+        // Must be 64-byte aligned.
+        assert_eq!(ptr % 64, 0);
+    }
+
+    #[test]
+    fn request_scope_updates_metrics() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let fs = HookFs::new(Arc::clone(&events), false, false);
+        let fuse = FrankenFuse::new(Box::new(fs));
+        let cx = Cx::for_testing();
+
+        // Successful request.
+        let _ = fuse.with_request_scope(&cx, RequestOp::Read, |_cx| Ok::<u32, FfsError>(7));
+
+        let s = fuse.metrics().snapshot();
+        assert_eq!(s.requests_total, 1);
+        assert_eq!(s.requests_ok, 1);
+        assert_eq!(s.requests_err, 0);
+    }
+
+    #[test]
+    fn request_scope_records_err_metric() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let fs = HookFs::new(Arc::clone(&events), false, false);
+        let fuse = FrankenFuse::new(Box::new(fs));
+        let cx = Cx::for_testing();
+
+        let _ = fuse.with_request_scope(&cx, RequestOp::Read, |_cx| {
+            Err::<u32, FfsError>(FfsError::NotFound("gone".into()))
+        });
+
+        let s = fuse.metrics().snapshot();
+        assert_eq!(s.requests_total, 1);
+        assert_eq!(s.requests_ok, 0);
+        assert_eq!(s.requests_err, 1);
+    }
+
+    #[test]
+    fn concurrent_fsops_access_no_deadlock() {
+        // Verify FsOps can be called concurrently from multiple threads
+        // via Arc<dyn FsOps>.
+        let fs: Arc<dyn FsOps> = Arc::new(StubFs);
+        let barrier = Arc::new(std::sync::Barrier::new(10));
+
+        std::thread::scope(|s| {
+            for _ in 0..10 {
+                let fs: Arc<dyn FsOps> = Arc::clone(&fs);
+                let barrier = Arc::clone(&barrier);
+                s.spawn(move || {
+                    let cx = Cx::for_testing();
+                    barrier.wait();
+                    for _ in 0..100 {
+                        let _ = fs.getattr(&cx, InodeNumber(1));
+                        let _ = fs.readdir(&cx, InodeNumber(1), 0);
+                        let _ = fs.read(&cx, InodeNumber(1), 0, 4096);
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn concurrent_metrics_stress() {
+        // 10 threads x 1000 increments each.
+        let metrics = Arc::new(AtomicMetrics::new());
+        let barrier = Arc::new(std::sync::Barrier::new(10));
+
+        std::thread::scope(|s| {
+            for _ in 0..10 {
+                let m = Arc::clone(&metrics);
+                let b = Arc::clone(&barrier);
+                s.spawn(move || {
+                    b.wait();
+                    for _ in 0..1000 {
+                        m.record_ok();
+                        m.record_bytes_read(512);
+                    }
+                });
+            }
+        });
+
+        let s = metrics.snapshot();
+        assert_eq!(s.requests_total, 10_000);
+        assert_eq!(s.requests_ok, 10_000);
+        assert_eq!(s.requests_err, 0);
+        assert_eq!(s.bytes_read, 10_000 * 512);
+    }
+
+    #[test]
+    fn fuse_inner_shared_across_threads() {
+        // Simulate multi-threaded FUSE dispatch: multiple threads share
+        // the same FuseInner via Arc and call FsOps concurrently.
+        let inner = Arc::new(FuseInner {
+            ops: Arc::new(StubFs),
+            metrics: Arc::new(AtomicMetrics::new()),
+            thread_count: 4,
+        });
+        let barrier = Arc::new(std::sync::Barrier::new(10));
+
+        std::thread::scope(|s| {
+            for _ in 0..10 {
+                let inner = Arc::clone(&inner);
+                let barrier = Arc::clone(&barrier);
+                s.spawn(move || {
+                    let cx = Cx::for_testing();
+                    barrier.wait();
+                    for _ in 0..1000 {
+                        let _ = inner.ops.getattr(&cx, InodeNumber(2));
+                        inner.metrics.record_ok();
+                        let _ = inner.ops.read(&cx, InodeNumber(2), 0, 4096);
+                        inner.metrics.record_bytes_read(4096);
+                    }
+                });
+            }
+        });
+
+        let snap = inner.metrics.snapshot();
+        assert_eq!(snap.requests_ok, 10_000);
+        assert_eq!(snap.bytes_read, 10_000 * 4096);
+    }
+
+    // ── Mount lifecycle tests ─────────────────────────────────────────
+
+    #[test]
+    fn mount_config_default_has_30s_timeout() {
+        let cfg = MountConfig::default();
+        assert_eq!(cfg.unmount_timeout, Duration::from_secs(30));
+        assert!(cfg.options.read_only);
+    }
+
+    #[test]
+    fn mount_managed_rejects_empty_mountpoint() {
+        let ops: Box<dyn FsOps> = Box::new(StubFs);
+        let err = mount_managed(ops, "", &MountConfig::default()).unwrap_err();
+        assert!(
+            err.to_string().contains("empty"),
+            "expected 'empty' in error: {err}"
+        );
+    }
+
+    #[test]
+    fn mount_managed_rejects_nonexistent_mountpoint() {
+        let ops: Box<dyn FsOps> = Box::new(StubFs);
+        let err = mount_managed(
+            ops,
+            "/tmp/frankenfs_no_such_dir_xyzzy",
+            &MountConfig::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("does not exist"),
+            "expected 'does not exist' in error: {err}"
+        );
+    }
+
+    #[test]
+    fn mount_handle_shutdown_flag_lifecycle() {
+        // Build a MountHandle manually (without a real FUSE session) to
+        // exercise the shutdown flag + metrics plumbing.
+        let metrics = Arc::new(AtomicMetrics::new());
+        metrics.record_ok();
+        metrics.record_ok();
+        metrics.record_bytes_read(8192);
+
+        let handle = MountHandle {
+            session: None,
+            mountpoint: PathBuf::from("/mnt/test"),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            metrics: Arc::clone(&metrics),
+            config: MountConfig::default(),
+        };
+
+        // Shutdown flag starts false.
+        assert!(!handle.shutdown_flag().load(Ordering::Relaxed));
+
+        // Metrics snapshot reflects pre-recorded data.
+        let snap = handle.metrics_snapshot();
+        assert_eq!(snap.requests_ok, 2);
+        assert_eq!(snap.bytes_read, 8192);
+
+        // Unmount returns final snapshot.
+        let final_snap = handle.unmount();
+        assert_eq!(final_snap.requests_ok, 2);
+    }
+
+    #[test]
+    fn mount_handle_debug_format() {
+        let handle = MountHandle {
+            session: None,
+            mountpoint: PathBuf::from("/mnt/dbg"),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            metrics: Arc::new(AtomicMetrics::new()),
+            config: MountConfig::default(),
+        };
+        let dbg = format!("{handle:?}");
+        assert!(dbg.contains("MountHandle"), "missing struct name: {dbg}");
+        assert!(dbg.contains("/mnt/dbg"), "missing mountpoint: {dbg}");
+        assert!(dbg.contains("active: false"), "missing active: {dbg}");
+        assert!(dbg.contains("shutdown: false"), "missing shutdown: {dbg}");
+    }
+
+    #[test]
+    fn mount_handle_drop_is_safe_without_session() {
+        // Verify that dropping a MountHandle with no session doesn't panic.
+        let handle = MountHandle {
+            session: None,
+            mountpoint: PathBuf::from("/mnt/drop"),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            metrics: Arc::new(AtomicMetrics::new()),
+            config: MountConfig::default(),
+        };
+        drop(handle);
+    }
+
+    #[test]
+    fn mount_handle_wait_returns_on_shutdown() {
+        let metrics = Arc::new(AtomicMetrics::new());
+        metrics.record_ok();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_trigger = Arc::clone(&shutdown);
+
+        let handle = MountHandle {
+            session: None,
+            mountpoint: PathBuf::from("/mnt/wait"),
+            shutdown: Arc::clone(&shutdown),
+            metrics,
+            config: MountConfig::default(),
+        };
+
+        // Set the shutdown flag from another thread after a short delay.
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            shutdown_trigger.store(true, Ordering::Relaxed);
+        });
+
+        let snap = handle.wait();
+        assert_eq!(snap.requests_ok, 1);
     }
 }

@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod e2e;
+
 use anyhow::{Context, Result, bail};
 use ffs_ondisk::{
     BtrfsHeader, BtrfsItem, BtrfsSuperblock, Ext4DirEntry, Ext4GroupDesc, Ext4Inode,
@@ -32,7 +34,7 @@ impl ParityReport {
         let domains = vec![
             CoverageDomain::new("ext4 metadata parsing", 10, 19),
             CoverageDomain::new("btrfs metadata parsing", 8, 20),
-            CoverageDomain::new("MVCC/COW core", 4, 14),
+            CoverageDomain::new("MVCC/COW core", 5, 14),
             CoverageDomain::new("FUSE surface", 6, 12),
             CoverageDomain::new("self-healing durability policy", 5, 10),
         ];

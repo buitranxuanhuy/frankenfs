@@ -6,6 +6,8 @@
 //! corrupted blocks from repair symbols, and runs background scrub passes.
 
 pub mod codec;
+pub mod evidence;
+pub mod pipeline;
 pub mod recovery;
 pub mod scrub;
 pub mod storage;

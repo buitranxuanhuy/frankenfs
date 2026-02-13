@@ -87,6 +87,8 @@ enum InspectOutput {
         free_inodes_total: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         free_space_mismatch: Option<FreeSpaceMismatch>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        orphan_diagnostics: Option<Ext4OrphanDiagnosticsOutput>,
     },
     Btrfs {
         sectorsize: u32,
@@ -101,6 +103,12 @@ enum InspectOutput {
 struct FreeSpaceMismatch {
     gd_free_blocks: u64,
     gd_free_inodes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct Ext4OrphanDiagnosticsOutput {
+    count: u32,
+    sample_inodes: Vec<u64>,
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -137,33 +145,15 @@ fn inspect(path: &PathBuf, json: bool) -> Result<()> {
         .with_context(|| format!("failed to detect ext4/btrfs metadata in {}", path.display()))?;
 
     let output = match &flavor {
-        FsFlavor::Ext4(sb) => {
-            // Open the filesystem to read bitmaps for free space
-            let open_fs = OpenFs::open_with_options(&cx, path, &open_opts)
-                .with_context(|| format!("failed to open ext4 image: {}", path.display()))?;
-            let summary = open_fs
-                .free_space_summary(&cx)
-                .context("failed to compute free space summary")?;
-
-            let mismatch = if summary.blocks_mismatch || summary.inodes_mismatch {
-                Some(FreeSpaceMismatch {
-                    gd_free_blocks: summary.gd_free_blocks_total,
-                    gd_free_inodes: summary.gd_free_inodes_total,
-                })
-            } else {
-                None
-            };
-
-            InspectOutput::Ext4 {
-                block_size: sb.block_size,
-                inodes_count: sb.inodes_count,
-                blocks_count: sb.blocks_count,
-                volume_name: sb.volume_name.clone(),
-                free_blocks_total: summary.free_blocks_total,
-                free_inodes_total: summary.free_inodes_total,
-                free_space_mismatch: mismatch,
-            }
-        }
+        FsFlavor::Ext4(sb) => inspect_ext4_output(
+            &cx,
+            path,
+            &open_opts,
+            sb.block_size,
+            sb.inodes_count,
+            sb.blocks_count,
+            &sb.volume_name,
+        )?,
         FsFlavor::Btrfs(sb) => InspectOutput::Btrfs {
             sectorsize: sb.sectorsize,
             nodesize: sb.nodesize,
@@ -188,6 +178,7 @@ fn inspect(path: &PathBuf, json: bool) -> Result<()> {
                 free_blocks_total,
                 free_inodes_total,
                 free_space_mismatch,
+                orphan_diagnostics,
             } => {
                 println!("filesystem: ext4");
                 println!("block_size: {block_size}");
@@ -200,6 +191,12 @@ fn inspect(path: &PathBuf, json: bool) -> Result<()> {
                     println!(
                         "WARNING: mismatch with group descriptors (gd_free_blocks={}, gd_free_inodes={})",
                         mismatch.gd_free_blocks, mismatch.gd_free_inodes
+                    );
+                }
+                if let Some(orphan_diag) = orphan_diagnostics {
+                    println!(
+                        "orphans: count={} sample_inodes={:?}",
+                        orphan_diag.count, orphan_diag.sample_inodes
                     );
                 }
             }
@@ -219,6 +216,54 @@ fn inspect(path: &PathBuf, json: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn inspect_ext4_output(
+    cx: &Cx,
+    path: &PathBuf,
+    open_opts: &OpenOptions,
+    block_size: u32,
+    inodes_count: u32,
+    blocks_count: u64,
+    volume_name: &str,
+) -> Result<InspectOutput> {
+    // Open the filesystem to read bitmaps for free space and orphan diagnostics.
+    let open_fs = OpenFs::open_with_options(cx, path, open_opts)
+        .with_context(|| format!("failed to open ext4 image: {}", path.display()))?;
+    let summary = open_fs
+        .free_space_summary(cx)
+        .context("failed to compute free space summary")?;
+    let orphans = open_fs
+        .read_ext4_orphan_list(cx)
+        .context("failed to read ext4 orphan list")?;
+    let orphan_diagnostics = if orphans.inodes.is_empty() {
+        None
+    } else {
+        Some(Ext4OrphanDiagnosticsOutput {
+            count: u32::try_from(orphans.count()).unwrap_or(u32::MAX),
+            sample_inodes: orphans.inodes.iter().take(16).map(|ino| ino.0).collect(),
+        })
+    };
+
+    let mismatch = if summary.blocks_mismatch || summary.inodes_mismatch {
+        Some(FreeSpaceMismatch {
+            gd_free_blocks: summary.gd_free_blocks_total,
+            gd_free_inodes: summary.gd_free_inodes_total,
+        })
+    } else {
+        None
+    };
+
+    Ok(InspectOutput::Ext4 {
+        block_size,
+        inodes_count,
+        blocks_count,
+        volume_name: volume_name.to_owned(),
+        free_blocks_total: summary.free_blocks_total,
+        free_inodes_total: summary.free_inodes_total,
+        free_space_mismatch: mismatch,
+        orphan_diagnostics,
+    })
 }
 
 fn mount_cmd(image_path: &PathBuf, mountpoint: &PathBuf, allow_other: bool) -> Result<()> {
@@ -251,6 +296,7 @@ fn mount_cmd(image_path: &PathBuf, mountpoint: &PathBuf, allow_other: bool) -> R
         read_only: true,
         allow_other,
         auto_unmount: true,
+        worker_threads: 0,
     };
 
     let fs_ops: Box<dyn FsOps> = Box::new(open_fs);

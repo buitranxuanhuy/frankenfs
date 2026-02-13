@@ -8,10 +8,10 @@
 |--------|-------------|---------------|----------|
 | ext4 metadata parsing | 10 | 19 | 52.6% |
 | btrfs metadata parsing | 8 | 20 | 40.0% |
-| MVCC/COW core | 4 | 14 | 28.6% |
+| MVCC/COW core | 5 | 14 | 35.7% |
 | FUSE surface | 6 | 12 | 50.0% |
 | self-healing durability policy | 5 | 10 | 50.0% |
-| **Overall** | **33** | **75** | **44.0%** |
+| **Overall** | **34** | **75** | **45.3%** |
 
 > **Canonical source:** The `ParityReport::current()` function in `ffs-harness` is the
 > authoritative source for implemented/total counts. This table MUST match those
@@ -34,7 +34,7 @@
 | ext4 bitmap free space reading | `fs/ext4/balloc.c` | ✅ | `OpenFs::free_space_summary`, bitmap-derived free block/inode counts |
 | ext4 journal replay parity | `fs/ext4/ext4_jbd2.c` | 🟡 | Phase 1 implemented in `ffs-journal` (descriptor/commit/revoke replay + tests); full mount-path integration and complete parity still pending |
 | ext4 allocator parity | `fs/ext4/mballoc.c` | ❌ | Not yet implemented |
-| ext4 orphan recovery parity | `fs/ext4/orphan.c` | ❌ | Not yet implemented |
+| ext4 orphan recovery parity | `fs/ext4/orphan.c` | 🟡 | Read-only orphan-list detection/traversal implemented (`OpenFs::read_ext4_orphan_list` + CLI inspect diagnostics); mutating orphan cleanup still pending |
 | btrfs superblock decode | `fs/btrfs/disk-io.c` | ✅ | Implemented in `ffs-ondisk` |
 | btrfs btree header decode | `fs/btrfs/ctree.c` | ✅ | Implemented in `ffs-ondisk` |
 | btrfs leaf item metadata decode | `fs/btrfs/ctree.c` | ✅ | Implemented in `ffs-ondisk` |
@@ -50,7 +50,7 @@
 | MVCC commit sequencing | FrankenFS spec §3 | ✅ | Implemented in `ffs-mvcc` |
 | FCW conflict detection | FrankenFS spec §3 | ✅ | Implemented in `ffs-mvcc` |
 | version retention policy | FrankenFS spec §3 | ✅ | Current in-memory retention |
-| COW block rewrite path | FrankenFS spec §3 | 🟡 | Basic version copy only |
+| COW block rewrite path | FrankenFS spec §3 | ✅ | Allocation-backed COW rewrite path implemented in `ffs-mvcc` (`write_cow`, logical→physical mapping visibility, deferred-free + watermark GC integration) |
 | durability policy model | FrankenFS spec §4 | ✅ | Bayesian expected-loss selector |
 | asupersync config mapping | FrankenFS spec §4 | ✅ | `RaptorQConfig` mapping implemented |
 | format-aware scrub superblock validation | FrankenFS spec §4 | ✅ | `Ext4SuperblockValidator` + `BtrfsSuperblockValidator` in `ffs-repair`, wired into `ffs-cli scrub` |
