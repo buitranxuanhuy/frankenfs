@@ -11,7 +11,9 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Instant;
 use thiserror::Error;
+use tracing::{debug, error, info, trace};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockVersion {
@@ -119,6 +121,11 @@ pub struct MvccStore {
     ///
     /// Callers **must** pair every `register_snapshot` with a corresponding
     /// `release_snapshot` to avoid preventing GC indefinitely.
+    ///
+    /// NOTE: For new code, prefer using [`SnapshotRegistry`] + [`SnapshotHandle`]
+    /// which provide thread-safe RAII lifecycle management decoupled from the
+    /// version store lock.  These inline methods are retained for backward
+    /// compatibility and for use in single-threaded / test contexts.
     active_snapshots: BTreeMap<CommitSeq, u32>,
     /// Recent committed transactions retained for SSI antidependency
     /// checking.  Pruned by `prune_ssi_log`.
@@ -321,7 +328,13 @@ impl MvccStore {
     /// Multiple registrations of the same `CommitSeq` are ref-counted;
     /// each must be paired with a corresponding `release_snapshot`.
     pub fn register_snapshot(&mut self, snapshot: Snapshot) {
-        *self.active_snapshots.entry(snapshot.high).or_insert(0) += 1;
+        let count = self.active_snapshots.entry(snapshot.high).or_insert(0);
+        *count += 1;
+        trace!(
+            commit_seq = snapshot.high.0,
+            ref_count_after = *count,
+            "snapshot_acquire (inline)"
+        );
     }
 
     /// Release a previously registered snapshot.  When the last reference
@@ -334,11 +347,26 @@ impl MvccStore {
     pub fn release_snapshot(&mut self, snapshot: Snapshot) -> bool {
         if let Some(count) = self.active_snapshots.get_mut(&snapshot.high) {
             *count -= 1;
-            if *count == 0 {
+            let count_after = *count;
+            if count_after == 0 {
                 self.active_snapshots.remove(&snapshot.high);
+                debug!(
+                    commit_seq = snapshot.high.0,
+                    "snapshot_final_release (inline): ref_count reached 0"
+                );
+            } else {
+                trace!(
+                    commit_seq = snapshot.high.0,
+                    ref_count_after = count_after,
+                    "snapshot_release (inline)"
+                );
             }
             true
         } else {
+            error!(
+                commit_seq = snapshot.high.0,
+                "ref_count_underflow (inline): release called on unregistered snapshot"
+            );
             false
         }
     }
@@ -368,10 +396,34 @@ impl MvccStore {
     ///
     /// Returns the watermark that was used.
     pub fn prune_safe(&mut self) -> CommitSeq {
+        let old_count = self.version_count();
         let wm = self
             .watermark()
             .unwrap_or_else(|| self.current_snapshot().high);
         self.prune_versions_older_than(wm);
+        let new_count = self.version_count();
+        let freed = old_count.saturating_sub(new_count);
+        if freed > 0 {
+            debug!(
+                watermark = wm.0,
+                versions_freed = freed,
+                versions_remaining = new_count,
+                "watermark_advance: pruned old versions"
+            );
+        } else {
+            trace!(
+                watermark = wm.0,
+                versions_count = new_count,
+                "gc_eligible: no versions to prune"
+            );
+        }
+        if !self.active_snapshots.is_empty() {
+            trace!(
+                active_snapshots = self.active_snapshot_count(),
+                oldest_active = ?self.watermark(),
+                "gc_blocked: active snapshots prevent full pruning"
+            );
+        }
         wm
     }
 
@@ -388,6 +440,228 @@ impl MvccStore {
     }
 }
 
+// ── SnapshotRegistry: thread-safe, standalone snapshot lifecycle ──────────────
+
+/// Thread-safe snapshot registry for managing active snapshot lifetimes.
+///
+/// This is decoupled from `MvccStore` so that FUSE request handlers can
+/// acquire/release snapshots without holding the version-store lock.
+/// Snapshot operations only contend on the registry's internal lock.
+#[derive(Debug)]
+pub struct SnapshotRegistry {
+    active: RwLock<BTreeMap<CommitSeq, u32>>,
+    /// Timestamp of the oldest currently active snapshot registration.
+    /// Used for stall detection.
+    oldest_registered_at: RwLock<Option<Instant>>,
+    /// Duration threshold beyond which a stalled watermark is logged.
+    stall_threshold_secs: u64,
+    // Counters for metrics (monotonic).
+    acquired_total: std::sync::atomic::AtomicU64,
+    released_total: std::sync::atomic::AtomicU64,
+}
+
+impl Default for SnapshotRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SnapshotRegistry {
+    /// Create a new empty registry with the default stall threshold (60s).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            active: RwLock::new(BTreeMap::new()),
+            oldest_registered_at: RwLock::new(None),
+            stall_threshold_secs: 60,
+            acquired_total: std::sync::atomic::AtomicU64::new(0),
+            released_total: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Create a registry with a custom stall threshold.
+    #[must_use]
+    pub fn with_stall_threshold(stall_threshold_secs: u64) -> Self {
+        Self {
+            stall_threshold_secs,
+            ..Self::new()
+        }
+    }
+
+    /// Acquire a snapshot handle from an `Arc<SnapshotRegistry>`.
+    ///
+    /// The snapshot is registered as active and will prevent GC of versions
+    /// at or after this commit sequence until the returned handle is dropped.
+    pub fn acquire(this: &Arc<Self>, snapshot: Snapshot) -> SnapshotHandle {
+        this.register(snapshot);
+        SnapshotHandle {
+            snapshot,
+            registry: Arc::clone(this),
+        }
+    }
+
+    /// Register a snapshot as active (increment ref count).
+    pub fn register(&self, snapshot: Snapshot) {
+        let mut active = self.active.write();
+        let count = active.entry(snapshot.high).or_insert(0);
+        *count += 1;
+        let count_after = *count;
+
+        // Track oldest registration time.
+        if active.len() == 1 || self.oldest_registered_at.read().is_none() {
+            *self.oldest_registered_at.write() = Some(Instant::now());
+        }
+        drop(active);
+
+        self.acquired_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        trace!(
+            commit_seq = snapshot.high.0,
+            ref_count_after = count_after,
+            "snapshot_acquire"
+        );
+    }
+
+    /// Release a previously registered snapshot (decrement ref count).
+    ///
+    /// Returns `true` if the snapshot was still registered, `false` if
+    /// it was already fully released (caller bug, but not fatal).
+    pub fn release(&self, snapshot: Snapshot) -> bool {
+        let mut active = self.active.write();
+        let Some(mut count_after) = active.get(&snapshot.high).copied() else {
+            error!(
+                commit_seq = snapshot.high.0,
+                "ref_count_underflow: release called on unregistered snapshot"
+            );
+            return false;
+        };
+
+        let mut clear_oldest = false;
+        let mut reset_oldest = false;
+        count_after = count_after.saturating_sub(1);
+        if count_after == 0 {
+            active.remove(&snapshot.high);
+            debug!(
+                commit_seq = snapshot.high.0,
+                "snapshot_final_release: ref_count reached 0"
+            );
+            if active.is_empty() {
+                clear_oldest = true;
+            } else {
+                reset_oldest = true;
+            }
+        } else {
+            active.insert(snapshot.high, count_after);
+            trace!(
+                commit_seq = snapshot.high.0,
+                ref_count_after = count_after,
+                "snapshot_release"
+            );
+        }
+        drop(active);
+        if clear_oldest {
+            *self.oldest_registered_at.write() = None;
+        } else if reset_oldest {
+            // Reset to now — imprecise but avoids tracking per-snapshot times.
+            *self.oldest_registered_at.write() = Some(Instant::now());
+        }
+
+        self.released_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
+    /// The oldest active snapshot (safe GC watermark), or `None` if empty.
+    #[must_use]
+    pub fn watermark(&self) -> Option<CommitSeq> {
+        self.active.read().keys().next().copied()
+    }
+
+    /// Total number of active snapshot references (counting duplicates).
+    #[must_use]
+    pub fn active_count(&self) -> usize {
+        self.active.read().values().map(|c| *c as usize).sum()
+    }
+
+    /// Number of distinct commit sequences with active snapshots.
+    #[must_use]
+    pub fn distinct_count(&self) -> usize {
+        self.active.read().len()
+    }
+
+    /// Check for stalled watermark and log if threshold exceeded.
+    ///
+    /// Returns `Some(stall_duration_secs)` if stalled, `None` otherwise.
+    pub fn check_stalls(&self) -> Option<u64> {
+        let oldest = *self.oldest_registered_at.read();
+        if let (Some(registered_at), Some(wm)) = (oldest, self.watermark()) {
+            let elapsed = registered_at.elapsed().as_secs();
+            if elapsed >= self.stall_threshold_secs {
+                info!(
+                    current_watermark = wm.0,
+                    oldest_active = wm.0,
+                    stall_duration_secs = elapsed,
+                    "watermark_stall: oldest active snapshot held for > {}s",
+                    self.stall_threshold_secs
+                );
+                return Some(elapsed);
+            }
+        }
+        None
+    }
+
+    /// Total snapshots acquired since creation (monotonic counter).
+    #[must_use]
+    pub fn acquired_total(&self) -> u64 {
+        self.acquired_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Total snapshots released since creation (monotonic counter).
+    #[must_use]
+    pub fn released_total(&self) -> u64 {
+        self.released_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// RAII handle that releases a snapshot when dropped.
+///
+/// Acquire via [`SnapshotRegistry::acquire_from`].  The snapshot remains
+/// active (preventing GC of versions at or after its commit sequence)
+/// until this handle is dropped.  Panic-safe: `Drop` is always called.
+#[derive(Debug)]
+pub struct SnapshotHandle {
+    snapshot: Snapshot,
+    registry: Arc<SnapshotRegistry>,
+}
+
+impl SnapshotHandle {
+    /// The snapshot this handle protects.
+    #[must_use]
+    pub fn snapshot(&self) -> Snapshot {
+        self.snapshot
+    }
+
+    /// Reference to the underlying registry.
+    #[must_use]
+    pub fn registry(&self) -> &Arc<SnapshotRegistry> {
+        &self.registry
+    }
+}
+
+impl Drop for SnapshotHandle {
+    fn drop(&mut self) {
+        let released = self.registry.release(self.snapshot);
+        debug_assert!(
+            released,
+            "SnapshotHandle: snapshot was not registered or already released: {:?}",
+            self.snapshot
+        );
+    }
+}
+
 /// Snapshot-aware block device wrapper.
 ///
 /// Reads check the `MvccStore` for a version visible at the configured
@@ -401,31 +675,67 @@ impl MvccStore {
 /// - **Reads** acquire a shared (`read`) lock — many concurrent readers.
 /// - **Writes/commits** acquire an exclusive (`write`) lock.
 /// - The base device read (fallback path) happens **outside** the lock.
+///
+/// Snapshot ownership mode for `MvccBlockDevice`.
+///
+/// Either the device manages its snapshot via the `MvccStore`'s inline
+/// tracking (legacy) or via a standalone [`SnapshotHandle`] (preferred).
+#[derive(Debug)]
+enum SnapshotOwnership {
+    /// Snapshot registered on MvccStore; released in Drop.
+    Inline { snapshot: Snapshot },
+    /// Snapshot managed by a SnapshotHandle (RAII, auto-released on drop).
+    Handle { handle: SnapshotHandle },
+}
+
 #[derive(Debug)]
 pub struct MvccBlockDevice<D: BlockDevice> {
     base: D,
     store: Arc<RwLock<MvccStore>>,
-    snapshot: Snapshot,
+    ownership: SnapshotOwnership,
 }
 
 impl<D: BlockDevice> MvccBlockDevice<D> {
     /// Create a new MVCC block device at a given snapshot.
     ///
     /// The `store` is shared across all devices/transactions that
-    /// participate in the same MVCC group.
+    /// participate in the same MVCC group.  The snapshot is tracked
+    /// via `MvccStore`'s inline active_snapshots.
     pub fn new(base: D, store: Arc<RwLock<MvccStore>>, snapshot: Snapshot) -> Self {
         store.write().register_snapshot(snapshot);
         Self {
             base,
             store,
-            snapshot,
+            ownership: SnapshotOwnership::Inline { snapshot },
+        }
+    }
+
+    /// Create a new MVCC block device using a [`SnapshotRegistry`] for
+    /// lifecycle management.
+    ///
+    /// The snapshot is tracked via the registry's RAII handle, which
+    /// decouples snapshot lifecycle from the version-store lock.
+    pub fn with_registry(
+        base: D,
+        store: Arc<RwLock<MvccStore>>,
+        snapshot: Snapshot,
+        registry: &Arc<SnapshotRegistry>,
+    ) -> Self {
+        let handle = SnapshotRegistry::acquire(registry, snapshot);
+        Self {
+            base,
+            store,
+            ownership: SnapshotOwnership::Handle { handle },
         }
     }
 
     /// The snapshot this device reads at.
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
-        self.snapshot
+        match &self.ownership {
+            SnapshotOwnership::Inline { snapshot } => *snapshot,
+            SnapshotOwnership::Handle { handle } => handle.snapshot(),
+        }
     }
 
     /// Shared reference to the MVCC store.
@@ -443,21 +753,28 @@ impl<D: BlockDevice> MvccBlockDevice<D> {
 
 impl<D: BlockDevice> Drop for MvccBlockDevice<D> {
     fn drop(&mut self) {
-        let released = self.store.write().release_snapshot(self.snapshot);
-        debug_assert!(
-            released,
-            "mvcc snapshot was not registered or already released: {:?}",
-            self.snapshot
-        );
+        match &self.ownership {
+            SnapshotOwnership::Inline { snapshot } => {
+                let released = self.store.write().release_snapshot(*snapshot);
+                debug_assert!(
+                    released,
+                    "mvcc snapshot was not registered or already released: {snapshot:?}"
+                );
+            }
+            SnapshotOwnership::Handle { .. } => {
+                // SnapshotHandle's own Drop handles release.
+            }
+        }
     }
 }
 
 impl<D: BlockDevice> BlockDevice for MvccBlockDevice<D> {
     fn read_block(&self, cx: &Cx, block: BlockNumber) -> ffs_error::Result<BlockBuf> {
+        let snap = self.snapshot();
         // Check version store first (shared lock, no I/O).
         {
             let guard = self.store.read();
-            if let Some(bytes) = guard.read_visible(block, self.snapshot) {
+            if let Some(bytes) = guard.read_visible(block, snap) {
                 return Ok(BlockBuf::new(bytes.to_vec()));
             }
         }
@@ -2021,5 +2338,253 @@ mod tests {
                 "seed {seed}: SSI should prevent both writers from succeeding, got a={a} b={b}"
             );
         }
+    }
+
+    // ── SnapshotRegistry + SnapshotHandle tests ─────────────────────────
+
+    #[test]
+    fn snapshot_handle_increments_ref_count_on_create() {
+        let registry = Arc::new(SnapshotRegistry::new());
+        let snap = Snapshot { high: CommitSeq(5) };
+
+        assert_eq!(registry.active_count(), 0);
+        let handle = SnapshotRegistry::acquire(&registry, snap);
+        assert_eq!(registry.active_count(), 1);
+        assert_eq!(handle.snapshot(), snap);
+    }
+
+    #[test]
+    fn snapshot_handle_decrements_ref_count_on_drop() {
+        let registry = Arc::new(SnapshotRegistry::new());
+        let snap = Snapshot { high: CommitSeq(5) };
+
+        let handle = SnapshotRegistry::acquire(&registry, snap);
+        assert_eq!(registry.active_count(), 1);
+
+        drop(handle);
+        assert_eq!(registry.active_count(), 0);
+    }
+
+    #[test]
+    fn registry_gc_respects_oldest_active_snapshot() {
+        let registry = Arc::new(SnapshotRegistry::new());
+        let mut store = MvccStore::new();
+        let block = BlockNumber(1);
+
+        // Write 5 versions.
+        for v in 1_u8..=5 {
+            let mut txn = store.begin();
+            txn.stage_write(block, vec![v]);
+            store.commit(txn).expect("commit");
+        }
+
+        // Acquire a handle at commit 3.
+        let snap3 = Snapshot { high: CommitSeq(3) };
+        let _handle = SnapshotRegistry::acquire(&registry, snap3);
+
+        // Use registry watermark for pruning.
+        let wm = registry.watermark().unwrap();
+        assert_eq!(wm, CommitSeq(3));
+        store.prune_versions_older_than(wm);
+
+        // Version at commit 3 should still be readable.
+        assert_eq!(store.read_visible(block, snap3).unwrap(), &[3]);
+
+        // Latest version should also be readable.
+        let snap_latest = store.current_snapshot();
+        assert_eq!(store.read_visible(block, snap_latest).unwrap(), &[5]);
+    }
+
+    #[test]
+    fn registry_watermark_advances_when_oldest_released() {
+        let registry = Arc::new(SnapshotRegistry::new());
+
+        let old = Snapshot { high: CommitSeq(3) };
+        let mid = Snapshot { high: CommitSeq(7) };
+        let new = Snapshot {
+            high: CommitSeq(12),
+        };
+
+        let h_old = SnapshotRegistry::acquire(&registry, old);
+        let h_mid = SnapshotRegistry::acquire(&registry, mid);
+        let _h_new = SnapshotRegistry::acquire(&registry, new);
+
+        assert_eq!(registry.watermark(), Some(CommitSeq(3)));
+
+        // Release oldest — watermark advances.
+        drop(h_old);
+        assert_eq!(registry.watermark(), Some(CommitSeq(7)));
+
+        // Release mid — watermark advances again.
+        drop(h_mid);
+        assert_eq!(registry.watermark(), Some(CommitSeq(12)));
+    }
+
+    #[test]
+    fn registry_multiple_handles_same_snapshot() {
+        let registry = Arc::new(SnapshotRegistry::new());
+        let snap = Snapshot { high: CommitSeq(5) };
+
+        let h1 = SnapshotRegistry::acquire(&registry, snap);
+        let h2 = SnapshotRegistry::acquire(&registry, snap);
+        assert_eq!(registry.active_count(), 2);
+
+        drop(h1);
+        assert_eq!(registry.active_count(), 1);
+        assert_eq!(registry.watermark(), Some(CommitSeq(5)));
+
+        drop(h2);
+        assert_eq!(registry.active_count(), 0);
+        assert!(registry.watermark().is_none());
+    }
+
+    #[test]
+    fn registry_no_memory_leak_100k_acquire_release() {
+        let registry = Arc::new(SnapshotRegistry::new());
+
+        for i in 0_u64..100_000 {
+            let snap = Snapshot {
+                high: CommitSeq(i % 100),
+            };
+            let handle = SnapshotRegistry::acquire(&registry, snap);
+            drop(handle);
+        }
+
+        assert_eq!(registry.active_count(), 0);
+        assert!(registry.watermark().is_none());
+        assert_eq!(registry.acquired_total(), 100_000);
+        assert_eq!(registry.released_total(), 100_000);
+    }
+
+    #[test]
+    fn registry_concurrent_16_threads() {
+        let registry = Arc::new(SnapshotRegistry::new());
+        let num_threads: usize = 16;
+        let ops_per_thread: usize = 1000;
+        let barrier = Arc::new(std::sync::Barrier::new(num_threads));
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let registry = Arc::clone(&registry);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for j in 0..ops_per_thread {
+                        let seq = u64::try_from(i * ops_per_thread + j).unwrap();
+                        let snap = Snapshot {
+                            high: CommitSeq(seq % 50),
+                        };
+                        let handle = SnapshotRegistry::acquire(&registry, snap);
+                        // Hold briefly.
+                        std::hint::black_box(&handle);
+                        drop(handle);
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        assert_eq!(registry.active_count(), 0);
+        let total = u64::try_from(num_threads * ops_per_thread).unwrap();
+        assert_eq!(registry.acquired_total(), total);
+        assert_eq!(registry.released_total(), total);
+    }
+
+    #[test]
+    fn snapshot_handle_released_on_panic() {
+        let registry = Arc::new(SnapshotRegistry::new());
+        let snap = Snapshot { high: CommitSeq(7) };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _handle = SnapshotRegistry::acquire(&registry, snap);
+            panic!("simulated FUSE handler panic");
+        }));
+
+        assert!(result.is_err(), "panic should have been caught");
+        // The handle's Drop should have released the snapshot.
+        assert_eq!(
+            registry.active_count(),
+            0,
+            "snapshot should be released even after panic"
+        );
+    }
+
+    #[test]
+    fn registry_stall_detection() {
+        // Use a very short threshold for testing.
+        let registry = Arc::new(SnapshotRegistry::with_stall_threshold(0));
+        let snap = Snapshot { high: CommitSeq(1) };
+
+        let _handle = SnapshotRegistry::acquire(&registry, snap);
+        // Even with threshold=0, the check should detect a stall.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let stall = registry.check_stalls();
+        assert!(stall.is_some(), "should detect stall with threshold=0");
+    }
+
+    #[test]
+    fn registry_metrics_counters() {
+        let registry = Arc::new(SnapshotRegistry::new());
+        assert_eq!(registry.acquired_total(), 0);
+        assert_eq!(registry.released_total(), 0);
+
+        let snap = Snapshot { high: CommitSeq(1) };
+        let h1 = SnapshotRegistry::acquire(&registry, snap);
+        let h2 = SnapshotRegistry::acquire(&registry, snap);
+        assert_eq!(registry.acquired_total(), 2);
+        assert_eq!(registry.released_total(), 0);
+
+        drop(h1);
+        assert_eq!(registry.released_total(), 1);
+
+        drop(h2);
+        assert_eq!(registry.acquired_total(), 2);
+        assert_eq!(registry.released_total(), 2);
+    }
+
+    #[test]
+    fn mvcc_device_with_registry_lifecycle() {
+        let store = Arc::new(RwLock::new(MvccStore::new()));
+        let registry = Arc::new(SnapshotRegistry::new());
+        let snap = store.read().current_snapshot();
+
+        assert_eq!(registry.active_count(), 0);
+
+        {
+            let base = MemBlockDevice::new(512, 4);
+            let dev = MvccBlockDevice::with_registry(base, Arc::clone(&store), snap, &registry);
+            assert_eq!(dev.snapshot(), snap);
+            assert_eq!(registry.active_count(), 1);
+            // MvccStore's inline tracking should NOT be affected.
+            assert_eq!(store.read().active_snapshot_count(), 0);
+        }
+
+        // After drop, registry count returns to 0.
+        assert_eq!(registry.active_count(), 0);
+    }
+
+    #[test]
+    fn mvcc_device_with_registry_reads_correctly() {
+        let cx = test_cx();
+        let store = Arc::new(RwLock::new(MvccStore::new()));
+        let registry = Arc::new(SnapshotRegistry::new());
+
+        // Commit a version.
+        {
+            let mut guard = store.write();
+            let mut txn = guard.begin();
+            txn.stage_write(BlockNumber(1), vec![0xAB; 512]);
+            guard.commit(txn).expect("commit");
+        }
+
+        let snap = store.read().current_snapshot();
+        let base = MemBlockDevice::new(512, 16);
+        let dev = MvccBlockDevice::with_registry(base, Arc::clone(&store), snap, &registry);
+
+        let buf = dev.read_block(&cx, BlockNumber(1)).expect("read");
+        assert_eq!(buf.as_slice(), &[0xAB; 512]);
     }
 }

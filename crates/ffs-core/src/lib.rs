@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
@@ -1143,7 +1143,14 @@ impl OpenFs {
 
         while !out.is_empty() {
             let mapping = map_logical_to_physical(&ctx.chunks, logical)
-                .map_err(|e| parse_to_ffs_error(&e))?
+                .map_err(|e| {
+                    warn!(
+                        logical,
+                        reason = %e,
+                        "btrfs chunk_map_failed: parse error while mapping logical address"
+                    );
+                    parse_to_ffs_error(&e)
+                })?
                 .ok_or_else(|| FfsError::Corruption {
                     block: logical,
                     detail: "logical bytenr not mapped to physical bytenr".into(),
@@ -1154,9 +1161,25 @@ impl OpenFs {
                 .unwrap_or(usize::MAX)
                 .min(out.len());
 
+            trace!(
+                logical_start = logical,
+                physical_start = mapping.physical,
+                span,
+                "btrfs chunk_map"
+            );
+
             let (head, tail) = out.split_at_mut(span);
-            self.dev
-                .read_exact_at(cx, ByteOffset(mapping.physical), head)?;
+            if let Err(err) = self
+                .dev
+                .read_exact_at(cx, ByteOffset(mapping.physical), head)
+            {
+                warn!(
+                    physical_start = mapping.physical,
+                    reason = %err,
+                    "btrfs io_error: failed to read mapped physical range"
+                );
+                return Err(err);
+            }
             logical = logical.saturating_add(span as u64);
             out = tail;
         }
@@ -1172,7 +1195,10 @@ impl OpenFs {
         offset: u64,
         size: u32,
     ) -> Result<Vec<u8>, FfsError> {
+        let read_started = Instant::now();
         let canonical = self.btrfs_canonical_inode(ino)?;
+        trace!(inode = canonical, offset, length = size, "btrfs read_start");
+
         let items = self.walk_btrfs_fs_tree(cx)?;
         let inode_entry = Self::btrfs_find_inode_item(&items, canonical)?;
         let inode = parse_inode_item(&inode_entry.data).map_err(|e| parse_to_ffs_error(&e))?;
@@ -1182,6 +1208,12 @@ impl OpenFs {
         }
 
         if offset >= inode.size {
+            trace!(
+                inode = canonical,
+                bytes_returned = 0_u64,
+                duration_us = read_started.elapsed().as_micros(),
+                "btrfs read_complete"
+            );
             return Ok(Vec::new());
         }
 
@@ -1189,6 +1221,10 @@ impl OpenFs {
             usize::try_from((inode.size - offset).min(u64::from(size))).unwrap_or(size as usize);
         let mut out = vec![0_u8; to_read];
         let read_end = offset.saturating_add(to_read as u64);
+
+        if to_read > 1_048_576 {
+            debug!(inode = canonical, length = to_read, "btrfs large_read");
+        }
 
         let mut extents: Vec<(u64, BtrfsExtentData)> = items
             .iter()
@@ -1203,19 +1239,62 @@ impl OpenFs {
             .collect::<Result<_, _>>()?;
         extents.sort_by_key(|(logical, _)| *logical);
 
-        for (logical_start, extent) in extents {
+        if extents.len() > 10 {
+            debug!(
+                inode = canonical,
+                extent_count = extents.len(),
+                "btrfs fragmented_read"
+            );
+        }
+        if extents.is_empty() {
+            debug!(
+                inode = canonical,
+                file_offset = offset,
+                "btrfs extent_not_found"
+            );
+        }
+
+        let mut covered_until = offset;
+        for (logical_start, extent) in &extents {
             match extent {
-                BtrfsExtentData::Inline { data } => {
+                BtrfsExtentData::Inline { compression, data } => {
+                    if *compression != 0 {
+                        info!(
+                            inode = canonical,
+                            compression_type = *compression,
+                            "btrfs compressed_unsupported"
+                        );
+                        return Err(FfsError::UnsupportedFeature(format!(
+                            "btrfs compression type {compression}"
+                        )));
+                    }
+
+                    trace!(
+                        inode = canonical,
+                        file_offset = logical_start,
+                        data_len = data.len(),
+                        "btrfs extent_lookup inline"
+                    );
+
                     let extent_len =
                         u64::try_from(data.len()).map_err(|_| FfsError::Corruption {
                             block: 0,
                             detail: "inline extent length overflow".into(),
                         })?;
                     let extent_end = logical_start.saturating_add(extent_len);
-                    let overlap_start = logical_start.max(offset);
+                    let overlap_start = (*logical_start).max(offset);
                     let overlap_end = extent_end.min(read_end);
                     if overlap_start >= overlap_end {
                         continue;
+                    }
+                    if covered_until < overlap_start {
+                        let zero_len = overlap_start - covered_until;
+                        trace!(
+                            inode = canonical,
+                            file_offset = covered_until,
+                            zero_len,
+                            "btrfs hole_fill"
+                        );
                     }
 
                     let src_start =
@@ -1239,37 +1318,74 @@ impl OpenFs {
                     })?;
                     out[dst_start..dst_start + copy_len]
                         .copy_from_slice(&data[src_start..src_start + copy_len]);
+                    covered_until = covered_until.max(overlap_end);
                 }
                 BtrfsExtentData::Regular {
                     extent_type,
+                    compression,
                     disk_bytenr,
                     extent_offset,
                     num_bytes,
                     ..
                 } => {
-                    let extent_end = logical_start.saturating_add(num_bytes);
-                    let overlap_start = logical_start.max(offset);
+                    if *compression != 0 {
+                        info!(
+                            inode = canonical,
+                            compression_type = *compression,
+                            "btrfs compressed_unsupported"
+                        );
+                        return Err(FfsError::UnsupportedFeature(format!(
+                            "btrfs compression type {compression}"
+                        )));
+                    }
+
+                    let extent_end = logical_start.saturating_add(*num_bytes);
+                    let overlap_start = (*logical_start).max(offset);
                     let overlap_end = extent_end.min(read_end);
                     if overlap_start >= overlap_end {
                         continue;
                     }
+                    if covered_until < overlap_start {
+                        let zero_len = overlap_start - covered_until;
+                        trace!(
+                            inode = canonical,
+                            file_offset = covered_until,
+                            zero_len,
+                            "btrfs hole_fill"
+                        );
+                    }
 
                     // Preallocated extents have no initialized data yet.
-                    if extent_type == BTRFS_FILE_EXTENT_PREALLOC {
+                    if *extent_type == BTRFS_FILE_EXTENT_PREALLOC {
+                        trace!(
+                            inode = canonical,
+                            file_offset = overlap_start,
+                            zero_len = overlap_end - overlap_start,
+                            "btrfs hole_fill"
+                        );
+                        covered_until = covered_until.max(overlap_end);
                         continue;
                     }
-                    if extent_type != BTRFS_FILE_EXTENT_REG {
+                    if *extent_type != BTRFS_FILE_EXTENT_REG {
                         return Err(FfsError::Format(format!(
                             "unsupported btrfs extent type {extent_type}"
                         )));
                     }
 
+                    trace!(
+                        inode = canonical,
+                        file_offset = logical_start,
+                        logical_addr = disk_bytenr,
+                        disk_len = num_bytes,
+                        "btrfs extent_lookup regular"
+                    );
+
                     let extent_delta = overlap_start - logical_start;
                     let source_logical = disk_bytenr
-                        .checked_add(extent_offset)
+                        .checked_add(*extent_offset)
                         .and_then(|x| x.checked_add(extent_delta))
                         .ok_or_else(|| FfsError::Corruption {
-                            block: disk_bytenr,
+                            block: *disk_bytenr,
                             detail: "extent source logical overflow".into(),
                         })?;
                     let dst_start = usize::try_from(overlap_start - offset).map_err(|_| {
@@ -1289,10 +1405,26 @@ impl OpenFs {
                         source_logical,
                         &mut out[dst_start..dst_start + copy_len],
                     )?;
+                    covered_until = covered_until.max(overlap_end);
                 }
             }
         }
+        if covered_until < read_end {
+            let zero_len = read_end - covered_until;
+            trace!(
+                inode = canonical,
+                file_offset = covered_until,
+                zero_len,
+                "btrfs hole_fill"
+            );
+        }
 
+        trace!(
+            inode = canonical,
+            bytes_returned = out.len(),
+            duration_us = read_started.elapsed().as_micros(),
+            "btrfs read_complete"
+        );
         Ok(out)
     }
 
@@ -4770,6 +4902,110 @@ mod tests {
     }
 
     #[test]
+    fn open_fs_btrfs_fsops_read_offset_and_truncated_eof() {
+        let image = build_btrfs_fsops_image();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let ops: &dyn FsOps = &fs;
+
+        let partial = ops.read(&cx, InodeNumber(257), 6, 4).unwrap();
+        assert_eq!(&partial, b"from");
+
+        let eof_truncated = ops.read(&cx, InodeNumber(257), 20, 16).unwrap();
+        assert_eq!(&eof_truncated, b"ps");
+    }
+
+    #[test]
+    fn open_fs_btrfs_fsops_read_inline_extent() {
+        let inline = b"inline-btrfs-payload";
+        let mut image = build_btrfs_fsops_image();
+        let mut extent_payload = vec![0_u8; 21 + inline.len()];
+        extent_payload[0..8].copy_from_slice(&1_u64.to_le_bytes());
+        extent_payload[8..16].copy_from_slice(&(inline.len() as u64).to_le_bytes());
+        extent_payload[20] = ffs_btrfs::BTRFS_FILE_EXTENT_INLINE;
+        extent_payload[21..].copy_from_slice(inline);
+
+        set_btrfs_test_file_size(&mut image, inline.len() as u64);
+        let extent_payload_len =
+            u32::try_from(extent_payload.len()).expect("extent payload length should fit in u32");
+        set_btrfs_test_extent_data_size(&mut image, extent_payload_len);
+        write_btrfs_test_extent_payload(&mut image, &extent_payload);
+
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let ops: &dyn FsOps = &fs;
+
+        let data = ops.read(&cx, InodeNumber(257), 0, 128).unwrap();
+        assert_eq!(&data, inline);
+    }
+
+    #[test]
+    fn open_fs_btrfs_fsops_read_prealloc_extent_zero_filled() {
+        let mut image = build_btrfs_fsops_image();
+        set_btrfs_test_extent_type(&mut image, BTRFS_FILE_EXTENT_PREALLOC);
+
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let ops: &dyn FsOps = &fs;
+
+        let data = ops.read(&cx, InodeNumber(257), 0, 64).unwrap();
+        assert_eq!(data, vec![0_u8; 22]);
+    }
+
+    #[test]
+    fn open_fs_btrfs_fsops_read_sparse_hole_zero_filled() {
+        let mut image = build_btrfs_fsops_image();
+        set_btrfs_test_file_size(&mut image, 30);
+        set_btrfs_test_extent_key_offset(&mut image, 8);
+
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let ops: &dyn FsOps = &fs;
+
+        let data = ops.read(&cx, InodeNumber(257), 0, 64).unwrap();
+        let mut expected = vec![0_u8; 8];
+        expected.extend_from_slice(b"hello from btrfs fsops");
+        assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn open_fs_btrfs_fsops_read_compressed_extent_unsupported() {
+        let mut image = build_btrfs_fsops_image();
+        set_btrfs_test_extent_compression(&mut image, 1);
+
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let ops: &dyn FsOps = &fs;
+
+        let err = ops.read(&cx, InodeNumber(257), 0, 64).unwrap_err();
+        assert!(matches!(err, FfsError::UnsupportedFeature(_)));
+    }
+
+    #[test]
+    fn open_fs_btrfs_fsops_read_multiblock_regular_extent() {
+        let mut image = build_btrfs_fsops_image();
+        let expected: Vec<u8> = (0..6000)
+            .map(|i| u8::try_from(i % 251).expect("value should fit in u8"))
+            .collect();
+        set_btrfs_test_file_size(&mut image, expected.len() as u64);
+        set_btrfs_test_extent_lengths(&mut image, expected.len() as u64);
+        write_btrfs_test_file_data(&mut image, &expected);
+
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let ops: &dyn FsOps = &fs;
+
+        let data = ops.read(&cx, InodeNumber(257), 0, 7000).unwrap();
+        assert_eq!(data, expected);
+    }
+
+    #[test]
     fn durability_autopilot_prefers_more_redundancy_when_failures_observed() {
         let candidates = [1.02, 1.05, 1.10];
 
@@ -5184,6 +5420,67 @@ mod tests {
         extent
     }
 
+    const BTRFS_TEST_FS_TREE_LOGICAL: usize = 0x8_000;
+    const BTRFS_TEST_FILE_DATA_LOGICAL: usize = 0x12_000;
+    const BTRFS_TEST_FILE_INODE_OFF: usize = 2860;
+    const BTRFS_TEST_EXTENT_OFF: usize = 2780;
+    const BTRFS_TEST_EXTENT_ITEM_INDEX: usize = 3;
+    const BTRFS_TEST_LEAF_HEADER_SIZE: usize = 101;
+    const BTRFS_TEST_LEAF_ITEM_SIZE: usize = 25;
+
+    fn btrfs_test_extent_item_off() -> usize {
+        BTRFS_TEST_FS_TREE_LOGICAL
+            + BTRFS_TEST_LEAF_HEADER_SIZE
+            + BTRFS_TEST_EXTENT_ITEM_INDEX * BTRFS_TEST_LEAF_ITEM_SIZE
+    }
+
+    fn btrfs_test_extent_payload_off() -> usize {
+        BTRFS_TEST_FS_TREE_LOGICAL + BTRFS_TEST_EXTENT_OFF
+    }
+
+    fn set_btrfs_test_file_size(image: &mut [u8], size: u64) {
+        let size_off = BTRFS_TEST_FS_TREE_LOGICAL + BTRFS_TEST_FILE_INODE_OFF + 16;
+        image[size_off..size_off + 8].copy_from_slice(&size.to_le_bytes());
+        image[size_off + 8..size_off + 16].copy_from_slice(&size.to_le_bytes());
+    }
+
+    fn set_btrfs_test_extent_key_offset(image: &mut [u8], logical_offset: u64) {
+        let item_off = btrfs_test_extent_item_off();
+        image[item_off + 9..item_off + 17].copy_from_slice(&logical_offset.to_le_bytes());
+    }
+
+    fn set_btrfs_test_extent_data_size(image: &mut [u8], data_size: u32) {
+        let item_off = btrfs_test_extent_item_off();
+        image[item_off + 21..item_off + 25].copy_from_slice(&data_size.to_le_bytes());
+    }
+
+    fn set_btrfs_test_extent_type(image: &mut [u8], extent_type: u8) {
+        let extent_off = btrfs_test_extent_payload_off();
+        image[extent_off + 20] = extent_type;
+    }
+
+    fn set_btrfs_test_extent_compression(image: &mut [u8], compression: u8) {
+        let extent_off = btrfs_test_extent_payload_off();
+        image[extent_off + 16] = compression;
+    }
+
+    fn set_btrfs_test_extent_lengths(image: &mut [u8], length: u64) {
+        let extent_off = btrfs_test_extent_payload_off();
+        image[extent_off + 8..extent_off + 16].copy_from_slice(&length.to_le_bytes()); // ram_bytes
+        image[extent_off + 29..extent_off + 37].copy_from_slice(&length.to_le_bytes()); // disk_num_bytes
+        image[extent_off + 45..extent_off + 53].copy_from_slice(&length.to_le_bytes()); // num_bytes
+    }
+
+    fn write_btrfs_test_extent_payload(image: &mut [u8], payload: &[u8]) {
+        let extent_off = btrfs_test_extent_payload_off();
+        image[extent_off..extent_off + payload.len()].copy_from_slice(payload);
+    }
+
+    fn write_btrfs_test_file_data(image: &mut [u8], data: &[u8]) {
+        let data_off = BTRFS_TEST_FILE_DATA_LOGICAL;
+        image[data_off..data_off + data.len()].copy_from_slice(data);
+    }
+
     /// Build a minimal btrfs image with ROOT_TREE + FS_TREE content sufficient
     /// for read-only `FsOps` operations (`getattr/lookup/readdir/read`).
     #[allow(clippy::cast_possible_truncation)]
@@ -5444,6 +5741,344 @@ mod tests {
         let fs = OpenFs::from_device(&cx, Box::new(dev), &opts).unwrap();
         assert!(fs.is_btrfs());
         assert!(fs.btrfs_context.is_some());
+    }
+
+    // ── Btrfs file read tests ────────────────────────────────────────────
+
+    fn encode_btrfs_extent_inline(data: &[u8]) -> Vec<u8> {
+        let mut extent = vec![0_u8; 21 + data.len()];
+        extent[0..8].copy_from_slice(&1_u64.to_le_bytes()); // generation
+        let data_len = u64::try_from(data.len()).expect("test data length should fit u64");
+        extent[8..16].copy_from_slice(&data_len.to_le_bytes()); // ram_bytes
+        extent[20] = ffs_btrfs::BTRFS_FILE_EXTENT_INLINE;
+        extent[21..].copy_from_slice(data);
+        extent
+    }
+
+    #[allow(dead_code)]
+    fn encode_btrfs_extent_prealloc(num_bytes: u64) -> [u8; 53] {
+        let mut extent = [0_u8; 53];
+        extent[0..8].copy_from_slice(&1_u64.to_le_bytes()); // generation
+        extent[8..16].copy_from_slice(&num_bytes.to_le_bytes()); // ram_bytes
+        extent[20] = BTRFS_FILE_EXTENT_PREALLOC;
+        extent[21..29].copy_from_slice(&0_u64.to_le_bytes()); // disk_bytenr (unused for prealloc)
+        extent[29..37].copy_from_slice(&num_bytes.to_le_bytes()); // disk_num_bytes
+        extent[37..45].copy_from_slice(&0_u64.to_le_bytes()); // extent_offset
+        extent[45..53].copy_from_slice(&num_bytes.to_le_bytes()); // num_bytes
+        extent
+    }
+
+    /// Build a btrfs image with a single file containing an inline extent.
+    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::too_many_lines)]
+    fn build_btrfs_inline_image(file_data: &[u8]) -> Vec<u8> {
+        let image_size: usize = 512 * 1024;
+        let mut image = vec![0_u8; image_size];
+        let sb_off = BTRFS_SUPER_INFO_OFFSET;
+
+        let root_tree_logical = 0x4_000_u64;
+        let fs_tree_logical = 0x8_000_u64;
+
+        image[sb_off + 0x40..sb_off + 0x48].copy_from_slice(&BTRFS_MAGIC.to_le_bytes());
+        image[sb_off + 0x48..sb_off + 0x50].copy_from_slice(&1_u64.to_le_bytes());
+        image[sb_off + 0x50..sb_off + 0x58].copy_from_slice(&root_tree_logical.to_le_bytes());
+        image[sb_off + 0x58..sb_off + 0x60].copy_from_slice(&0_u64.to_le_bytes());
+        image[sb_off + 0x70..sb_off + 0x78].copy_from_slice(&(image_size as u64).to_le_bytes());
+        image[sb_off + 0x80..sb_off + 0x88].copy_from_slice(&256_u64.to_le_bytes());
+        image[sb_off + 0x88..sb_off + 0x90].copy_from_slice(&1_u64.to_le_bytes());
+        image[sb_off + 0x90..sb_off + 0x94].copy_from_slice(&4096_u32.to_le_bytes());
+        image[sb_off + 0x94..sb_off + 0x98].copy_from_slice(&4096_u32.to_le_bytes());
+        image[sb_off + 0x9C..sb_off + 0xA0].copy_from_slice(&4096_u32.to_le_bytes());
+        image[sb_off + 0xC6] = 0;
+
+        let mut chunk_array = Vec::new();
+        chunk_array.extend_from_slice(&256_u64.to_le_bytes());
+        chunk_array.push(228_u8);
+        chunk_array.extend_from_slice(&0_u64.to_le_bytes());
+        chunk_array.extend_from_slice(&(image_size as u64).to_le_bytes());
+        chunk_array.extend_from_slice(&2_u64.to_le_bytes());
+        chunk_array.extend_from_slice(&0x1_0000_u64.to_le_bytes());
+        chunk_array.extend_from_slice(&2_u64.to_le_bytes());
+        chunk_array.extend_from_slice(&4096_u32.to_le_bytes());
+        chunk_array.extend_from_slice(&4096_u32.to_le_bytes());
+        chunk_array.extend_from_slice(&4096_u32.to_le_bytes());
+        chunk_array.extend_from_slice(&1_u16.to_le_bytes());
+        chunk_array.extend_from_slice(&0_u16.to_le_bytes());
+        chunk_array.extend_from_slice(&1_u64.to_le_bytes());
+        chunk_array.extend_from_slice(&0_u64.to_le_bytes());
+        chunk_array.extend_from_slice(&[0_u8; 16]);
+
+        image[sb_off + 0xA0..sb_off + 0xA4]
+            .copy_from_slice(&(chunk_array.len() as u32).to_le_bytes());
+        let array_start = sb_off + 0x32B;
+        image[array_start..array_start + chunk_array.len()].copy_from_slice(&chunk_array);
+
+        // Root tree leaf: one ROOT_ITEM for FS_TREE
+        let root_leaf = root_tree_logical as usize;
+        image[root_leaf + 0x30..root_leaf + 0x38].copy_from_slice(&root_tree_logical.to_le_bytes());
+        image[root_leaf + 0x50..root_leaf + 0x58].copy_from_slice(&1_u64.to_le_bytes());
+        image[root_leaf + 0x58..root_leaf + 0x60].copy_from_slice(&1_u64.to_le_bytes());
+        image[root_leaf + 0x60..root_leaf + 0x64].copy_from_slice(&1_u32.to_le_bytes());
+        image[root_leaf + 0x64] = 0;
+
+        let root_item_offset: u32 = 3000;
+        let root_item_size: u32 = 239;
+        write_btrfs_leaf_item(
+            &mut image,
+            root_leaf,
+            0,
+            BTRFS_FS_TREE_OBJECTID,
+            BTRFS_ITEM_ROOT_ITEM,
+            0,
+            root_item_offset,
+            root_item_size,
+        );
+        let mut root_item = vec![0_u8; root_item_size as usize];
+        root_item[176..184].copy_from_slice(&fs_tree_logical.to_le_bytes());
+        let root_item_last = root_item.len() - 1;
+        root_item[root_item_last] = 0;
+        let root_data_off = root_leaf + root_item_offset as usize;
+        image[root_data_off..root_data_off + root_item.len()].copy_from_slice(&root_item);
+
+        // FS tree leaf: root_inode(256), dir_index(hello.txt→257),
+        //               file_inode(257), inline_extent(257)
+        let fs_leaf = fs_tree_logical as usize;
+        image[fs_leaf + 0x30..fs_leaf + 0x38].copy_from_slice(&fs_tree_logical.to_le_bytes());
+        image[fs_leaf + 0x50..fs_leaf + 0x58].copy_from_slice(&1_u64.to_le_bytes());
+        image[fs_leaf + 0x58..fs_leaf + 0x60].copy_from_slice(&5_u64.to_le_bytes());
+        image[fs_leaf + 0x60..fs_leaf + 0x64].copy_from_slice(&4_u32.to_le_bytes());
+        image[fs_leaf + 0x64] = 0;
+
+        let root_inode = encode_btrfs_inode_item(0o040_755, 4096, 4096, 2);
+        let file_inode =
+            encode_btrfs_inode_item(0o100_644, file_data.len() as u64, file_data.len() as u64, 1);
+        let dir_index =
+            encode_btrfs_dir_index_entry(b"hello.txt", 257, ffs_btrfs::BTRFS_FT_REG_FILE);
+        let inline_extent = encode_btrfs_extent_inline(file_data);
+
+        let root_inode_off: u32 = 3200;
+        let dir_index_off: u32 = 3060;
+        let file_inode_off: u32 = 2860;
+        let extent_off: u32 = 2780;
+
+        write_btrfs_leaf_item(
+            &mut image,
+            fs_leaf,
+            0,
+            256,
+            BTRFS_ITEM_INODE_ITEM,
+            0,
+            root_inode_off,
+            root_inode.len() as u32,
+        );
+        write_btrfs_leaf_item(
+            &mut image,
+            fs_leaf,
+            1,
+            256,
+            BTRFS_ITEM_DIR_INDEX,
+            1,
+            dir_index_off,
+            dir_index.len() as u32,
+        );
+        write_btrfs_leaf_item(
+            &mut image,
+            fs_leaf,
+            2,
+            257,
+            BTRFS_ITEM_INODE_ITEM,
+            0,
+            file_inode_off,
+            file_inode.len() as u32,
+        );
+        write_btrfs_leaf_item(
+            &mut image,
+            fs_leaf,
+            3,
+            257,
+            BTRFS_ITEM_EXTENT_DATA,
+            0,
+            extent_off,
+            inline_extent.len() as u32,
+        );
+
+        image[fs_leaf + root_inode_off as usize
+            ..fs_leaf + root_inode_off as usize + root_inode.len()]
+            .copy_from_slice(&root_inode);
+        image[fs_leaf + dir_index_off as usize..fs_leaf + dir_index_off as usize + dir_index.len()]
+            .copy_from_slice(&dir_index);
+        image[fs_leaf + file_inode_off as usize
+            ..fs_leaf + file_inode_off as usize + file_inode.len()]
+            .copy_from_slice(&file_inode);
+        image[fs_leaf + extent_off as usize..fs_leaf + extent_off as usize + inline_extent.len()]
+            .copy_from_slice(&inline_extent);
+
+        image
+    }
+
+    #[test]
+    fn btrfs_read_inline_file() {
+        let content = b"small inline data";
+        let image = build_btrfs_inline_image(content);
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let ops: &dyn FsOps = &fs;
+        let data = ops.read(&cx, InodeNumber(257), 0, 128).unwrap();
+        assert_eq!(&data, content);
+    }
+
+    #[test]
+    fn btrfs_read_regular_extent_file() {
+        let image = build_btrfs_fsops_image();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let ops: &dyn FsOps = &fs;
+        let data = ops.read(&cx, InodeNumber(257), 0, 4096).unwrap();
+        assert_eq!(&data, b"hello from btrfs fsops");
+    }
+
+    #[test]
+    fn btrfs_read_at_offset() {
+        let image = build_btrfs_fsops_image();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let ops: &dyn FsOps = &fs;
+        // Read from offset 6 into "hello from btrfs fsops"
+        let data = ops.read(&cx, InodeNumber(257), 6, 128).unwrap();
+        assert_eq!(&data, b"from btrfs fsops");
+    }
+
+    #[test]
+    fn btrfs_read_beyond_eof_returns_truncated() {
+        let image = build_btrfs_fsops_image();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let ops: &dyn FsOps = &fs;
+        // File is 22 bytes. Read 4096 from offset 0 → should get exactly 22 bytes.
+        let data = ops.read(&cx, InodeNumber(257), 0, 4096).unwrap();
+        assert_eq!(data.len(), 22);
+        assert_eq!(&data, b"hello from btrfs fsops");
+
+        // Read from beyond EOF → empty.
+        let data = ops.read(&cx, InodeNumber(257), 100, 4096).unwrap();
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn btrfs_read_compressed_extent_returns_unsupported() {
+        let mut image = build_btrfs_fsops_image();
+        // Set compression byte (offset 16 within extent payload) to zlib (1).
+        set_btrfs_test_extent_compression(&mut image, 1);
+
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let ops: &dyn FsOps = &fs;
+        let err = ops.read(&cx, InodeNumber(257), 0, 128).unwrap_err();
+        assert_eq!(err.to_errno(), libc::EOPNOTSUPP);
+    }
+
+    #[test]
+    fn btrfs_read_prealloc_extent_returns_zeros() {
+        let mut image = build_btrfs_fsops_image();
+        let file_size = 64_u64;
+        // Change extent type to prealloc
+        set_btrfs_test_extent_type(&mut image, BTRFS_FILE_EXTENT_PREALLOC);
+        set_btrfs_test_extent_lengths(&mut image, file_size);
+        set_btrfs_test_file_size(&mut image, file_size);
+
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let ops: &dyn FsOps = &fs;
+        let data = ops.read(&cx, InodeNumber(257), 0, 128).unwrap();
+        let file_size_usize = usize::try_from(file_size).expect("file size should fit in usize");
+        assert_eq!(data.len(), file_size_usize);
+        assert!(data.iter().all(|b| *b == 0), "prealloc should be all zeros");
+    }
+
+    #[test]
+    fn btrfs_read_file_with_hole() {
+        // Build an image where a file has an extent starting at offset > 0,
+        // creating a hole at the beginning.
+        let mut image = build_btrfs_fsops_image();
+        let file_bytes = b"hello from btrfs fsops";
+        let hole_size = 32_u64;
+        let file_size = hole_size + file_bytes.len() as u64;
+
+        // Move the extent to start at offset `hole_size` instead of 0.
+        set_btrfs_test_extent_key_offset(&mut image, hole_size);
+        set_btrfs_test_file_size(&mut image, file_size);
+
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let ops: &dyn FsOps = &fs;
+        let data = ops.read(&cx, InodeNumber(257), 0, 256).unwrap();
+        let file_size_usize = usize::try_from(file_size).expect("file size should fit in usize");
+        assert_eq!(data.len(), file_size_usize);
+        let hole_size_usize = usize::try_from(hole_size).expect("hole size should fit in usize");
+        // First `hole_size` bytes should be zeros (hole).
+        assert!(
+            data[..hole_size_usize].iter().all(|b| *b == 0),
+            "hole region should be all zeros"
+        );
+        // After hole, file data should appear.
+        assert_eq!(&data[hole_size_usize..], file_bytes);
+    }
+
+    #[test]
+    fn btrfs_read_random_offsets_consistent() {
+        let image = build_btrfs_fsops_image();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let ops: &dyn FsOps = &fs;
+        let full = ops.read(&cx, InodeNumber(257), 0, 4096).unwrap();
+        assert_eq!(&full, b"hello from btrfs fsops");
+
+        // Read at every byte offset and verify consistency.
+        for start in 0..full.len() {
+            let chunk = ops.read(&cx, InodeNumber(257), start as u64, 4096).unwrap();
+            assert_eq!(&chunk, &full[start..], "read at offset {start} mismatch");
+        }
+
+        // Various sizes from the beginning.
+        for size in [1_u32, 5, 10, 22, 100] {
+            let chunk = ops.read(&cx, InodeNumber(257), 0, size).unwrap();
+            let expected_len = full.len().min(size as usize);
+            assert_eq!(chunk.len(), expected_len, "size {size}: length mismatch");
+            assert_eq!(
+                &chunk,
+                &full[..expected_len],
+                "size {size}: content mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn btrfs_read_directory_returns_is_directory() {
+        let image = build_btrfs_fsops_image();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let ops: &dyn FsOps = &fs;
+        // Root inode (256, aliased as 1) is a directory.
+        let err = ops.read(&cx, InodeNumber(1), 0, 4096).unwrap_err();
+        assert_eq!(err.to_errno(), libc::EISDIR);
     }
 
     // ── DurabilityAutopilot tests ────────────────────────────────────────
