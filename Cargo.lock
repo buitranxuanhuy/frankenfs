@@ -648,6 +648,7 @@ version = "0.1.0"
 dependencies = [
  "asupersync",
  "crc32c",
+ "criterion",
  "ffs-block",
  "ffs-error",
  "ffs-types",

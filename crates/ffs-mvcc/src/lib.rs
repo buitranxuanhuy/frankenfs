@@ -280,7 +280,7 @@ impl MvccStore {
     pub fn compression_stats(&self) -> CompressionStats {
         let mut stats = CompressionStats::default();
         for versions in self.versions.values() {
-            for version in versions {
+            for (idx, version) in versions.iter().enumerate() {
                 match &version.data {
                     VersionData::Full(bytes) => {
                         stats.full_versions += 1;
@@ -289,11 +289,9 @@ impl MvccStore {
                     VersionData::Identical => {
                         stats.identical_versions += 1;
                         // Estimate bytes saved: use the resolved data size
-                        if let Some(bytes) = compression::resolve_data_with(
-                            versions,
-                            versions.iter().position(|v| std::ptr::eq(v, version)).unwrap_or(0),
-                            |v| &v.data,
-                        ) {
+                        if let Some(bytes) =
+                            compression::resolve_data_with(versions, idx, |v| &v.data)
+                        {
                             stats.bytes_saved += bytes.len();
                         }
                     }
@@ -421,10 +419,6 @@ impl MvccStore {
                 data: version_data,
             });
 
-            if let Some(cap) = chain_cap {
-                self.enforce_chain_cap(block, cap);
-            }
-
             if let Some(intent) = cow_writes.get(&block) {
                 self.physical_versions
                     .entry(block)
@@ -435,6 +429,11 @@ impl MvccStore {
                         commit_seq,
                         writer: txn_id,
                     });
+            }
+
+            if let Some(cap) = chain_cap {
+                self.enforce_chain_cap(block, cap);
+                self.enforce_physical_chain_cap(block, cap);
             }
         }
 
@@ -506,10 +505,6 @@ impl MvccStore {
                 data: version_data,
             });
 
-            if let Some(cap) = chain_cap {
-                self.enforce_chain_cap(block, cap);
-            }
-
             if let Some(intent) = cow_writes.get(&block) {
                 self.physical_versions
                     .entry(block)
@@ -520,6 +515,11 @@ impl MvccStore {
                         commit_seq,
                         writer: txn_id,
                     });
+            }
+
+            if let Some(cap) = chain_cap {
+                self.enforce_chain_cap(block, cap);
+                self.enforce_physical_chain_cap(block, cap);
             }
         }
 
@@ -539,22 +539,19 @@ impl MvccStore {
     /// If so, return `VersionData::Identical` (dedup); otherwise `VersionData::Full`.
     fn maybe_dedup(&self, block: BlockNumber, new_bytes: &[u8]) -> VersionData {
         if let Some(versions) = self.versions.get(&block) {
-            if let Some(last) = versions.last() {
+            if !versions.is_empty() {
                 // Resolve the latest version's data (might itself be Identical).
-                if let Some(existing) = compression::resolve_data_with(
-                    versions,
-                    versions.len() - 1,
-                    |v| &v.data,
-                ) {
-                    if existing == new_bytes {
-                        trace!(
-                            block = block.0,
-                            chain_len = versions.len(),
-                            bytes_saved = new_bytes.len(),
-                            "version_dedup: identical to previous"
-                        );
-                        return VersionData::Identical;
-                    }
+                if let Some(existing) =
+                    compression::resolve_data_with(versions, versions.len() - 1, |v| &v.data)
+                    && existing == new_bytes
+                {
+                    trace!(
+                        block = block.0,
+                        chain_len = versions.len(),
+                        bytes_saved = new_bytes.len(),
+                        "version_dedup: identical to previous"
+                    );
+                    return VersionData::Identical;
                 }
             }
         }
@@ -562,43 +559,97 @@ impl MvccStore {
     }
 
     /// Enforce chain length cap for a block by pruning the oldest versions.
-    /// Always keeps at least 1 version. Ensures the first remaining version
-    /// is `Full` (not `Identical`) so the chain remains resolvable.
+    ///
+    /// Pruning is watermark-aware: versions are only dropped when doing so
+    /// cannot break visibility for any active snapshot.
     fn enforce_chain_cap(&mut self, block: BlockNumber, max_len: usize) {
         let max_len = max_len.max(1);
+        let watermark = self
+            .watermark()
+            .unwrap_or_else(|| self.current_snapshot().high);
         if let Some(versions) = self.versions.get_mut(&block) {
-            if versions.len() > max_len {
-                let trim = versions.len() - max_len;
-                versions.drain(0..trim);
-                // Ensure the new head is Full (resolvable).
-                if let Some(head) = versions.first_mut() {
-                    if head.data.is_identical() {
-                        // Walk forward to find the first Full, then copy its data to head.
-                        // This should be rare since dedup only marks consecutive identical.
-                        let resolved = compression::resolve_data_with(
-                            versions,
-                            0,
-                            |v| &v.data,
-                        );
-                        // resolve_data_with at index 0 on Identical returns None (malformed).
-                        // Fix by resolving from later in the chain.
-                        if resolved.is_none() {
-                            // Walk forward for the first Full.
-                            if let Some(full_data) = versions.iter()
-                                .find_map(|v| v.data.as_bytes().map(|b| b.to_vec()))
-                            {
-                                versions[0].data = VersionData::Full(full_data);
-                            }
-                        }
-                    }
-                }
+            let trimmed = Self::trim_block_chain_to_cap(versions, max_len, watermark);
+            if trimmed > 0 {
+                Self::ensure_chain_head_full(versions);
                 trace!(
                     block = block.0,
-                    trimmed = trim,
+                    watermark = watermark.0,
+                    trimmed,
                     remaining = versions.len(),
                     "chain_cap_enforced"
                 );
             }
+        }
+    }
+
+    /// Enforce chain cap for physical versions using the same watermark-safe
+    /// rule as logical versions.
+    fn enforce_physical_chain_cap(&mut self, block: BlockNumber, max_len: usize) {
+        let max_len = max_len.max(1);
+        let watermark = self
+            .watermark()
+            .unwrap_or_else(|| self.current_snapshot().high);
+        if let Some(versions) = self.physical_versions.get_mut(&block) {
+            let trimmed = Self::trim_physical_chain_to_cap(versions, max_len, watermark);
+            if trimmed > 0 {
+                trace!(
+                    block = block.0,
+                    watermark = watermark.0,
+                    trimmed,
+                    remaining = versions.len(),
+                    "physical_chain_cap_enforced"
+                );
+            }
+        }
+    }
+
+    fn trim_block_chain_to_cap(
+        versions: &mut Vec<BlockVersion>,
+        max_len: usize,
+        watermark: CommitSeq,
+    ) -> usize {
+        let mut trim = 0_usize;
+        while versions.len().saturating_sub(trim) > max_len {
+            let next = trim + 1;
+            if next >= versions.len() || versions[next].commit_seq > watermark {
+                break;
+            }
+            trim += 1;
+        }
+        if trim > 0 {
+            versions.drain(0..trim);
+        }
+        trim
+    }
+
+    fn trim_physical_chain_to_cap(
+        versions: &mut Vec<PhysicalBlockVersion>,
+        max_len: usize,
+        watermark: CommitSeq,
+    ) -> usize {
+        let mut trim = 0_usize;
+        while versions.len().saturating_sub(trim) > max_len {
+            let next = trim + 1;
+            if next >= versions.len() || versions[next].commit_seq > watermark {
+                break;
+            }
+            trim += 1;
+        }
+        if trim > 0 {
+            versions.drain(0..trim);
+        }
+        trim
+    }
+
+    fn ensure_chain_head_full(versions: &mut [BlockVersion]) {
+        if versions.first().is_none_or(|v| !v.data.is_identical()) {
+            return;
+        }
+        if let Some(full_data) = versions
+            .iter()
+            .find_map(|v| v.data.as_bytes().map(ToOwned::to_owned))
+        {
+            versions[0].data = VersionData::Full(full_data);
         }
     }
 
@@ -721,6 +772,7 @@ impl MvccStore {
 
             if keep_from > 0 {
                 versions.drain(0..keep_from);
+                Self::ensure_chain_head_full(versions);
             }
         }
 
@@ -2692,6 +2744,125 @@ mod tests {
                 "block {b} should have latest value"
             );
         }
+    }
+
+    // ── Version-chain compression tests ───────────────────────────────
+
+    #[test]
+    fn compression_reconstructs_chain_across_identical_markers() {
+        let mut store = MvccStore::with_compression_policy(CompressionPolicy::dedup_only());
+        let block = BlockNumber(9);
+        let payloads = [
+            vec![0xAA; 8],
+            vec![0xAA; 8],
+            vec![0xBB; 8],
+            vec![0xBB; 8],
+            vec![0xBB; 8],
+            vec![0xCC; 8],
+        ];
+
+        let mut snaps = Vec::with_capacity(payloads.len());
+        for payload in &payloads {
+            let mut txn = store.begin();
+            txn.stage_write(block, payload.clone());
+            store.commit(txn).expect("commit");
+            snaps.push(store.current_snapshot());
+        }
+
+        for (snap, expected) in snaps.iter().zip(payloads.iter()) {
+            assert_eq!(
+                store.read_visible(block, *snap).expect("visible"),
+                expected.as_slice()
+            );
+        }
+
+        let chain = store.versions.get(&block).expect("chain");
+        assert!(matches!(chain[0].data, VersionData::Full(_)));
+        assert!(matches!(chain[1].data, VersionData::Identical));
+        assert!(matches!(chain[2].data, VersionData::Full(_)));
+        assert!(matches!(chain[3].data, VersionData::Identical));
+        assert!(matches!(chain[4].data, VersionData::Identical));
+        assert!(matches!(chain[5].data, VersionData::Full(_)));
+    }
+
+    #[test]
+    fn compression_chain_cap_respects_active_snapshot() {
+        let mut store = MvccStore::with_compression_policy(CompressionPolicy {
+            dedup_identical: false,
+            max_chain_length: Some(3),
+        });
+        let block = BlockNumber(77);
+        let mut snaps = Vec::new();
+
+        for v in 1_u8..=4 {
+            let mut txn = store.begin();
+            txn.stage_write(block, vec![v]);
+            store.commit(txn).expect("commit");
+            snaps.push(store.current_snapshot());
+        }
+
+        let held = snaps[3];
+        store.register_snapshot(held);
+
+        for v in 5_u8..=6 {
+            let mut txn = store.begin();
+            txn.stage_write(block, vec![v]);
+            store.commit(txn).expect("commit");
+        }
+
+        assert_eq!(
+            store
+                .read_visible(block, held)
+                .expect("held snapshot remains visible"),
+            &[4]
+        );
+
+        let chain = store.versions.get(&block).expect("chain");
+        assert!(chain.len() >= 3);
+        assert!(
+            chain
+                .first()
+                .is_some_and(|v| matches!(v.data, VersionData::Full(_)))
+        );
+
+        assert!(store.release_snapshot(held));
+
+        let mut txn = store.begin();
+        txn.stage_write(block, vec![7]);
+        store.commit(txn).expect("commit");
+
+        let chain = store.versions.get(&block).expect("chain");
+        assert!(chain.len() <= 3, "chain should be capped after release");
+        assert!(
+            chain
+                .first()
+                .is_some_and(|v| matches!(v.data, VersionData::Full(_)))
+        );
+    }
+
+    #[test]
+    fn compression_hot_block_memory_reduction_is_measurable() {
+        let mut store = MvccStore::with_compression_policy(CompressionPolicy::dedup_only());
+        let block = BlockNumber(101);
+        let payload = vec![0x42; 4096];
+        let writes = 100_usize;
+
+        for _ in 0..writes {
+            let mut txn = store.begin();
+            txn.stage_write(block, payload.clone());
+            store.commit(txn).expect("commit");
+        }
+
+        let stats = store.compression_stats();
+        let uncompressed = writes * payload.len();
+        assert_eq!(stats.full_versions, 1);
+        assert_eq!(stats.identical_versions, writes - 1);
+        assert_eq!(stats.bytes_stored, payload.len());
+        assert_eq!(stats.bytes_saved, uncompressed - payload.len());
+        assert!(stats.compression_ratio() < 0.02);
+
+        let latest = store.current_snapshot();
+        assert_eq!(store.read_visible(block, latest).expect("latest"), payload);
     }
 
     // ── SSI conflict detection tests ───────────────────────────────────

@@ -7,6 +7,7 @@
 //!
 //! Snapshot lifecycle is managed externally via [`SnapshotRegistry`].
 
+use crate::compression::{self, CompressionPolicy, VersionData};
 use crate::{BlockVersion, CommitError, CommittedTxnRecord, SnapshotRegistry, Transaction};
 use ffs_types::{BlockNumber, CommitSeq, Snapshot, TxnId};
 use parking_lot::RwLock;
@@ -48,6 +49,8 @@ pub struct ShardedMvccStore {
     next_commit: AtomicU64,
     /// Inline snapshot tracking (for callers who don't use SnapshotRegistry).
     active_snapshots: RwLock<BTreeMap<CommitSeq, u32>>,
+    /// Compression policy for version chains.
+    compression_policy: CompressionPolicy,
 }
 
 impl ShardedMvccStore {
@@ -56,6 +59,12 @@ impl ShardedMvccStore {
     /// A reasonable default is `min(num_cpus, 64)`.
     #[must_use]
     pub fn new(shard_count: usize) -> Self {
+        Self::with_compression_policy(shard_count, CompressionPolicy::default())
+    }
+
+    /// Create a new sharded store with a custom compression policy.
+    #[must_use]
+    pub fn with_compression_policy(shard_count: usize, policy: CompressionPolicy) -> Self {
         let shard_count = shard_count.max(1);
         info!(shard_count, "sharded_mvcc_store: initializing");
         let shards = (0..shard_count)
@@ -67,6 +76,7 @@ impl ShardedMvccStore {
             next_txn: AtomicU64::new(1),
             next_commit: AtomicU64::new(1),
             active_snapshots: RwLock::new(BTreeMap::new()),
+            compression_policy: policy,
         }
     }
 
@@ -82,6 +92,34 @@ impl ShardedMvccStore {
         let shard_count_u64 = u64::try_from(self.shard_count).expect("shard_count must fit in u64");
         let rem = block.0 % shard_count_u64;
         usize::try_from(rem).expect("remainder must fit in usize")
+    }
+
+    fn latest_payload_matches(versions: &[BlockVersion], bytes: &[u8]) -> bool {
+        versions.len().checked_sub(1).is_some_and(|last_idx| {
+            compression::resolve_data_with(versions, last_idx, |v| &v.data)
+                .is_some_and(|existing| existing == bytes)
+        })
+    }
+
+    fn build_version_data(
+        existing_versions: Option<&Vec<BlockVersion>>,
+        bytes: Vec<u8>,
+        dedup_enabled: bool,
+        block: BlockNumber,
+    ) -> VersionData {
+        if dedup_enabled
+            && existing_versions
+                .is_some_and(|versions| Self::latest_payload_matches(versions, bytes.as_slice()))
+        {
+            trace!(
+                block = block.0,
+                bytes_saved = bytes.len(),
+                "sharded_version_dedup"
+            );
+            VersionData::Identical
+        } else {
+            VersionData::Full(bytes)
+        }
     }
 
     /// The current snapshot (latest committed version).
@@ -118,11 +156,10 @@ impl ShardedMvccStore {
         let shard_idx = self.shard_index(block);
         let shard = self.shards[shard_idx].read();
         shard.versions.get(&block).and_then(|versions| {
-            versions
+            let idx = versions
                 .iter()
-                .rev()
-                .find(|v| v.commit_seq <= snapshot.high)
-                .map(|v| v.bytes.clone())
+                .rposition(|v| v.commit_seq <= snapshot.high)?;
+            compression::resolve_data_with(versions, idx, |v| &v.data).map(<[u8]>::to_vec)
         })
     }
 
@@ -175,6 +212,7 @@ impl ShardedMvccStore {
 
         // Write versions to shards.
         let txn_id = txn.id();
+        let dedup_enabled = self.compression_policy.dedup_identical;
         for (block, bytes) in txn.into_writes() {
             let shard_idx = self.shard_index(block);
             let shard = shard_guards
@@ -182,11 +220,15 @@ impl ShardedMvccStore {
                 .find(|(idx, _)| *idx == shard_idx)
                 .map(|(_, guard)| guard)
                 .expect("shard must be locked");
+
+            let version_data =
+                Self::build_version_data(shard.versions.get(&block), bytes, dedup_enabled, block);
+
             shard.versions.entry(block).or_default().push(BlockVersion {
                 block,
                 commit_seq,
                 writer: txn_id,
-                bytes,
+                data: version_data,
             });
         }
 
@@ -265,6 +307,7 @@ impl ShardedMvccStore {
         let write_keys: BTreeSet<BlockNumber> = txn.write_set().keys().copied().collect();
 
         // Write versions and SSI log entries per shard.
+        let dedup_enabled = self.compression_policy.dedup_identical;
         for (block, bytes) in txn.into_writes() {
             let shard_idx = self.shard_index(block);
             let shard = shard_guards
@@ -272,11 +315,15 @@ impl ShardedMvccStore {
                 .find(|(idx, _)| *idx == shard_idx)
                 .map(|(_, guard)| guard)
                 .expect("shard must be locked");
+
+            let version_data =
+                Self::build_version_data(shard.versions.get(&block), bytes, dedup_enabled, block);
+
             shard.versions.entry(block).or_default().push(BlockVersion {
                 block,
                 commit_seq,
                 writer: txn_id,
-                bytes,
+                data: version_data,
             });
         }
 

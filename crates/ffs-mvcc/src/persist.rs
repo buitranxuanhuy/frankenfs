@@ -63,6 +63,29 @@ pub struct WalStats {
     pub checkpoint_commit_seq: u64,
 }
 
+/// Report produced after WAL recovery (replay on startup).
+///
+/// This captures enough detail for the evidence ledger integration:
+/// how many commits were replayed, how many records were discarded
+/// (corrupt or truncated), and whether a checkpoint was used.
+#[derive(Debug, Clone, Default)]
+pub struct WalRecoveryReport {
+    /// Number of commits successfully replayed.
+    pub commits_replayed: u64,
+    /// Number of block versions restored.
+    pub versions_replayed: u64,
+    /// Number of WAL records discarded (corrupt CRC or truncated tail).
+    pub records_discarded: u64,
+    /// Byte offset where valid WAL data ends.
+    pub wal_valid_bytes: u64,
+    /// Total WAL file size in bytes.
+    pub wal_total_bytes: u64,
+    /// Whether a checkpoint was loaded before WAL replay.
+    pub used_checkpoint: bool,
+    /// Highest commit sequence restored from checkpoint, if any.
+    pub checkpoint_commit_seq: Option<u64>,
+}
+
 // ── Checkpoint format ─────────────────────────────────────────────────────────
 //
 // Checkpoints provide a compact snapshot of MVCC state that can be loaded faster
@@ -111,6 +134,7 @@ pub struct PersistentMvccStore {
     wal: RwLock<WalFile>,
     options: PersistOptions,
     stats: RwLock<WalStats>,
+    recovery_report: WalRecoveryReport,
 }
 
 /// WAL file handle with position tracking.
@@ -192,11 +216,15 @@ impl PersistentMvccStore {
 
         let mut store = MvccStore::new();
         let mut stats = WalStats::default();
+        let mut recovery = WalRecoveryReport::default();
 
         // Try to load checkpoint first
         if checkpoint_path.exists() {
             load_checkpoint(checkpoint_path, &mut store)?;
-            stats.checkpoint_commit_seq = store.next_commit.saturating_sub(1);
+            let ckpt_seq = store.next_commit.saturating_sub(1);
+            stats.checkpoint_commit_seq = ckpt_seq;
+            recovery.used_checkpoint = true;
+            recovery.checkpoint_commit_seq = Some(ckpt_seq);
         }
 
         // Open or create WAL
@@ -210,13 +238,25 @@ impl PersistentMvccStore {
 
         let write_pos: u64;
 
-        if wal_exists && file.metadata()?.len() > 0 {
+        let wal_total_bytes = if wal_exists {
+            file.metadata()?.len()
+        } else {
+            0
+        };
+
+        if wal_exists && wal_total_bytes > 0 {
             // Replay WAL entries that are newer than the checkpoint
             let checkpoint_seq = store.next_commit.saturating_sub(1);
             let (pos, replay_stats) = replay_wal_from_seq(&mut file, &mut store, checkpoint_seq)?;
             write_pos = pos;
-            stats.replayed_commits = replay_stats.0;
-            stats.replayed_versions = replay_stats.1;
+            stats.replayed_commits = replay_stats.commits_replayed;
+            stats.replayed_versions = replay_stats.versions_replayed;
+
+            recovery.commits_replayed = replay_stats.commits_replayed;
+            recovery.versions_replayed = replay_stats.versions_replayed;
+            recovery.records_discarded = replay_stats.records_discarded;
+            recovery.wal_valid_bytes = pos;
+            recovery.wal_total_bytes = wal_total_bytes;
         } else {
             // Write fresh WAL header
             let header = WalHeader::default();
@@ -234,6 +274,7 @@ impl PersistentMvccStore {
             wal: RwLock::new(WalFile::new(file, write_pos)),
             options,
             stats: RwLock::new(stats),
+            recovery_report: recovery,
         })
     }
 
@@ -255,14 +296,23 @@ impl PersistentMvccStore {
 
         let mut store = MvccStore::new();
         let mut stats = WalStats::default();
+        let mut recovery = WalRecoveryReport::default();
         let write_pos: u64;
 
-        if exists && file.metadata()?.len() > 0 {
+        let wal_total_bytes = if exists { file.metadata()?.len() } else { 0 };
+
+        if exists && wal_total_bytes > 0 {
             // Replay existing WAL
             let (pos, replay_stats) = replay_wal(&mut file, &mut store)?;
             write_pos = pos;
-            stats.replayed_commits = replay_stats.0;
-            stats.replayed_versions = replay_stats.1;
+            stats.replayed_commits = replay_stats.commits_replayed;
+            stats.replayed_versions = replay_stats.versions_replayed;
+
+            recovery.commits_replayed = replay_stats.commits_replayed;
+            recovery.versions_replayed = replay_stats.versions_replayed;
+            recovery.records_discarded = replay_stats.records_discarded;
+            recovery.wal_valid_bytes = pos;
+            recovery.wal_total_bytes = wal_total_bytes;
         } else {
             // Write fresh header
             let header = WalHeader::default();
@@ -280,6 +330,7 @@ impl PersistentMvccStore {
             wal: RwLock::new(WalFile::new(file, write_pos)),
             options,
             stats: RwLock::new(stats),
+            recovery_report: recovery,
         })
     }
 
@@ -388,6 +439,15 @@ impl PersistentMvccStore {
     /// Release a previously registered snapshot.
     pub fn release_snapshot(&self, snapshot: crate::Snapshot) -> bool {
         self.store.write().release_snapshot(snapshot)
+    }
+
+    /// Get the recovery report from the most recent WAL replay.
+    ///
+    /// This captures how many commits were replayed, how many records were
+    /// discarded, and whether a checkpoint was used. Useful for evidence
+    /// ledger integration.
+    pub fn recovery_report(&self) -> &WalRecoveryReport {
+        &self.recovery_report
     }
 
     /// Get WAL statistics.
@@ -539,7 +599,7 @@ fn write_checkpoint(
         writer.write_all(&num_versions_bytes)?;
         hasher.update(&num_versions_bytes);
 
-        for version in block_versions {
+        for (vi, version) in block_versions.iter().enumerate() {
             let commit_seq_bytes = version.commit_seq.0.to_le_bytes();
             writer.write_all(&commit_seq_bytes)?;
             hasher.update(&commit_seq_bytes);
@@ -548,14 +608,19 @@ fn write_checkpoint(
             writer.write_all(&txn_id_bytes)?;
             hasher.update(&txn_id_bytes);
 
-            let data_len = u32::try_from(version.bytes.len())
+            // Materialize compressed data: resolve Identical markers before writing.
+            let materialized =
+                crate::compression::resolve_data_with(block_versions, vi, |v| &v.data)
+                    .unwrap_or(&[]);
+
+            let data_len = u32::try_from(materialized.len())
                 .map_err(|_| FfsError::Format("version data too large".to_owned()))?;
             let data_len_bytes = data_len.to_le_bytes();
             writer.write_all(&data_len_bytes)?;
             hasher.update(&data_len_bytes);
 
-            writer.write_all(&version.bytes)?;
-            hasher.update(&version.bytes);
+            writer.write_all(materialized)?;
+            hasher.update(materialized);
         }
     }
 
@@ -641,7 +706,7 @@ fn load_checkpoint(path: &Path, store: &mut MvccStore) -> Result<()> {
                 block,
                 commit_seq,
                 writer: txn_id,
-                bytes: data,
+                data: crate::compression::VersionData::Full(data),
             });
         }
 
@@ -685,21 +750,28 @@ impl Crc32cHasher {
     }
 }
 
+/// Internal replay stats returned by WAL replay functions.
+struct ReplayStats {
+    commits_replayed: u64,
+    versions_replayed: u64,
+    records_discarded: u64,
+}
+
 /// Replay WAL file into an MvccStore.
 ///
-/// Returns (write_position, (commits_replayed, versions_replayed)).
-fn replay_wal(file: &mut File, store: &mut MvccStore) -> Result<(u64, (u64, u64))> {
+/// Returns `(write_position, replay_stats)`.
+fn replay_wal(file: &mut File, store: &mut MvccStore) -> Result<(u64, ReplayStats)> {
     replay_wal_from_seq(file, store, 0)
 }
 
 /// Replay WAL file into an MvccStore, skipping commits at or before `skip_up_to_seq`.
 ///
-/// Returns (write_position, (commits_replayed, versions_replayed)).
+/// Returns `(write_position, replay_stats)`.
 fn replay_wal_from_seq(
     file: &mut File,
     store: &mut MvccStore,
     skip_up_to_seq: u64,
-) -> Result<(u64, (u64, u64))> {
+) -> Result<(u64, ReplayStats)> {
     file.seek(SeekFrom::Start(0))?;
 
     // Read and validate header
@@ -714,6 +786,7 @@ fn replay_wal_from_seq(
     let mut offset = 0_usize;
     let mut commits_replayed = 0_u64;
     let mut versions_replayed = 0_u64;
+    let mut records_discarded = 0_u64;
 
     while offset < data.len() {
         match wal::decode_commit(&data[offset..]) {
@@ -737,12 +810,13 @@ fn replay_wal_from_seq(
                 break;
             }
             DecodeResult::NeedMore(_) => {
-                // Truncated record at end - stop replay but don't error
+                // Truncated record at end — count as discarded
+                records_discarded += 1;
                 break;
             }
             DecodeResult::Corrupted(_msg) => {
-                // Corrupted record - stop replay but don't error
-                // This handles partial writes from crashes
+                // Corrupted record — count as discarded
+                records_discarded += 1;
                 break;
             }
         }
@@ -756,7 +830,14 @@ fn replay_wal_from_seq(
         .checked_add(offset_u64)
         .ok_or_else(|| FfsError::Format("WAL position overflow".to_owned()))?;
 
-    Ok((write_pos, (commits_replayed, versions_replayed)))
+    Ok((
+        write_pos,
+        ReplayStats {
+            commits_replayed,
+            versions_replayed,
+            records_discarded,
+        },
+    ))
 }
 
 /// Apply a WAL commit record to an MvccStore.
@@ -780,7 +861,7 @@ fn apply_wal_commit(store: &mut MvccStore, commit: &WalCommit) {
             block: write.block,
             commit_seq: commit.commit_seq,
             writer: commit.txn_id,
-            bytes: write.data.clone(),
+            data: crate::compression::VersionData::Full(write.data.clone()),
         };
         store.versions.entry(write.block).or_default().push(version);
     }
@@ -1184,5 +1265,126 @@ mod tests {
         // Should fail to load corrupted checkpoint
         let result = PersistentMvccStore::open_with_checkpoint(&cx, &wal_path, &ckpt_path);
         assert!(result.is_err());
+    }
+
+    // ── Recovery report tests ─────────────────────────────────────────────
+
+    #[test]
+    fn recovery_report_fresh_wal() {
+        let cx = test_cx();
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path();
+        std::fs::remove_file(path).ok();
+
+        let store = PersistentMvccStore::open(&cx, path).expect("open");
+        let report = store.recovery_report();
+        assert_eq!(report.commits_replayed, 0);
+        assert_eq!(report.versions_replayed, 0);
+        assert_eq!(report.records_discarded, 0);
+        assert!(!report.used_checkpoint);
+        assert!(report.checkpoint_commit_seq.is_none());
+    }
+
+    #[test]
+    fn recovery_report_after_replay() {
+        let cx = test_cx();
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+
+        // Write 3 commits
+        {
+            let store = PersistentMvccStore::open(&cx, &path).expect("open");
+            for i in 1_u8..=3 {
+                let mut txn = store.begin();
+                txn.stage_write(BlockNumber(u64::from(i)), vec![i; 16]);
+                store.commit(txn).expect("commit");
+            }
+        }
+
+        // Reopen and check recovery report
+        {
+            let store = PersistentMvccStore::open(&cx, &path).expect("reopen");
+            let report = store.recovery_report();
+            assert_eq!(report.commits_replayed, 3);
+            assert_eq!(report.versions_replayed, 3);
+            assert_eq!(report.records_discarded, 0);
+            assert!(!report.used_checkpoint);
+            assert!(report.wal_valid_bytes > 0);
+        }
+    }
+
+    #[test]
+    fn recovery_report_with_discarded_records() {
+        let cx = test_cx();
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+
+        // Write 2 commits
+        {
+            let store = PersistentMvccStore::open(&cx, &path).expect("open");
+            let mut txn = store.begin();
+            txn.stage_write(BlockNumber(1), vec![1; 32]);
+            store.commit(txn).expect("commit 1");
+
+            let mut txn = store.begin();
+            txn.stage_write(BlockNumber(2), vec![2; 32]);
+            store.commit(txn).expect("commit 2");
+        }
+
+        // Truncate to corrupt the last record
+        {
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("open for truncate");
+            let len = file.metadata().expect("metadata").len();
+            file.set_len(len - 10).expect("truncate");
+        }
+
+        // Reopen — should see 1 discarded record
+        {
+            let store = PersistentMvccStore::open(&cx, &path).expect("reopen");
+            let report = store.recovery_report();
+            assert_eq!(report.commits_replayed, 1);
+            assert_eq!(report.records_discarded, 1);
+            assert!(report.wal_total_bytes > report.wal_valid_bytes);
+        }
+    }
+
+    #[test]
+    fn recovery_report_with_checkpoint() {
+        let cx = test_cx();
+        let wal_tmp = NamedTempFile::new().expect("create wal file");
+        let wal_path = wal_tmp.path().to_path_buf();
+        let ckpt_tmp = NamedTempFile::new().expect("create checkpoint file");
+        let ckpt_path = ckpt_tmp.path().to_path_buf();
+
+        // Write 3 commits, checkpoint, write 2 more
+        {
+            let store = PersistentMvccStore::open(&cx, &wal_path).expect("open");
+            for i in 1_u8..=3 {
+                let mut txn = store.begin();
+                txn.stage_write(BlockNumber(u64::from(i)), vec![i; 16]);
+                store.commit(txn).expect("commit");
+            }
+            store.checkpoint(&ckpt_path).expect("checkpoint");
+            for i in 4_u8..=5 {
+                let mut txn = store.begin();
+                txn.stage_write(BlockNumber(u64::from(i)), vec![i; 16]);
+                store.commit(txn).expect("commit");
+            }
+        }
+
+        // Reopen with checkpoint
+        {
+            let store = PersistentMvccStore::open_with_checkpoint(&cx, &wal_path, &ckpt_path)
+                .expect("reopen");
+            let report = store.recovery_report();
+            assert!(report.used_checkpoint);
+            assert_eq!(report.checkpoint_commit_seq, Some(3));
+            // Only commits 4-5 should be replayed from WAL
+            assert_eq!(report.commits_replayed, 2);
+            assert_eq!(report.records_discarded, 0);
+        }
     }
 }

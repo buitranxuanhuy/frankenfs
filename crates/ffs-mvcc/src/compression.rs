@@ -41,29 +41,29 @@ impl VersionData {
     #[must_use]
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
-            VersionData::Full(bytes) => Some(bytes),
-            VersionData::Identical => None,
+            Self::Full(bytes) => Some(bytes),
+            Self::Identical => None,
         }
     }
 
     /// Returns `true` if this version is a dedup marker (no data stored).
     #[must_use]
     pub fn is_identical(&self) -> bool {
-        matches!(self, VersionData::Identical)
+        matches!(self, Self::Identical)
     }
 
     /// Returns `true` if this version stores full data inline.
     #[must_use]
     pub fn is_full(&self) -> bool {
-        matches!(self, VersionData::Full(_))
+        matches!(self, Self::Full(_))
     }
 
     /// Memory used by this version's data (0 for `Identical`).
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
         match self {
-            VersionData::Full(bytes) => bytes.len(),
-            VersionData::Identical => 0,
+            Self::Full(bytes) => bytes.len(),
+            Self::Identical => 0,
         }
     }
 
@@ -71,8 +71,8 @@ impl VersionData {
     #[must_use]
     pub fn into_bytes(self) -> Option<Vec<u8>> {
         match self {
-            VersionData::Full(bytes) => Some(bytes),
-            VersionData::Identical => None,
+            Self::Full(bytes) => Some(bytes),
+            Self::Identical => None,
         }
     }
 }
@@ -220,10 +220,7 @@ mod tests {
 
     #[test]
     fn resolve_full_at_index() {
-        let chain = vec![
-            VersionData::Full(vec![0xAA]),
-            VersionData::Full(vec![0xBB]),
-        ];
+        let chain = vec![VersionData::Full(vec![0xAA]), VersionData::Full(vec![0xBB])];
         let result = resolve_data_with(&chain, 1, |d| d);
         assert_eq!(result, Some(&[0xBB][..]));
     }
@@ -250,11 +247,11 @@ mod tests {
     #[test]
     fn resolve_mixed_chain() {
         let chain = vec![
-            VersionData::Full(vec![1]),     // 0
-            VersionData::Identical,          // 1 -> resolves to [1]
-            VersionData::Full(vec![2]),      // 2
-            VersionData::Identical,          // 3 -> resolves to [2]
-            VersionData::Identical,          // 4 -> resolves to [2]
+            VersionData::Full(vec![1]), // 0
+            VersionData::Identical,     // 1 -> resolves to [1]
+            VersionData::Full(vec![2]), // 2
+            VersionData::Identical,     // 3 -> resolves to [2]
+            VersionData::Identical,     // 4 -> resolves to [2]
         ];
         assert_eq!(resolve_data_with(&chain, 0, |d| d), Some(&[1][..]));
         assert_eq!(resolve_data_with(&chain, 1, |d| d), Some(&[1][..]));
@@ -278,8 +275,8 @@ mod tests {
     #[test]
     fn compression_stats_empty() {
         let stats = CompressionStats::default();
-        assert_eq!(stats.dedup_ratio(), 0.0);
-        assert_eq!(stats.compression_ratio(), 1.0);
+        assert!(stats.dedup_ratio().abs() < f64::EPSILON);
+        assert!((stats.compression_ratio() - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]

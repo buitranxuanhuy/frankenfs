@@ -71,6 +71,10 @@ pub struct ReplayOutcome {
     pub stats: ReplayStats,
 }
 
+/// A single committed transaction: a list of (target block, payload) writes
+/// paired with the set of revoked block numbers for that transaction.
+pub type CommittedTxn = (Vec<(BlockNumber, Vec<u8>)>, BTreeSet<BlockNumber>);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Jbd2Header {
     magic: u32,
@@ -221,6 +225,86 @@ pub fn replay_jbd2(
         committed_sequences,
         stats,
     })
+}
+
+/// Statistics from a journal write-back application.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ApplyStats {
+    /// Number of blocks written to the device.
+    pub blocks_written: u64,
+    /// Number of blocks verified after write-back.
+    pub blocks_verified: u64,
+    /// Number of verification mismatches (should be 0 for correct operation).
+    pub verify_mismatches: u64,
+}
+
+/// Apply the results of a JBD2 replay to the device by re-playing committed
+/// transactions.
+///
+/// This is a separate "apply" step useful when replay was performed in
+/// simulation mode. For normal replay the blocks are already written during
+/// [`replay_jbd2`].
+///
+/// Each committed transaction's writes are written to their target locations
+/// on the device, skipping revoked blocks. After writing, each block is
+/// re-read and compared to detect silent corruption.
+///
+/// # Errors
+///
+/// Returns an error on I/O failure or if any verification read-back does
+/// not match the written data.
+pub fn apply_replay(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    committed: &[CommittedTxn],
+) -> Result<ApplyStats> {
+    let mut stats = ApplyStats::default();
+
+    for (writes, revoked) in committed {
+        for (target, payload) in writes {
+            if revoked.contains(target) {
+                continue;
+            }
+            dev.write_block(cx, *target, payload)?;
+            stats.blocks_written = stats.blocks_written.saturating_add(1);
+
+            // Verify: re-read the block and compare.
+            let readback = dev.read_block(cx, *target)?;
+            stats.blocks_verified = stats.blocks_verified.saturating_add(1);
+            if readback.as_slice() != payload.as_slice() {
+                return Err(FfsError::Corruption {
+                    block: target.0,
+                    detail: format!("JBD2 write-back verification failed for block {}", target.0),
+                });
+            }
+        }
+    }
+
+    Ok(stats)
+}
+
+/// Clear a JBD2 journal region by zeroing all blocks.
+///
+/// This marks the journal as clean so a subsequent mount does not attempt
+/// replay. The operation is safe to interrupt: an incomplete clear simply
+/// means the next mount will replay again (idempotent).
+///
+/// # Errors
+///
+/// Returns an I/O error if any block write fails.
+pub fn clear_journal(cx: &Cx, dev: &dyn BlockDevice, region: JournalRegion) -> Result<()> {
+    let zero = vec![
+        0_u8;
+        usize::try_from(dev.block_size())
+            .map_err(|_| FfsError::Format("block_size does not fit usize".to_owned()))?
+    ];
+
+    for idx in 0..region.blocks {
+        let block = resolve_region_block(region, idx)?;
+        dev.write_block(cx, block, &zero)?;
+    }
+
+    Ok(())
 }
 
 /// A single recovered native COW write operation.
@@ -909,5 +993,119 @@ mod tests {
 
         let second = NativeCowJournal::open(&cx, &dev, region).expect("open second");
         assert_eq!(second.next_slot(), 2);
+    }
+
+    #[test]
+    fn clear_journal_zeros_region() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let region = JournalRegion {
+            start: BlockNumber(10),
+            blocks: 4,
+        };
+
+        // Write journal data.
+        let descriptor = descriptor_block(512, 1, &[(3, JBD2_TAG_FLAG_LAST)]);
+        dev.raw_write(BlockNumber(10), descriptor);
+        dev.raw_write(BlockNumber(11), vec![0xA5; 512]);
+        dev.raw_write(BlockNumber(12), commit_block(512, 1));
+
+        // Replay first (to apply writes).
+        let outcome = replay_jbd2(&cx, &dev, region).expect("replay");
+        assert_eq!(outcome.stats.replayed_blocks, 1);
+
+        // Clear the journal.
+        clear_journal(&cx, &dev, region).expect("clear");
+
+        // Verify all journal blocks are zeroed.
+        for idx in 0..4 {
+            let block = dev.read_block(&cx, BlockNumber(10 + idx)).expect("read");
+            assert!(
+                block.as_slice().iter().all(|b| *b == 0),
+                "journal block {idx} not zeroed"
+            );
+        }
+
+        // Replaying the cleared journal should produce no committed sequences.
+        let second = replay_jbd2(&cx, &dev, region).expect("replay cleared journal");
+        assert!(second.committed_sequences.is_empty());
+        assert_eq!(second.stats.replayed_blocks, 0);
+    }
+
+    #[test]
+    fn replay_jbd2_is_idempotent() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let region = JournalRegion {
+            start: BlockNumber(10),
+            blocks: 8,
+        };
+
+        let descriptor = descriptor_block(512, 5, &[(3, JBD2_TAG_FLAG_LAST)]);
+        dev.raw_write(BlockNumber(10), descriptor);
+        dev.raw_write(BlockNumber(11), vec![0xBB; 512]);
+        dev.raw_write(BlockNumber(12), commit_block(512, 5));
+
+        // First replay.
+        let first = replay_jbd2(&cx, &dev, region).expect("first replay");
+        assert_eq!(first.committed_sequences, vec![5]);
+        let target_after_first = dev
+            .read_block(&cx, BlockNumber(3))
+            .expect("read")
+            .as_slice()
+            .to_vec();
+
+        // Second replay (should produce identical result).
+        let second = replay_jbd2(&cx, &dev, region).expect("second replay");
+        assert_eq!(second.committed_sequences, vec![5]);
+        let target_after_second = dev
+            .read_block(&cx, BlockNumber(3))
+            .expect("read")
+            .as_slice()
+            .to_vec();
+
+        assert_eq!(target_after_first, target_after_second);
+        assert_eq!(target_after_first, vec![0xBB; 512]);
+    }
+
+    #[test]
+    fn apply_replay_writes_and_verifies() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+
+        let writes = vec![(BlockNumber(5), vec![0xAA; 512])];
+        let revoked = BTreeSet::new();
+        let committed = vec![(writes, revoked)];
+
+        let stats = apply_replay(&cx, &dev, &committed).expect("apply");
+        assert_eq!(stats.blocks_written, 1);
+        assert_eq!(stats.blocks_verified, 1);
+        assert_eq!(stats.verify_mismatches, 0);
+
+        let block = dev.read_block(&cx, BlockNumber(5)).expect("read");
+        assert_eq!(block.as_slice(), &[0xAA; 512]);
+    }
+
+    #[test]
+    fn apply_replay_respects_revoke_list() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+
+        let writes = vec![
+            (BlockNumber(5), vec![0xAA; 512]),
+            (BlockNumber(6), vec![0xBB; 512]),
+        ];
+        let mut revoked = BTreeSet::new();
+        revoked.insert(BlockNumber(6)); // Revoke block 6.
+        let committed = vec![(writes, revoked)];
+
+        let stats = apply_replay(&cx, &dev, &committed).expect("apply");
+        assert_eq!(stats.blocks_written, 1); // Only block 5 written.
+
+        let block5 = dev.read_block(&cx, BlockNumber(5)).expect("read 5");
+        assert_eq!(block5.as_slice(), &[0xAA; 512]);
+
+        let block6 = dev.read_block(&cx, BlockNumber(6)).expect("read 6");
+        assert_eq!(block6.as_slice(), &[0_u8; 512]); // Block 6 not written.
     }
 }
