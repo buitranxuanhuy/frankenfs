@@ -4,11 +4,14 @@
 //! Builds on `ffs_ondisk::btrfs` parsing primitives. I/O-agnostic —
 //! callers provide a read callback for physical byte access.
 
+use asupersync::Cx;
+use ffs_mvcc::{CommitError, MvccStore, Transaction};
 pub use ffs_ondisk::btrfs::*;
-use ffs_types::ParseError;
+use ffs_types::{BlockNumber, CommitSeq, ParseError, Snapshot, TxnId};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
-use tracing::{debug, trace};
+use thiserror::Error;
+use tracing::{debug, info, trace, warn};
 
 /// A single leaf item yielded by tree traversal: key + raw payload bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +61,13 @@ pub const BTRFS_FT_SYMLINK: u8 = 7;
 pub const BTRFS_FILE_EXTENT_INLINE: u8 = 0;
 pub const BTRFS_FILE_EXTENT_REG: u8 = 1;
 pub const BTRFS_FILE_EXTENT_PREALLOC: u8 = 2;
+
+/// Internal MVCC metadata block base used for btrfs transaction manifests.
+const BTRFS_TX_META_BASE_BLOCK: u64 = 0x4_0000_0000;
+/// Internal MVCC metadata block base used for tree-root pointer updates.
+const BTRFS_TX_TREE_ROOT_BASE_BLOCK: u64 = 0x4_1000_0000;
+/// Internal MVCC metadata block base used for pending-free ledgers.
+const BTRFS_TX_PENDING_FREE_BASE_BLOCK: u64 = 0x4_2000_0000;
 
 /// Parsed subset of `btrfs_root_item` needed for tree bootstrapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1642,6 +1652,308 @@ impl DelayedRefQueue {
     }
 }
 
+/// Logical tree identifier for btrfs roots.
+pub type TreeId = u64;
+
+/// Root pointer update staged by a btrfs transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeRoot {
+    /// Logical bytenr of the new root node.
+    pub bytenr: u64,
+    /// Tree level of the root node.
+    pub level: u8,
+}
+
+/// Summary returned when a transaction is aborted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BtrfsAbortSummary {
+    pub txn_id: TxnId,
+    pub discarded_tree_updates: usize,
+    pub released_allocations: Vec<BlockNumber>,
+    pub deferred_frees: Vec<BlockNumber>,
+}
+
+/// Errors from btrfs transaction orchestration.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum BtrfsTransactionError {
+    #[error("request checkpoint failed before transaction begin")]
+    CancelledBegin,
+    #[error("request checkpoint failed before transaction commit")]
+    CancelledCommit,
+    #[error("request checkpoint failed after transaction commit")]
+    CancelledPostCommit,
+    #[error("btrfs transaction already finished")]
+    AlreadyFinished,
+    #[error("tree root set is empty; stage at least one root update before commit")]
+    EmptyRootSet,
+    #[error("tree root block address overflow for tree_id={tree_id}")]
+    TreeRootAddressOverflow { tree_id: TreeId },
+    #[error("transaction metadata block address overflow for txn_id={txn_id:?}")]
+    MetadataAddressOverflow { txn_id: TxnId },
+    #[error("pending-free metadata block address overflow for txn_id={txn_id:?}")]
+    PendingFreeAddressOverflow { txn_id: TxnId },
+    #[error("delayed reference flush failed: {0:?}")]
+    DelayedRefs(BtrfsMutationError),
+    #[error("mvcc commit failed: {0}")]
+    Commit(#[from] CommitError),
+}
+
+/// In-memory btrfs transaction handle bridged onto MVCC commit boundaries.
+///
+/// This models core btrfs transaction semantics:
+/// - snapshot-at-begin reads
+/// - staged tree-root updates
+/// - delayed-ref accumulation + flush on commit
+/// - explicit abort path with allocation cleanup bookkeeping
+#[derive(Debug)]
+pub struct BtrfsTransaction {
+    txn_id: TxnId,
+    snapshot: Snapshot,
+    generation: u64,
+    mvcc_txn: Option<Transaction>,
+    pending_trees: BTreeMap<TreeId, TreeRoot>,
+    delayed_refs: DelayedRefQueue,
+    allocated: Vec<BlockNumber>,
+    to_free: Vec<BlockNumber>,
+}
+
+impl BtrfsTransaction {
+    /// Begin a btrfs transaction backed by an MVCC transaction.
+    pub fn begin(
+        store: &mut MvccStore,
+        generation: u64,
+        cx: &Cx,
+    ) -> Result<Self, BtrfsTransactionError> {
+        cx.checkpoint()
+            .map_err(|_| BtrfsTransactionError::CancelledBegin)?;
+        let mvcc_txn = store.begin();
+        debug!(
+            target: "ffs::btrfs::txn",
+            txn_id = mvcc_txn.id.0,
+            snapshot = mvcc_txn.snapshot.high.0,
+            generation,
+            "btrfs_tx_begin"
+        );
+        Ok(Self {
+            txn_id: mvcc_txn.id,
+            snapshot: mvcc_txn.snapshot,
+            generation,
+            mvcc_txn: Some(mvcc_txn),
+            pending_trees: BTreeMap::new(),
+            delayed_refs: DelayedRefQueue::new(),
+            allocated: Vec::new(),
+            to_free: Vec::new(),
+        })
+    }
+
+    /// Transaction identifier.
+    #[must_use]
+    pub const fn txn_id(&self) -> TxnId {
+        self.txn_id
+    }
+
+    /// Snapshot captured at begin.
+    #[must_use]
+    pub const fn snapshot(&self) -> Snapshot {
+        self.snapshot
+    }
+
+    /// Transaction generation.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Staged tree-root updates.
+    #[must_use]
+    pub fn pending_trees(&self) -> &BTreeMap<TreeId, TreeRoot> {
+        &self.pending_trees
+    }
+
+    /// Number of queued delayed references.
+    #[must_use]
+    pub fn delayed_ref_count(&self) -> usize {
+        self.delayed_refs.pending_count()
+    }
+
+    /// Queue or replace a tree-root update.
+    pub fn stage_tree_root(&mut self, tree_id: TreeId, root: TreeRoot) {
+        self.pending_trees.insert(tree_id, root);
+    }
+
+    /// Stage a logical block write in the underlying MVCC transaction.
+    pub fn stage_block_write(
+        &mut self,
+        block: BlockNumber,
+        data: Vec<u8>,
+    ) -> Result<(), BtrfsTransactionError> {
+        let txn = self
+            .mvcc_txn
+            .as_mut()
+            .ok_or(BtrfsTransactionError::AlreadyFinished)?;
+        txn.stage_write(block, data);
+        Ok(())
+    }
+
+    /// Record a newly allocated block so abort can return it for cleanup.
+    pub fn track_allocation(&mut self, block: BlockNumber) {
+        self.allocated.push(block);
+    }
+
+    /// Record a block to be freed after a successful commit.
+    pub fn defer_free_on_commit(&mut self, block: BlockNumber) {
+        self.to_free.push(block);
+    }
+
+    /// Queue a delayed reference to flush during commit.
+    pub fn queue_delayed_ref(&mut self, extent: ExtentKey, ref_type: BtrfsRef, action: RefAction) {
+        self.delayed_refs.queue(extent, ref_type, action);
+    }
+
+    /// Commit this transaction through MVCC.
+    ///
+    /// Commit steps:
+    /// 1. Flush delayed refs deterministically.
+    /// 2. Stage tree-root updates and metadata records.
+    /// 3. Commit the MVCC transaction (FCW conflict detection).
+    pub fn commit(
+        mut self,
+        store: &mut MvccStore,
+        cx: &Cx,
+    ) -> Result<CommitSeq, BtrfsTransactionError> {
+        cx.checkpoint()
+            .map_err(|_| BtrfsTransactionError::CancelledCommit)?;
+        if self.pending_trees.is_empty() {
+            return Err(BtrfsTransactionError::EmptyRootSet);
+        }
+
+        let commit_started = std::time::Instant::now();
+        let delayed_ref_total = self.delayed_refs.pending_count();
+        let mut materialized_refcounts = BTreeMap::new();
+        if delayed_ref_total > 0 {
+            self.delayed_refs
+                .flush(usize::MAX, &mut materialized_refcounts)
+                .map_err(BtrfsTransactionError::DelayedRefs)?;
+        }
+
+        self.stage_metadata_records()?;
+
+        let txn = self
+            .mvcc_txn
+            .take()
+            .ok_or(BtrfsTransactionError::AlreadyFinished)?;
+        let commit_seq = store.commit(txn)?;
+        let duration_us = u64::try_from(commit_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        info!(
+            target: "ffs::btrfs::txn",
+            txn_id = self.txn_id.0,
+            generation = self.generation,
+            commit_seq = commit_seq.0,
+            trees_modified = self.pending_trees.len(),
+            delayed_refs_flushed = delayed_ref_total,
+            staged_allocations = self.allocated.len(),
+            pending_frees = self.to_free.len(),
+            duration_us,
+            "btrfs_tx_commit"
+        );
+        cx.checkpoint()
+            .map_err(|_| BtrfsTransactionError::CancelledPostCommit)?;
+        Ok(commit_seq)
+    }
+
+    /// Abort this transaction and return cleanup bookkeeping.
+    #[must_use]
+    pub fn abort(mut self) -> BtrfsAbortSummary {
+        let _ = self.mvcc_txn.take();
+        warn!(
+            target: "ffs::btrfs::txn",
+            txn_id = self.txn_id.0,
+            generation = self.generation,
+            discarded_tree_updates = self.pending_trees.len(),
+            allocated = self.allocated.len(),
+            deferred_frees = self.to_free.len(),
+            "btrfs_tx_abort"
+        );
+        BtrfsAbortSummary {
+            txn_id: self.txn_id,
+            discarded_tree_updates: self.pending_trees.len(),
+            released_allocations: self.allocated,
+            deferred_frees: self.to_free,
+        }
+    }
+
+    fn stage_metadata_records(&mut self) -> Result<(), BtrfsTransactionError> {
+        let tx_meta_block = Self::metadata_block_for_txn(self.txn_id)?;
+        self.stage_block_write(tx_meta_block, self.encode_tx_metadata())?;
+
+        let tree_updates: Vec<(TreeId, TreeRoot)> = self
+            .pending_trees
+            .iter()
+            .map(|(tree_id, root)| (*tree_id, *root))
+            .collect();
+        for (tree_id, root) in tree_updates {
+            let block = Self::tree_root_block(tree_id)?;
+            let payload = Self::encode_tree_root_record(self.generation, tree_id, root);
+            self.stage_block_write(block, payload)?;
+        }
+
+        if !self.to_free.is_empty() {
+            let free_block = Self::pending_free_block_for_txn(self.txn_id)?;
+            self.stage_block_write(free_block, self.encode_pending_frees())?;
+        }
+
+        Ok(())
+    }
+
+    fn metadata_block_for_txn(txn_id: TxnId) -> Result<BlockNumber, BtrfsTransactionError> {
+        BTRFS_TX_META_BASE_BLOCK
+            .checked_add(txn_id.0)
+            .map(BlockNumber)
+            .ok_or(BtrfsTransactionError::MetadataAddressOverflow { txn_id })
+    }
+
+    fn tree_root_block(tree_id: TreeId) -> Result<BlockNumber, BtrfsTransactionError> {
+        BTRFS_TX_TREE_ROOT_BASE_BLOCK
+            .checked_add(tree_id)
+            .map(BlockNumber)
+            .ok_or(BtrfsTransactionError::TreeRootAddressOverflow { tree_id })
+    }
+
+    fn pending_free_block_for_txn(txn_id: TxnId) -> Result<BlockNumber, BtrfsTransactionError> {
+        BTRFS_TX_PENDING_FREE_BASE_BLOCK
+            .checked_add(txn_id.0)
+            .map(BlockNumber)
+            .ok_or(BtrfsTransactionError::PendingFreeAddressOverflow { txn_id })
+    }
+
+    fn encode_tx_metadata(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(32);
+        bytes.extend_from_slice(&self.generation.to_le_bytes());
+        bytes.extend_from_slice(&self.snapshot.high.0.to_le_bytes());
+        bytes.extend_from_slice(&self.txn_id.0.to_le_bytes());
+        bytes.extend_from_slice(&(self.pending_trees.len() as u64).to_le_bytes());
+        bytes
+    }
+
+    fn encode_pending_frees(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(8 + self.to_free.len().saturating_mul(8));
+        bytes.extend_from_slice(&(self.to_free.len() as u64).to_le_bytes());
+        for block in &self.to_free {
+            bytes.extend_from_slice(&block.0.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn encode_tree_root_record(generation: u64, tree_id: TreeId, root: TreeRoot) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(32);
+        bytes.extend_from_slice(&generation.to_le_bytes());
+        bytes.extend_from_slice(&tree_id.to_le_bytes());
+        bytes.extend_from_slice(&root.bytenr.to_le_bytes());
+        bytes.push(root.level);
+        bytes
+    }
+}
+
 /// Result of an extent allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExtentAllocation {
@@ -2854,6 +3166,175 @@ mod tests {
         assert_eq!(flushed, 10_000);
         assert_eq!(queue.pending_count(), 0);
         assert_eq!(refcounts.len(), 10_000);
+    }
+
+    #[test]
+    fn btrfs_tx_begin_abort_discards_staged_updates() {
+        let cx = Cx::for_request();
+        let mut store = MvccStore::new();
+        let mut txn = BtrfsTransaction::begin(&mut store, 7, &cx).expect("begin");
+
+        txn.stage_tree_root(
+            BTRFS_FS_TREE_OBJECTID,
+            TreeRoot {
+                bytenr: 0x2000,
+                level: 1,
+            },
+        );
+        txn.stage_block_write(BlockNumber(777), b"transient".to_vec())
+            .expect("stage write");
+        txn.track_allocation(BlockNumber(900));
+        txn.defer_free_on_commit(BlockNumber(901));
+
+        let summary = txn.abort();
+        assert_eq!(summary.discarded_tree_updates, 1);
+        assert_eq!(summary.released_allocations, vec![BlockNumber(900)]);
+        assert_eq!(summary.deferred_frees, vec![BlockNumber(901)]);
+
+        let snapshot = store.current_snapshot();
+        assert!(store.read_visible(BlockNumber(777), snapshot).is_none());
+    }
+
+    #[test]
+    fn btrfs_tx_commit_persists_tree_root_and_payload() {
+        let cx = Cx::for_request();
+        let mut store = MvccStore::new();
+        let mut txn = BtrfsTransaction::begin(&mut store, 11, &cx).expect("begin");
+        txn.stage_tree_root(
+            BTRFS_FS_TREE_OBJECTID,
+            TreeRoot {
+                bytenr: 0x55_0000,
+                level: 2,
+            },
+        );
+        txn.stage_block_write(BlockNumber(1234), b"hello-btrfs".to_vec())
+            .expect("stage payload");
+        txn.queue_delayed_ref(
+            ExtentKey {
+                bytenr: 0x8000,
+                num_bytes: 4096,
+            },
+            BtrfsRef::DataExtent {
+                root: BTRFS_FS_TREE_OBJECTID,
+                objectid: 256,
+                offset: 0,
+            },
+            RefAction::Insert,
+        );
+
+        let commit_seq = txn.commit(&mut store, &cx).expect("commit");
+        assert_eq!(commit_seq, CommitSeq(1));
+
+        let snapshot = store.current_snapshot();
+        let payload = store
+            .read_visible(BlockNumber(1234), snapshot)
+            .expect("payload visible");
+        assert_eq!(payload, b"hello-btrfs");
+
+        let tree_block =
+            BtrfsTransaction::tree_root_block(BTRFS_FS_TREE_OBJECTID).expect("tree block");
+        let tree_record = store
+            .read_visible(tree_block, snapshot)
+            .expect("tree root record");
+        assert_eq!(tree_record.len(), 25);
+        assert_eq!(
+            u64::from_le_bytes(tree_record[0..8].try_into().unwrap()),
+            11_u64
+        );
+        assert_eq!(
+            u64::from_le_bytes(tree_record[8..16].try_into().unwrap()),
+            BTRFS_FS_TREE_OBJECTID
+        );
+        assert_eq!(
+            u64::from_le_bytes(tree_record[16..24].try_into().unwrap()),
+            0x55_0000_u64
+        );
+        assert_eq!(tree_record[24], 2_u8);
+    }
+
+    #[test]
+    fn btrfs_tx_disjoint_trees_commit_without_fcw_conflict() {
+        let cx = Cx::for_request();
+        let mut store = MvccStore::new();
+
+        let mut tx1 = BtrfsTransaction::begin(&mut store, 20, &cx).expect("begin tx1");
+        let mut tx2 = BtrfsTransaction::begin(&mut store, 20, &cx).expect("begin tx2");
+
+        tx1.stage_tree_root(
+            BTRFS_FS_TREE_OBJECTID,
+            TreeRoot {
+                bytenr: 0x60_0000,
+                level: 1,
+            },
+        );
+        tx2.stage_tree_root(
+            BTRFS_EXTENT_TREE_OBJECTID,
+            TreeRoot {
+                bytenr: 0x61_0000,
+                level: 0,
+            },
+        );
+
+        let c1 = tx1.commit(&mut store, &cx).expect("commit tx1");
+        let c2 = tx2.commit(&mut store, &cx).expect("commit tx2");
+        assert_eq!(c1, CommitSeq(1));
+        assert_eq!(c2, CommitSeq(2));
+    }
+
+    #[test]
+    fn btrfs_tx_same_tree_conflicts_via_fcw() {
+        let cx = Cx::for_request();
+        let mut store = MvccStore::new();
+
+        let mut tx1 = BtrfsTransaction::begin(&mut store, 30, &cx).expect("begin tx1");
+        let mut tx2 = BtrfsTransaction::begin(&mut store, 30, &cx).expect("begin tx2");
+
+        tx1.stage_tree_root(
+            BTRFS_FS_TREE_OBJECTID,
+            TreeRoot {
+                bytenr: 0x70_0000,
+                level: 1,
+            },
+        );
+        tx2.stage_tree_root(
+            BTRFS_FS_TREE_OBJECTID,
+            TreeRoot {
+                bytenr: 0x71_0000,
+                level: 1,
+            },
+        );
+
+        let _ = tx1.commit(&mut store, &cx).expect("tx1 commit");
+        let err = tx2.commit(&mut store, &cx).expect_err("tx2 must conflict");
+        match err {
+            BtrfsTransactionError::Commit(CommitError::Conflict { block, .. }) => {
+                let expected =
+                    BtrfsTransaction::tree_root_block(BTRFS_FS_TREE_OBJECTID).expect("block");
+                assert_eq!(block, expected);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn btrfs_tx_drop_without_commit_has_no_visible_effect() {
+        let cx = Cx::for_request();
+        let mut store = MvccStore::new();
+        {
+            let mut txn = BtrfsTransaction::begin(&mut store, 44, &cx).expect("begin");
+            txn.stage_tree_root(
+                BTRFS_FS_TREE_OBJECTID,
+                TreeRoot {
+                    bytenr: 0x80_0000,
+                    level: 1,
+                },
+            );
+            txn.stage_block_write(BlockNumber(3210), b"uncommitted".to_vec())
+                .expect("stage");
+        }
+
+        let snapshot = store.current_snapshot();
+        assert!(store.read_visible(BlockNumber(3210), snapshot).is_none());
     }
 
     #[test]

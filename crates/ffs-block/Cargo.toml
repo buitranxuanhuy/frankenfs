@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+s3fifo = []
+
 [dependencies]
 ffs-types = { workspace = true }
 ffs-error = { workspace = true }

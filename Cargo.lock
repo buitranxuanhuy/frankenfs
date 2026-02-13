@@ -501,9 +501,12 @@ dependencies = [
 name = "ffs-btrfs"
 version = "0.1.0"
 dependencies = [
+ "asupersync",
+ "ffs-mvcc",
  "ffs-ondisk",
  "ffs-types",
  "serde_json",
+ "thiserror",
  "tracing",
 ]
 

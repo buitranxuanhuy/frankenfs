@@ -7,8 +7,11 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+asupersync = { workspace = true }
+ffs-mvcc = { workspace = true }
 ffs-ondisk = { workspace = true }
 ffs-types = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

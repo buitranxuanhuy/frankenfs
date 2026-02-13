@@ -43,7 +43,7 @@
 | btrfs read-only tree walk | `fs/btrfs/ctree.c` | ✅ | `walk_tree` in `ffs-btrfs` |
 | btrfs item payload decode (ROOT/INODE/DIR/EXTENT_DATA) | `fs/btrfs/ctree.c` | ✅ | Implemented in `ffs-btrfs` (`parse_root_item`, `parse_inode_item`, `parse_dir_items`, `parse_extent_data`) |
 | btrfs open/validate pipeline | `fs/btrfs/disk-io.c` | ✅ | `BtrfsContext` in `ffs-core` |
-| btrfs transaction parity | `fs/btrfs/transaction.c` | ❌ | Not yet implemented |
+| btrfs transaction parity | `fs/btrfs/transaction.c` | 🟡 | `BtrfsTransaction` in `ffs-btrfs` now models begin/commit/abort over `MvccStore` with staged tree-root records, delayed-ref flush-before-commit, and FCW conflict coverage tests. Superblock/checksum-tree on-disk mutation wiring in `ffs-core` remains pending. |
 | btrfs delayed refs parity | `fs/btrfs/delayed-ref.c` | ✅ | `DelayedRefQueue` + `BtrfsRef` model + bounded flush/refcount tracking in `ffs-btrfs::BtrfsExtentAllocator`, with queue/refcount/stress tests |
 | btrfs scrub parity | `fs/btrfs/scrub.c` | ❌ | Not yet implemented |
 | MVCC snapshot visibility | FrankenFS spec §3 | ✅ | Implemented in `ffs-mvcc` |
