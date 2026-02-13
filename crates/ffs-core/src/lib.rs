@@ -132,6 +132,373 @@ pub trait DegradationPolicy: Send + Sync {
     fn name(&self) -> &str;
 }
 
+// ── Degradation FSM ─────────────────────────────────────────────────────────
+
+/// Formal degradation levels matching `SystemPressure::degradation_level()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum DegradationLevel {
+    /// headroom >= 0.5 — full service
+    Normal = 0,
+    /// headroom >= 0.3 — background tasks paused
+    Warning = 1,
+    /// headroom >= 0.15 — caches reduced
+    Degraded = 2,
+    /// headroom >= 0.05 — writes throttled
+    Critical = 3,
+    /// headroom < 0.05 — read-only mode
+    Emergency = 4,
+}
+
+impl DegradationLevel {
+    /// Convert from a `SystemPressure::degradation_level()` u8 value.
+    #[must_use]
+    pub fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::Normal,
+            1 => Self::Warning,
+            2 => Self::Degraded,
+            3 => Self::Critical,
+            _ => Self::Emergency,
+        }
+    }
+
+    /// Human-readable label.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Warning => "warning",
+            Self::Degraded => "degraded",
+            Self::Critical => "critical",
+            Self::Emergency => "emergency",
+        }
+    }
+
+    /// Whether background work (scrub, GC) should be paused at this level.
+    #[must_use]
+    pub fn should_pause_background(self) -> bool {
+        self >= Self::Warning
+    }
+
+    /// Whether caches should be reduced at this level.
+    #[must_use]
+    pub fn should_reduce_cache(self) -> bool {
+        self >= Self::Degraded
+    }
+
+    /// Whether writes should be throttled at this level.
+    #[must_use]
+    pub fn should_throttle_writes(self) -> bool {
+        self >= Self::Critical
+    }
+
+    /// Whether the filesystem should be read-only at this level.
+    #[must_use]
+    pub fn should_read_only(self) -> bool {
+        self == Self::Emergency
+    }
+}
+
+impl std::fmt::Display for DegradationLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Degradation FSM with hysteresis to prevent oscillation.
+///
+/// The FSM escalates immediately when pressure worsens but requires a
+/// sustained improvement (configurable via `recovery_samples`) before
+/// de-escalating. This prevents rapid flickering between levels.
+pub struct DegradationFsm {
+    current: parking_lot::Mutex<FsmState>,
+    pressure: Arc<SystemPressure>,
+    policies: parking_lot::Mutex<Vec<Arc<dyn DegradationPolicy>>>,
+    recovery_samples: u32,
+}
+
+struct FsmState {
+    level: DegradationLevel,
+    /// Counter of consecutive samples at a level better than current.
+    /// Must reach `recovery_samples` before de-escalation.
+    recovery_count: u32,
+    /// Total transitions since creation.
+    transition_count: u64,
+}
+
+/// Record of a degradation level transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DegradationTransition {
+    pub from: DegradationLevel,
+    pub to: DegradationLevel,
+    pub headroom: u32, // headroom * 1000, stored as integer to be Eq
+}
+
+impl DegradationFsm {
+    /// Create a new FSM starting at `Normal`.
+    ///
+    /// `recovery_samples` is how many consecutive improved samples are needed
+    /// before de-escalating (default: 3).
+    #[must_use]
+    pub fn new(pressure: Arc<SystemPressure>, recovery_samples: u32) -> Self {
+        Self {
+            current: parking_lot::Mutex::new(FsmState {
+                level: DegradationLevel::Normal,
+                recovery_count: 0,
+                transition_count: 0,
+            }),
+            pressure,
+            policies: parking_lot::Mutex::new(Vec::new()),
+            recovery_samples,
+        }
+    }
+
+    /// Register a policy to be notified on level changes.
+    pub fn add_policy(&self, policy: Arc<dyn DegradationPolicy>) {
+        self.policies.lock().push(policy);
+    }
+
+    /// Current degradation level.
+    #[must_use]
+    pub fn level(&self) -> DegradationLevel {
+        self.current.lock().level
+    }
+
+    /// Total number of transitions since creation.
+    #[must_use]
+    pub fn transition_count(&self) -> u64 {
+        self.current.lock().transition_count
+    }
+
+    /// Tick the FSM with a fresh pressure reading.
+    ///
+    /// Returns `Some(transition)` if the level changed, `None` otherwise.
+    pub fn tick(&self) -> Option<DegradationTransition> {
+        let headroom = self.pressure.headroom();
+        let observed = DegradationLevel::from_raw(self.pressure.degradation_level());
+
+        let mut state = self.current.lock();
+        let prev = state.level;
+
+        if observed > prev {
+            // Escalate immediately.
+            state.level = observed;
+            state.recovery_count = 0;
+            state.transition_count += 1;
+        } else if observed < prev {
+            // Require sustained improvement before de-escalating.
+            state.recovery_count += 1;
+            if state.recovery_count >= self.recovery_samples {
+                state.level = observed;
+                state.recovery_count = 0;
+                state.transition_count += 1;
+            }
+        } else {
+            state.recovery_count = 0;
+        }
+
+        let new = state.level;
+        drop(state);
+
+        // Notify policies with current headroom (regardless of transition).
+        let policies = self.policies.lock();
+        for policy in policies.iter() {
+            policy.apply(headroom);
+        }
+
+        if new != prev {
+            info!(
+                target: "ffs::backpressure",
+                from = prev.label(),
+                to = new.label(),
+                headroom,
+                "degradation_transition"
+            );
+            Some(DegradationTransition {
+                from: prev,
+                to: new,
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                headroom: (headroom * 1000.0) as u32,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl std::fmt::Debug for DegradationFsm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.current.lock();
+        f.debug_struct("DegradationFsm")
+            .field("level", &state.level)
+            .field("recovery_count", &state.recovery_count)
+            .field("transitions", &state.transition_count)
+            .finish()
+    }
+}
+
+// ── Backpressure gate ───────────────────────────────────────────────────────
+
+/// Decision returned by [`BackpressureGate::check`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackpressureDecision {
+    /// Proceed normally.
+    Proceed,
+    /// Operation should be throttled (delay before proceeding).
+    Throttle,
+    /// Operation should be shed (rejected with EBUSY or ENOSPC).
+    Shed,
+}
+
+/// Per-operation backpressure check.
+///
+/// Given a `DegradationFsm` and the type of operation, returns a decision
+/// on whether to proceed, throttle, or shed the request.
+pub struct BackpressureGate {
+    fsm: Arc<DegradationFsm>,
+}
+
+impl BackpressureGate {
+    /// Create a new gate wrapping the given FSM.
+    #[must_use]
+    pub fn new(fsm: Arc<DegradationFsm>) -> Self {
+        Self { fsm }
+    }
+
+    /// Check whether the given operation should proceed.
+    #[must_use]
+    pub fn check(&self, op: RequestOp) -> BackpressureDecision {
+        let level = self.fsm.level();
+        match level {
+            DegradationLevel::Normal | DegradationLevel::Warning => {
+                // Normal and warning: all ops proceed (background pausing
+                // is handled separately by the scrub/GC scheduler).
+                BackpressureDecision::Proceed
+            }
+            DegradationLevel::Degraded => {
+                // Reads always proceed; writes proceed but may be throttled.
+                if op.is_write() {
+                    BackpressureDecision::Throttle
+                } else {
+                    BackpressureDecision::Proceed
+                }
+            }
+            DegradationLevel::Critical => {
+                // Writes throttled, metadata writes shed.
+                if op.is_write() {
+                    BackpressureDecision::Throttle
+                } else {
+                    BackpressureDecision::Proceed
+                }
+            }
+            DegradationLevel::Emergency => {
+                // Read-only mode: all writes shed.
+                if op.is_write() {
+                    BackpressureDecision::Shed
+                } else {
+                    BackpressureDecision::Proceed
+                }
+            }
+        }
+    }
+
+    /// Current degradation level.
+    #[must_use]
+    pub fn level(&self) -> DegradationLevel {
+        self.fsm.level()
+    }
+}
+
+impl std::fmt::Debug for BackpressureGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackpressureGate")
+            .field("level", &self.fsm.level())
+            .finish()
+    }
+}
+
+// ── Pressure monitor ────────────────────────────────────────────────────────
+
+/// Aggregated pressure monitor that drives the degradation FSM.
+///
+/// Combines CPU load sampling (via `ComputeBudget`) with the FSM to provide
+/// a single entry point for periodic pressure updates.
+pub struct PressureMonitor {
+    budget: ComputeBudget,
+    fsm: Arc<DegradationFsm>,
+    sample_count: std::sync::atomic::AtomicU64,
+}
+
+impl PressureMonitor {
+    /// Create a new monitor with a shared pressure handle and FSM.
+    #[must_use]
+    pub fn new(pressure: Arc<SystemPressure>, recovery_samples: u32) -> Self {
+        let budget = ComputeBudget::new(Arc::clone(&pressure));
+        let fsm = Arc::new(DegradationFsm::new(pressure, recovery_samples));
+        Self {
+            budget,
+            fsm,
+            sample_count: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Sample system pressure and tick the FSM.
+    ///
+    /// Returns any transition that occurred.
+    pub fn sample(&self) -> Option<DegradationTransition> {
+        self.budget.sample();
+        self.sample_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.fsm.tick()
+    }
+
+    /// Get a `BackpressureGate` for checking individual operations.
+    #[must_use]
+    pub fn gate(&self) -> BackpressureGate {
+        BackpressureGate::new(Arc::clone(&self.fsm))
+    }
+
+    /// The underlying FSM.
+    #[must_use]
+    pub fn fsm(&self) -> &Arc<DegradationFsm> {
+        &self.fsm
+    }
+
+    /// The underlying compute budget.
+    #[must_use]
+    pub fn budget(&self) -> &ComputeBudget {
+        &self.budget
+    }
+
+    /// Number of samples taken.
+    #[must_use]
+    pub fn sample_count(&self) -> u64 {
+        self.sample_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Current degradation level.
+    #[must_use]
+    pub fn level(&self) -> DegradationLevel {
+        self.fsm.level()
+    }
+
+    /// Register a degradation policy.
+    pub fn add_policy(&self, policy: Arc<dyn DegradationPolicy>) {
+        self.fsm.add_policy(policy);
+    }
+}
+
+impl std::fmt::Debug for PressureMonitor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PressureMonitor")
+            .field("budget", &self.budget)
+            .field("fsm", &self.fsm)
+            .field("samples", &self.sample_count())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FsFlavor {
     Ext4(Ext4Superblock),
@@ -2776,6 +3143,23 @@ pub enum RequestOp {
     Rename,
     Setattr,
     Write,
+}
+
+impl RequestOp {
+    /// Whether this operation mutates the filesystem.
+    #[must_use]
+    pub const fn is_write(self) -> bool {
+        matches!(
+            self,
+            Self::Create
+                | Self::Mkdir
+                | Self::Unlink
+                | Self::Rmdir
+                | Self::Rename
+                | Self::Setattr
+                | Self::Write
+        )
+    }
 }
 
 /// MVCC scope acquired for a single VFS request.

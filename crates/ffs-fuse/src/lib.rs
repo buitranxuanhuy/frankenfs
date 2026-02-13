@@ -6,7 +6,10 @@
 //! and errors are mapped through [`FfsError::to_errno()`].
 
 use asupersync::Cx;
-use ffs_core::{FileType as FfsFileType, FsOps, InodeAttr, RequestOp, SetAttrRequest};
+use ffs_core::{
+    BackpressureDecision, BackpressureGate, FileType as FfsFileType, FsOps, InodeAttr, RequestOp,
+    SetAttrRequest,
+};
 use ffs_error::FfsError;
 use ffs_types::InodeNumber;
 use fuser::{
@@ -264,6 +267,7 @@ struct FuseInner {
     metrics: Arc<AtomicMetrics>,
     thread_count: usize,
     read_only: bool,
+    backpressure: Option<BackpressureGate>,
 }
 
 impl std::fmt::Debug for FuseInner {
@@ -323,6 +327,27 @@ impl FrankenFuse {
                 metrics: Arc::new(AtomicMetrics::new()),
                 thread_count,
                 read_only: options.read_only,
+                backpressure: None,
+            }),
+        }
+    }
+
+    /// Create a FUSE adapter with an attached backpressure gate.
+    #[must_use]
+    pub fn with_backpressure(
+        ops: Box<dyn FsOps>,
+        options: &MountOptions,
+        gate: BackpressureGate,
+    ) -> Self {
+        let thread_count = options.resolved_thread_count();
+        info!(thread_count, "FrankenFuse initialized with backpressure");
+        Self {
+            inner: Arc::new(FuseInner {
+                ops: Arc::from(ops),
+                metrics: Arc::new(AtomicMetrics::new()),
+                thread_count,
+                read_only: options.read_only,
+                backpressure: Some(gate),
             }),
         }
     }
@@ -337,6 +362,15 @@ impl FrankenFuse {
     #[must_use]
     pub fn thread_count(&self) -> usize {
         self.inner.thread_count
+    }
+
+    /// Check backpressure for an operation. Returns `true` if the operation
+    /// should be rejected (shed).
+    fn should_shed(&self, op: RequestOp) -> bool {
+        self.inner
+            .backpressure
+            .as_ref()
+            .is_some_and(|gate| gate.check(op) == BackpressureDecision::Shed)
     }
 
     /// Create a `Cx` for a FUSE request.
@@ -710,6 +744,11 @@ impl Filesystem for FrankenFuse {
             reply.error(libc::EROFS);
             return;
         }
+        if self.should_shed(RequestOp::Setattr) {
+            warn!(ino, "backpressure: shedding setattr");
+            reply.error(libc::EBUSY);
+            return;
+        }
         let cx = Self::cx_for_request();
         let resolve_time = |t: TimeOrNow| -> SystemTime {
             match t {
@@ -758,6 +797,11 @@ impl Filesystem for FrankenFuse {
             reply.error(libc::EROFS);
             return;
         }
+        if self.should_shed(RequestOp::Mkdir) {
+            warn!(parent, "backpressure: shedding mkdir");
+            reply.error(libc::EBUSY);
+            return;
+        }
         let cx = Self::cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Mkdir, |cx| {
             self.inner.ops.mkdir(
@@ -789,6 +833,11 @@ impl Filesystem for FrankenFuse {
             reply.error(libc::EROFS);
             return;
         }
+        if self.should_shed(RequestOp::Unlink) {
+            warn!(parent, "backpressure: shedding unlink");
+            reply.error(libc::EBUSY);
+            return;
+        }
         let cx = Self::cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Unlink, |cx| {
             self.inner.ops.unlink(cx, InodeNumber(parent), name)
@@ -811,6 +860,11 @@ impl Filesystem for FrankenFuse {
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         if self.inner.read_only {
             reply.error(libc::EROFS);
+            return;
+        }
+        if self.should_shed(RequestOp::Rmdir) {
+            warn!(parent, "backpressure: shedding rmdir");
+            reply.error(libc::EBUSY);
             return;
         }
         let cx = Self::cx_for_request();
@@ -844,6 +898,11 @@ impl Filesystem for FrankenFuse {
     ) {
         if self.inner.read_only {
             reply.error(libc::EROFS);
+            return;
+        }
+        if self.should_shed(RequestOp::Rename) {
+            warn!(parent, "backpressure: shedding rename");
+            reply.error(libc::EBUSY);
             return;
         }
         let cx = Self::cx_for_request();
@@ -887,6 +946,11 @@ impl Filesystem for FrankenFuse {
             reply.error(libc::EROFS);
             return;
         }
+        if self.should_shed(RequestOp::Write) {
+            warn!(ino, "backpressure: shedding write");
+            reply.error(libc::EBUSY);
+            return;
+        }
         let cx = Self::cx_for_request();
         let byte_offset = u64::try_from(offset).unwrap_or(0);
         match self.with_request_scope(&cx, RequestOp::Write, |cx| {
@@ -922,6 +986,11 @@ impl Filesystem for FrankenFuse {
     ) {
         if self.inner.read_only {
             reply.error(libc::EROFS);
+            return;
+        }
+        if self.should_shed(RequestOp::Create) {
+            warn!(parent, "backpressure: shedding create");
+            reply.error(libc::EBUSY);
             return;
         }
         let cx = Self::cx_for_request();
@@ -1815,6 +1884,7 @@ mod tests {
             metrics: Arc::new(AtomicMetrics::new()),
             thread_count: 4,
             read_only: true,
+            backpressure: None,
         });
         let barrier = Arc::new(std::sync::Barrier::new(10));
 
