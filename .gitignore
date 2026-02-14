@@ -9,3 +9,23 @@ legacy_ext4_and_btrfs_code/
 
 # macOS AppleDouble / resource fork files
 ._*
+
+# Profiling and benchmark data
+perf.data
+perf.data.*
+
+# Local scratch DBs
+storage.sqlite3
+storage.sqlite3-*
+
+# FastEmbed model caches (downloaded at runtime)
+.fastembed_cache/
+
+# Profiling output directories
+profiles/
+
+# Codex harness build artifacts
+target-codex-harness/
+
+# Optimization artifacts (agent-generated)
+artifacts/
