@@ -1,0 +1,61 @@
+==============================================
+E2E Test: ffs_writeback_e2e
+==============================================
+Started: 2026-02-13T15:21:29-05:00
+Log directory: /data/projects/frankenfs/artifacts/e2e/20260213_152129_ffs_writeback_e2e
+Temp directory: /data/tmp/ffs_e2e_6Hl1gM
+
+
+=== Environment ===
+Time: 2026-02-13T15:21:29-05:00
+System:
+  Linux threadripperje 6.17.0-14-generic #14-Ubuntu SMP PREEMPT_DYNAMIC Fri Jan  9 17:01:16 UTC 2026 x86_64 GNU/Linux
+  User: uid=1000(ubuntu) gid=1000(ubuntu) groups=1000(ubuntu),4(adm),24(cdrom),27(sudo),30(dip),44(video),46(plugdev),100(users),116(lpadmin),128(docker),991(render),995(input)
+
+Rust toolchain:
+  rustc 1.95.0-nightly (47611e160 2026-02-12)
+  binary: rustc
+  commit-hash: 47611e16044c68ef27bac31c35fda2ba1dc20b73
+  commit-date: 2026-02-12
+  host: x86_64-unknown-linux-gnu
+  release: 1.95.0-nightly
+  LLVM version: 22.1.0
+  cargo 1.95.0-nightly (ce69df6f7 2026-02-12)
+
+FUSE:
+  crw-rw-rw- 1 root root 10, 229 Feb 10 19:34 /dev/fuse
+  fusermount3 version: 3.17.4
+
+Filesystem tools:
+  mkfs.ext4: /usr/sbin/mkfs.ext4
+  debugfs: /usr/sbin/debugfs
+
+
+=== Write-back cache durability scenarios ===
+Time: 2026-02-13T15:21:29-05:00
+Running deterministic scenarios from crates/ffs-block/tests/writeback_e2e.rs
+Running: cargo test -p ffs-block --test writeback_e2e -- --nocapture
+      Blocking waiting for file lock on artifact directory
+     Compiling asupersync v0.1.1 (/dp/asupersync)
+     Compiling ffs-block v0.1.0 (/data/projects/frankenfs/crates/ffs-block)
+      Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 24s
+       Running tests/writeback_e2e.rs (/data/tmp/cargo-target/debug/deps/writeback_e2e-2ba950b8b50883b1)
+  
+  running 6 tests
+  test scenario_4_abort_discards_dirty_blocks ... ok
+  test scenario_3_sigkill_dirty_block_loss_is_clean ... ok
+  test scenario_5_backpressure_under_load ... ok
+  test scenario_6_concurrent_transactions_and_flush ... ok
+  test scenario_1_basic_flush_correctness ... ok
+  test scenario_2_clean_unmount_flushes_everything ... ok
+  
+  test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.01s
+  
+Exit code: 0 (duration: 86.424075131s)
+
+==============================================
+PASSED
+==============================================
+Duration: 87s
+Log file: /data/projects/frankenfs/artifacts/e2e/20260213_152129_ffs_writeback_e2e/run.log
+

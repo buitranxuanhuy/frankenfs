@@ -1,0 +1,599 @@
+==============================================
+E2E Test: ffs_smoke
+==============================================
+Started: 2026-02-12T16:17:47-05:00
+Log directory: /data/projects/frankenfs/artifacts/e2e/20260212_161747_ffs_smoke
+Temp directory: /data/tmp/ffs_e2e_EAKHdr
+
+
+=== Environment ===
+Time: 2026-02-12T16:17:47-05:00
+System:
+  Linux threadripperje 6.17.0-14-generic #14-Ubuntu SMP PREEMPT_DYNAMIC Fri Jan  9 17:01:16 UTC 2026 x86_64 GNU/Linux
+  User: uid=1000(ubuntu) gid=1000(ubuntu) groups=1000(ubuntu),4(adm),24(cdrom),27(sudo),30(dip),44(video),46(plugdev),100(users),116(lpadmin),128(docker),991(render),995(input)
+
+Rust toolchain:
+  rustc 1.95.0-nightly (18d13b533 2026-02-09)
+  binary: rustc
+  commit-hash: 18d13b5332916ffca8eadb9106d54b5b434e9978
+  commit-date: 2026-02-09
+  host: x86_64-unknown-linux-gnu
+  release: 1.95.0-nightly
+  LLVM version: 22.1.0
+  cargo 1.95.0-nightly (fe2f314ae 2026-01-30)
+
+FUSE:
+  crw-rw-rw- 1 root root 10, 229 Feb 10 19:34 /dev/fuse
+  fusermount3 version: 3.17.4
+
+Filesystem tools:
+  mkfs.ext4: /usr/sbin/mkfs.ext4
+  debugfs: /usr/sbin/debugfs
+
+
+=== Phase 1: Build ===
+Time: 2026-02-12T16:17:48-05:00
+Running: cargo build --workspace
+      Blocking waiting for file lock on artifact directory
+     Compiling zerocopy v0.8.39
+     Compiling serde_json v1.0.149
+     Compiling ftui-layout v0.1.1 (/dp/frankentui/crates/ftui-layout)
+     Compiling ffs-ext4 v0.1.0 (/data/projects/frankenfs/crates/ffs-ext4)
+     Compiling asupersync v0.1.1 (/dp/asupersync)
+     Compiling ftui-text v0.1.1 (/dp/frankentui/crates/ftui-text)
+     Compiling ftui-widgets v0.1.1 (/dp/frankentui/crates/ftui-widgets)
+     Compiling ftui-runtime v0.1.1 (/dp/frankentui/crates/ftui-runtime)
+     Compiling fuser v0.16.0
+     Compiling ftui v0.1.1 (/dp/frankentui/crates/ftui)
+     Compiling ffs-block v0.1.0 (/data/projects/frankenfs/crates/ffs-block)
+     Compiling ffs-journal v0.1.0 (/data/projects/frankenfs/crates/ffs-journal)
+     Compiling ffs-mvcc v0.1.0 (/data/projects/frankenfs/crates/ffs-mvcc)
+     Compiling ffs-alloc v0.1.0 (/data/projects/frankenfs/crates/ffs-alloc)
+     Compiling ffs-btree v0.1.0 (/data/projects/frankenfs/crates/ffs-btree)
+     Compiling ffs-repair v0.1.0 (/data/projects/frankenfs/crates/ffs-repair)
+     Compiling ffs-xattr v0.1.0 (/data/projects/frankenfs/crates/ffs-xattr)
+     Compiling ffs-extent v0.1.0 (/data/projects/frankenfs/crates/ffs-extent)
+     Compiling ffs-core v0.1.0 (/data/projects/frankenfs/crates/ffs-core)
+     Compiling ffs-inode v0.1.0 (/data/projects/frankenfs/crates/ffs-inode)
+     Compiling ffs-dir v0.1.0 (/data/projects/frankenfs/crates/ffs-dir)
+     Compiling ffs-harness v0.1.0 (/data/projects/frankenfs/crates/ffs-harness)
+     Compiling ffs v0.1.0 (/data/projects/frankenfs/crates/ffs)
+     Compiling ffs-fuse v0.1.0 (/data/projects/frankenfs/crates/ffs-fuse)
+     Compiling ffs-tui v0.1.0 (/data/projects/frankenfs/crates/ffs-tui)
+     Compiling ffs-cli v0.1.0 (/data/projects/frankenfs/crates/ffs-cli)
+      Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 28s
+Exit code: 0 (duration: 88.381034958s)
+
+=== Phase 2: Create Test Image ===
+Time: 2026-02-12T16:19:16-05:00
+
+=== Creating ext4 test image ===
+Time: 2026-02-12T16:19:16-05:00
+Path: /data/tmp/ffs_e2e_EAKHdr/e2e_test.ext4
+Size: 16 MiB
+Image created successfully
+
+=== Phase 3: CLI Commands ===
+Time: 2026-02-12T16:19:16-05:00
+Testing: ffs inspect
+Running: cargo run -p ffs-cli --release -- inspect /data/tmp/ffs_e2e_EAKHdr/e2e_test.ext4 --json
+      Finished `release` profile [optimized] target(s) in 0.10s
+       Running `/data/tmp/cargo-target/release/ffs-cli inspect /data/tmp/ffs_e2e_EAKHdr/e2e_test.ext4 --json`
+  {
+    "filesystem": "ext4",
+    "block_size": 4096,
+    "inodes_count": 4096,
+    "blocks_count": 4096,
+    "volume_name": "e2e_test"
+  }
+Exit code: 0 (duration: .179499743s)
+
+Testing: ffs scrub
+Running: cargo run -p ffs-cli --release -- scrub /data/tmp/ffs_e2e_EAKHdr/e2e_test.ext4 --json
+      Finished `release` profile [optimized] target(s) in 0.09s
+       Running `/data/tmp/cargo-target/release/ffs-cli scrub /data/tmp/ffs_e2e_EAKHdr/e2e_test.ext4 --json`
+  {
+    "blocks_scanned": 4096,
+    "blocks_corrupt": 4050,
+    "blocks_error_or_higher": 1,
+    "blocks_io_error": 0,
+    "findings": [
+      {
+        "block": 0,
+        "kind": "checksum_mismatch",
+        "severity": "critical",
+        "detail": "ext4 superblock checksum invalid: invalid field: s_checksum (superblock CRC32C mismatch)"
+      },
+      {
+        "block": 2,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 10,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 11,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 12,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 13,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 14,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 15,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 16,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 17,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 18,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 20,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 21,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 22,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 23,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 24,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 25,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 26,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 27,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 28,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 29,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 30,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 31,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 32,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 33,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 34,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 36,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 37,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 38,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 39,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 40,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 41,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 42,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 43,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 44,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 45,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 46,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 47,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 48,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 49,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 50,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 51,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 52,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 53,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 54,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 55,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 56,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 57,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 58,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 59,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 60,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 61,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 62,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 63,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 64,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 65,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 66,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 67,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 68,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 69,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 70,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 71,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 72,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 73,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 74,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 75,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 76,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 77,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 78,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 79,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 80,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 81,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 82,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 83,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 84,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 85,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 86,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 87,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 88,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 89,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 90,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+      {
+        "block": 91,
+        "kind": "unexpected_zeroes",
+        "severity": "warning",
+        "detail": "block is entirely zeroed"
+      },
+Exit code: 2 (duration: .201896360s)
+
+FAILED: Assertion failed: cargo run -p ffs-cli --release -- scrub /data/tmp/ffs_e2e_EAKHdr/e2e_test.ext4 --json
+
+Log file: /data/projects/frankenfs/artifacts/e2e/20260212_161747_ffs_smoke/run.log
+
+Last 50 lines of log:

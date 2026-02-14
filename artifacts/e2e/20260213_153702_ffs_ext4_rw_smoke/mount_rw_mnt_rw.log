@@ -1,0 +1,6 @@
+    Finished `release` profile [optimized] target(s) in 0.09s
+     Running `/data/tmp/cargo-target/release/ffs-cli mount /data/tmp/ffs_e2e_ba7Wx6/work.ext4 /data/tmp/ffs_e2e_ba7Wx6/mnt_rw --rw`
+Mounting ext4 image (block_size=4096, blocks=16384, rw) at /data/tmp/ffs_e2e_ba7Wx6/mnt_rw
+error: FUSE mount failed at /data/tmp/ffs_e2e_ba7Wx6/mnt_rw: mount I/O error: fusermount3: option allow_other only allowed if 'user_allow_other' is set in /etc/fuse.conf
+: fusermount3: option allow_other only allowed if 'user_allow_other' is set in /etc/fuse.conf
+

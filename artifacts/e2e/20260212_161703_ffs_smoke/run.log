@@ -1,0 +1,90 @@
+==============================================
+E2E Test: ffs_smoke
+==============================================
+Started: 2026-02-12T16:17:03-05:00
+Log directory: /data/projects/frankenfs/artifacts/e2e/20260212_161703_ffs_smoke
+Temp directory: /data/tmp/ffs_e2e_aWSAIV
+
+
+=== Environment ===
+Time: 2026-02-12T16:17:03-05:00
+System:
+  Linux threadripperje 6.17.0-14-generic #14-Ubuntu SMP PREEMPT_DYNAMIC Fri Jan  9 17:01:16 UTC 2026 x86_64 GNU/Linux
+  User: uid=1000(ubuntu) gid=1000(ubuntu) groups=1000(ubuntu),4(adm),24(cdrom),27(sudo),30(dip),44(video),46(plugdev),100(users),116(lpadmin),128(docker),991(render),995(input)
+
+Rust toolchain:
+  rustc 1.95.0-nightly (18d13b533 2026-02-09)
+  binary: rustc
+  commit-hash: 18d13b5332916ffca8eadb9106d54b5b434e9978
+  commit-date: 2026-02-09
+  host: x86_64-unknown-linux-gnu
+  release: 1.95.0-nightly
+  LLVM version: 22.1.0
+  cargo 1.95.0-nightly (fe2f314ae 2026-01-30)
+
+FUSE:
+  crw-rw-rw- 1 root root 10, 229 Feb 10 19:34 /dev/fuse
+  fusermount3 version: 3.17.4
+
+Filesystem tools:
+  mkfs.ext4: /usr/sbin/mkfs.ext4
+  debugfs: /usr/sbin/debugfs
+
+
+=== Phase 1: Build ===
+Time: 2026-02-12T16:17:04-05:00
+Running: cargo
+build
+--workspace
+  Rust's package manager
+  
+  Usage: cargo [+toolchain] [OPTIONS] [COMMAND]
+         cargo [+toolchain] [OPTIONS] -Zscript <MANIFEST_RS> [ARGS]...
+  
+  Options:
+    -V, --version                  Print version info and exit
+        --list                     List installed commands
+        --explain <CODE>           Provide a detailed explanation of a rustc error message
+    -v, --verbose...               Use verbose output (-vv very verbose/build.rs output)
+    -q, --quiet                    Do not print cargo log messages
+        --color <WHEN>             Coloring [possible values: auto, always, never]
+    -C <DIRECTORY>                 Change to DIRECTORY before doing anything (nightly-only)
+        --locked                   Assert that `Cargo.lock` will remain unchanged
+        --offline                  Run without accessing the network
+        --frozen                   Equivalent to specifying both --locked and --offline
+        --config <KEY=VALUE|PATH>  Override a configuration value
+    -Z <FLAG>                      Unstable (nightly-only) flags to Cargo, see 'cargo -Z help' for
+                                   details
+    -h, --help                     Print help
+  
+  Commands:
+      build, b    Compile the current package
+      check, c    Analyze the current package and report errors, but don't build object files
+      clean       Remove the target directory
+      doc, d      Build this package's and its dependencies' documentation
+      new         Create a new cargo package
+      init        Create a new cargo package in an existing directory
+      add         Add dependencies to a manifest file
+      remove      Remove dependencies from a manifest file
+      run, r      Run a binary or example of the local package
+      test, t     Run the tests
+      bench       Run the benchmarks
+      update      Update dependencies listed in Cargo.lock
+      search      Search registry for crates
+      publish     Package and upload this package to the registry
+      install     Install a Rust binary
+      uninstall   Uninstall a Rust binary
+      ...         See all commands with --list
+  
+  See 'cargo help <command>' for more information on a specific command.
+  /data/projects/frankenfs/scripts/e2e/lib.sh: line 104: build: command not found
+  /data/projects/frankenfs/scripts/e2e/lib.sh: line 105: --workspace: command not found
+Exit code: 127 (duration: .052952497s)
+
+FAILED: Assertion failed: cargo
+build
+--workspace
+
+Log file: /data/projects/frankenfs/artifacts/e2e/20260212_161703_ffs_smoke/run.log
+
+Last 50 lines of log:

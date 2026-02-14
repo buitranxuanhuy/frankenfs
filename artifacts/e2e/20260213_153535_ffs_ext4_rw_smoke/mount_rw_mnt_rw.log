@@ -1,0 +1,3 @@
+    Finished `release` profile [optimized] target(s) in 0.10s
+     Running `/data/tmp/cargo-target/release/ffs-cli mount /data/tmp/ffs_e2e_eyZQyL/work.ext4 /data/tmp/ffs_e2e_eyZQyL/mnt_rw --rw`
+error: failed to open filesystem image: /data/tmp/ffs_e2e_eyZQyL/work.ext4: unsupported feature: non-contiguous ext4 journal extents are not supported
