@@ -869,8 +869,10 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
         // Log recovery evidence.
         self.log_recovery_evidence(&recovery_result)?;
 
-        let (recovered_count, unrecoverable_count, symbols_refreshed) =
-            match recovery_result.evidence.outcome {
+        let (recovered_count, unrecoverable_count, symbols_refreshed) = match recovery_result
+            .evidence
+            .outcome
+        {
             RecoveryOutcome::Recovered => {
                 info!(
                     group = group_num.0,
@@ -1433,6 +1435,21 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
 
+    const E2E_GROUP_COUNT: u32 = 20;
+    const E2E_GROUP_BLOCK_COUNT: u32 = 64;
+    const E2E_SOURCE_BLOCK_COUNT: u32 = 20;
+    const E2E_REPAIR_SYMBOL_COUNT: u32 = 8;
+    const E2E_CORRUPTION_PERCENT: u64 = 5;
+    const E2E_SEED: u64 = 0x05ee_df00_dd15_ca11;
+
+    struct RepairE2eFixture {
+        device: MemBlockDevice,
+        groups: Vec<GroupConfig>,
+        source_blocks: Vec<u64>,
+        corrupt_blocks: Vec<u64>,
+        before_hashes: BTreeMap<u64, String>,
+    }
+
     // ── In-memory block device ────────────────────────────────────────
 
     struct MemBlockDevice {
@@ -1548,6 +1565,25 @@ mod tests {
         source_block_count: u32,
         repair_symbol_count: u32,
     ) -> usize {
+        bootstrap_storage_result(
+            cx,
+            device,
+            layout,
+            source_first_block,
+            source_block_count,
+            repair_symbol_count,
+        )
+        .expect("bootstrap storage")
+    }
+
+    fn bootstrap_storage_result(
+        cx: &Cx,
+        device: &MemBlockDevice,
+        layout: RepairGroupLayout,
+        source_first_block: BlockNumber,
+        source_block_count: u32,
+        repair_symbol_count: u32,
+    ) -> Result<usize> {
         let encoded = encode_group(
             cx,
             device,
@@ -1556,8 +1592,7 @@ mod tests {
             source_first_block,
             source_block_count,
             repair_symbol_count,
-        )
-        .expect("encode group");
+        )?;
 
         let storage = RepairGroupStorage::new(device, layout);
         let desc = RepairGroupDescExt {
@@ -1572,19 +1607,15 @@ mod tests {
             repair_generation: 0,
             checksum: 0,
         };
-        storage
-            .write_group_desc_ext(cx, &desc)
-            .expect("write bootstrap desc");
+        storage.write_group_desc_ext(cx, &desc)?;
 
         let symbols = encoded
             .repair_symbols
             .into_iter()
             .map(|s| (s.esi, s.data))
             .collect::<Vec<_>>();
-        storage
-            .write_repair_symbols(cx, &symbols, 1)
-            .expect("write repair symbols");
-        symbols.len()
+        storage.write_repair_symbols(cx, &symbols, 1)?;
+        Ok(symbols.len())
     }
 
     fn read_generation(cx: &Cx, device: &MemBlockDevice, layout: RepairGroupLayout) -> u64 {
@@ -1702,6 +1733,118 @@ mod tests {
         }
     }
 
+    fn inject_corruption_blocks(cx: &Cx, device: &MemBlockDevice, blocks: &[u64]) {
+        for &block in blocks {
+            let mut bytes = device
+                .read_block(cx, BlockNumber(block))
+                .expect("read source block")
+                .as_slice()
+                .to_vec();
+            let last = bytes.len().saturating_sub(1);
+            bytes[0] ^= 0xA5;
+            bytes[last] ^= 0x5A;
+            device
+                .write_block(cx, BlockNumber(block), &bytes)
+                .expect("inject corruption");
+        }
+    }
+
+    fn build_repair_e2e_fixture(cx: &Cx) -> RepairE2eFixture {
+        let total_blocks = u64::from(E2E_GROUP_COUNT) * u64::from(E2E_GROUP_BLOCK_COUNT);
+        let device = MemBlockDevice::new(1024, total_blocks);
+
+        let mut groups = Vec::new();
+        let mut source_blocks = Vec::new();
+        for group in 0..E2E_GROUP_COUNT {
+            let group_first = u64::from(group) * u64::from(E2E_GROUP_BLOCK_COUNT);
+            let layout = RepairGroupLayout::new(
+                GroupNumber(group),
+                BlockNumber(group_first),
+                E2E_GROUP_BLOCK_COUNT,
+                0,
+                E2E_REPAIR_SYMBOL_COUNT,
+            )
+            .expect("layout");
+            let source_first = BlockNumber(group_first);
+
+            write_source_blocks(cx, &device, source_first, E2E_SOURCE_BLOCK_COUNT);
+            bootstrap_storage(
+                cx,
+                &device,
+                layout,
+                source_first,
+                E2E_SOURCE_BLOCK_COUNT,
+                E2E_REPAIR_SYMBOL_COUNT,
+            );
+
+            groups.push(GroupConfig {
+                layout,
+                source_first_block: source_first,
+                source_block_count: E2E_SOURCE_BLOCK_COUNT,
+            });
+            for idx in 0..u64::from(E2E_SOURCE_BLOCK_COUNT) {
+                source_blocks.push(group_first + idx);
+            }
+        }
+
+        let target_corrupt = (source_blocks.len()
+            * usize::try_from(E2E_CORRUPTION_PERCENT).expect("percent fits"))
+            / 100;
+        assert_eq!(
+            target_corrupt,
+            usize::try_from(E2E_GROUP_COUNT).expect("group count fits")
+        );
+
+        let mut corrupt_blocks = Vec::with_capacity(target_corrupt);
+        for group in 0..E2E_GROUP_COUNT {
+            let group_first = u64::from(group) * u64::from(E2E_GROUP_BLOCK_COUNT);
+            let offset =
+                splitmix64(E2E_SEED ^ u64::from(group)) % u64::from(E2E_SOURCE_BLOCK_COUNT);
+            corrupt_blocks.push(group_first + offset);
+        }
+
+        let before_hashes = block_hashes(cx, &device, &source_blocks);
+        inject_corruption_blocks(cx, &device, &corrupt_blocks);
+
+        RepairE2eFixture {
+            device,
+            groups,
+            source_blocks,
+            corrupt_blocks,
+            before_hashes,
+        }
+    }
+
+    fn assert_repair_e2e_evidence(ledger_data: &[u8], expected_repairs: usize) {
+        let records = crate::evidence::parse_evidence_ledger(ledger_data);
+        let corruption_detected = records
+            .iter()
+            .filter(|r| r.event_type == EvidenceEventType::CorruptionDetected)
+            .count();
+        let repair_attempted = records
+            .iter()
+            .filter(|r| r.event_type == EvidenceEventType::RepairAttempted)
+            .count();
+        let repair_succeeded = records
+            .iter()
+            .filter(|r| r.event_type == EvidenceEventType::RepairSucceeded)
+            .count();
+        let repair_failed = records
+            .iter()
+            .filter(|r| r.event_type == EvidenceEventType::RepairFailed)
+            .count();
+        let scrub_cycle_complete = records
+            .iter()
+            .filter(|r| r.event_type == EvidenceEventType::ScrubCycleComplete)
+            .count();
+
+        assert_eq!(corruption_detected, expected_repairs);
+        assert_eq!(repair_attempted, expected_repairs);
+        assert_eq!(repair_succeeded, expected_repairs);
+        assert_eq!(repair_failed, 0);
+        assert_eq!(scrub_cycle_complete, expected_repairs);
+    }
+
     // ── Unit tests ────────────────────────────────────────────────────
 
     #[test]
@@ -1807,6 +1950,29 @@ mod tests {
                 originals[usize::try_from(idx).unwrap()].as_slice(),
                 "block {idx} not restored"
             );
+        }
+    }
+
+    #[test]
+    fn bootstrap_storage_rejects_symbols_beyond_layout_capacity() {
+        let cx = Cx::for_testing();
+        let device = MemBlockDevice::new(256, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+        let source_first = BlockNumber(0);
+
+        write_source_blocks(&cx, &device, source_first, 8);
+        let err = bootstrap_storage_result(&cx, &device, layout, source_first, 8, 8)
+            .expect_err("repair symbols should exceed reserved layout capacity");
+
+        match err {
+            FfsError::RepairFailed(message) => {
+                assert!(
+                    message.contains("too many raw symbols for reserved region"),
+                    "unexpected repair error message: {message}"
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
         }
     }
 
@@ -2650,80 +2816,13 @@ mod tests {
     #[test]
     fn e2e_survive_five_percent_random_block_corruption_with_daemon() {
         let cx = Cx::for_testing();
-        const GROUP_COUNT: u32 = 20;
-        const GROUP_BLOCK_COUNT: u32 = 64;
-        const SOURCE_BLOCK_COUNT: u32 = 20;
-        const REPAIR_SYMBOL_COUNT: u32 = 8;
-        const CORRUPTION_PERCENT: u64 = 5;
-        const SEED: u64 = 0x5eed_f00d_d15c_a11;
-
-        let total_blocks = u64::from(GROUP_COUNT) * u64::from(GROUP_BLOCK_COUNT);
-        let device = MemBlockDevice::new(1024, total_blocks);
-
-        let mut groups = Vec::new();
-        let mut source_blocks = Vec::new();
-        for group in 0..GROUP_COUNT {
-            let group_first = u64::from(group) * u64::from(GROUP_BLOCK_COUNT);
-            let layout = RepairGroupLayout::new(
-                GroupNumber(group),
-                BlockNumber(group_first),
-                GROUP_BLOCK_COUNT,
-                0,
-                4,
-            )
-            .expect("layout");
-            let source_first = BlockNumber(group_first);
-
-            write_source_blocks(&cx, &device, source_first, SOURCE_BLOCK_COUNT);
-            bootstrap_storage(
-                &cx,
-                &device,
-                layout,
-                source_first,
-                SOURCE_BLOCK_COUNT,
-                REPAIR_SYMBOL_COUNT,
-            );
-
-            groups.push(GroupConfig {
-                layout,
-                source_first_block: source_first,
-                source_block_count: SOURCE_BLOCK_COUNT,
-            });
-            for idx in 0..u64::from(SOURCE_BLOCK_COUNT) {
-                source_blocks.push(group_first + idx);
-            }
-        }
-
-        let target_corrupt = (source_blocks.len()
-            * usize::try_from(CORRUPTION_PERCENT).expect("percent fits"))
-            / 100;
-        assert_eq!(
-            target_corrupt,
-            usize::try_from(GROUP_COUNT).expect("group count fits")
-        );
-
-        let mut corrupt_blocks = Vec::with_capacity(target_corrupt);
-        for group in 0..GROUP_COUNT {
-            let group_first = u64::from(group) * u64::from(GROUP_BLOCK_COUNT);
-            let offset = splitmix64(SEED ^ u64::from(group)) % u64::from(SOURCE_BLOCK_COUNT);
-            corrupt_blocks.push(group_first + offset);
-        }
-
-        let before_hashes = block_hashes(&cx, &device, &source_blocks);
-
-        for &block in &corrupt_blocks {
-            let mut bytes = device
-                .read_block(&cx, BlockNumber(block))
-                .expect("read source block")
-                .as_slice()
-                .to_vec();
-            let last = bytes.len().saturating_sub(1);
-            bytes[0] ^= 0xA5;
-            bytes[last] ^= 0x5A;
-            device
-                .write_block(&cx, BlockNumber(block), &bytes)
-                .expect("inject corruption");
-        }
+        let RepairE2eFixture {
+            device,
+            groups,
+            source_blocks,
+            corrupt_blocks,
+            before_hashes,
+        } = build_repair_e2e_fixture(&cx);
 
         let validator = CorruptBlockValidator::new(corrupt_blocks.clone());
         let mut ledger_buf = Vec::new();
@@ -2733,7 +2832,7 @@ mod tests {
             test_uuid(),
             groups,
             &mut ledger_buf,
-            REPAIR_SYMBOL_COUNT,
+            E2E_REPAIR_SYMBOL_COUNT,
         );
         let mut daemon = ScrubDaemon::new(
             pipeline,
@@ -2748,14 +2847,9 @@ mod tests {
         daemon.run_one_round(&cx).expect("daemon one round");
         let elapsed = started.elapsed();
 
-        assert_eq!(
-            daemon.metrics().blocks_corrupt_found,
-            u64::try_from(corrupt_blocks.len()).expect("len fits u64")
-        );
-        assert_eq!(
-            daemon.metrics().blocks_recovered,
-            u64::try_from(corrupt_blocks.len()).expect("len fits u64")
-        );
+        let expected_repairs = u64::try_from(corrupt_blocks.len()).expect("len fits u64");
+        assert_eq!(daemon.metrics().blocks_corrupt_found, expected_repairs);
+        assert_eq!(daemon.metrics().blocks_recovered, expected_repairs);
         assert_eq!(daemon.metrics().blocks_unrecoverable, 0);
         assert_eq!(daemon.metrics().scrub_rounds_completed, 1);
 
@@ -2764,38 +2858,10 @@ mod tests {
 
         let (pipeline, _metrics) = daemon.into_parts();
         let ledger_data = pipeline.into_ledger();
-        let records = crate::evidence::parse_evidence_ledger(ledger_data);
-
-        let corruption_detected = records
-            .iter()
-            .filter(|r| r.event_type == EvidenceEventType::CorruptionDetected)
-            .count();
-        let repair_attempted = records
-            .iter()
-            .filter(|r| r.event_type == EvidenceEventType::RepairAttempted)
-            .count();
-        let repair_succeeded = records
-            .iter()
-            .filter(|r| r.event_type == EvidenceEventType::RepairSucceeded)
-            .count();
-        let repair_failed = records
-            .iter()
-            .filter(|r| r.event_type == EvidenceEventType::RepairFailed)
-            .count();
-        let scrub_cycle_complete = records
-            .iter()
-            .filter(|r| r.event_type == EvidenceEventType::ScrubCycleComplete)
-            .count();
-
-        assert_eq!(corruption_detected, corrupt_blocks.len());
-        assert_eq!(repair_attempted, corrupt_blocks.len());
-        assert_eq!(repair_succeeded, corrupt_blocks.len());
-        assert_eq!(repair_failed, 0);
-        assert_eq!(scrub_cycle_complete, corrupt_blocks.len());
+        assert_repair_e2e_evidence(ledger_data, corrupt_blocks.len());
         assert!(
             elapsed <= Duration::from_secs(120),
-            "repair e2e exceeded timeout: {:?}",
-            elapsed
+            "repair e2e exceeded timeout: {elapsed:?}"
         );
 
         maybe_write_repair_e2e_artifacts(
@@ -2803,8 +2869,8 @@ mod tests {
             &after_hashes,
             &corrupt_blocks,
             ledger_data,
-            SEED,
-            CORRUPTION_PERCENT,
+            E2E_SEED,
+            E2E_CORRUPTION_PERCENT,
         );
     }
 }
