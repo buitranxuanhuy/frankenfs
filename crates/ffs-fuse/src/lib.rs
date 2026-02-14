@@ -973,6 +973,81 @@ impl Filesystem for FrankenFuse {
         }
     }
 
+    fn flush(&mut self, _req: &Request<'_>, ino: u64, fh: u64, lock_owner: u64, reply: ReplyEmpty) {
+        let cx = Self::cx_for_request();
+        match self.with_request_scope(&cx, RequestOp::Flush, |cx| {
+            self.inner.ops.flush(cx, InodeNumber(ino), fh, lock_owner)
+        }) {
+            Ok(()) => reply.ok(),
+            Err(e) => {
+                Self::reply_error_empty(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "flush",
+                        ino,
+                        offset: None,
+                    },
+                    reply,
+                );
+            }
+        }
+    }
+
+    fn fsync(&mut self, _req: &Request<'_>, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
+        if self.inner.read_only {
+            reply.error(libc::EROFS);
+            return;
+        }
+        let cx = Self::cx_for_request();
+        match self.with_request_scope(&cx, RequestOp::Fsync, |cx| {
+            self.inner.ops.fsync(cx, InodeNumber(ino), fh, datasync)
+        }) {
+            Ok(()) => reply.ok(),
+            Err(e) => {
+                Self::reply_error_empty(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "fsync",
+                        ino,
+                        offset: None,
+                    },
+                    reply,
+                );
+            }
+        }
+    }
+
+    fn fsyncdir(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        if self.inner.read_only {
+            reply.error(libc::EROFS);
+            return;
+        }
+        let cx = Self::cx_for_request();
+        match self.with_request_scope(&cx, RequestOp::Fsyncdir, |cx| {
+            self.inner.ops.fsyncdir(cx, InodeNumber(ino), fh, datasync)
+        }) {
+            Ok(()) => reply.ok(),
+            Err(e) => {
+                Self::reply_error_empty(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "fsyncdir",
+                        ino,
+                        offset: None,
+                    },
+                    reply,
+                );
+            }
+        }
+    }
+
     #[allow(clippy::cast_possible_truncation)] // FUSE mode u32 → ext4 u16
     fn create(
         &mut self,

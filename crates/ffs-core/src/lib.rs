@@ -4934,7 +4934,7 @@ impl FsOps for OpenFs {
                     op = "fsync",
                     ino = ino.0,
                     datasync,
-                    duration_us = started.elapsed().as_micros() as u64,
+                    duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
                     "fsync_complete"
                 );
                 Ok(())
@@ -4969,7 +4969,7 @@ impl FsOps for OpenFs {
                     op = "fsyncdir",
                     ino = ino.0,
                     datasync,
-                    duration_us = started.elapsed().as_micros() as u64,
+                    duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
                     "fsyncdir_complete"
                 );
                 Ok(())
