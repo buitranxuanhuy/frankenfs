@@ -1,0 +1,95 @@
+bd-15c.11	task	0	repair_durability	S/A	25	1.1 RaptorQ + 12.13 Change-point + 11.11 PoR
+bd-15c.5	task	0	general	B	9	0.8 Runtime Decision Core + 0.19 Evidence Ledger
+bd-2s4	epic	0	runtime_backpressure	A	16	0.5 Graceful Degradation + 10.3 Learning-Augmented Online + 12.13 Change-point
+bd-huh	epic	0	format_path	A	10.666666666666666	8.16 SSI certification + 5.1 Typestate + 0.15 Tail decomposition
+bd-15c	epic	0	repair_durability	S/A	25	1.1 RaptorQ + 12.13 Change-point + 11.11 PoR
+bd-3tz.2	task	1	runtime_backpressure	A	16	0.5 Graceful Degradation + 10.3 Learning-Augmented Online + 12.13 Change-point
+bd-22w.10	task	1	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-14jb.5	task	1	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-5s0r.5	task	1	repair_durability	S/A	25	1.1 RaptorQ + 12.13 Change-point + 11.11 PoR
+bd-6tme.2	task	1	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-6tme.1	task	1	general	B	9	0.8 Runtime Decision Core + 0.19 Evidence Ledger
+bd-32yn.7	task	1	quality_assurance	A	50	0.1 Optimization Loop + 0.7 Artifact Contract + 6.12 Proptest
+bd-32yn.6	task	1	quality_assurance	A	50	0.1 Optimization Loop + 0.7 Artifact Contract + 6.12 Proptest
+bd-32yn.5	task	1	general	B	9	0.8 Runtime Decision Core + 0.19 Evidence Ledger
+bd-32yn.3	task	1	quality_assurance	A	50	0.1 Optimization Loop + 0.7 Artifact Contract + 6.12 Proptest
+bd-32yn.2	task	1	repair_durability	S/A	25	1.1 RaptorQ + 12.13 Change-point + 11.11 PoR
+bd-32yn	epic	1	quality_assurance	A	50	0.1 Optimization Loop + 0.7 Artifact Contract + 6.12 Proptest
+bd-2jk.11	task	1	repair_durability	S/A	25	1.1 RaptorQ + 12.13 Change-point + 11.11 PoR
+bd-2jk.10	task	1	runtime_backpressure	A	16	0.5 Graceful Degradation + 10.3 Learning-Augmented Online + 12.13 Change-point
+bd-5s0r	epic	1	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-14jb	epic	1	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-2s4.5	task	1	runtime_backpressure	A	16	0.5 Graceful Degradation + 10.3 Learning-Augmented Online + 12.13 Change-point
+bd-15c.12	task	1	repair_durability	S/A	25	1.1 RaptorQ + 12.13 Change-point + 11.11 PoR
+bd-15c.10	task	1	repair_durability	S/A	25	1.1 RaptorQ + 12.13 Change-point + 11.11 PoR
+bd-2jk.9	task	1	general	B	9	0.8 Runtime Decision Core + 0.19 Evidence Ledger
+bd-cebm	task	1	repair_durability	S/A	25	1.1 RaptorQ + 12.13 Change-point + 11.11 PoR
+bd-3en1	task	1	runtime_backpressure	A	16	0.5 Graceful Degradation + 10.3 Learning-Augmented Online + 12.13 Change-point
+bd-2ju	task	1	quality_assurance	A	50	0.1 Optimization Loop + 0.7 Artifact Contract + 6.12 Proptest
+bd-3tz	epic	1	runtime_backpressure	A	16	0.5 Graceful Degradation + 10.3 Learning-Augmented Online + 12.13 Change-point
+bd-29z	epic	1	format_path	A	10.666666666666666	8.16 SSI certification + 5.1 Typestate + 0.15 Tail decomposition
+bd-22w	epic	1	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-375	epic	1	runtime_backpressure	A	16	0.5 Graceful Degradation + 10.3 Learning-Augmented Online + 12.13 Change-point
+bd-1xe	epic	1	format_path	A	10.666666666666666	8.16 SSI certification + 5.1 Typestate + 0.15 Tail decomposition
+bd-2jk	epic	1	quality_assurance	A	50	0.1 Optimization Loop + 0.7 Artifact Contract + 6.12 Proptest
+bd-3ib.4	task	2	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-3ib.3	task	2	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-6tme.3	task	2	repair_durability	S/A	25	1.1 RaptorQ + 12.13 Change-point + 11.11 PoR
+bd-2jk.14	task	2	quality_assurance	A	50	0.1 Optimization Loop + 0.7 Artifact Contract + 6.12 Proptest
+bd-29z.2	task	2	format_path	A	10.666666666666666	8.16 SSI certification + 5.1 Typestate + 0.15 Tail decomposition
+bd-375.6	task	2	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-3tz.3	task	2	general	B	9	0.8 Runtime Decision Core + 0.19 Evidence Ledger
+bd-1xe.6	task	2	runtime_backpressure	A	16	0.5 Graceful Degradation + 10.3 Learning-Augmented Online + 12.13 Change-point
+bd-1xe.5	task	2	format_path	A	10.666666666666666	8.16 SSI certification + 5.1 Typestate + 0.15 Tail decomposition
+bd-32yn.8	task	2	quality_assurance	A	50	0.1 Optimization Loop + 0.7 Artifact Contract + 6.12 Proptest
+bd-1c4y.4	task	2	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-2oah.5	task	2	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-2s4.6	task	2	runtime_backpressure	A	16	0.5 Graceful Degradation + 10.3 Learning-Augmented Online + 12.13 Change-point
+bd-1c4y.3	task	2	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-2oah.4	task	2	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-1mdk.4	task	2	quality_assurance	A	50	0.1 Optimization Loop + 0.7 Artifact Contract + 6.12 Proptest
+bd-1mdk.3	task	2	general	B	9	0.8 Runtime Decision Core + 0.19 Evidence Ledger
+bd-1mdk.2	task	2	general	B	9	0.8 Runtime Decision Core + 0.19 Evidence Ledger
+bd-1mdk.1	task	2	general	B	9	0.8 Runtime Decision Core + 0.19 Evidence Ledger
+bd-18gn	task	2	general	B	9	0.8 Runtime Decision Core + 0.19 Evidence Ledger
+bd-6tme	epic	2	repair_durability	S/A	25	1.1 RaptorQ + 12.13 Change-point + 11.11 PoR
+bd-32yn.4	task	2	quality_assurance	A	50	0.1 Optimization Loop + 0.7 Artifact Contract + 6.12 Proptest
+bd-2jk.13	task	2	repair_durability	S/A	25	1.1 RaptorQ + 12.13 Change-point + 11.11 PoR
+bd-2jk.12	task	2	general	B	9	0.8 Runtime Decision Core + 0.19 Evidence Ledger
+bd-1mdk	epic	2	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-2oah.3	task	2	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-2oah.2	task	2	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-2oah.1	task	2	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-2oah	epic	2	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-1c4y.2	task	2	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-1c4y.1	task	2	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-1c4y	epic	2	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-3iyg	task	2	format_path	A	10.666666666666666	8.16 SSI certification + 5.1 Typestate + 0.15 Tail decomposition
+bd-huh.6	task	2	format_path	A	10.666666666666666	8.16 SSI certification + 5.1 Typestate + 0.15 Tail decomposition
+bd-15c.7	task	2	repair_durability	S/A	25	1.1 RaptorQ + 12.13 Change-point + 11.11 PoR
+bd-22w.7	task	2	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-2s4.2	task	2	runtime_backpressure	A	16	0.5 Graceful Degradation + 10.3 Learning-Augmented Online + 12.13 Change-point
+bd-2jk.7	task	2	general	B	9	0.8 Runtime Decision Core + 0.19 Evidence Ledger
+bd-13i9	task	2	runtime_backpressure	A	16	0.5 Graceful Degradation + 10.3 Learning-Augmented Online + 12.13 Change-point
+bd-lqwc	task	2	quality_assurance	A	50	0.1 Optimization Loop + 0.7 Artifact Contract + 6.12 Proptest
+bd-1ymg	task	2	general	B	9	0.8 Runtime Decision Core + 0.19 Evidence Ledger
+bd-1wtx	task	2	general	B	9	0.8 Runtime Decision Core + 0.19 Evidence Ledger
+bd-3rix	task	2	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-38o	task	2	runtime_backpressure	A	16	0.5 Graceful Degradation + 10.3 Learning-Augmented Online + 12.13 Change-point
+bd-820	task	2	repair_durability	S/A	25	1.1 RaptorQ + 12.13 Change-point + 11.11 PoR
+bd-14c	task	2	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-16r	task	2	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-1bx	task	2	general	B	9	0.8 Runtime Decision Core + 0.19 Evidence Ledger
+bd-2tt	task	2	format_path	A	10.666666666666666	8.16 SSI certification + 5.1 Typestate + 0.15 Tail decomposition
+bd-3ik	task	2	format_path	A	10.666666666666666	8.16 SSI certification + 5.1 Typestate + 0.15 Tail decomposition
+bd-15c.4	task	2	quality_assurance	A	50	0.1 Optimization Loop + 0.7 Artifact Contract + 6.12 Proptest
+bd-375.3	task	2	runtime_backpressure	A	16	0.5 Graceful Degradation + 10.3 Learning-Augmented Online + 12.13 Change-point
+bd-3ib	epic	2	concurrency_perf	S/A	13.333333333333334	14.10 EBR + 15.1 S3-FIFO + 15.4 Parallel WAL
+bd-2jk.4	task	2	general	B	9	0.8 Runtime Decision Core + 0.19 Evidence Ledger
+bd-3ib.2	task	3	runtime_backpressure	A	16	0.5 Graceful Degradation + 10.3 Learning-Augmented Online + 12.13 Change-point
+bd-xzn0	task	3	general	B	9	0.8 Runtime Decision Core + 0.19 Evidence Ledger
+bd-7tn4	task	3	repair_durability	S/A	25	1.1 RaptorQ + 12.13 Change-point + 11.11 PoR
+bd-2jds	task	3	general	B	9	0.8 Runtime Decision Core + 0.19 Evidence Ledger
+bd-2oc7	task	3	repair_durability	S/A	25	1.1 RaptorQ + 12.13 Change-point + 11.11 PoR
+bd-2lpe	task	3	general	B	9	0.8 Runtime Decision Core + 0.19 Evidence Ledger
+bd-qpt5	task	3	general	B	9	0.8 Runtime Decision Core + 0.19 Evidence Ledger
