@@ -2,7 +2,7 @@
 
 use asupersync::Cx;
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use ffs_block::{ArcCache, BlockBuf, BlockDevice, ByteBlockDevice, ByteDevice};
+use ffs_block::{ArcCache, ArcWritePolicy, BlockBuf, BlockDevice, ByteBlockDevice, ByteDevice};
 use ffs_error::Result;
 use ffs_types::{BlockNumber, ByteOffset};
 use parking_lot::Mutex;
@@ -58,6 +58,17 @@ fn make_cache(
     let mem = MemByteDevice::new(block_size as usize * block_count);
     let dev = ByteBlockDevice::new(mem, block_size).expect("device");
     ArcCache::new(dev, capacity).expect("cache")
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn make_writeback_cache(
+    block_size: u32,
+    block_count: usize,
+    capacity: usize,
+) -> ArcCache<ByteBlockDevice<MemByteDevice>> {
+    let mem = MemByteDevice::new(block_size as usize * block_count);
+    let dev = ByteBlockDevice::new(mem, block_size).expect("device");
+    ArcCache::new_with_policy(dev, capacity, ArcWritePolicy::WriteBack).expect("cache")
 }
 
 // ── Benchmarks ──────────────────────────────────────────────────────────
@@ -132,11 +143,51 @@ fn bench_metrics_snapshot(c: &mut Criterion) {
     });
 }
 
+fn bench_writeback_sync_single_4k(c: &mut Criterion) {
+    let cx = Cx::for_testing();
+    let cache = make_writeback_cache(4096, 512, 256);
+    let payload = vec![0xAB; 4096];
+    let mut block = 0_u64;
+
+    c.bench_function("writeback_sync_single_4k", |b| {
+        b.iter(|| {
+            let target = BlockNumber(block % 256);
+            cache
+                .write_block(black_box(&cx), black_box(target), black_box(&payload))
+                .expect("write");
+            cache.sync(black_box(&cx)).expect("sync");
+            block = block.wrapping_add(1);
+        });
+    });
+}
+
+fn bench_writeback_sync_100x4k(c: &mut Criterion) {
+    let cx = Cx::for_testing();
+    let cache = make_writeback_cache(4096, 2048, 1024);
+    let payload = vec![0xCD; 4096];
+    let mut base = 0_u64;
+
+    c.bench_function("writeback_sync_100x4k", |b| {
+        b.iter(|| {
+            for offset in 0_u64..100_u64 {
+                let target = BlockNumber((base + offset) % 1024);
+                cache
+                    .write_block(black_box(&cx), black_box(target), black_box(&payload))
+                    .expect("write");
+            }
+            cache.sync(black_box(&cx)).expect("sync");
+            base = base.wrapping_add(100);
+        });
+    });
+}
+
 criterion_group!(
     cache_benches,
     bench_cache_hit,
     bench_cache_miss,
     bench_cache_mixed_workload,
     bench_metrics_snapshot,
+    bench_writeback_sync_single_4k,
+    bench_writeback_sync_100x4k,
 );
 criterion_main!(cache_benches);

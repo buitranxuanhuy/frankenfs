@@ -253,7 +253,14 @@ fn scenario_3_sigkill_dirty_block_loss_is_clean() {
             .write_block(&cx, BlockNumber(block), &payload)
             .expect("baseline write");
     }
+    let fsync_started = Instant::now();
     cache.sync(&cx).expect("sync durable baseline");
+    let fsync_elapsed = fsync_started.elapsed();
+    assert!(
+        fsync_elapsed <= Duration::from_millis(100),
+        "single-small-file fsync path should stay under 100ms in-memory test harness, got {fsync_elapsed:?}"
+    );
+    assert_eq!(cache.inner().sync_count(), 1, "expected one explicit sync");
 
     let mut non_fsync = HashMap::new();
     for block in 100_u64..300_u64 {

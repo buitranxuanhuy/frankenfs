@@ -44,4 +44,8 @@ echo "--- Criterion: ondisk_parse ---"
 cargo bench -p ffs-harness --bench ondisk_parse
 
 echo ""
+echo "--- Criterion: writeback fsync latency ---"
+cargo bench -p ffs-block --bench arc_cache -- writeback_sync_
+
+echo ""
 echo "=== Benchmark suite complete ==="

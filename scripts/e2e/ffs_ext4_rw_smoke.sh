@@ -279,6 +279,16 @@ MOUNT_CRASH="$E2E_TEMP_DIR/mnt_crash"
 if start_mount rw "$WORK_IMAGE" "$MOUNT_CRASH" 1; then
     e2e_assert bash -lc "printf 'crash-path-write\n' > '$MOUNT_CRASH/crash_marker.txt'"
     e2e_assert_file "$MOUNT_CRASH/crash_marker.txt"
+    HAVE_FSYNC_MARKER=0
+    if command -v python3 >/dev/null 2>&1; then
+        e2e_assert python3 -c "import os; p='$MOUNT_CRASH/fsync_marker.txt'; f=open(p, 'wb'); f.write(b'fsync-path-write\\n'); f.flush(); os.fsync(f.fileno()); f.close()"
+        e2e_assert_file "$MOUNT_CRASH/fsync_marker.txt"
+        HAVE_FSYNC_MARKER=1
+    else
+        e2e_log "python3 unavailable; skipping explicit fsync marker write"
+    fi
+    e2e_assert bash -lc "printf 'non-fsync-write\n' > '$MOUNT_CRASH/non_fsync_marker.txt'"
+    e2e_assert_file "$MOUNT_CRASH/non_fsync_marker.txt"
 
     e2e_log "Simulating abrupt crash: kill -9 $CURRENT_MOUNT_PID"
     kill -9 "$CURRENT_MOUNT_PID" 2>/dev/null || true
@@ -291,6 +301,14 @@ if start_mount rw "$WORK_IMAGE" "$MOUNT_CRASH" 1; then
 
     e2e_step "Phase 5.2: remount after crash"
     if start_mount ro "$WORK_IMAGE" "$MOUNT_RO" 1; then
+        if [[ "$HAVE_FSYNC_MARKER" -eq 1 ]]; then
+            e2e_assert grep -Fxq "fsync-path-write" "$MOUNT_RO/fsync_marker.txt"
+        fi
+        if [[ -f "$MOUNT_RO/non_fsync_marker.txt" ]]; then
+            e2e_assert grep -Fxq "non-fsync-write" "$MOUNT_RO/non_fsync_marker.txt"
+        else
+            e2e_log "non_fsync_marker.txt absent after crash (allowed for non-fsync write)"
+        fi
         log_tree "$MOUNT_RO" "Post-crash remount directory tree"
         stop_mount "$MOUNT_RO"
     else
