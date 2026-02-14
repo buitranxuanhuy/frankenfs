@@ -751,6 +751,95 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             })
     }
 
+    fn log_repair_attempt(
+        &mut self,
+        group_cfg: &GroupConfig,
+        corrupt_blocks: &[BlockNumber],
+    ) -> Result<()> {
+        let attempt_detail = RepairDetail {
+            generation: 0,
+            corrupt_count: corrupt_blocks.len(),
+            symbols_used: 0,
+            symbols_available: usize::try_from(group_cfg.layout.repair_block_count)
+                .unwrap_or(usize::MAX),
+            decoder_stats: RecoveryDecoderStats::default(),
+            verify_pass: false,
+            reason: None,
+        };
+        self.ledger
+            .append(&EvidenceRecord::repair_attempted(
+                group_cfg.layout.group.0,
+                attempt_detail,
+            ))
+            .map_err(|e| FfsError::RepairFailed(format!("failed to write recovery evidence: {e}")))
+    }
+
+    fn log_recovery_evidence(&mut self, recovery_result: &RecoveryAttemptResult) -> Result<()> {
+        let evidence_record = EvidenceRecord::from_recovery(&recovery_result.evidence);
+        self.ledger
+            .append(&evidence_record)
+            .map_err(|e| FfsError::RepairFailed(format!("failed to write recovery evidence: {e}")))
+    }
+
+    fn mark_recovered_blocks(
+        block_outcomes: &mut BTreeMap<u64, BlockOutcome>,
+        repaired_blocks: &[BlockNumber],
+    ) -> usize {
+        for block in repaired_blocks {
+            block_outcomes.insert(block.0, BlockOutcome::Recovered);
+        }
+        repaired_blocks.len()
+    }
+
+    fn mark_unrecoverable_blocks(
+        block_outcomes: &mut BTreeMap<u64, BlockOutcome>,
+        blocks: &[BlockNumber],
+    ) -> usize {
+        for block in blocks {
+            block_outcomes.insert(block.0, BlockOutcome::Unrecoverable);
+        }
+        blocks.len()
+    }
+
+    fn mark_remaining_unrecoverable(
+        block_outcomes: &mut BTreeMap<u64, BlockOutcome>,
+        corrupt_blocks: &[BlockNumber],
+        repaired_blocks: &[BlockNumber],
+    ) -> usize {
+        let repaired_set: BTreeSet<u64> = repaired_blocks.iter().map(|b| b.0).collect();
+        let mut unrecoverable = 0;
+        for block in corrupt_blocks {
+            if !repaired_set.contains(&block.0) {
+                block_outcomes.insert(block.0, BlockOutcome::Unrecoverable);
+                unrecoverable += 1;
+            }
+        }
+        unrecoverable
+    }
+
+    fn refresh_symbols_after_recovery(&mut self, cx: &Cx, group_cfg: &GroupConfig) -> bool {
+        let group_num = group_cfg.layout.group;
+        let refresh_symbol_count = self.selected_refresh_symbol_count(group_cfg);
+        if refresh_symbol_count == 0 {
+            return false;
+        }
+
+        match self.refresh_symbols(cx, group_cfg, refresh_symbol_count, RefreshMode::Recovery) {
+            Ok(()) => {
+                info!(group = group_num.0, "repair symbols refreshed");
+                true
+            }
+            Err(e) => {
+                error!(
+                    group = group_num.0,
+                    error = %e,
+                    "failed to refresh repair symbols"
+                );
+                false
+            }
+        }
+    }
+
     /// Recover a single group's corrupt blocks and return a summary.
     fn recover_group(
         &mut self,
@@ -772,70 +861,27 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             "attempting recovery for group"
         );
 
-        let attempt_detail = RepairDetail {
-            generation: 0,
-            corrupt_count: corrupt_blocks.len(),
-            symbols_used: 0,
-            symbols_available: usize::try_from(group_cfg.layout.repair_block_count)
-                .unwrap_or(usize::MAX),
-            decoder_stats: RecoveryDecoderStats::default(),
-            verify_pass: false,
-            reason: None,
-        };
-        self.ledger
-            .append(&EvidenceRecord::repair_attempted(
-                group_num.0,
-                attempt_detail,
-            ))
-            .map_err(|e| {
-                FfsError::RepairFailed(format!("failed to write recovery evidence: {e}"))
-            })?;
+        self.log_repair_attempt(group_cfg, corrupt_blocks)?;
 
         // Attempt recovery.
         let recovery_result = self.attempt_group_recovery(cx, group_cfg, corrupt_blocks);
 
         // Log recovery evidence.
-        let evidence_record = EvidenceRecord::from_recovery(&recovery_result.evidence);
-        self.ledger.append(&evidence_record).map_err(|e| {
-            FfsError::RepairFailed(format!("failed to write recovery evidence: {e}"))
-        })?;
+        self.log_recovery_evidence(&recovery_result)?;
 
-        let mut symbols_refreshed = false;
-
-        match recovery_result.evidence.outcome {
+        let (recovered_count, unrecoverable_count, symbols_refreshed) =
+            match recovery_result.evidence.outcome {
             RecoveryOutcome::Recovered => {
                 info!(
                     group = group_num.0,
                     blocks_recovered = recovery_result.repaired_blocks.len(),
                     "recovery successful"
                 );
-                for block in &recovery_result.repaired_blocks {
-                    block_outcomes.insert(block.0, BlockOutcome::Recovered);
-                }
-                *total_recovered += recovery_result.repaired_blocks.len();
-
-                // Refresh symbols after successful recovery.
-                let refresh_symbol_count = self.selected_refresh_symbol_count(group_cfg);
-                if refresh_symbol_count > 0 {
-                    match self.refresh_symbols(
-                        cx,
-                        group_cfg,
-                        refresh_symbol_count,
-                        RefreshMode::Recovery,
-                    ) {
-                        Ok(()) => {
-                            symbols_refreshed = true;
-                            info!(group = group_num.0, "repair symbols refreshed");
-                        }
-                        Err(e) => {
-                            error!(
-                                group = group_num.0,
-                                error = %e,
-                                "failed to refresh repair symbols"
-                            );
-                        }
-                    }
-                }
+                (
+                    Self::mark_recovered_blocks(block_outcomes, &recovery_result.repaired_blocks),
+                    0,
+                    self.refresh_symbols_after_recovery(cx, group_cfg),
+                )
             }
             RecoveryOutcome::Partial => {
                 warn!(
@@ -847,23 +893,15 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
                         .unwrap_or("unknown"),
                     "partial recovery"
                 );
-                for block in &recovery_result.repaired_blocks {
-                    block_outcomes.insert(block.0, BlockOutcome::Recovered);
-                }
-                *total_recovered += recovery_result.repaired_blocks.len();
-
-                // Mark remaining corrupt blocks as unrecoverable.
-                let repaired_set: std::collections::BTreeSet<u64> = recovery_result
-                    .repaired_blocks
-                    .iter()
-                    .map(|b| b.0)
-                    .collect();
-                for block in corrupt_blocks {
-                    if !repaired_set.contains(&block.0) {
-                        block_outcomes.insert(block.0, BlockOutcome::Unrecoverable);
-                        *total_unrecoverable += 1;
-                    }
-                }
+                (
+                    Self::mark_recovered_blocks(block_outcomes, &recovery_result.repaired_blocks),
+                    Self::mark_remaining_unrecoverable(
+                        block_outcomes,
+                        corrupt_blocks,
+                        &recovery_result.repaired_blocks,
+                    ),
+                    false,
+                )
             }
             RecoveryOutcome::Failed => {
                 error!(
@@ -875,18 +913,21 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
                         .unwrap_or("unknown"),
                     "recovery failed"
                 );
-                for block in corrupt_blocks {
-                    block_outcomes.insert(block.0, BlockOutcome::Unrecoverable);
-                }
-                *total_unrecoverable += corrupt_blocks.len();
+                (
+                    0,
+                    Self::mark_unrecoverable_blocks(block_outcomes, corrupt_blocks),
+                    false,
+                )
             }
-        }
+        };
+        *total_recovered += recovered_count;
+        *total_unrecoverable += unrecoverable_count;
 
         Ok(GroupRecoverySummary {
             group: group_num.0,
             corrupt_count: corrupt_blocks.len(),
-            recovered_count: recovery_result.repaired_blocks.len(),
-            unrecoverable_count: corrupt_blocks.len() - recovery_result.repaired_blocks.len(),
+            recovered_count,
+            unrecoverable_count,
             symbols_refreshed,
             decoder_stats: Some(recovery_result.evidence.decoder_stats),
         })
