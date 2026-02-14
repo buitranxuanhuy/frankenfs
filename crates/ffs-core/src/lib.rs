@@ -206,6 +206,12 @@ impl std::fmt::Display for DegradationLevel {
     }
 }
 
+impl From<DegradationLevel> for u8 {
+    fn from(level: DegradationLevel) -> Self {
+        level as Self
+    }
+}
+
 /// Degradation FSM with hysteresis to prevent oscillation.
 ///
 /// The FSM escalates immediately when pressure worsens but requires a
@@ -213,6 +219,7 @@ impl std::fmt::Display for DegradationLevel {
 /// de-escalating. This prevents rapid flickering between levels.
 pub struct DegradationFsm {
     current: parking_lot::Mutex<FsmState>,
+    level_cache: std::sync::atomic::AtomicU8,
     pressure: Arc<SystemPressure>,
     policies: parking_lot::Mutex<Vec<Arc<dyn DegradationPolicy>>>,
     recovery_samples: u32,
@@ -248,6 +255,7 @@ impl DegradationFsm {
                 recovery_count: 0,
                 transition_count: 0,
             }),
+            level_cache: std::sync::atomic::AtomicU8::new(u8::from(DegradationLevel::Normal)),
             pressure,
             policies: parking_lot::Mutex::new(Vec::new()),
             recovery_samples,
@@ -262,7 +270,7 @@ impl DegradationFsm {
     /// Current degradation level.
     #[must_use]
     pub fn level(&self) -> DegradationLevel {
-        self.current.lock().level
+        DegradationLevel::from_raw(self.level_cache.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Total number of transitions since creation.
@@ -303,6 +311,8 @@ impl DegradationFsm {
         }
 
         let new = state.level;
+        self.level_cache
+            .store(u8::from(new), std::sync::atomic::Ordering::Relaxed);
         drop(state);
 
         // Notify policies with current headroom (regardless of transition).
@@ -3137,6 +3147,9 @@ pub enum RequestOp {
     Getxattr,
     Lookup,
     Listxattr,
+    Flush,
+    Fsync,
+    Fsyncdir,
     Open,
     Opendir,
     Read,
@@ -3165,6 +3178,8 @@ impl RequestOp {
                 | Self::Rename
                 | Self::Setattr
                 | Self::Write
+                | Self::Fsync
+                | Self::Fsyncdir
         )
     }
 }
@@ -3361,6 +3376,44 @@ pub trait FsOps: Send + Sync {
         _attrs: &SetAttrRequest,
     ) -> ffs_error::Result<InodeAttr> {
         Err(FfsError::ReadOnly)
+    }
+
+    /// Flush per-handle state on `close(2)`; no durability guarantee required.
+    ///
+    /// This hook exists for backends that keep per-handle locks or delayed
+    /// write errors. Stateless implementations may return `Ok(())`.
+    fn flush(
+        &self,
+        _cx: &Cx,
+        _ino: InodeNumber,
+        _fh: u64,
+        _lock_owner: u64,
+    ) -> ffs_error::Result<()> {
+        Ok(())
+    }
+
+    /// Synchronize file data to stable storage.
+    ///
+    /// `datasync=true` allows skipping non-essential metadata where supported.
+    fn fsync(
+        &self,
+        _cx: &Cx,
+        _ino: InodeNumber,
+        _fh: u64,
+        _datasync: bool,
+    ) -> ffs_error::Result<()> {
+        Err(FfsError::ReadOnly)
+    }
+
+    /// Synchronize directory contents to stable storage.
+    fn fsyncdir(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        fh: u64,
+        datasync: bool,
+    ) -> ffs_error::Result<()> {
+        self.fsync(cx, ino, fh, datasync)
     }
 
     // ── Request scope hooks ───────────────────────────────────────────
@@ -4847,6 +4900,80 @@ impl FsOps for OpenFs {
     ) -> ffs_error::Result<InodeAttr> {
         match &self.flavor {
             FsFlavor::Ext4(_) => self.ext4_setattr(cx, ino, attrs),
+            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+        }
+    }
+
+    fn flush(
+        &self,
+        _cx: &Cx,
+        _ino: InodeNumber,
+        _fh: u64,
+        _lock_owner: u64,
+    ) -> ffs_error::Result<()> {
+        Ok(())
+    }
+
+    fn fsync(&self, cx: &Cx, ino: InodeNumber, _fh: u64, datasync: bool) -> ffs_error::Result<()> {
+        match &self.flavor {
+            FsFlavor::Ext4(_) => {
+                if !self.is_writable() {
+                    return Err(FfsError::ReadOnly);
+                }
+                let started = Instant::now();
+                debug!(
+                    target: "ffs::durability",
+                    op = "fsync",
+                    ino = ino.0,
+                    datasync,
+                    "fsync_start"
+                );
+                self.dev.sync(cx)?;
+                debug!(
+                    target: "ffs::durability",
+                    op = "fsync",
+                    ino = ino.0,
+                    datasync,
+                    duration_us = started.elapsed().as_micros() as u64,
+                    "fsync_complete"
+                );
+                Ok(())
+            }
+            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+        }
+    }
+
+    fn fsyncdir(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        _fh: u64,
+        datasync: bool,
+    ) -> ffs_error::Result<()> {
+        match &self.flavor {
+            FsFlavor::Ext4(_) => {
+                if !self.is_writable() {
+                    return Err(FfsError::ReadOnly);
+                }
+                let started = Instant::now();
+                debug!(
+                    target: "ffs::durability",
+                    op = "fsyncdir",
+                    ino = ino.0,
+                    datasync,
+                    "fsyncdir_start"
+                );
+                self.dev.sync(cx)?;
+                debug!(
+                    target: "ffs::durability",
+                    op = "fsyncdir",
+                    ino = ino.0,
+                    datasync,
+                    duration_us = started.elapsed().as_micros() as u64,
+                    "fsyncdir_complete"
+                );
+                Ok(())
+            }
             FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
         }
     }
@@ -9013,6 +9140,14 @@ mod tests {
         let err = fs.rmdir(&cx, root, OsStr::new("d")).unwrap_err();
         assert_eq!(err.to_errno(), libc::EROFS);
 
+        let err = fs.fsync(&cx, root, 0, false).unwrap_err();
+        assert_eq!(err.to_errno(), libc::EROFS);
+
+        let err = fs.fsyncdir(&cx, root, 0, false).unwrap_err();
+        assert_eq!(err.to_errno(), libc::EROFS);
+
+        fs.flush(&cx, root, 0, 0).expect("flush default no-op");
+
         let err = fs
             .rename(&cx, root, OsStr::new("a"), root, OsStr::new("b"))
             .unwrap_err();
@@ -9281,6 +9416,33 @@ mod tests {
 
         let err = fs.write(&cx, InodeNumber(11), 0, b"data").unwrap_err();
         assert_eq!(err.to_errno(), libc::EROFS);
+
+        let err = fs.fsync(&cx, InodeNumber(11), 0, false).unwrap_err();
+        assert_eq!(err.to_errno(), libc::EROFS);
+
+        let err = fs.fsyncdir(&cx, InodeNumber(2), 0, false).unwrap_err();
+        assert_eq!(err.to_errno(), libc::EROFS);
+
+        fs.flush(&cx, InodeNumber(11), 0, 0)
+            .expect("flush should be allowed on read-only mount");
+    }
+
+    #[test]
+    fn write_fsync_and_fsyncdir_writable_ext4_succeed() {
+        let Some(fs) = open_writable_ext4() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        let attr = fs
+            .create(&cx, root, OsStr::new("sync_me.txt"), 0o644, 0, 0)
+            .expect("create");
+        fs.write(&cx, attr.ino, 0, b"durable")
+            .expect("write before fsync");
+
+        fs.fsync(&cx, attr.ino, 0, false).expect("fsync");
+        fs.fsyncdir(&cx, root, 0, false).expect("fsyncdir");
     }
 
     #[test]
@@ -10041,6 +10203,23 @@ mod tests {
     }
 
     #[test]
+    fn backpressure_gate_hot_loop_million_checks() {
+        let pressure = Arc::new(SystemPressure::with_headroom(0.2));
+        let fsm = Arc::new(DegradationFsm::new(Arc::clone(&pressure), 1));
+        fsm.tick();
+        let gate = BackpressureGate::new(fsm);
+
+        let mut throttled = 0_u64;
+        for _ in 0..5_000_000 {
+            if gate.check(RequestOp::Write) == BackpressureDecision::Throttle {
+                throttled += 1;
+            }
+        }
+
+        assert_eq!(throttled, 5_000_000);
+    }
+
+    #[test]
     fn pressure_monitor_samples_and_ticks() {
         let pressure = Arc::new(SystemPressure::new());
         let monitor = PressureMonitor::new(pressure, 3);
@@ -10078,6 +10257,7 @@ mod tests {
         assert!(!RequestOp::Lookup.is_write());
         assert!(!RequestOp::Readdir.is_write());
         assert!(!RequestOp::Readlink.is_write());
+        assert!(!RequestOp::Flush.is_write());
         assert!(!RequestOp::Open.is_write());
         assert!(!RequestOp::Opendir.is_write());
         assert!(!RequestOp::Getxattr.is_write());
@@ -10090,5 +10270,7 @@ mod tests {
         assert!(RequestOp::Rename.is_write());
         assert!(RequestOp::Setattr.is_write());
         assert!(RequestOp::Write.is_write());
+        assert!(RequestOp::Fsync.is_write());
+        assert!(RequestOp::Fsyncdir.is_write());
     }
 }
