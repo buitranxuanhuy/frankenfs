@@ -11,8 +11,14 @@ End-to-end smoke tests for FrankenFS that exercise user-facing workflows.
 # Run ext4 read-write smoke + crash checks
 ./scripts/e2e/ffs_ext4_rw_smoke.sh
 
+# Run btrfs read-write smoke + persistence checks
+./scripts/e2e/ffs_btrfs_rw_smoke.sh
+
 # Run write-back durability scenarios
 ./scripts/e2e/ffs_writeback_e2e.sh
+
+# Run deterministic 5% corruption auto-repair E2E
+./scripts/e2e/ffs_repair_5pct_e2e.sh
 ```
 
 ## What It Tests
@@ -47,6 +53,22 @@ The ext4 read-write smoke suite exercises:
 4. Clean shutdown persistence: remount read-only and re-verify post-unmount state
 5. Best-effort crash phase: SIGKILL mount process, inspect image, and verify remount or explicit recovery diagnostic
 
+The btrfs read-write smoke suite exercises:
+
+1. Fixture lifecycle: create a fresh 256MiB mkfs.btrfs image, then fallback to a known-good btrfs fixture if current parser support is incomplete
+2. RW operations: create/write/overwrite (small/4KB/1MB), append, truncate extend/shrink
+3. Directory/name/link operations: mkdir/rmdir, rename within/across dir, rename-overwrite, unlink, symlink, hardlink, and inode-sharing checks
+4. COW-oriented checks: repeated rewrites of a hot file with superblock generation/root snapshots before/after write bursts
+5. Persistence checks: clean unmount, read-only remount, and post-remount data/metadata validation
+6. CI artifacts: structured per-test timing logs and a `junit.xml` report under the suite artifact directory
+
+The 5% repair E2E suite exercises:
+
+1. Deterministic 5% random block corruption across repair groups
+2. Background scrub daemon auto-detection and auto-recovery
+3. Full before/after block digest equivalence checks
+4. Structured evidence ledger capture and artifact export
+
 ## Output
 
 Test artifacts are stored in `artifacts/e2e/<timestamp>/`:
@@ -68,6 +90,7 @@ artifacts/e2e/20260212_161500_ffs_smoke/
 
 - Rust toolchain (nightly)
 - `mkfs.ext4` and `debugfs` (e2fsprogs)
+- `mkfs.btrfs` and `btrfs` (btrfs-progs)
 - `/dev/fuse` accessible (for mount tests)
 - `fusermount` or `fusermount3` (for unmounting)
 - `mountpoint` utility (used for readiness checks)

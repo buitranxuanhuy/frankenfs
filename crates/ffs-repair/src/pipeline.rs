@@ -15,9 +15,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use asupersync::Cx;
+use asupersync::{Cx, SystemPressure};
 use ffs_block::BlockDevice;
 use ffs_error::{FfsError, Result};
 use ffs_types::{BlockNumber, GroupNumber};
@@ -27,7 +28,8 @@ use tracing::{debug, error, info, trace, warn};
 use crate::autopilot::{DurabilityAutopilot, OverheadDecision};
 use crate::codec::{EncodedGroup, encode_group};
 use crate::evidence::{
-    CorruptionDetail, EvidenceLedger, EvidenceRecord, PolicyDecisionDetail, SymbolRefreshDetail,
+    CorruptionDetail, EvidenceLedger, EvidenceRecord, PolicyDecisionDetail, RepairDetail,
+    SymbolRefreshDetail,
 };
 use crate::recovery::{
     GroupRecoveryOrchestrator, RecoveryAttemptResult, RecoveryDecoderStats, RecoveryOutcome,
@@ -165,6 +167,85 @@ impl RecoveryReport {
     pub fn is_fully_recovered(&self) -> bool {
         self.total_unrecoverable == 0
     }
+}
+
+// ── Daemon scheduler ──────────────────────────────────────────────────────
+
+/// Background scrub daemon configuration.
+#[derive(Debug, Clone)]
+pub struct ScrubDaemonConfig {
+    /// Delay between daemon ticks.
+    pub interval: Duration,
+    /// Cancellation polling granularity while sleeping.
+    pub cancel_check_interval: Duration,
+    /// Headroom threshold below which the daemon yields for backpressure.
+    pub backpressure_headroom_threshold: f32,
+    /// Yield duration when backpressure is active.
+    pub backpressure_sleep: Duration,
+}
+
+impl Default for ScrubDaemonConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(5),
+            cancel_check_interval: Duration::from_millis(100),
+            backpressure_headroom_threshold: 0.3,
+            backpressure_sleep: Duration::from_millis(25),
+        }
+    }
+}
+
+/// Live scrub daemon counters exposed to callers/TUI layers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScrubDaemonMetrics {
+    pub blocks_scanned_total: u64,
+    pub blocks_corrupt_found: u64,
+    pub blocks_recovered: u64,
+    pub blocks_unrecoverable: u64,
+    pub scrub_rounds_completed: u64,
+    pub current_group: u32,
+    pub scrub_rate_blocks_per_sec: f64,
+    pub backpressure_yields: u64,
+}
+
+impl Default for ScrubDaemonMetrics {
+    fn default() -> Self {
+        Self {
+            blocks_scanned_total: 0,
+            blocks_corrupt_found: 0,
+            blocks_recovered: 0,
+            blocks_unrecoverable: 0,
+            scrub_rounds_completed: 0,
+            current_group: 0,
+            scrub_rate_blocks_per_sec: 0.0,
+            backpressure_yields: 0,
+        }
+    }
+}
+
+/// Summary for one daemon tick (one group scan attempt).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScrubDaemonStep {
+    pub group: u32,
+    pub blocks_scanned: u64,
+    pub corrupt_count: usize,
+    pub recovered_count: usize,
+    pub unrecoverable_count: usize,
+    pub duration_ms: u64,
+}
+
+/// Round-robin background scheduler over [`ScrubWithRecovery`] group configs.
+pub struct ScrubDaemon<'a, W: Write> {
+    pipeline: ScrubWithRecovery<'a, W>,
+    config: ScrubDaemonConfig,
+    metrics: ScrubDaemonMetrics,
+    next_group_index: usize,
+    pressure: Option<Arc<SystemPressure>>,
+    round_number: u64,
+    round_started_at: Instant,
+    round_groups_scanned: usize,
+    round_corrupt: usize,
+    round_recovered: usize,
 }
 
 // ── Pipeline ──────────────────────────────────────────────────────────────
@@ -347,6 +428,58 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
     }
 
     // ── Internal helpers ──────────────────────────────────────────────
+
+    fn corrupt_blocks_from_report(report: &ScrubReport) -> Vec<BlockNumber> {
+        let mut blocks: Vec<BlockNumber> = report
+            .findings
+            .iter()
+            .filter(|finding| finding.severity >= Severity::Error)
+            .map(|finding| finding.block)
+            .collect();
+        blocks.sort_unstable_by_key(|block| block.0);
+        blocks.dedup_by_key(|block| block.0);
+        blocks
+    }
+
+    fn scrub_group_once(
+        &mut self,
+        cx: &Cx,
+        group_cfg: GroupConfig,
+    ) -> Result<(ScrubReport, Option<GroupRecoverySummary>)> {
+        let group = group_cfg.layout.group;
+        let scrubber = Scrubber::new(self.device, self.validator);
+        let report = scrubber.scrub_range(
+            cx,
+            group_cfg.source_first_block,
+            u64::from(group_cfg.source_block_count),
+        )?;
+
+        let scrub_record = EvidenceRecord::from_scrub_report(group.0, &report);
+        self.ledger.append(&scrub_record).map_err(|e| {
+            FfsError::RepairFailed(format!("failed to write scrub-cycle evidence: {e}"))
+        })?;
+
+        self.update_adaptive_policy(&report)?;
+        self.maybe_refresh_dirty_group(cx, group, false)?;
+
+        let corrupt_blocks = Self::corrupt_blocks_from_report(&report);
+        if corrupt_blocks.is_empty() {
+            return Ok((report, None));
+        }
+
+        let mut block_outcomes = BTreeMap::new();
+        let mut total_recovered = 0_usize;
+        let mut total_unrecoverable = 0_usize;
+        let summary = self.recover_group(
+            cx,
+            &group_cfg,
+            &corrupt_blocks,
+            &mut block_outcomes,
+            &mut total_recovered,
+            &mut total_unrecoverable,
+        )?;
+        Ok((report, Some(summary)))
+    }
 
     fn apply_default_refresh_policies(&mut self) {
         for group_cfg in &self.groups {
@@ -638,6 +771,25 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             corrupt_count = corrupt_blocks.len(),
             "attempting recovery for group"
         );
+
+        let attempt_detail = RepairDetail {
+            generation: 0,
+            corrupt_count: corrupt_blocks.len(),
+            symbols_used: 0,
+            symbols_available: usize::try_from(group_cfg.layout.repair_block_count)
+                .unwrap_or(usize::MAX),
+            decoder_stats: RecoveryDecoderStats::default(),
+            verify_pass: false,
+            reason: None,
+        };
+        self.ledger
+            .append(&EvidenceRecord::repair_attempted(
+                group_num.0,
+                attempt_detail,
+            ))
+            .map_err(|e| {
+                FfsError::RepairFailed(format!("failed to write recovery evidence: {e}"))
+            })?;
 
         // Attempt recovery.
         let recovery_result = self.attempt_group_recovery(cx, group_cfg, corrupt_blocks);
@@ -966,6 +1118,266 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
     }
 }
 
+impl<'a, W: Write> ScrubDaemon<'a, W> {
+    /// Create a round-robin scrub daemon over an existing recovery pipeline.
+    pub fn new(pipeline: ScrubWithRecovery<'a, W>, config: ScrubDaemonConfig) -> Self {
+        Self {
+            pipeline,
+            config,
+            metrics: ScrubDaemonMetrics::default(),
+            next_group_index: 0,
+            pressure: None,
+            round_number: 0,
+            round_started_at: Instant::now(),
+            round_groups_scanned: 0,
+            round_corrupt: 0,
+            round_recovered: 0,
+        }
+    }
+
+    /// Attach shared system pressure for backpressure-aware yielding.
+    #[must_use]
+    pub fn with_pressure(mut self, pressure: Arc<SystemPressure>) -> Self {
+        self.pressure = Some(pressure);
+        self
+    }
+
+    /// Current daemon counters.
+    #[must_use]
+    pub fn metrics(&self) -> &ScrubDaemonMetrics {
+        &self.metrics
+    }
+
+    /// Consume the daemon and return the inner pipeline + final metrics.
+    #[must_use]
+    pub fn into_parts(self) -> (ScrubWithRecovery<'a, W>, ScrubDaemonMetrics) {
+        (self.pipeline, self.metrics)
+    }
+
+    /// Consume the daemon and return only the inner pipeline.
+    #[must_use]
+    pub fn into_pipeline(self) -> ScrubWithRecovery<'a, W> {
+        self.pipeline
+    }
+
+    /// Execute one daemon tick (scan one group, recover if needed).
+    pub fn run_once(&mut self, cx: &Cx) -> Result<ScrubDaemonStep> {
+        if self.pipeline.groups.is_empty() {
+            return Err(FfsError::RepairFailed(
+                "scrub daemon requires at least one group".to_owned(),
+            ));
+        }
+
+        if self.next_group_index == 0 {
+            self.round_number = self.round_number.saturating_add(1);
+            self.round_started_at = Instant::now();
+            self.round_groups_scanned = 0;
+            self.round_corrupt = 0;
+            self.round_recovered = 0;
+            debug!(
+                target: "ffs::repair::daemon",
+                round_number = self.round_number,
+                starting_group = self.pipeline.groups[0].layout.group.0,
+                "scrub_round_start"
+            );
+        }
+
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+
+        let group_cfg = self.pipeline.groups[self.next_group_index];
+        let group = group_cfg.layout.group;
+        trace!(
+            target: "ffs::repair::daemon",
+            group_id = group.0,
+            "group_scan_start"
+        );
+
+        let started = Instant::now();
+        let (report, summary) = self.pipeline.scrub_group_once(cx, group_cfg)?;
+        let elapsed = started.elapsed();
+        let duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+
+        let corrupt_count = summary.as_ref().map_or(0, |s| s.corrupt_count);
+        let recovered_count = summary.as_ref().map_or(0, |s| s.recovered_count);
+        let unrecoverable_count = summary.as_ref().map_or(0, |s| s.unrecoverable_count);
+
+        trace!(
+            target: "ffs::repair::daemon",
+            group_id = group.0,
+            duration_ms,
+            blocks_scanned = report.blocks_scanned,
+            errors_found = report.findings.len(),
+            "group_scan_complete"
+        );
+
+        self.metrics.current_group = group.0;
+        self.metrics.blocks_scanned_total = self
+            .metrics
+            .blocks_scanned_total
+            .saturating_add(report.blocks_scanned);
+        self.metrics.blocks_corrupt_found = self
+            .metrics
+            .blocks_corrupt_found
+            .saturating_add(u64::try_from(corrupt_count).unwrap_or(u64::MAX));
+        self.metrics.blocks_recovered = self
+            .metrics
+            .blocks_recovered
+            .saturating_add(u64::try_from(recovered_count).unwrap_or(u64::MAX));
+        self.metrics.blocks_unrecoverable = self
+            .metrics
+            .blocks_unrecoverable
+            .saturating_add(u64::try_from(unrecoverable_count).unwrap_or(u64::MAX));
+        self.metrics.scrub_rate_blocks_per_sec = if elapsed.is_zero() {
+            0.0
+        } else {
+            report.blocks_scanned as f64 / elapsed.as_secs_f64()
+        };
+
+        self.round_groups_scanned = self.round_groups_scanned.saturating_add(1);
+        self.round_corrupt = self.round_corrupt.saturating_add(corrupt_count);
+        self.round_recovered = self.round_recovered.saturating_add(recovered_count);
+
+        self.next_group_index += 1;
+        if self.next_group_index >= self.pipeline.groups.len() {
+            self.next_group_index = 0;
+            self.metrics.scrub_rounds_completed =
+                self.metrics.scrub_rounds_completed.saturating_add(1);
+            info!(
+                target: "ffs::repair::daemon",
+                round_number = self.round_number,
+                duration_secs = self.round_started_at.elapsed().as_secs_f64(),
+                groups_scanned = self.round_groups_scanned,
+                total_corrupt = self.round_corrupt,
+                total_recovered = self.round_recovered,
+                "scrub_round_complete"
+            );
+        }
+
+        self.maybe_backpressure_yield(cx, group)?;
+
+        Ok(ScrubDaemonStep {
+            group: group.0,
+            blocks_scanned: report.blocks_scanned,
+            corrupt_count,
+            recovered_count,
+            unrecoverable_count,
+            duration_ms,
+        })
+    }
+
+    /// Execute one full round (all configured groups exactly once).
+    pub fn run_one_round(&mut self, cx: &Cx) -> Result<()> {
+        let total_groups = self.pipeline.groups.len();
+        for _ in 0..total_groups {
+            self.run_once(cx)?;
+        }
+        Ok(())
+    }
+
+    /// Run continuously until cancellation is requested.
+    pub fn run_until_cancelled(&mut self, cx: &Cx) -> Result<ScrubDaemonMetrics> {
+        info!(
+            target: "ffs::repair::daemon",
+            total_groups = self.pipeline.groups.len(),
+            interval_secs = self.config.interval.as_secs_f64(),
+            backpressure_threshold = self.config.backpressure_headroom_threshold,
+            "scrub_daemon_start"
+        );
+
+        loop {
+            if cx.checkpoint().is_err() {
+                info!(
+                    target: "ffs::repair::daemon",
+                    reason = "cancelled",
+                    blocks_scanned_total = self.metrics.blocks_scanned_total,
+                    blocks_corrupt_found = self.metrics.blocks_corrupt_found,
+                    blocks_recovered = self.metrics.blocks_recovered,
+                    blocks_unrecoverable = self.metrics.blocks_unrecoverable,
+                    scrub_rounds_completed = self.metrics.scrub_rounds_completed,
+                    "scrub_daemon_stop"
+                );
+                return Ok(self.metrics.clone());
+            }
+
+            let tick_started = Instant::now();
+            match self.run_once(cx) {
+                Ok(_) => {}
+                Err(FfsError::Cancelled) => {
+                    info!(
+                        target: "ffs::repair::daemon",
+                        reason = "cancelled",
+                        blocks_scanned_total = self.metrics.blocks_scanned_total,
+                        blocks_corrupt_found = self.metrics.blocks_corrupt_found,
+                        blocks_recovered = self.metrics.blocks_recovered,
+                        blocks_unrecoverable = self.metrics.blocks_unrecoverable,
+                        scrub_rounds_completed = self.metrics.scrub_rounds_completed,
+                        "scrub_daemon_stop"
+                    );
+                    return Ok(self.metrics.clone());
+                }
+                Err(err) => return Err(err),
+            }
+
+            let tick_elapsed = tick_started.elapsed();
+            let idle = self.config.interval.saturating_sub(tick_elapsed);
+            if let Err(err) = self.sleep_with_checkpoint(cx, idle) {
+                if matches!(err, FfsError::Cancelled) {
+                    info!(
+                        target: "ffs::repair::daemon",
+                        reason = "cancelled",
+                        blocks_scanned_total = self.metrics.blocks_scanned_total,
+                        blocks_corrupt_found = self.metrics.blocks_corrupt_found,
+                        blocks_recovered = self.metrics.blocks_recovered,
+                        blocks_unrecoverable = self.metrics.blocks_unrecoverable,
+                        scrub_rounds_completed = self.metrics.scrub_rounds_completed,
+                        "scrub_daemon_stop"
+                    );
+                    return Ok(self.metrics.clone());
+                }
+                return Err(err);
+            }
+        }
+    }
+
+    fn maybe_backpressure_yield(&mut self, cx: &Cx, group: GroupNumber) -> Result<()> {
+        let Some(pressure) = self.pressure.as_ref() else {
+            return Ok(());
+        };
+
+        let headroom = pressure.headroom();
+        if headroom >= self.config.backpressure_headroom_threshold {
+            return Ok(());
+        }
+
+        let yield_duration = self.config.backpressure_sleep;
+        self.metrics.backpressure_yields = self.metrics.backpressure_yields.saturating_add(1);
+        debug!(
+            target: "ffs::repair::daemon",
+            current_group = group.0,
+            pressure_source = pressure.level_label(),
+            headroom,
+            yield_duration_ms = yield_duration.as_millis(),
+            "backpressure_yield"
+        );
+        self.sleep_with_checkpoint(cx, yield_duration)
+    }
+
+    fn sleep_with_checkpoint(&self, cx: &Cx, duration: Duration) -> Result<()> {
+        if duration.is_zero() {
+            return Ok(());
+        }
+
+        let mut remaining = duration;
+        while !remaining.is_zero() {
+            let slice = remaining.min(self.config.cancel_check_interval);
+            std::thread::sleep(slice);
+            remaining = remaining.saturating_sub(slice);
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        }
+        Ok(())
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -973,11 +1385,12 @@ mod tests {
     use super::*;
     use crate::autopilot::DurabilityAutopilot;
     use crate::codec::encode_group;
+    use crate::evidence::EvidenceEventType;
     use crate::scrub::{BlockVerdict, CorruptionKind, Severity};
     use crate::symbol::RepairGroupDescExt;
     use ffs_block::BlockBuf;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::{Arc, Mutex};
 
     // ── In-memory block device ────────────────────────────────────────
 
@@ -1152,6 +1565,75 @@ mod tests {
             symbols_selected,
             metadata_group: false,
         }
+    }
+
+    fn splitmix64(mut x: u64) -> u64 {
+        x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^ (x >> 31)
+    }
+
+    fn block_hashes(cx: &Cx, device: &MemBlockDevice, blocks: &[u64]) -> BTreeMap<u64, String> {
+        let mut hashes = BTreeMap::new();
+        for &block in blocks {
+            let bytes = device.read_block(cx, BlockNumber(block)).expect("read");
+            let digest = blake3::hash(bytes.as_slice()).to_hex().to_string();
+            hashes.insert(block, digest);
+        }
+        hashes
+    }
+
+    fn maybe_write_repair_e2e_artifacts(
+        before: &BTreeMap<u64, String>,
+        after: &BTreeMap<u64, String>,
+        corrupt_blocks: &[u64],
+        ledger_data: &[u8],
+        seed: u64,
+        corruption_percent: u64,
+    ) {
+        let Ok(dir) = std::env::var("FFS_REPAIR_E2E_ARTIFACT_DIR") else {
+            return;
+        };
+        let dir_path = std::path::Path::new(&dir);
+        std::fs::create_dir_all(dir_path).expect("create artifact dir");
+
+        let before_body = before
+            .iter()
+            .map(|(block, digest)| format!("{block} {digest}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            dir_path.join("before_checksums.txt"),
+            format!("{before_body}\n"),
+        )
+        .expect("write before checksums");
+
+        let after_body = after
+            .iter()
+            .map(|(block, digest)| format!("{block} {digest}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            dir_path.join("after_checksums.txt"),
+            format!("{after_body}\n"),
+        )
+        .expect("write after checksums");
+
+        let corruption_plan = serde_json::json!({
+            "seed": seed,
+            "corruption_percent": corruption_percent,
+            "total_corrupted_blocks": corrupt_blocks.len(),
+            "corrupted_blocks": corrupt_blocks,
+        });
+        std::fs::write(
+            dir_path.join("corruption_plan.json"),
+            serde_json::to_vec_pretty(&corruption_plan).expect("serialize corruption plan"),
+        )
+        .expect("write corruption plan");
+
+        std::fs::write(dir_path.join("recovery_evidence.jsonl"), ledger_data)
+            .expect("write recovery evidence");
     }
 
     /// Validator that flags specific block numbers as corrupt.
@@ -1421,8 +1903,8 @@ mod tests {
 
         let records = crate::evidence::parse_evidence_ledger(ledger_data);
         assert!(
-            records.len() >= 3,
-            "expected at least 3 evidence records (corruption + repair + refresh), got {}",
+            records.len() >= 4,
+            "expected at least 4 evidence records (corruption + attempt + repair + refresh), got {}",
             records.len()
         );
 
@@ -1431,15 +1913,20 @@ mod tests {
             records[0].event_type,
             crate::evidence::EvidenceEventType::CorruptionDetected
         );
-        // Second record: repair succeeded.
-        assert_eq!(
-            records[1].event_type,
-            crate::evidence::EvidenceEventType::RepairSucceeded
+        assert!(
+            records
+                .iter()
+                .any(|r| { r.event_type == crate::evidence::EvidenceEventType::RepairAttempted })
         );
-        // Third record: symbol refresh.
-        assert_eq!(
-            records[2].event_type,
-            crate::evidence::EvidenceEventType::SymbolRefresh
+        assert!(
+            records
+                .iter()
+                .any(|r| { r.event_type == crate::evidence::EvidenceEventType::RepairSucceeded })
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| { r.event_type == crate::evidence::EvidenceEventType::SymbolRefresh })
         );
     }
 
@@ -1876,6 +2363,407 @@ mod tests {
         assert_eq!(
             refresh_detail.symbols_generated,
             policy_detail.symbols_selected
+        );
+    }
+
+    #[test]
+    fn scrub_daemon_scans_at_least_one_group() {
+        let cx = Cx::for_testing();
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+        let source_first = BlockNumber(0);
+        let source_count = 8;
+
+        write_source_blocks(&cx, &device, source_first, source_count);
+        bootstrap_storage(&cx, &device, layout, source_first, source_count, 4);
+
+        let validator = CorruptBlockValidator::new(vec![]);
+        let group_cfg = GroupConfig {
+            layout,
+            source_first_block: source_first,
+            source_block_count: source_count,
+        };
+        let mut ledger_buf = Vec::new();
+        let pipeline = ScrubWithRecovery::new(
+            &device,
+            &validator,
+            test_uuid(),
+            vec![group_cfg],
+            &mut ledger_buf,
+            4,
+        );
+        let mut daemon = ScrubDaemon::new(
+            pipeline,
+            ScrubDaemonConfig {
+                interval: Duration::ZERO,
+                cancel_check_interval: Duration::from_millis(1),
+                ..ScrubDaemonConfig::default()
+            },
+        );
+
+        let step = daemon.run_once(&cx).expect("run once");
+        assert_eq!(step.group, 0);
+        assert!(step.blocks_scanned > 0);
+        assert!(daemon.metrics().blocks_scanned_total >= u64::from(source_count));
+        assert_eq!(daemon.metrics().scrub_rounds_completed, 1);
+    }
+
+    #[test]
+    fn scrub_daemon_detects_corruption_and_triggers_recovery() {
+        let cx = Cx::for_testing();
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+        let source_first = BlockNumber(0);
+        let source_count = 8;
+
+        let originals = write_source_blocks(&cx, &device, source_first, source_count);
+        bootstrap_storage(&cx, &device, layout, source_first, source_count, 4);
+
+        let corrupt_block = BlockNumber(3);
+        device
+            .write_block(&cx, corrupt_block, &vec![0xEF; block_size as usize])
+            .expect("inject corruption");
+
+        let validator = CorruptBlockValidator::new(vec![3]);
+        let group_cfg = GroupConfig {
+            layout,
+            source_first_block: source_first,
+            source_block_count: source_count,
+        };
+        let mut ledger_buf = Vec::new();
+        let pipeline = ScrubWithRecovery::new(
+            &device,
+            &validator,
+            test_uuid(),
+            vec![group_cfg],
+            &mut ledger_buf,
+            4,
+        );
+        let mut daemon = ScrubDaemon::new(
+            pipeline,
+            ScrubDaemonConfig {
+                interval: Duration::ZERO,
+                cancel_check_interval: Duration::from_millis(1),
+                ..ScrubDaemonConfig::default()
+            },
+        );
+
+        let step = daemon.run_once(&cx).expect("run once");
+        assert_eq!(step.corrupt_count, 1);
+        assert_eq!(step.recovered_count, 1);
+        assert_eq!(step.unrecoverable_count, 0);
+
+        let restored = device
+            .read_block(&cx, corrupt_block)
+            .expect("read restored");
+        assert_eq!(restored.as_slice(), originals[3].as_slice());
+
+        let (pipeline, _metrics) = daemon.into_parts();
+        let ledger = pipeline.into_ledger();
+        let records = crate::evidence::parse_evidence_ledger(ledger);
+        assert!(
+            records.iter().any(|r| {
+                r.event_type == crate::evidence::EvidenceEventType::ScrubCycleComplete
+            })
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| r.event_type == crate::evidence::EvidenceEventType::RepairSucceeded)
+        );
+    }
+
+    #[test]
+    fn scrub_daemon_respects_cancellation_promptly() {
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+        let source_first = BlockNumber(0);
+        let source_count = 8;
+
+        write_source_blocks(&cx, &device, source_first, source_count);
+        bootstrap_storage(&cx, &device, layout, source_first, source_count, 4);
+
+        let validator = CorruptBlockValidator::new(vec![]);
+        let group_cfg = GroupConfig {
+            layout,
+            source_first_block: source_first,
+            source_block_count: source_count,
+        };
+        let mut ledger_buf = Vec::new();
+        let pipeline = ScrubWithRecovery::new(
+            &device,
+            &validator,
+            test_uuid(),
+            vec![group_cfg],
+            &mut ledger_buf,
+            4,
+        );
+        let mut daemon = ScrubDaemon::new(pipeline, ScrubDaemonConfig::default());
+
+        let metrics = daemon.run_until_cancelled(&cx).expect("cancelled stop");
+        assert_eq!(metrics.blocks_scanned_total, 0);
+        assert_eq!(metrics.scrub_rounds_completed, 0);
+    }
+
+    #[test]
+    fn scrub_daemon_yields_under_backpressure() {
+        let cx = Cx::for_testing();
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+        let source_first = BlockNumber(0);
+        let source_count = 8;
+
+        write_source_blocks(&cx, &device, source_first, source_count);
+        bootstrap_storage(&cx, &device, layout, source_first, source_count, 4);
+
+        let validator = CorruptBlockValidator::new(vec![]);
+        let group_cfg = GroupConfig {
+            layout,
+            source_first_block: source_first,
+            source_block_count: source_count,
+        };
+        let mut ledger_buf = Vec::new();
+        let pipeline = ScrubWithRecovery::new(
+            &device,
+            &validator,
+            test_uuid(),
+            vec![group_cfg],
+            &mut ledger_buf,
+            4,
+        );
+        let pressure = Arc::new(SystemPressure::with_headroom(0.1));
+        let mut daemon = ScrubDaemon::new(
+            pipeline,
+            ScrubDaemonConfig {
+                interval: Duration::ZERO,
+                cancel_check_interval: Duration::from_millis(1),
+                backpressure_headroom_threshold: 0.5,
+                backpressure_sleep: Duration::from_millis(1),
+            },
+        )
+        .with_pressure(pressure);
+
+        let _step = daemon.run_once(&cx).expect("run once");
+        assert_eq!(daemon.metrics().backpressure_yields, 1);
+    }
+
+    #[test]
+    fn scrub_daemon_completes_full_round_without_error() {
+        let cx = Cx::for_testing();
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 256);
+
+        let layout0 =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout0");
+        let layout1 =
+            RepairGroupLayout::new(GroupNumber(1), BlockNumber(64), 64, 0, 4).expect("layout1");
+
+        let source_count = 8;
+        write_source_blocks(&cx, &device, BlockNumber(0), source_count);
+        write_source_blocks(&cx, &device, BlockNumber(64), source_count);
+        bootstrap_storage(&cx, &device, layout0, BlockNumber(0), source_count, 4);
+        bootstrap_storage(&cx, &device, layout1, BlockNumber(64), source_count, 4);
+
+        let validator = CorruptBlockValidator::new(vec![]);
+        let groups = vec![
+            GroupConfig {
+                layout: layout0,
+                source_first_block: BlockNumber(0),
+                source_block_count: source_count,
+            },
+            GroupConfig {
+                layout: layout1,
+                source_first_block: BlockNumber(64),
+                source_block_count: source_count,
+            },
+        ];
+
+        let mut ledger_buf = Vec::new();
+        let pipeline =
+            ScrubWithRecovery::new(&device, &validator, test_uuid(), groups, &mut ledger_buf, 4);
+        let mut daemon = ScrubDaemon::new(
+            pipeline,
+            ScrubDaemonConfig {
+                interval: Duration::ZERO,
+                cancel_check_interval: Duration::from_millis(1),
+                ..ScrubDaemonConfig::default()
+            },
+        );
+
+        daemon.run_one_round(&cx).expect("run one round");
+        assert_eq!(daemon.metrics().scrub_rounds_completed, 1);
+        assert!(daemon.metrics().blocks_scanned_total >= u64::from(source_count) * 2);
+    }
+
+    #[test]
+    fn e2e_survive_five_percent_random_block_corruption_with_daemon() {
+        let cx = Cx::for_testing();
+        const GROUP_COUNT: u32 = 20;
+        const GROUP_BLOCK_COUNT: u32 = 64;
+        const SOURCE_BLOCK_COUNT: u32 = 20;
+        const REPAIR_SYMBOL_COUNT: u32 = 8;
+        const CORRUPTION_PERCENT: u64 = 5;
+        const SEED: u64 = 0x5eed_f00d_d15c_a11;
+
+        let total_blocks = u64::from(GROUP_COUNT) * u64::from(GROUP_BLOCK_COUNT);
+        let device = MemBlockDevice::new(1024, total_blocks);
+
+        let mut groups = Vec::new();
+        let mut source_blocks = Vec::new();
+        for group in 0..GROUP_COUNT {
+            let group_first = u64::from(group) * u64::from(GROUP_BLOCK_COUNT);
+            let layout = RepairGroupLayout::new(
+                GroupNumber(group),
+                BlockNumber(group_first),
+                GROUP_BLOCK_COUNT,
+                0,
+                4,
+            )
+            .expect("layout");
+            let source_first = BlockNumber(group_first);
+
+            write_source_blocks(&cx, &device, source_first, SOURCE_BLOCK_COUNT);
+            bootstrap_storage(
+                &cx,
+                &device,
+                layout,
+                source_first,
+                SOURCE_BLOCK_COUNT,
+                REPAIR_SYMBOL_COUNT,
+            );
+
+            groups.push(GroupConfig {
+                layout,
+                source_first_block: source_first,
+                source_block_count: SOURCE_BLOCK_COUNT,
+            });
+            for idx in 0..u64::from(SOURCE_BLOCK_COUNT) {
+                source_blocks.push(group_first + idx);
+            }
+        }
+
+        let target_corrupt = (source_blocks.len()
+            * usize::try_from(CORRUPTION_PERCENT).expect("percent fits"))
+            / 100;
+        assert_eq!(
+            target_corrupt,
+            usize::try_from(GROUP_COUNT).expect("group count fits")
+        );
+
+        let mut corrupt_blocks = Vec::with_capacity(target_corrupt);
+        for group in 0..GROUP_COUNT {
+            let group_first = u64::from(group) * u64::from(GROUP_BLOCK_COUNT);
+            let offset = splitmix64(SEED ^ u64::from(group)) % u64::from(SOURCE_BLOCK_COUNT);
+            corrupt_blocks.push(group_first + offset);
+        }
+
+        let before_hashes = block_hashes(&cx, &device, &source_blocks);
+
+        for &block in &corrupt_blocks {
+            let mut bytes = device
+                .read_block(&cx, BlockNumber(block))
+                .expect("read source block")
+                .as_slice()
+                .to_vec();
+            let last = bytes.len().saturating_sub(1);
+            bytes[0] ^= 0xA5;
+            bytes[last] ^= 0x5A;
+            device
+                .write_block(&cx, BlockNumber(block), &bytes)
+                .expect("inject corruption");
+        }
+
+        let validator = CorruptBlockValidator::new(corrupt_blocks.clone());
+        let mut ledger_buf = Vec::new();
+        let pipeline = ScrubWithRecovery::new(
+            &device,
+            &validator,
+            test_uuid(),
+            groups,
+            &mut ledger_buf,
+            REPAIR_SYMBOL_COUNT,
+        );
+        let mut daemon = ScrubDaemon::new(
+            pipeline,
+            ScrubDaemonConfig {
+                interval: Duration::ZERO,
+                cancel_check_interval: Duration::from_millis(1),
+                ..ScrubDaemonConfig::default()
+            },
+        );
+
+        let started = Instant::now();
+        daemon.run_one_round(&cx).expect("daemon one round");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            daemon.metrics().blocks_corrupt_found,
+            u64::try_from(corrupt_blocks.len()).expect("len fits u64")
+        );
+        assert_eq!(
+            daemon.metrics().blocks_recovered,
+            u64::try_from(corrupt_blocks.len()).expect("len fits u64")
+        );
+        assert_eq!(daemon.metrics().blocks_unrecoverable, 0);
+        assert_eq!(daemon.metrics().scrub_rounds_completed, 1);
+
+        let after_hashes = block_hashes(&cx, &device, &source_blocks);
+        assert_eq!(before_hashes, after_hashes, "data mismatch after repair");
+
+        let (pipeline, _metrics) = daemon.into_parts();
+        let ledger_data = pipeline.into_ledger();
+        let records = crate::evidence::parse_evidence_ledger(ledger_data);
+
+        let corruption_detected = records
+            .iter()
+            .filter(|r| r.event_type == EvidenceEventType::CorruptionDetected)
+            .count();
+        let repair_attempted = records
+            .iter()
+            .filter(|r| r.event_type == EvidenceEventType::RepairAttempted)
+            .count();
+        let repair_succeeded = records
+            .iter()
+            .filter(|r| r.event_type == EvidenceEventType::RepairSucceeded)
+            .count();
+        let repair_failed = records
+            .iter()
+            .filter(|r| r.event_type == EvidenceEventType::RepairFailed)
+            .count();
+        let scrub_cycle_complete = records
+            .iter()
+            .filter(|r| r.event_type == EvidenceEventType::ScrubCycleComplete)
+            .count();
+
+        assert_eq!(corruption_detected, corrupt_blocks.len());
+        assert_eq!(repair_attempted, corrupt_blocks.len());
+        assert_eq!(repair_succeeded, corrupt_blocks.len());
+        assert_eq!(repair_failed, 0);
+        assert_eq!(scrub_cycle_complete, corrupt_blocks.len());
+        assert!(
+            elapsed <= Duration::from_secs(120),
+            "repair e2e exceeded timeout: {:?}",
+            elapsed
+        );
+
+        maybe_write_repair_e2e_artifacts(
+            &before_hashes,
+            &after_hashes,
+            &corrupt_blocks,
+            ledger_data,
+            SEED,
+            CORRUPTION_PERCENT,
         );
     }
 }
