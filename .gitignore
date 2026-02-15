@@ -24,8 +24,17 @@ storage.sqlite3-*
 # Profiling output directories
 profiles/
 
-# Codex harness build artifacts
-target-codex-harness/
+# Codex build artifacts
+target-codex*/
+
+# Compiler crash reports
+rustc-ice-*.txt
+
+# Build artifacts
+a.out
+
+# bv graph output
+--graph-format.svg
 
 # Optimization artifacts (agent-generated)
 artifacts/
