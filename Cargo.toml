@@ -71,7 +71,7 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 fuser = "0.16.0"
 
 # Sibling project dependencies
-asupersync = { path = "/dp/asupersync" }
+asupersync = { version = "0.2.0", path = "/dp/asupersync" }
 ftui = { path = "/dp/frankentui/crates/ftui" }
 
 # Workspace crate cross-references
