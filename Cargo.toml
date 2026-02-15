@@ -72,7 +72,7 @@ fuser = "0.16.0"
 
 # Sibling project dependencies
 asupersync = { version = "0.2.0", path = "/dp/asupersync" }
-ftui = { path = "/dp/frankentui/crates/ftui" }
+ftui = { version = "0.2.0", path = "/dp/frankentui/crates/ftui" }
 
 # Workspace crate cross-references
 ffs = { path = "crates/ffs" }
