@@ -65,7 +65,7 @@
 | CLI inspect command | FrankenFS spec §6 | ✅ | Implemented in `ffs-cli` |
 | fixture conformance harness | FrankenFS spec §7 | ✅ | Implemented in `ffs-harness` |
 | benchmark harness | FrankenFS spec §8 | ✅ | Criterion benchmark added |
-| xfstests generic/ext4 subset infrastructure | xfstests (`check`, generic/, ext4/) | 🟡 | Curated subset manifests + E2E planner/runner script (`scripts/e2e/ffs_xfstests_e2e.sh`) + CI planning gate. Full execution requires external xfstests checkout/prereqs and mount-capable environment. |
+| xfstests generic/ext4 subset infrastructure | xfstests (`check`, generic/, ext4/) | 🟡 | Curated subset manifests + E2E planner/runner script (`scripts/e2e/ffs_xfstests_e2e.sh`) + CI planning gate + structured `results.json`/`junit.xml` + run-mode regression guard (`scripts/e2e/xfstests_regression_guard.json`). Full execution still requires external xfstests checkout/prereqs and mount-capable environment. |
 
 Legend: `✅` implemented, `🟡` partial, `❌` not implemented.
 

@@ -138,6 +138,7 @@ jobs:
             artifacts/e2e/**/*.log
             artifacts/e2e/**/xfstests/*.json
             artifacts/e2e/**/xfstests/*.txt
+            artifacts/e2e/**/xfstests/*.xml
 
   # Warn if goldens are modified in a PR
   golden-change-check:

@@ -1428,11 +1428,11 @@ mod tests {
     use super::*;
     use crate::autopilot::DurabilityAutopilot;
     use crate::codec::encode_group;
-    use crate::evidence::EvidenceEventType;
+    use crate::evidence::{EvidenceEventType, EvidenceRecord};
     use crate::scrub::{BlockVerdict, CorruptionKind, Severity};
     use crate::symbol::RepairGroupDescExt;
     use ffs_block::BlockBuf;
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
     const E2E_GROUP_COUNT: u32 = 20;
@@ -1817,32 +1817,198 @@ mod tests {
 
     fn assert_repair_e2e_evidence(ledger_data: &[u8], expected_repairs: usize) {
         let records = crate::evidence::parse_evidence_ledger(ledger_data);
-        let corruption_detected = records
-            .iter()
-            .filter(|r| r.event_type == EvidenceEventType::CorruptionDetected)
-            .count();
-        let repair_attempted = records
-            .iter()
-            .filter(|r| r.event_type == EvidenceEventType::RepairAttempted)
-            .count();
-        let repair_succeeded = records
-            .iter()
-            .filter(|r| r.event_type == EvidenceEventType::RepairSucceeded)
-            .count();
-        let repair_failed = records
-            .iter()
-            .filter(|r| r.event_type == EvidenceEventType::RepairFailed)
-            .count();
-        let scrub_cycle_complete = records
-            .iter()
-            .filter(|r| r.event_type == EvidenceEventType::ScrubCycleComplete)
-            .count();
+        assert_ledger_self_consistency(&records);
+        let corruption_detected = count_event(&records, EvidenceEventType::CorruptionDetected);
+        let repair_attempted = count_event(&records, EvidenceEventType::RepairAttempted);
+        let repair_succeeded = count_event(&records, EvidenceEventType::RepairSucceeded);
+        let repair_failed = count_event(&records, EvidenceEventType::RepairFailed);
+        let scrub_cycle_complete = count_event(&records, EvidenceEventType::ScrubCycleComplete);
 
         assert_eq!(corruption_detected, expected_repairs);
         assert_eq!(repair_attempted, expected_repairs);
         assert_eq!(repair_succeeded, expected_repairs);
         assert_eq!(repair_failed, 0);
         assert_eq!(scrub_cycle_complete, expected_repairs);
+
+        let mut corrupt_by_group: HashMap<u32, u64> = HashMap::new();
+        let mut scanned_by_group: HashMap<u32, u64> = HashMap::new();
+        for record in &records {
+            match record.event_type {
+                EvidenceEventType::CorruptionDetected => {
+                    let detail = record.corruption.as_ref().expect("corruption detail");
+                    corrupt_by_group
+                        .entry(record.block_group)
+                        .and_modify(|count| *count += u64::from(detail.blocks_affected))
+                        .or_insert_with(|| u64::from(detail.blocks_affected));
+                }
+                EvidenceEventType::ScrubCycleComplete => {
+                    let detail = record.scrub_cycle.as_ref().expect("scrub-cycle detail");
+                    scanned_by_group
+                        .entry(record.block_group)
+                        .and_modify(|count| *count += detail.blocks_scanned)
+                        .or_insert(detail.blocks_scanned);
+                }
+                _ => {}
+            }
+        }
+
+        for (group, corrupt_blocks) in &corrupt_by_group {
+            let scanned = scanned_by_group.get(group).copied().unwrap_or_default();
+            assert!(
+                scanned >= *corrupt_blocks,
+                "group {group}: scrub blocks_scanned ({scanned}) is less than corrupt blocks ({corrupt_blocks})"
+            );
+        }
+    }
+
+    fn count_event(records: &[EvidenceRecord], event_type: EvidenceEventType) -> usize {
+        records
+            .iter()
+            .filter(|record| record.event_type == event_type)
+            .count()
+    }
+
+    fn assert_ledger_self_consistency(records: &[EvidenceRecord]) {
+        let mut seen = HashSet::new();
+        let mut attempts_by_group: HashMap<u32, usize> = HashMap::new();
+        let mut terminal_by_group: HashMap<u32, usize> = HashMap::new();
+        let mut corruption_by_group: HashMap<u32, u64> = HashMap::new();
+        let mut scrub_scanned_by_group: HashMap<u32, u64> = HashMap::new();
+
+        for window in records.windows(2) {
+            let previous = &window[0];
+            let current = &window[1];
+            assert!(
+                previous.timestamp_ns <= current.timestamp_ns,
+                "ledger timestamps are not monotonic: prev={} current={}",
+                previous.timestamp_ns,
+                current.timestamp_ns
+            );
+        }
+
+        for record in records {
+            let unique_key = (
+                record.event_type,
+                record.block_group,
+                record.block_range,
+                record.timestamp_ns,
+            );
+            assert!(
+                seen.insert(unique_key),
+                "duplicate ledger record key: event={:?} group={} range={:?} ts={}",
+                record.event_type,
+                record.block_group,
+                record.block_range,
+                record.timestamp_ns
+            );
+
+            match record.event_type {
+                EvidenceEventType::CorruptionDetected => {
+                    let detail = record.corruption.as_ref().expect("corruption detail");
+                    corruption_by_group
+                        .entry(record.block_group)
+                        .and_modify(|count| *count += u64::from(detail.blocks_affected))
+                        .or_insert_with(|| u64::from(detail.blocks_affected));
+                }
+                EvidenceEventType::RepairAttempted => {
+                    attempts_by_group
+                        .entry(record.block_group)
+                        .and_modify(|count| *count += 1)
+                        .or_insert(1);
+                }
+                EvidenceEventType::RepairSucceeded | EvidenceEventType::RepairFailed => {
+                    terminal_by_group
+                        .entry(record.block_group)
+                        .and_modify(|count| *count += 1)
+                        .or_insert(1);
+                }
+                EvidenceEventType::ScrubCycleComplete => {
+                    let detail = record.scrub_cycle.as_ref().expect("scrub-cycle detail");
+                    scrub_scanned_by_group
+                        .entry(record.block_group)
+                        .and_modify(|count| *count += detail.blocks_scanned)
+                        .or_insert(detail.blocks_scanned);
+                }
+                _ => {}
+            }
+        }
+
+        for (group, attempts) in &attempts_by_group {
+            let terminal = terminal_by_group.get(group).copied().unwrap_or_default();
+            assert!(
+                terminal >= *attempts,
+                "group {group}: repair attempts ({attempts}) exceed terminal outcomes ({terminal})"
+            );
+        }
+
+        for (group, corrupt_blocks) in &corruption_by_group {
+            let attempts = attempts_by_group.get(group).copied().unwrap_or_default();
+            assert!(
+                attempts > 0,
+                "group {group}: corruption detected ({corrupt_blocks} blocks) but no repair attempt"
+            );
+            if let Some(scanned) = scrub_scanned_by_group.get(group).copied() {
+                assert!(
+                    scanned == 0 || scanned >= *corrupt_blocks,
+                    "group {group}: scrub blocks_scanned ({scanned}) is less than corrupt blocks ({corrupt_blocks})"
+                );
+            }
+        }
+    }
+
+    fn assert_group_event_coverage(records: &[EvidenceRecord], corrupt_blocks: &[u64]) {
+        let expected_groups: HashSet<u32> = corrupt_blocks
+            .iter()
+            .map(|block| {
+                u32::try_from(*block / u64::from(E2E_GROUP_BLOCK_COUNT)).expect("group fits u32")
+            })
+            .collect();
+        for group in expected_groups {
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| {
+                        record.block_group == group
+                            && record.event_type == EvidenceEventType::CorruptionDetected
+                    })
+                    .count(),
+                1,
+                "group {group} expected one CorruptionDetected"
+            );
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| {
+                        record.block_group == group
+                            && record.event_type == EvidenceEventType::RepairAttempted
+                    })
+                    .count(),
+                1,
+                "group {group} expected one RepairAttempted"
+            );
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| {
+                        record.block_group == group
+                            && record.event_type == EvidenceEventType::RepairSucceeded
+                    })
+                    .count(),
+                1,
+                "group {group} expected one RepairSucceeded"
+            );
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| {
+                        record.block_group == group
+                            && record.event_type == EvidenceEventType::ScrubCycleComplete
+                    })
+                    .count(),
+                1,
+                "group {group} expected one ScrubCycleComplete"
+            );
+        }
     }
 
     // ── Unit tests ────────────────────────────────────────────────────
@@ -1899,6 +2065,16 @@ mod tests {
         // Verify the block was actually restored.
         let restored = device.read_block(&cx, corrupt_block).expect("read");
         assert_eq!(restored.as_slice(), originals[3].as_slice());
+
+        let records = crate::evidence::parse_evidence_ledger(pipeline.into_ledger());
+        assert_ledger_self_consistency(&records);
+        assert_eq!(
+            count_event(&records, EvidenceEventType::CorruptionDetected),
+            1
+        );
+        assert_eq!(count_event(&records, EvidenceEventType::RepairAttempted), 1);
+        assert_eq!(count_event(&records, EvidenceEventType::RepairSucceeded), 1);
+        assert_eq!(count_event(&records, EvidenceEventType::RepairFailed), 0);
     }
 
     #[test]
@@ -2026,6 +2202,33 @@ mod tests {
                 "block {idx} should be unrecoverable"
             );
         }
+
+        let records = crate::evidence::parse_evidence_ledger(pipeline.into_ledger());
+        assert_ledger_self_consistency(&records);
+        assert_eq!(
+            count_event(&records, EvidenceEventType::CorruptionDetected),
+            1
+        );
+        assert_eq!(count_event(&records, EvidenceEventType::RepairAttempted), 1);
+        assert_eq!(count_event(&records, EvidenceEventType::RepairSucceeded), 0);
+        assert_eq!(count_event(&records, EvidenceEventType::RepairFailed), 1);
+
+        let failed_record = records
+            .iter()
+            .find(|record| record.event_type == EvidenceEventType::RepairFailed)
+            .expect("repair_failed record");
+        let failure_reason = failed_record
+            .repair
+            .as_ref()
+            .and_then(|detail| detail.reason.as_deref())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(
+            failure_reason.contains("insufficient")
+                || failure_reason.contains("unrecoverable")
+                || failure_reason.contains("recover"),
+            "unexpected repair failure reason: {failure_reason}"
+        );
     }
 
     #[test]
@@ -2488,6 +2691,7 @@ mod tests {
         assert!(report.is_fully_recovered());
 
         let records = crate::evidence::parse_evidence_ledger(pipeline.into_ledger());
+        assert_ledger_self_consistency(&records);
         let policy = records
             .iter()
             .find(|record| record.event_type == crate::evidence::EvidenceEventType::PolicyDecision)
@@ -2859,6 +3063,10 @@ mod tests {
         let (pipeline, _metrics) = daemon.into_parts();
         let ledger_data = pipeline.into_ledger();
         assert_repair_e2e_evidence(ledger_data, corrupt_blocks.len());
+
+        let records = crate::evidence::parse_evidence_ledger(ledger_data);
+        assert_group_event_coverage(&records, &corrupt_blocks);
+
         assert!(
             elapsed <= Duration::from_secs(120),
             "repair e2e exceeded timeout: {elapsed:?}"

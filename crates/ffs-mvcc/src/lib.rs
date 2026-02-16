@@ -9,7 +9,7 @@ use asupersync::Cx;
 pub use compression::CompressionPolicy;
 use compression::{CompressionStats, VersionData};
 use crossbeam_epoch as epoch;
-use ffs_block::{BlockBuf, BlockDevice};
+use ffs_block::{BlockBuf, BlockDevice, FlushPinToken, MvccFlushLifecycle};
 use ffs_error::{FfsError, Result as FfsResult};
 use ffs_types::{BlockNumber, CommitSeq, Snapshot, TxnId};
 use parking_lot::RwLock;
@@ -1554,6 +1554,147 @@ impl Drop for SnapshotHandle {
             "SnapshotHandle: snapshot was not registered or already released: {:?}",
             self.snapshot
         );
+    }
+}
+
+/// Flush lifecycle that pins MVCC snapshots while dirty cache blocks are flushed.
+///
+/// The pin is held for the full lifetime of [`FlushPinToken`], preventing
+/// `prune_safe` / `prune_versions_older_than` from reclaiming versions that the
+/// in-flight flush still references.
+#[derive(Debug, Clone)]
+pub struct StoreBackedMvccFlushLifecycle {
+    store: Arc<RwLock<MvccStore>>,
+    active_flush_pins: Arc<AtomicU64>,
+    acquired_flush_pins: Arc<AtomicU64>,
+    released_flush_pins: Arc<AtomicU64>,
+}
+
+impl StoreBackedMvccFlushLifecycle {
+    #[must_use]
+    pub fn new(store: Arc<RwLock<MvccStore>>) -> Self {
+        Self {
+            store,
+            active_flush_pins: Arc::new(AtomicU64::new(0)),
+            acquired_flush_pins: Arc::new(AtomicU64::new(0)),
+            released_flush_pins: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[must_use]
+    pub fn store(&self) -> &Arc<RwLock<MvccStore>> {
+        &self.store
+    }
+
+    #[must_use]
+    pub fn active_flush_pins(&self) -> u64 {
+        self.active_flush_pins.load(Ordering::SeqCst)
+    }
+
+    #[must_use]
+    pub fn acquired_flush_pins(&self) -> u64 {
+        self.acquired_flush_pins.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn released_flush_pins(&self) -> u64 {
+        self.released_flush_pins.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Debug)]
+struct StoreBackedFlushPin {
+    store: Arc<RwLock<MvccStore>>,
+    snapshot: Snapshot,
+    block: BlockNumber,
+    commit_seq: CommitSeq,
+    pin_id: u64,
+    active_flush_pins: Arc<AtomicU64>,
+    released_flush_pins: Arc<AtomicU64>,
+}
+
+impl Drop for StoreBackedFlushPin {
+    fn drop(&mut self) {
+        let released = self.store.write().release_snapshot(self.snapshot);
+        if !released {
+            warn!(
+                target: "ffs::mvcc::flush",
+                event = "flush_epoch_guard_release_underflow",
+                block_id = self.block.0,
+                epoch_id = self.commit_seq.0,
+                flush_pin_id = self.pin_id
+            );
+        }
+
+        if self
+            .active_flush_pins
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_sub(1)
+            })
+            .is_err()
+        {
+            warn!(
+                target: "ffs::mvcc::flush",
+                event = "flush_epoch_guard_active_counter_underflow",
+                block_id = self.block.0,
+                epoch_id = self.commit_seq.0,
+                flush_pin_id = self.pin_id
+            );
+        }
+
+        self.released_flush_pins.fetch_add(1, Ordering::Relaxed);
+        trace!(
+            target: "ffs::mvcc::flush",
+            event = "flush_epoch_guard_released",
+            block_id = self.block.0,
+            epoch_id = self.commit_seq.0,
+            flush_pin_id = self.pin_id,
+            blocks_flushed = 1_u64
+        );
+    }
+}
+
+impl MvccFlushLifecycle for StoreBackedMvccFlushLifecycle {
+    fn pin_for_flush(&self, block: BlockNumber, commit_seq: CommitSeq) -> FfsResult<FlushPinToken> {
+        if commit_seq == CommitSeq::ZERO {
+            return Ok(FlushPinToken::noop());
+        }
+
+        let snapshot = Snapshot { high: commit_seq };
+        self.store.write().register_snapshot(snapshot);
+
+        self.active_flush_pins.fetch_add(1, Ordering::SeqCst);
+        let pin_id = self
+            .acquired_flush_pins
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        trace!(
+            target: "ffs::mvcc::flush",
+            event = "flush_epoch_guard_acquired",
+            block_id = block.0,
+            epoch_id = commit_seq.0,
+            flush_pin_id = pin_id
+        );
+
+        Ok(FlushPinToken::new(StoreBackedFlushPin {
+            store: Arc::clone(&self.store),
+            snapshot,
+            block,
+            commit_seq,
+            pin_id,
+            active_flush_pins: Arc::clone(&self.active_flush_pins),
+            released_flush_pins: Arc::clone(&self.released_flush_pins),
+        }))
+    }
+
+    fn mark_persisted(&self, block: BlockNumber, commit_seq: CommitSeq) -> FfsResult<()> {
+        trace!(
+            target: "ffs::mvcc::flush",
+            event = "flush_mark_persisted",
+            block_id = block.0,
+            epoch_id = commit_seq.0
+        );
+        Ok(())
     }
 }
 

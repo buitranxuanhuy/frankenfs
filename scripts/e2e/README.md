@@ -77,7 +77,9 @@ The xfstests E2E suite exercises:
 1. Curated generic/ext4 subset selection from tracked list files
 2. Planning artifacts for CI (`selected_tests.txt`, `summary.json`)
 3. Optional direct `xfstests check` execution when a configured checkout is available
-4. Safe skip/fail behavior via strictness toggle
+4. Structured result artifacts (`results.json`, `junit.xml`) for per-commit tracking
+5. Regression guard enforcement in run mode (`must_pass`, `min_pass_count`, `min_pass_rate`)
+6. Safe skip/fail behavior via strictness toggle
 
 ## Output
 
@@ -105,6 +107,7 @@ artifacts/e2e/20260212_161500_ffs_smoke/
 | `XFSTESTS_DRY_RUN` | `1` | In run mode, pass `-n` to `check` (selection validation without executing tests) |
 | `XFSTESTS_FILTER` | `all` | Select `all`, `generic`, or `ext4` curated subsets |
 | `XFSTESTS_STRICT` | `0` | If `1`, missing xfstests prerequisites fail instead of skip |
+| `XFSTESTS_REGRESSION_GUARD_JSON` | `scripts/e2e/xfstests_regression_guard.json` | Regression guard config used in run mode to fail on must-pass or pass-rate regressions |
 
 ## Requirements
 
@@ -182,6 +185,11 @@ The E2E tests can be run in CI by:
 4. Running xfstests subset execution (requires configured checkout):
    ```bash
    XFSTESTS_MODE=run XFSTESTS_DIR=/path/to/xfstests-dev ./scripts/e2e/ffs_xfstests_e2e.sh
+   ```
+
+5. Adjusting regression thresholds:
+   ```bash
+   cat scripts/e2e/xfstests_regression_guard.json
    ```
 
 ## Adding New Tests
