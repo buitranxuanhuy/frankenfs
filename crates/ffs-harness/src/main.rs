@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, bail};
 use ffs_harness::{
     ParityReport,
-    e2e::{CrashReplaySuiteConfig, run_crash_replay_suite},
+    e2e::{CrashReplaySuiteConfig, FsxStressConfig, run_crash_replay_suite, run_fsx_stress},
     extract_btrfs_superblock, extract_ext4_superblock, extract_region, validate_btrfs_fixture,
     validate_ext4_fixture,
 };
@@ -46,6 +46,7 @@ fn run() -> Result<()> {
         }
         Some("generate-fixture") => generate_fixture(&args[1..]),
         Some("run-crash-replay") => run_crash_replay(&args[1..]),
+        Some("run-fsx-stress") => run_fsx_stress_cmd(&args[1..]),
         Some("--help" | "-h" | "help") | None => {
             print_usage();
             Ok(())
@@ -152,6 +153,64 @@ fn run_crash_replay(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn run_fsx_stress_cmd(args: &[String]) -> Result<()> {
+    let mut config = FsxStressConfig::default();
+    let mut index = 0_usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--ops" => {
+                let raw = args.get(index + 1).context("--ops requires a value")?;
+                config.operation_count = raw.parse().context("invalid --ops value")?;
+                index += 2;
+            }
+            "--seed" => {
+                let raw = args.get(index + 1).context("--seed requires a value")?;
+                config.seed = raw.parse().context("invalid --seed value")?;
+                index += 2;
+            }
+            "--max-file-bytes" => {
+                let raw = args
+                    .get(index + 1)
+                    .context("--max-file-bytes requires a value")?;
+                config.max_file_size_bytes =
+                    raw.parse().context("invalid --max-file-bytes value")?;
+                index += 2;
+            }
+            "--corrupt-every" => {
+                let raw = args
+                    .get(index + 1)
+                    .context("--corrupt-every requires a value")?;
+                config.corruption_every_ops =
+                    raw.parse().context("invalid --corrupt-every value")?;
+                index += 2;
+            }
+            "--verify-every" => {
+                let raw = args
+                    .get(index + 1)
+                    .context("--verify-every requires a value")?;
+                config.full_verify_every_ops =
+                    raw.parse().context("invalid --verify-every value")?;
+                index += 2;
+            }
+            "--out" => {
+                let raw = args.get(index + 1).context("--out requires a value")?;
+                config.output_dir = Some(Path::new(raw).to_path_buf());
+                index += 2;
+            }
+            other => {
+                bail!("unknown run-fsx-stress option: {other}");
+            }
+        }
+    }
+
+    let report = run_fsx_stress(&config)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    if !report.passed {
+        bail!("fsx stress reported a mismatch");
+    }
+    Ok(())
+}
+
 fn print_usage() {
     println!("ffs-harness — fixture management and parity reporting");
     println!();
@@ -164,6 +223,9 @@ fn print_usage() {
     println!(
         "  ffs-harness run-crash-replay [--count N] [--seed S] [--min-ops N] [--max-ops N] [--out DIR]"
     );
+    println!(
+        "  ffs-harness run-fsx-stress [--ops N] [--seed S] [--max-file-bytes N] [--corrupt-every N] [--verify-every N] [--out DIR]"
+    );
     println!();
     println!("FIXTURE GENERATION:");
     println!("  Extracts sparse JSON fixtures from real filesystem images.");
@@ -175,10 +237,19 @@ fn print_usage() {
     println!("  Runs deterministic crash/replay schedules and emits a JSON summary.");
     println!("  Use --out DIR to persist schedule artifacts + repro pack.");
     println!();
+    println!("FSX STRESS:");
+    println!(
+        "  Runs weighted fsx-style read/write/truncate/fsync/fallocate/punch-hole/reopen operations."
+    );
+    println!(
+        "  Periodically injects corruption and verifies deterministic repair + full-file integrity."
+    );
+    println!();
     println!("EXAMPLES:");
     println!("  ffs-harness generate-fixture my_ext4.img > conformance/fixtures/my_ext4.json");
     println!(
         "  ffs-harness generate-fixture my_ext4.img region 2048 32 > conformance/fixtures/gd.json"
     );
     println!("  ffs-harness run-crash-replay --count 500 --out artifacts/crash_replay");
+    println!("  ffs-harness run-fsx-stress --ops 100000 --seed 123 --out artifacts/fsx");
 }

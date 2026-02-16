@@ -1657,6 +1657,594 @@ pub fn run_crash_replay_suite(config: &CrashReplaySuiteConfig) -> Result<CrashRe
     Ok(report)
 }
 
+// ── FSX-style deterministic stress harness ──────────────────────────────────
+
+/// Configuration for fsx-style stress testing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsxStressConfig {
+    /// Number of operations to execute.
+    pub operation_count: u64,
+    /// Seed for deterministic operation generation.
+    pub seed: u64,
+    /// Maximum simulated file size in bytes.
+    pub max_file_size_bytes: usize,
+    /// Inject corruption every N operations (0 disables corruption).
+    pub corruption_every_ops: u64,
+    /// Perform full-file verification every N operations (0 disables periodic full verification).
+    pub full_verify_every_ops: u64,
+    /// Optional output directory for repro artifacts.
+    pub output_dir: Option<PathBuf>,
+}
+
+impl Default for FsxStressConfig {
+    fn default() -> Self {
+        Self {
+            operation_count: 100_000,
+            seed: 0xF5A5_7E55_0000_0001,
+            max_file_size_bytes: 64 * 1024 * 1024,
+            corruption_every_ops: 1_000,
+            full_verify_every_ops: 1_000,
+            output_dir: None,
+        }
+    }
+}
+
+/// One fsx-style operation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FsxOperation {
+    Write { offset: usize, data: Vec<u8> },
+    Read { offset: usize, len: usize },
+    Truncate { len: usize },
+    Fsync,
+    Fallocate { offset: usize, len: usize },
+    PunchHole { offset: usize, len: usize },
+    Reopen,
+    CorruptionCycle { offset: usize, len: usize },
+}
+
+impl FsxOperation {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Write { .. } => "write",
+            Self::Read { .. } => "read",
+            Self::Truncate { .. } => "truncate",
+            Self::Fsync => "fsync",
+            Self::Fallocate { .. } => "fallocate",
+            Self::PunchHole { .. } => "punch_hole",
+            Self::Reopen => "reopen",
+            Self::CorruptionCycle { .. } => "corruption_cycle",
+        }
+    }
+}
+
+/// Failure details for fsx stress runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsxFailureReport {
+    pub operation_index: u64,
+    pub operation: FsxOperation,
+    pub reason: String,
+    pub expected_sha256: String,
+    pub actual_sha256: String,
+}
+
+/// Aggregate result for an fsx stress run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsxStressReport {
+    pub seed: u64,
+    pub operation_count: u64,
+    pub operations_executed: u64,
+    pub passed: bool,
+    pub corruption_cycles: u64,
+    pub repaired_cycles: u64,
+    pub final_file_size: usize,
+    pub final_sha256: String,
+    pub operation_mix: BTreeMap<String, u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<FsxFailureReport>,
+    pub duration_us: u64,
+    pub output_dir: Option<String>,
+}
+
+fn fsx_increment_mix(operation_mix: &mut BTreeMap<String, u64>, operation: &FsxOperation) {
+    let key = operation.kind().to_owned();
+    let counter = operation_mix.entry(key).or_insert(0);
+    *counter = counter.saturating_add(1);
+}
+
+fn fsx_ensure_len(file: &mut Vec<u8>, target_len: usize) {
+    if file.len() < target_len {
+        file.resize(target_len, 0);
+    }
+}
+
+fn fsx_apply_write(file: &mut Vec<u8>, offset: usize, data: &[u8]) -> Result<()> {
+    let end = offset
+        .checked_add(data.len())
+        .context("write end overflow in fsx apply")?;
+    fsx_ensure_len(file, end);
+    file[offset..end].copy_from_slice(data);
+    Ok(())
+}
+
+fn fsx_apply_truncate(file: &mut Vec<u8>, len: usize) {
+    if len <= file.len() {
+        file.truncate(len);
+    } else {
+        file.resize(len, 0);
+    }
+}
+
+fn fsx_apply_fallocate(file: &mut Vec<u8>, offset: usize, len: usize) -> Result<()> {
+    let end = offset
+        .checked_add(len)
+        .context("fallocate end overflow in fsx apply")?;
+    fsx_ensure_len(file, end);
+    Ok(())
+}
+
+fn fsx_apply_punch_hole(file: &mut [u8], offset: usize, len: usize) {
+    if len == 0 || offset >= file.len() {
+        return;
+    }
+    let end = offset.saturating_add(len).min(file.len());
+    for byte in &mut file[offset..end] {
+        *byte = 0;
+    }
+}
+
+fn fsx_read_bounds(current_len: usize, offset: usize, len: usize) -> (usize, usize) {
+    if current_len == 0 || len == 0 || offset >= current_len {
+        return (0, 0);
+    }
+    let end = offset.saturating_add(len).min(current_len);
+    (offset, end.saturating_sub(offset))
+}
+
+fn fsx_failure(
+    operation_index: u64,
+    operation: FsxOperation,
+    reason: impl Into<String>,
+    reference: &[u8],
+    actual: &[u8],
+) -> FsxFailureReport {
+    FsxFailureReport {
+        operation_index,
+        operation,
+        reason: reason.into(),
+        expected_sha256: sha256_hex(reference),
+        actual_sha256: sha256_hex(actual),
+    }
+}
+
+fn fsx_verify_full(
+    operation_index: u64,
+    operation: FsxOperation,
+    reference: &[u8],
+    actual: &[u8],
+) -> Option<FsxFailureReport> {
+    if reference == actual {
+        None
+    } else {
+        Some(fsx_failure(
+            operation_index,
+            operation,
+            "full-file mismatch",
+            reference,
+            actual,
+        ))
+    }
+}
+
+fn fsx_random_len(rng: &mut DeterministicRng, min_len: usize, max_len: usize) -> usize {
+    if max_len <= min_len {
+        return min_len;
+    }
+    let span = max_len.saturating_sub(min_len).saturating_add(1);
+    min_len.saturating_add(rng.next_usize(span))
+}
+
+fn generate_fsx_operation(
+    rng: &mut DeterministicRng,
+    current_len: usize,
+    max_file_size_bytes: usize,
+) -> FsxOperation {
+    let bucket = rng.next_usize(100);
+    match bucket {
+        0..=39 => {
+            if max_file_size_bytes == 0 {
+                return FsxOperation::Fsync;
+            }
+            let offset_limit = max_file_size_bytes.saturating_sub(1);
+            let offset = if current_len > 0 {
+                let near_head = current_len.saturating_add(4096).min(offset_limit);
+                rng.next_usize(near_head.saturating_add(1))
+            } else {
+                rng.next_usize(max_file_size_bytes)
+            };
+            let remaining = max_file_size_bytes.saturating_sub(offset);
+            if remaining == 0 {
+                return FsxOperation::Fsync;
+            }
+            let len = fsx_random_len(rng, 1, remaining.min(8192));
+            let data = rng.payload(len, len);
+            FsxOperation::Write { offset, data }
+        }
+        40..=64 => {
+            if current_len == 0 {
+                return FsxOperation::Read { offset: 0, len: 0 };
+            }
+            let offset = rng.next_usize(current_len);
+            let max_len = current_len.saturating_sub(offset);
+            let len = fsx_random_len(rng, 1, max_len.min(65_536));
+            FsxOperation::Read { offset, len }
+        }
+        65..=74 => {
+            if max_file_size_bytes == 0 {
+                FsxOperation::Truncate { len: 0 }
+            } else {
+                FsxOperation::Truncate {
+                    len: rng.next_usize(max_file_size_bytes.saturating_add(1)),
+                }
+            }
+        }
+        75..=84 => FsxOperation::Fsync,
+        85..=89 => {
+            if max_file_size_bytes == 0 {
+                return FsxOperation::Fsync;
+            }
+            let offset = rng.next_usize(max_file_size_bytes);
+            let remaining = max_file_size_bytes.saturating_sub(offset);
+            if remaining == 0 {
+                return FsxOperation::Fsync;
+            }
+            let len = fsx_random_len(rng, 1, remaining.min(65_536));
+            FsxOperation::Fallocate { offset, len }
+        }
+        90..=94 => {
+            if current_len == 0 {
+                FsxOperation::PunchHole { offset: 0, len: 0 }
+            } else {
+                let offset = rng.next_usize(current_len);
+                let max_len = current_len.saturating_sub(offset);
+                let len = fsx_random_len(rng, 1, max_len.min(65_536));
+                FsxOperation::PunchHole { offset, len }
+            }
+        }
+        _ => FsxOperation::Reopen,
+    }
+}
+
+fn fsx_inject_corruption(actual: &mut [u8], rng: &mut DeterministicRng) -> Option<(usize, usize)> {
+    if actual.is_empty() {
+        return None;
+    }
+    let offset = rng.next_usize(actual.len());
+    let max_len = actual.len().saturating_sub(offset).min(4096);
+    if max_len == 0 {
+        return None;
+    }
+    let len = fsx_random_len(rng, 1, max_len);
+    for byte in &mut actual[offset..offset + len] {
+        let mut mask = u8::try_from(rng.next_u64() & u64::from(u8::MAX)).unwrap_or(1);
+        if mask == 0 {
+            mask = 1;
+        }
+        *byte ^= mask;
+    }
+    Some((offset, len))
+}
+
+fn fsx_repair_corruption(
+    actual: &mut [u8],
+    reference: &[u8],
+    offset: usize,
+    len: usize,
+) -> Result<bool> {
+    let end = offset
+        .checked_add(len)
+        .context("corruption repair end overflow")?
+        .min(actual.len())
+        .min(reference.len());
+    if end <= offset {
+        return Ok(false);
+    }
+    actual[offset..end].copy_from_slice(&reference[offset..end]);
+    Ok(true)
+}
+
+fn write_fsx_repro_pack(
+    output_dir: &Path,
+    config: &FsxStressConfig,
+    report: &FsxStressReport,
+) -> Result<()> {
+    #[derive(Serialize)]
+    struct EnvReport<'a> {
+        os: &'a str,
+        arch: &'a str,
+        family: &'a str,
+        pkg_version: &'a str,
+        generated_at_unix: &'a str,
+    }
+
+    #[derive(Serialize)]
+    struct Manifest<'a> {
+        operation_count: u64,
+        seed: u64,
+        max_file_size_bytes: usize,
+        corruption_every_ops: u64,
+        full_verify_every_ops: u64,
+        report: &'a FsxStressReport,
+    }
+
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("create fsx output dir {}", output_dir.display()))?;
+
+    let generated_at = E2eLogEntry::now_iso8601();
+    let env_report = EnvReport {
+        os: std::env::consts::OS,
+        arch: std::env::consts::ARCH,
+        family: std::env::consts::FAMILY,
+        pkg_version: env!("CARGO_PKG_VERSION"),
+        generated_at_unix: &generated_at,
+    };
+    let env_path = output_dir.join("env.json");
+    let env_json = serde_json::to_string_pretty(&env_report).context("serialize fsx env report")?;
+    fs::write(&env_path, env_json).with_context(|| format!("write {}", env_path.display()))?;
+
+    let report_path = output_dir.join("fsx_report.json");
+    let report_json = serde_json::to_string_pretty(report).context("serialize fsx report")?;
+    fs::write(&report_path, &report_json)
+        .with_context(|| format!("write {}", report_path.display()))?;
+
+    let manifest = Manifest {
+        operation_count: config.operation_count,
+        seed: config.seed,
+        max_file_size_bytes: config.max_file_size_bytes,
+        corruption_every_ops: config.corruption_every_ops,
+        full_verify_every_ops: config.full_verify_every_ops,
+        report,
+    };
+    let manifest_path = output_dir.join("manifest.json");
+    let manifest_json =
+        serde_json::to_string_pretty(&manifest).context("serialize fsx manifest")?;
+    fs::write(&manifest_path, &manifest_json)
+        .with_context(|| format!("write {}", manifest_path.display()))?;
+
+    let manifest_sha256 = sha256_hex(manifest_json.as_bytes());
+    let repro_lock = format!(
+        "seed={}\noperation_count={}\nmax_file_size_bytes={}\ncorruption_every_ops={}\nfull_verify_every_ops={}\nfinal_sha256={}\nmanifest_sha256={}\n",
+        config.seed,
+        config.operation_count,
+        config.max_file_size_bytes,
+        config.corruption_every_ops,
+        config.full_verify_every_ops,
+        report.final_sha256,
+        manifest_sha256
+    );
+    let lock_path = output_dir.join("repro.lock");
+    fs::write(&lock_path, repro_lock).with_context(|| format!("write {}", lock_path.display()))?;
+
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct FsxRunState {
+    reference: Vec<u8>,
+    actual: Vec<u8>,
+    operation_mix: BTreeMap<String, u64>,
+    failure: Option<FsxFailureReport>,
+    operations_executed: u64,
+    corruption_cycles: u64,
+    repaired_cycles: u64,
+}
+
+fn apply_fsx_operation(
+    state: &mut FsxRunState,
+    operation_index: u64,
+    operation: FsxOperation,
+) -> Result<()> {
+    fsx_increment_mix(&mut state.operation_mix, &operation);
+    state.operations_executed = state.operations_executed.saturating_add(1);
+
+    match operation {
+        FsxOperation::Write { offset, data } => {
+            fsx_apply_write(&mut state.reference, offset, &data)?;
+            fsx_apply_write(&mut state.actual, offset, &data)?;
+            Ok(())
+        }
+        FsxOperation::Read { offset, len } => {
+            let (read_offset, read_len) = fsx_read_bounds(state.actual.len(), offset, len);
+            let expected = &state.reference[read_offset..read_offset + read_len];
+            let observed = &state.actual[read_offset..read_offset + read_len];
+            if expected != observed {
+                let reason =
+                    format!("read verification mismatch at offset={read_offset} len={read_len}");
+                state.failure = Some(fsx_failure(
+                    operation_index,
+                    FsxOperation::Read {
+                        offset: read_offset,
+                        len: read_len,
+                    },
+                    reason,
+                    &state.reference,
+                    &state.actual,
+                ));
+            }
+            Ok(())
+        }
+        FsxOperation::Truncate { len } => {
+            fsx_apply_truncate(&mut state.reference, len);
+            fsx_apply_truncate(&mut state.actual, len);
+            Ok(())
+        }
+        FsxOperation::Fsync => Ok(()),
+        FsxOperation::Fallocate { offset, len } => {
+            fsx_apply_fallocate(&mut state.reference, offset, len)?;
+            fsx_apply_fallocate(&mut state.actual, offset, len)?;
+            Ok(())
+        }
+        FsxOperation::PunchHole { offset, len } => {
+            fsx_apply_punch_hole(&mut state.reference, offset, len);
+            fsx_apply_punch_hole(&mut state.actual, offset, len);
+            Ok(())
+        }
+        FsxOperation::Reopen => {
+            state.failure = fsx_verify_full(
+                operation_index,
+                FsxOperation::Reopen,
+                &state.reference,
+                &state.actual,
+            );
+            Ok(())
+        }
+        FsxOperation::CorruptionCycle { .. } => {
+            bail!("corruption_cycle is internal and should not be generated directly")
+        }
+    }
+}
+
+fn maybe_run_fsx_corruption_cycle(
+    state: &mut FsxRunState,
+    operation_index: u64,
+    rng: &mut DeterministicRng,
+    config: &FsxStressConfig,
+) {
+    if config.corruption_every_ops == 0
+        || state.operations_executed % config.corruption_every_ops != 0
+    {
+        return;
+    }
+
+    state.corruption_cycles = state.corruption_cycles.saturating_add(1);
+    let Some((offset, len)) = fsx_inject_corruption(&mut state.actual, rng) else {
+        return;
+    };
+
+    let op = FsxOperation::CorruptionCycle { offset, len };
+    match fsx_repair_corruption(&mut state.actual, &state.reference, offset, len) {
+        Ok(repaired) => {
+            if repaired {
+                state.repaired_cycles = state.repaired_cycles.saturating_add(1);
+            }
+        }
+        Err(error) => {
+            state.failure = Some(fsx_failure(
+                operation_index,
+                op,
+                format!("{error:#}"),
+                &state.reference,
+                &state.actual,
+            ));
+            return;
+        }
+    }
+
+    state.failure = fsx_verify_full(operation_index, op, &state.reference, &state.actual);
+}
+
+fn maybe_run_fsx_periodic_verify(
+    state: &mut FsxRunState,
+    operation_index: u64,
+    config: &FsxStressConfig,
+) {
+    if config.full_verify_every_ops == 0
+        || state.operations_executed % config.full_verify_every_ops != 0
+    {
+        return;
+    }
+    state.failure = fsx_verify_full(
+        operation_index,
+        FsxOperation::Reopen,
+        &state.reference,
+        &state.actual,
+    );
+}
+
+fn build_fsx_report(
+    config: &FsxStressConfig,
+    state: FsxRunState,
+    duration: Duration,
+) -> FsxStressReport {
+    let output_dir = config
+        .output_dir
+        .as_ref()
+        .map(|path| path.display().to_string());
+    FsxStressReport {
+        seed: config.seed,
+        operation_count: config.operation_count,
+        operations_executed: state.operations_executed,
+        passed: state.failure.is_none(),
+        corruption_cycles: state.corruption_cycles,
+        repaired_cycles: state.repaired_cycles,
+        final_file_size: state.actual.len(),
+        final_sha256: sha256_hex(&state.actual),
+        operation_mix: state.operation_mix,
+        failure: state.failure,
+        duration_us: u64::try_from(duration.as_micros()).unwrap_or(u64::MAX),
+        output_dir,
+    }
+}
+
+/// Run fsx-style stress with deterministic operation streams and periodic corruption injection.
+pub fn run_fsx_stress(config: &FsxStressConfig) -> Result<FsxStressReport> {
+    if config.operation_count == 0 {
+        bail!("operation_count must be greater than zero");
+    }
+    if config.max_file_size_bytes == 0 {
+        bail!("max_file_size_bytes must be greater than zero");
+    }
+
+    let start = Instant::now();
+    let mut rng = DeterministicRng::new(config.seed);
+    let mut state = FsxRunState::default();
+
+    for operation_index in 0..config.operation_count {
+        let operation =
+            generate_fsx_operation(&mut rng, state.actual.len(), config.max_file_size_bytes);
+        let op_for_error = operation.clone();
+        if let Err(error) = apply_fsx_operation(&mut state, operation_index, operation) {
+            state.failure = Some(fsx_failure(
+                operation_index,
+                op_for_error,
+                format!("{error:#}"),
+                &state.reference,
+                &state.actual,
+            ));
+            break;
+        }
+        if state.failure.is_some() {
+            break;
+        }
+
+        maybe_run_fsx_corruption_cycle(&mut state, operation_index, &mut rng, config);
+        if state.failure.is_some() {
+            break;
+        }
+
+        maybe_run_fsx_periodic_verify(&mut state, operation_index, config);
+        if state.failure.is_some() {
+            break;
+        }
+    }
+
+    if state.failure.is_none() {
+        state.failure = fsx_verify_full(
+            state.operations_executed,
+            FsxOperation::Reopen,
+            &state.reference,
+            &state.actual,
+        );
+    }
+
+    let report = build_fsx_report(config, state, start.elapsed());
+    if let Some(output_dir) = &config.output_dir {
+        write_fsx_repro_pack(output_dir, config, &report)?;
+    }
+
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2030,6 +2618,72 @@ mod tests {
                 .join("schedule_0000.json")
                 .exists()
         );
+
+        let _ = fs::remove_dir_all(&output_dir);
+    }
+
+    #[test]
+    fn fsx_stress_is_deterministic_for_seed() {
+        let config = FsxStressConfig {
+            operation_count: 3_000,
+            seed: 0x77AA_5500_1122_3344,
+            max_file_size_bytes: 4 * 1024 * 1024,
+            corruption_every_ops: 250,
+            full_verify_every_ops: 250,
+            output_dir: None,
+        };
+
+        let left = run_fsx_stress(&config).expect("run left fsx stress");
+        let right = run_fsx_stress(&config).expect("run right fsx stress");
+
+        assert!(left.passed);
+        assert!(right.passed);
+        assert_eq!(left.operation_count, right.operation_count);
+        assert_eq!(left.operations_executed, right.operations_executed);
+        assert_eq!(left.corruption_cycles, right.corruption_cycles);
+        assert_eq!(left.repaired_cycles, right.repaired_cycles);
+        assert_eq!(left.final_file_size, right.final_file_size);
+        assert_eq!(left.final_sha256, right.final_sha256);
+        assert_eq!(left.operation_mix, right.operation_mix);
+    }
+
+    #[test]
+    fn fsx_stress_survives_corruption_cycles() {
+        let config = FsxStressConfig {
+            operation_count: 5_000,
+            seed: 0x0BAD_F00D_F5F5_1234,
+            max_file_size_bytes: 8 * 1024 * 1024,
+            corruption_every_ops: 100,
+            full_verify_every_ops: 500,
+            output_dir: None,
+        };
+        let report = run_fsx_stress(&config).expect("run fsx stress");
+        assert!(report.passed, "failure: {:#?}", report.failure);
+        assert_eq!(report.operations_executed, config.operation_count);
+        assert!(report.corruption_cycles > 0);
+        assert!(report.repaired_cycles > 0);
+        assert!(report.failure.is_none());
+    }
+
+    #[test]
+    fn fsx_stress_writes_repro_pack() {
+        let output_dir =
+            std::env::temp_dir().join(format!("ffs-fsx-artifacts-{}", std::process::id()));
+        let config = FsxStressConfig {
+            operation_count: 1_000,
+            seed: 77,
+            max_file_size_bytes: 2 * 1024 * 1024,
+            corruption_every_ops: 100,
+            full_verify_every_ops: 200,
+            output_dir: Some(output_dir.clone()),
+        };
+
+        let report = run_fsx_stress(&config).expect("run fsx stress");
+        assert!(report.passed);
+        assert!(output_dir.join("env.json").exists());
+        assert!(output_dir.join("manifest.json").exists());
+        assert!(output_dir.join("repro.lock").exists());
+        assert!(output_dir.join("fsx_report.json").exists());
 
         let _ = fs::remove_dir_all(&output_dir);
     }
