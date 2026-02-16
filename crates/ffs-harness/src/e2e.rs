@@ -10,6 +10,7 @@
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::panic;
@@ -729,6 +730,933 @@ impl E2eTestResult {
     }
 }
 
+// ── Deterministic crash-replay harness ──────────────────────────────────────
+
+const ROOT_DIR: &str = "/";
+
+/// Whether to crash before or after applying an operation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum CrashPointStage {
+    BeforeOp,
+    AfterOp,
+}
+
+/// A crash injection location within a generated schedule.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CrashPoint {
+    pub op_index: usize,
+    pub stage: CrashPointStage,
+}
+
+/// A single synthetic filesystem operation used in crash-replay schedules.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CrashOperation {
+    Create {
+        path: String,
+        fsync: bool,
+    },
+    Write {
+        path: String,
+        data: Vec<u8>,
+        fsync: bool,
+    },
+    Rename {
+        from: String,
+        to: String,
+        fsync: bool,
+    },
+    Unlink {
+        path: String,
+        fsync: bool,
+    },
+    Mkdir {
+        path: String,
+        fsync: bool,
+    },
+    Rmdir {
+        path: String,
+        fsync: bool,
+    },
+}
+
+impl CrashOperation {
+    fn fsync(&self) -> bool {
+        match self {
+            Self::Create { fsync, .. }
+            | Self::Write { fsync, .. }
+            | Self::Rename { fsync, .. }
+            | Self::Unlink { fsync, .. }
+            | Self::Mkdir { fsync, .. }
+            | Self::Rmdir { fsync, .. } => *fsync,
+        }
+    }
+}
+
+/// A deterministic crash-replay schedule.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CrashSchedule {
+    pub schedule_id: u32,
+    pub seed: u64,
+    pub operations: Vec<CrashOperation>,
+    pub crash_points: Vec<CrashPoint>,
+}
+
+/// Result for one crash point replay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrashReplayCaseResult {
+    pub crash_point: CrashPoint,
+    pub executed_operations: usize,
+    pub passed: bool,
+    pub errors: Vec<String>,
+}
+
+/// Result for one generated schedule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrashReplayScheduleResult {
+    pub schedule_id: u32,
+    pub seed: u64,
+    pub operation_count: usize,
+    pub passed: bool,
+    pub case_results: Vec<CrashReplayCaseResult>,
+    pub duration_us: u64,
+}
+
+/// Config for the deterministic crash-replay suite.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrashReplaySuiteConfig {
+    /// Number of schedules to generate and execute.
+    pub schedule_count: u32,
+    /// Minimum operations in each schedule.
+    pub min_operations: usize,
+    /// Maximum operations in each schedule.
+    pub max_operations: usize,
+    /// Seed used to derive per-schedule deterministic seeds.
+    pub base_seed: u64,
+    /// Optional directory to persist per-schedule artifacts.
+    pub output_dir: Option<PathBuf>,
+}
+
+impl Default for CrashReplaySuiteConfig {
+    fn default() -> Self {
+        Self {
+            schedule_count: 500,
+            min_operations: 100,
+            max_operations: 1000,
+            base_seed: 0xFF5E_ED00_0000_0001,
+            output_dir: None,
+        }
+    }
+}
+
+/// Aggregate result of the crash-replay suite.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrashReplaySuiteReport {
+    pub schedule_count: u32,
+    pub passed_schedules: u32,
+    pub failed_schedules: u32,
+    pub duration_us: u64,
+    pub output_dir: Option<String>,
+    pub results: Vec<CrashReplayScheduleResult>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CrashFsState {
+    directories: BTreeSet<String>,
+    files: BTreeMap<String, Vec<u8>>,
+}
+
+impl CrashFsState {
+    fn with_root() -> Self {
+        let mut directories = BTreeSet::new();
+        directories.insert(ROOT_DIR.to_owned());
+        Self {
+            directories,
+            files: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct CrashReplayExpectations {
+    files: BTreeMap<String, Option<Vec<u8>>>,
+    directories: BTreeMap<String, bool>,
+}
+
+#[derive(Debug, Clone)]
+struct CrashReplaySimulationOutcome {
+    recovered: CrashFsState,
+    expectations: CrashReplayExpectations,
+    executed_operations: usize,
+}
+
+#[derive(Debug, Clone)]
+struct DeterministicRng {
+    state: u64,
+}
+
+impl DeterministicRng {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: seed ^ 0x9E37_79B9_7F4A_7C15,
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn next_bool(&mut self) -> bool {
+        self.next_u64() & 1 == 0
+    }
+
+    fn next_usize(&mut self, upper_exclusive: usize) -> usize {
+        if upper_exclusive <= 1 {
+            return 0;
+        }
+        let upper_u64 = u64::try_from(upper_exclusive).unwrap_or(u64::MAX);
+        let value = self.next_u64() % upper_u64;
+        usize::try_from(value).unwrap_or(0)
+    }
+
+    fn payload(&mut self, min_len: usize, max_len: usize) -> Vec<u8> {
+        let span = max_len.saturating_sub(min_len).saturating_add(1);
+        let len = min_len.saturating_add(self.next_usize(span));
+        let mut bytes = Vec::with_capacity(len);
+        for _ in 0..len {
+            let byte = u8::try_from(self.next_u64() & u64::from(u8::MAX)).unwrap_or(0);
+            bytes.push(byte);
+        }
+        bytes
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CrashScheduleGenerator {
+    directories: Vec<String>,
+    files: Vec<String>,
+    next_dir_id: u32,
+    next_file_id: u32,
+}
+
+impl CrashScheduleGenerator {
+    fn new() -> Self {
+        Self {
+            directories: vec![ROOT_DIR.to_owned()],
+            files: Vec::new(),
+            next_dir_id: 0,
+            next_file_id: 0,
+        }
+    }
+
+    fn next_operation(&mut self, rng: &mut DeterministicRng, op_index: usize) -> CrashOperation {
+        let branch = rng.next_usize(100);
+        let fsync = rng.next_usize(3) == 0;
+
+        if branch < 15 {
+            self.generate_mkdir(rng, fsync)
+        } else if branch < 30 {
+            self.generate_create(rng, fsync)
+        } else if branch < 65 {
+            self.generate_write(rng, op_index, fsync)
+        } else if branch < 80 {
+            self.generate_rename(rng, fsync)
+                .unwrap_or_else(|| self.generate_write(rng, op_index, fsync))
+        } else if branch < 92 {
+            self.generate_unlink(rng, fsync)
+                .unwrap_or_else(|| self.generate_write(rng, op_index, fsync))
+        } else {
+            self.generate_rmdir(rng, fsync)
+                .unwrap_or_else(|| self.generate_write(rng, op_index, fsync))
+        }
+    }
+
+    fn random_directory(&self, rng: &mut DeterministicRng) -> String {
+        let index = rng.next_usize(self.directories.len());
+        self.directories[index].clone()
+    }
+
+    fn allocate_dir_path(&mut self, parent: &str) -> String {
+        let path = join_path(parent, &format!("d{:05}", self.next_dir_id));
+        self.next_dir_id = self.next_dir_id.saturating_add(1);
+        path
+    }
+
+    fn allocate_file_path(&mut self, parent: &str) -> String {
+        let path = join_path(parent, &format!("f{:06}.bin", self.next_file_id));
+        self.next_file_id = self.next_file_id.saturating_add(1);
+        path
+    }
+
+    fn generate_mkdir(&mut self, rng: &mut DeterministicRng, fsync: bool) -> CrashOperation {
+        let parent = self.random_directory(rng);
+        let path = self.allocate_dir_path(&parent);
+        self.directories.push(path.clone());
+        CrashOperation::Mkdir { path, fsync }
+    }
+
+    fn generate_create(&mut self, rng: &mut DeterministicRng, fsync: bool) -> CrashOperation {
+        let parent = self.random_directory(rng);
+        let path = self.allocate_file_path(&parent);
+        self.files.push(path.clone());
+        CrashOperation::Create { path, fsync }
+    }
+
+    fn generate_write(
+        &mut self,
+        rng: &mut DeterministicRng,
+        op_index: usize,
+        fsync: bool,
+    ) -> CrashOperation {
+        let use_existing = !self.files.is_empty() && rng.next_usize(100) < 60;
+        let path = if use_existing {
+            let index = rng.next_usize(self.files.len());
+            self.files[index].clone()
+        } else {
+            let parent = self.random_directory(rng);
+            let new_path = self.allocate_file_path(&parent);
+            self.files.push(new_path.clone());
+            new_path
+        };
+
+        let mut data = rng.payload(64, 512);
+        let tag = format!("op={op_index:05};");
+        for (slot, byte) in tag.as_bytes().iter().enumerate() {
+            if slot >= data.len() {
+                break;
+            }
+            data[slot] = *byte;
+        }
+
+        CrashOperation::Write { path, data, fsync }
+    }
+
+    fn generate_rename(
+        &mut self,
+        rng: &mut DeterministicRng,
+        fsync: bool,
+    ) -> Option<CrashOperation> {
+        if self.files.is_empty() {
+            return None;
+        }
+        let source_index = rng.next_usize(self.files.len());
+        let from = self.files.remove(source_index);
+        let parent = self.random_directory(rng);
+        let to = self.allocate_file_path(&parent);
+        self.files.push(to.clone());
+        Some(CrashOperation::Rename { from, to, fsync })
+    }
+
+    fn generate_unlink(
+        &mut self,
+        rng: &mut DeterministicRng,
+        fsync: bool,
+    ) -> Option<CrashOperation> {
+        if self.files.is_empty() {
+            return None;
+        }
+        let index = rng.next_usize(self.files.len());
+        let path = self.files.remove(index);
+        Some(CrashOperation::Unlink { path, fsync })
+    }
+
+    fn generate_rmdir(
+        &mut self,
+        rng: &mut DeterministicRng,
+        fsync: bool,
+    ) -> Option<CrashOperation> {
+        let removable: Vec<&String> =
+            self.directories
+                .iter()
+                .filter(|dir| dir.as_str() != ROOT_DIR)
+                .filter(|dir| {
+                    let candidate = dir.as_str();
+                    !self.files.iter().any(|file| is_descendant(file, candidate))
+                        && !self.directories.iter().any(|other| {
+                            other.as_str() != candidate && is_descendant(other, candidate)
+                        })
+                })
+                .collect();
+
+        if removable.is_empty() {
+            return None;
+        }
+
+        let chosen = removable[rng.next_usize(removable.len())].clone();
+        self.directories.retain(|dir| dir != &chosen);
+        Some(CrashOperation::Rmdir {
+            path: chosen,
+            fsync,
+        })
+    }
+}
+
+fn join_path(parent: &str, name: &str) -> String {
+    if parent == ROOT_DIR {
+        format!("/{name}")
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+fn parent_directory(path: &str) -> Option<&str> {
+    if path == ROOT_DIR {
+        return None;
+    }
+    let slash = path.rfind('/')?;
+    if slash == 0 {
+        Some(ROOT_DIR)
+    } else {
+        Some(&path[..slash])
+    }
+}
+
+fn is_descendant(path: &str, directory: &str) -> bool {
+    if directory == ROOT_DIR {
+        return path.starts_with(ROOT_DIR) && path.len() > ROOT_DIR.len();
+    }
+    if !path.starts_with(directory) {
+        return false;
+    }
+    path.as_bytes()
+        .get(directory.len())
+        .is_some_and(|byte| *byte == b'/')
+}
+
+fn validate_absolute_path(path: &str) -> Result<()> {
+    if !path.starts_with('/') {
+        bail!("path must be absolute: {path}");
+    }
+    if path.len() > 1 && path.ends_with('/') {
+        bail!("path must not end with '/': {path}");
+    }
+    Ok(())
+}
+
+fn ensure_parent_directory_exists(state: &CrashFsState, path: &str) -> Result<()> {
+    let parent = parent_directory(path).context("path has no parent")?;
+    if !state.directories.contains(parent) {
+        bail!("parent directory does not exist: {parent}");
+    }
+    Ok(())
+}
+
+fn apply_operation(state: &mut CrashFsState, op: &CrashOperation) -> Result<()> {
+    match op {
+        CrashOperation::Create { path, .. } => {
+            validate_absolute_path(path)?;
+            ensure_parent_directory_exists(state, path)?;
+            state.files.insert(path.clone(), Vec::new());
+        }
+        CrashOperation::Write { path, data, .. } => {
+            validate_absolute_path(path)?;
+            ensure_parent_directory_exists(state, path)?;
+            state.files.insert(path.clone(), data.clone());
+        }
+        CrashOperation::Rename { from, to, .. } => {
+            validate_absolute_path(from)?;
+            validate_absolute_path(to)?;
+            ensure_parent_directory_exists(state, to)?;
+            let payload = state
+                .files
+                .remove(from)
+                .with_context(|| format!("rename source missing: {from}"))?;
+            state.files.insert(to.clone(), payload);
+        }
+        CrashOperation::Unlink { path, .. } => {
+            validate_absolute_path(path)?;
+            let removed = state.files.remove(path);
+            if removed.is_none() {
+                bail!("unlink target missing: {path}");
+            }
+        }
+        CrashOperation::Mkdir { path, .. } => {
+            validate_absolute_path(path)?;
+            ensure_parent_directory_exists(state, path)?;
+            state.directories.insert(path.clone());
+        }
+        CrashOperation::Rmdir { path, .. } => {
+            validate_absolute_path(path)?;
+            if path == ROOT_DIR {
+                bail!("cannot remove root directory");
+            }
+            if !state.directories.contains(path) {
+                bail!("rmdir target missing: {path}");
+            }
+            let has_children = state.files.keys().any(|entry| is_descendant(entry, path))
+                || state
+                    .directories
+                    .iter()
+                    .any(|entry| entry != path && is_descendant(entry, path));
+            if has_children {
+                bail!("rmdir target is not empty: {path}");
+            }
+            state.directories.remove(path);
+        }
+    }
+    Ok(())
+}
+
+fn sync_parent_directories_from_working(
+    path: &str,
+    working: &CrashFsState,
+    durable: &mut CrashFsState,
+) {
+    let mut current = parent_directory(path);
+    while let Some(directory) = current {
+        if working.directories.contains(directory) {
+            durable.directories.insert(directory.to_owned());
+        }
+        if directory == ROOT_DIR {
+            break;
+        }
+        current = parent_directory(directory);
+    }
+}
+
+fn commit_operation(
+    op: &CrashOperation,
+    working: &CrashFsState,
+    durable: &mut CrashFsState,
+    expectations: &mut CrashReplayExpectations,
+) -> Result<()> {
+    match op {
+        CrashOperation::Create { path, .. } | CrashOperation::Write { path, .. } => {
+            let payload = working
+                .files
+                .get(path)
+                .with_context(|| format!("fsync target missing in working set: {path}"))?
+                .clone();
+            sync_parent_directories_from_working(path, working, durable);
+            durable.files.insert(path.clone(), payload.clone());
+            expectations.files.insert(path.clone(), Some(payload));
+        }
+        CrashOperation::Rename { from, to, .. } => {
+            let payload = working
+                .files
+                .get(to)
+                .with_context(|| format!("rename fsync target missing in working set: {to}"))?
+                .clone();
+            sync_parent_directories_from_working(to, working, durable);
+            durable.files.remove(from);
+            durable.files.insert(to.clone(), payload.clone());
+            expectations.files.insert(from.clone(), None);
+            expectations.files.insert(to.clone(), Some(payload));
+        }
+        CrashOperation::Unlink { path, .. } => {
+            durable.files.remove(path);
+            expectations.files.insert(path.clone(), None);
+        }
+        CrashOperation::Mkdir { path, .. } => {
+            if working.directories.contains(path) {
+                sync_parent_directories_from_working(path, working, durable);
+                durable.directories.insert(path.clone());
+                expectations.directories.insert(path.clone(), true);
+            }
+        }
+        CrashOperation::Rmdir { path, .. } => {
+            let removed_files: Vec<String> = durable
+                .files
+                .keys()
+                .filter(|entry| is_descendant(entry, path))
+                .cloned()
+                .collect();
+            for file in removed_files {
+                durable.files.remove(&file);
+                expectations.files.insert(file, None);
+            }
+
+            let removed_directories: Vec<String> = durable
+                .directories
+                .iter()
+                .filter(|entry| entry.as_str() == path || is_descendant(entry, path))
+                .cloned()
+                .collect();
+            for directory in removed_directories {
+                if directory != ROOT_DIR {
+                    durable.directories.remove(&directory);
+                    expectations.directories.insert(directory, false);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn executed_operation_count(total_operations: usize, crash_point: CrashPoint) -> usize {
+    let raw = match crash_point.stage {
+        CrashPointStage::BeforeOp => crash_point.op_index,
+        CrashPointStage::AfterOp => crash_point.op_index.saturating_add(1),
+    };
+    raw.min(total_operations)
+}
+
+fn validate_recovered_state(state: &CrashFsState) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    if !state.directories.contains(ROOT_DIR) {
+        errors.push("root directory missing after recovery".to_owned());
+    }
+
+    for directory in &state.directories {
+        if directory == ROOT_DIR {
+            continue;
+        }
+        if let Some(parent) = parent_directory(directory) {
+            if !state.directories.contains(parent) {
+                errors.push(format!(
+                    "directory parent missing after recovery: {directory} parent={parent}"
+                ));
+            }
+        } else {
+            errors.push(format!("directory has no parent: {directory}"));
+        }
+    }
+
+    for path in state.files.keys() {
+        if let Some(parent) = parent_directory(path) {
+            if !state.directories.contains(parent) {
+                errors.push(format!(
+                    "file parent missing after recovery: {path} parent={parent}"
+                ));
+            }
+        } else {
+            errors.push(format!("file has no parent: {path}"));
+        }
+    }
+
+    errors
+}
+
+fn validate_expectations(
+    recovered: &CrashFsState,
+    expectations: &CrashReplayExpectations,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    for (path, expected) in &expectations.files {
+        let actual = recovered.files.get(path);
+        match (expected, actual) {
+            (Some(bytes), Some(found)) if bytes == found => {}
+            (Some(bytes), Some(found)) => {
+                errors.push(format!(
+                    "fsync file bytes mismatch: {path} expected={} actual={}",
+                    bytes.len(),
+                    found.len(),
+                ));
+            }
+            (Some(_), None) => {
+                errors.push(format!("fsync file missing after recovery: {path}"));
+            }
+            (None, Some(_)) => {
+                errors.push(format!("fsync unlink not reflected after recovery: {path}"));
+            }
+            (None, None) => {}
+        }
+    }
+
+    for (directory, should_exist) in &expectations.directories {
+        let exists = recovered.directories.contains(directory);
+        if exists != *should_exist {
+            errors.push(format!(
+                "fsync directory expectation mismatch: {directory} expected_exists={should_exist} actual_exists={exists}",
+            ));
+        }
+    }
+
+    errors
+}
+
+fn simulate_crash_point(
+    schedule: &CrashSchedule,
+    crash_point: CrashPoint,
+) -> Result<CrashReplaySimulationOutcome> {
+    let mut working = CrashFsState::with_root();
+    let mut durable = CrashFsState::with_root();
+    let mut expectations = CrashReplayExpectations::default();
+    expectations.directories.insert(ROOT_DIR.to_owned(), true);
+
+    let executed = executed_operation_count(schedule.operations.len(), crash_point);
+    for operation in schedule.operations.iter().take(executed) {
+        apply_operation(&mut working, operation)?;
+        if operation.fsync() {
+            commit_operation(operation, &working, &mut durable, &mut expectations)?;
+        }
+    }
+
+    Ok(CrashReplaySimulationOutcome {
+        recovered: durable,
+        expectations,
+        executed_operations: executed,
+    })
+}
+
+fn derive_schedule_seed(base_seed: u64, schedule_id: u32) -> u64 {
+    base_seed ^ u64::from(schedule_id).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+fn choose_crash_points(rng: &mut DeterministicRng, operation_count: usize) -> Vec<CrashPoint> {
+    let desired = 1 + rng.next_usize(3);
+    let mut points = BTreeSet::new();
+
+    while points.len() < desired {
+        let op_index = rng.next_usize(operation_count);
+        let stage = if rng.next_bool() {
+            CrashPointStage::BeforeOp
+        } else {
+            CrashPointStage::AfterOp
+        };
+        points.insert(CrashPoint { op_index, stage });
+    }
+
+    points.into_iter().collect()
+}
+
+/// Generate one deterministic crash-replay schedule.
+pub fn generate_crash_schedule(
+    schedule_id: u32,
+    seed: u64,
+    min_operations: usize,
+    max_operations: usize,
+) -> Result<CrashSchedule> {
+    if min_operations == 0 {
+        bail!("min_operations must be greater than zero");
+    }
+    if max_operations < min_operations {
+        bail!("max_operations must be >= min_operations");
+    }
+
+    let mut rng = DeterministicRng::new(seed);
+    let span = max_operations
+        .saturating_sub(min_operations)
+        .saturating_add(1);
+    let operation_count = min_operations.saturating_add(rng.next_usize(span));
+
+    let mut generator = CrashScheduleGenerator::new();
+    let mut operations = Vec::with_capacity(operation_count);
+    for op_index in 0..operation_count {
+        operations.push(generator.next_operation(&mut rng, op_index));
+    }
+    let crash_points = choose_crash_points(&mut rng, operation_count);
+
+    Ok(CrashSchedule {
+        schedule_id,
+        seed,
+        operations,
+        crash_points,
+    })
+}
+
+/// Execute all crash points for a generated schedule.
+pub fn run_crash_schedule(schedule: &CrashSchedule) -> Result<CrashReplayScheduleResult> {
+    if schedule.operations.is_empty() {
+        bail!("schedule has no operations");
+    }
+    if schedule.crash_points.is_empty() {
+        bail!("schedule has no crash points");
+    }
+    if schedule
+        .crash_points
+        .iter()
+        .any(|point| point.op_index >= schedule.operations.len())
+    {
+        bail!("schedule contains out-of-range crash point");
+    }
+
+    let start = Instant::now();
+    let mut case_results = Vec::with_capacity(schedule.crash_points.len());
+    let mut passed = true;
+
+    for crash_point in &schedule.crash_points {
+        let primary = simulate_crash_point(schedule, *crash_point)?;
+        let replay = simulate_crash_point(schedule, *crash_point)?;
+
+        let mut errors = validate_recovered_state(&primary.recovered);
+        errors.extend(validate_expectations(
+            &primary.recovered,
+            &primary.expectations,
+        ));
+        if primary.recovered != replay.recovered {
+            errors.push("non-deterministic recovery state for identical crash point".to_owned());
+        }
+
+        let case_passed = errors.is_empty();
+        if !case_passed {
+            passed = false;
+        }
+        case_results.push(CrashReplayCaseResult {
+            crash_point: *crash_point,
+            executed_operations: primary.executed_operations,
+            passed: case_passed,
+            errors,
+        });
+    }
+
+    Ok(CrashReplayScheduleResult {
+        schedule_id: schedule.schedule_id,
+        seed: schedule.seed,
+        operation_count: schedule.operations.len(),
+        passed,
+        case_results,
+        duration_us: u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX),
+    })
+}
+
+fn write_schedule_artifact(
+    output_dir: &Path,
+    schedule: &CrashSchedule,
+    result: &CrashReplayScheduleResult,
+) -> Result<()> {
+    #[derive(Serialize)]
+    struct ScheduleArtifact<'a> {
+        schedule: &'a CrashSchedule,
+        result: &'a CrashReplayScheduleResult,
+    }
+
+    let schedules_dir = output_dir.join("schedules");
+    fs::create_dir_all(&schedules_dir)
+        .with_context(|| format!("create schedule artifact dir {}", schedules_dir.display()))?;
+
+    let path = schedules_dir.join(format!("schedule_{:04}.json", schedule.schedule_id));
+    let payload = ScheduleArtifact { schedule, result };
+    let text = serde_json::to_string_pretty(&payload)
+        .context("serialize crash schedule artifact to json")?;
+    fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+fn write_repro_pack(
+    output_dir: &Path,
+    config: &CrashReplaySuiteConfig,
+    report: &CrashReplaySuiteReport,
+) -> Result<()> {
+    #[derive(Serialize)]
+    struct EnvReport<'a> {
+        os: &'a str,
+        arch: &'a str,
+        family: &'a str,
+        pkg_version: &'a str,
+        generated_at_unix: &'a str,
+    }
+
+    #[derive(Serialize)]
+    struct Manifest<'a> {
+        schedule_count: u32,
+        passed_schedules: u32,
+        failed_schedules: u32,
+        min_operations: usize,
+        max_operations: usize,
+        base_seed: u64,
+        output_dir: Option<String>,
+        results: &'a [CrashReplayScheduleResult],
+    }
+
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("create repro output dir {}", output_dir.display()))?;
+
+    let generated_at = E2eLogEntry::now_iso8601();
+    let env_report = EnvReport {
+        os: std::env::consts::OS,
+        arch: std::env::consts::ARCH,
+        family: std::env::consts::FAMILY,
+        pkg_version: env!("CARGO_PKG_VERSION"),
+        generated_at_unix: &generated_at,
+    };
+    let env_path = output_dir.join("env.json");
+    let env_json = serde_json::to_string_pretty(&env_report).context("serialize env report")?;
+    fs::write(&env_path, env_json).with_context(|| format!("write {}", env_path.display()))?;
+
+    let manifest = Manifest {
+        schedule_count: report.schedule_count,
+        passed_schedules: report.passed_schedules,
+        failed_schedules: report.failed_schedules,
+        min_operations: config.min_operations,
+        max_operations: config.max_operations,
+        base_seed: config.base_seed,
+        output_dir: report.output_dir.clone(),
+        results: &report.results,
+    };
+    let manifest_path = output_dir.join("manifest.json");
+    let manifest_json = serde_json::to_string_pretty(&manifest).context("serialize manifest")?;
+    fs::write(&manifest_path, &manifest_json)
+        .with_context(|| format!("write {}", manifest_path.display()))?;
+
+    let manifest_sha256 = sha256_hex(manifest_json.as_bytes());
+    let repro_lock = format!(
+        "base_seed={}\nschedule_count={}\nmin_operations={}\nmax_operations={}\nmanifest_sha256={}\n",
+        config.base_seed,
+        report.schedule_count,
+        config.min_operations,
+        config.max_operations,
+        manifest_sha256
+    );
+    let lock_path = output_dir.join("repro.lock");
+    fs::write(&lock_path, repro_lock).with_context(|| format!("write {}", lock_path.display()))?;
+
+    Ok(())
+}
+
+/// Run the deterministic crash-replay suite.
+pub fn run_crash_replay_suite(config: &CrashReplaySuiteConfig) -> Result<CrashReplaySuiteReport> {
+    if config.schedule_count == 0 {
+        bail!("schedule_count must be greater than zero");
+    }
+    if config.min_operations == 0 {
+        bail!("min_operations must be greater than zero");
+    }
+    if config.max_operations < config.min_operations {
+        bail!("max_operations must be >= min_operations");
+    }
+
+    let start = Instant::now();
+    let mut results = Vec::with_capacity(usize::try_from(config.schedule_count).unwrap_or(0));
+    let mut passed_schedules = 0_u32;
+
+    for schedule_id in 0..config.schedule_count {
+        let seed = derive_schedule_seed(config.base_seed, schedule_id);
+        let schedule = generate_crash_schedule(
+            schedule_id,
+            seed,
+            config.min_operations,
+            config.max_operations,
+        )?;
+        let schedule_result = run_crash_schedule(&schedule)?;
+        if schedule_result.passed {
+            passed_schedules = passed_schedules.saturating_add(1);
+        }
+        if let Some(output_dir) = &config.output_dir {
+            write_schedule_artifact(output_dir, &schedule, &schedule_result)?;
+        }
+        results.push(schedule_result);
+    }
+
+    let failed_schedules = config.schedule_count.saturating_sub(passed_schedules);
+    let output_dir = config
+        .output_dir
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let report = CrashReplaySuiteReport {
+        schedule_count: config.schedule_count,
+        passed_schedules,
+        failed_schedules,
+        duration_us: u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX),
+        output_dir,
+        results,
+    };
+
+    if let Some(output_dir) = &config.output_dir {
+        write_repro_pack(output_dir, config, &report)?;
+    }
+
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1009,6 +1937,101 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&mountpoint);
+    }
+
+    #[test]
+    fn crash_schedule_generation_is_deterministic() {
+        let seed = 0xA11C_E55D_0000_0042;
+        let left = generate_crash_schedule(7, seed, 16, 24).expect("generate left schedule");
+        let right = generate_crash_schedule(7, seed, 16, 24).expect("generate right schedule");
+        assert_eq!(left, right);
+        assert!(!left.operations.is_empty());
+        assert!(!left.crash_points.is_empty());
+    }
+
+    #[test]
+    fn crash_schedule_replay_validates_fsynced_state() {
+        let schedule = CrashSchedule {
+            schedule_id: 11,
+            seed: 77,
+            operations: vec![
+                CrashOperation::Mkdir {
+                    path: "/logs".to_owned(),
+                    fsync: true,
+                },
+                CrashOperation::Write {
+                    path: "/logs/a.bin".to_owned(),
+                    data: b"alpha".to_vec(),
+                    fsync: true,
+                },
+                CrashOperation::Write {
+                    path: "/logs/a.bin".to_owned(),
+                    data: b"beta".to_vec(),
+                    fsync: false,
+                },
+                CrashOperation::Rename {
+                    from: "/logs/a.bin".to_owned(),
+                    to: "/logs/b.bin".to_owned(),
+                    fsync: true,
+                },
+            ],
+            crash_points: vec![
+                CrashPoint {
+                    op_index: 2,
+                    stage: CrashPointStage::AfterOp,
+                },
+                CrashPoint {
+                    op_index: 3,
+                    stage: CrashPointStage::AfterOp,
+                },
+            ],
+        };
+
+        let result = run_crash_schedule(&schedule).expect("run schedule");
+        assert!(result.passed, "errors: {:#?}", result.case_results);
+        assert_eq!(result.case_results.len(), 2);
+    }
+
+    #[test]
+    fn crash_replay_suite_runs_500_schedules() {
+        let config = CrashReplaySuiteConfig {
+            schedule_count: 500,
+            min_operations: 100,
+            max_operations: 1000,
+            base_seed: 0x1234_5678_9ABC_DEF0,
+            output_dir: None,
+        };
+        let report = run_crash_replay_suite(&config).expect("run crash replay suite");
+        assert_eq!(report.schedule_count, 500);
+        assert_eq!(report.failed_schedules, 0);
+        assert_eq!(report.passed_schedules, 500);
+    }
+
+    #[test]
+    fn crash_replay_suite_writes_repro_pack() {
+        let output_dir =
+            std::env::temp_dir().join(format!("ffs-crash-replay-artifacts-{}", std::process::id()));
+        let config = CrashReplaySuiteConfig {
+            schedule_count: 3,
+            min_operations: 8,
+            max_operations: 12,
+            base_seed: 99,
+            output_dir: Some(output_dir.clone()),
+        };
+
+        let report = run_crash_replay_suite(&config).expect("run crash replay suite");
+        assert_eq!(report.schedule_count, 3);
+        assert!(output_dir.join("env.json").exists());
+        assert!(output_dir.join("manifest.json").exists());
+        assert!(output_dir.join("repro.lock").exists());
+        assert!(
+            output_dir
+                .join("schedules")
+                .join("schedule_0000.json")
+                .exists()
+        );
+
+        let _ = fs::remove_dir_all(&output_dir);
     }
 
     #[test]
