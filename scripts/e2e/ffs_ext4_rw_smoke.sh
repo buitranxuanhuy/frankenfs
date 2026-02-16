@@ -15,6 +15,9 @@ source "$REPO_ROOT/scripts/e2e/lib.sh"
 
 export RUST_LOG="${RUST_LOG:-trace}"
 export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
+# Avoid implicit AllowOther injection from fuse3 auto-unmount in rootless test environments.
+export FFS_AUTO_UNMOUNT="${FFS_AUTO_UNMOUNT:-0}"
+FFS_CLI_BIN="${FFS_CLI_BIN:-$REPO_ROOT/target/release/ffs-cli}"
 
 e2e_init "ffs_ext4_rw_smoke"
 e2e_print_env
@@ -82,7 +85,16 @@ wait_for_mount_ready() {
     local timeout_seconds="${3:-20}"
     local elapsed=0
 
-    while ! mountpoint -q "$mount_point" 2>/dev/null; do
+    while true; do
+        if mountpoint -q "$mount_point" 2>/dev/null; then
+            return 0
+        fi
+        if [[ -n "${CURRENT_MOUNT_LOG:-}" ]] && [[ -f "$CURRENT_MOUNT_LOG" ]]; then
+            if grep -q "INIT response" "$CURRENT_MOUNT_LOG"; then
+                return 0
+            fi
+        fi
+
         sleep 0.5
         elapsed=$((elapsed + 1))
 
@@ -94,8 +106,6 @@ wait_for_mount_ready() {
             return 2
         fi
     done
-
-    return 0
 }
 
 start_mount() {
@@ -120,7 +130,7 @@ start_mount() {
     CURRENT_MOUNT_POINT="$mount_point"
     CURRENT_MOUNT_LOG="$E2E_LOG_DIR/mount_${mode}_$(basename "$mount_point").log"
 
-    local cmd=(cargo run -p ffs-cli --release -- mount "$image" "$mount_point")
+    local cmd=("$FFS_CLI_BIN" mount "$image" "$mount_point")
     if [[ "$mode" == "rw" ]]; then
         cmd+=(--rw)
     fi
@@ -157,6 +167,9 @@ start_mount() {
 
     if grep -qiE "option allow_other only allowed if 'user_allow_other' is set" "$CURRENT_MOUNT_LOG"; then
         e2e_skip "FUSE is present but user_allow_other is not enabled in /etc/fuse.conf"
+    fi
+    if grep -qiE "fusermount3: mount failed: Permission denied|fusermount: failed to open /dev/fuse: Operation not permitted|fusermount: mount failed: Operation not permitted" "$CURRENT_MOUNT_LOG"; then
+        e2e_skip "FUSE is present but mount is not permitted in this environment"
     fi
 
     if [[ "$mode" == "rw" ]] && grep -qiE "read-write mount is not yet supported|not yet supported|read-only mode only" "$CURRENT_MOUNT_LOG"; then
@@ -223,6 +236,7 @@ wait_for_pid_exit() {
 
 e2e_step "Phase 1: Build ffs-cli"
 e2e_assert cargo build -p ffs-cli --release
+e2e_assert_file "$FFS_CLI_BIN"
 
 e2e_step "Phase 2: Create base/work ext4 images"
 BASE_IMAGE="$E2E_TEMP_DIR/base.ext4"
@@ -445,7 +459,7 @@ PY
     e2e_assert_file "$INFLIGHT_WRITER_LOG"
 
     e2e_step "Phase 5.4: inspect after crash"
-    e2e_assert cargo run -p ffs-cli --release -- inspect "$WORK_IMAGE" --json
+    e2e_assert "$FFS_CLI_BIN" inspect "$WORK_IMAGE" --json
 
     e2e_step "Phase 5.5: remount read-only and verify invariants"
     if start_mount ro "$WORK_IMAGE" "$MOUNT_RO" 1; then

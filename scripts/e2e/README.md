@@ -85,6 +85,8 @@ artifacts/e2e/20260212_161500_ffs_smoke/
 | `RUST_LOG` | `info` | Rust log level (trace, debug, info, warn, error) |
 | `RUST_BACKTRACE` | `1` | Enable backtraces on panic |
 | `SKIP_MOUNT` | `0` | Set to `1` to skip FUSE mount tests |
+| `FFS_AUTO_UNMOUNT` | `0` (for ext4 RW smoke) | Passed through to `ffs mount`; set `0` to avoid implicit `allow_other` on rootless fuse3 setups |
+| `FFS_CLI_BIN` | `target/release/ffs-cli` | Path to local `ffs-cli` binary used by RW mount/inspect steps |
 | `BASELINE_FILE_COUNT` | `500` | Number of fsync-backed baseline files written before SIGKILL phase |
 | `CRASH_WRITER_RUNTIME_SECS` | `2` | Duration to run background in-flight writer before sending SIGKILL |
 | `CRASH_WRITER_SLEEP_SECS` | `0.01` | Per-write pacing interval for crash in-flight writer |
@@ -103,6 +105,8 @@ artifacts/e2e/20260212_161500_ffs_smoke/
 Mount tests are automatically skipped if:
 - `/dev/fuse` doesn't exist
 - `/dev/fuse` isn't readable/writable
+- `fuse3` rejects implicit `allow_other` because `user_allow_other` is not enabled in `/etc/fuse.conf`
+- `fusermount` returns `Permission denied` / `Operation not permitted` for the current runtime environment
 - `SKIP_MOUNT=1` is set
 
 ## Exit Codes

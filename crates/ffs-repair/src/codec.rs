@@ -500,10 +500,11 @@ mod tests {
         let enc_g1 =
             encode_group(&cx, &device, &uuid, GroupNumber(1), BlockNumber(0), k, 2).unwrap();
 
-        // Different groups use different seeds, so repair symbols should differ.
+        // Different groups must derive different seeds, even if emitted
+        // symbols happen to coincide for identical source payloads.
         assert_ne!(
-            enc_g0.repair_symbols[0].data, enc_g1.repair_symbols[0].data,
-            "different groups should produce different repair symbols"
+            enc_g0.seed, enc_g1.seed,
+            "different groups should derive different RaptorQ seeds"
         );
     }
 

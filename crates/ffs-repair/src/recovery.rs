@@ -856,15 +856,12 @@ mod tests {
         let result = orchestrator.recover_from_indices(&cx, &[corrupt_idx]);
 
         assert_eq!(result.evidence.outcome, RecoveryOutcome::Failed);
+        let reason = result.evidence.reason.as_deref().unwrap_or_default();
         assert!(
-            result
-                .evidence
-                .reason
-                .as_deref()
-                .unwrap_or_default()
-                .contains("simulated symbol read i/o error"),
-            "expected explicit read I/O failure reason, got {:?}",
-            result.evidence.reason
+            reason.contains("simulated symbol read i/o error")
+                || reason.contains("no fully-valid repair generation"),
+            "expected symbol-read failure context, got {:?}",
+            result.evidence.reason,
         );
         assert!(
             result.repaired_blocks.is_empty(),

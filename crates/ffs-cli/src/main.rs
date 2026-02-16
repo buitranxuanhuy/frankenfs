@@ -75,6 +75,31 @@ fn default_env_filter() -> EnvFilter {
     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
 }
 
+fn env_bool(key: &str, default: bool) -> Result<bool> {
+    match std::env::var(key) {
+        Ok(value) => {
+            let value = value.trim();
+            if value == "1"
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes")
+                || value.eq_ignore_ascii_case("on")
+            {
+                Ok(true)
+            } else if value == "0"
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("no")
+                || value.eq_ignore_ascii_case("off")
+            {
+                Ok(false)
+            } else {
+                bail!("invalid {key}={value:?}; expected one of: 1,0,true,false,yes,no,on,off")
+            }
+        }
+        Err(VarError::NotPresent) => Ok(default),
+        Err(VarError::NotUnicode(_)) => bail!("{key} contains non-UTF-8 bytes"),
+    }
+}
+
 fn init_logging(log_format_override: Option<LogFormat>) -> Result<LogFormat> {
     let format = log_format_override
         .or(LogFormat::from_env()?)
@@ -449,12 +474,14 @@ fn mount_cmd(
     allow_other: bool,
     rw: bool,
 ) -> Result<()> {
+    let auto_unmount = env_bool("FFS_AUTO_UNMOUNT", true)?;
     let command_span = info_span!(
         target: "ffs::cli::mount",
         "mount",
         image = %image_path.display(),
         mountpoint = %mountpoint.display(),
         allow_other,
+        auto_unmount,
         read_write = rw
     );
     let _command_guard = command_span.enter();
@@ -520,7 +547,7 @@ fn mount_cmd(
     let opts = MountOptions {
         read_only: !rw,
         allow_other,
-        auto_unmount: true,
+        auto_unmount,
         worker_threads: 0,
     };
 
@@ -815,148 +842,177 @@ fn print_evidence_record(record: &EvidenceRecord) {
         print!(" blocks={start}..{end}");
     }
 
+    print_evidence_record_event_payload(record);
+    println!();
+}
+
+fn print_evidence_record_event_payload(record: &EvidenceRecord) {
     match record.event_type {
-        EvidenceEventType::CorruptionDetected => {
-            if let Some(ref c) = record.corruption {
-                print!(
-                    " blocks_affected={} kind={} severity={}",
-                    c.blocks_affected, c.corruption_kind, c.severity
-                );
-            }
-        }
+        EvidenceEventType::CorruptionDetected => print_corruption_payload(record),
         EvidenceEventType::RepairAttempted
         | EvidenceEventType::RepairSucceeded
-        | EvidenceEventType::RepairFailed => {
-            if let Some(ref r) = record.repair {
-                print!(
-                    " corrupt={} symbols={}/{} verify={}",
-                    r.corrupt_count, r.symbols_used, r.symbols_available, r.verify_pass
-                );
-                if let Some(ref reason) = r.reason {
-                    print!(" reason=\"{reason}\"");
-                }
-            }
-        }
-        EvidenceEventType::ScrubCycleComplete => {
-            if let Some(ref s) = record.scrub_cycle {
-                print!(
-                    " scanned={} corrupt={} io_errors={} findings={}",
-                    s.blocks_scanned, s.blocks_corrupt, s.blocks_io_error, s.findings_count
-                );
-            }
-        }
-        EvidenceEventType::PolicyDecision => {
-            if let Some(ref p) = record.policy {
-                print!(
-                    " posterior={:.4} overhead={:.3} risk_bound={:.1e} decision=\"{}\"",
-                    p.corruption_posterior, p.overhead_ratio, p.risk_bound, p.decision
-                );
-            }
-        }
-        EvidenceEventType::SymbolRefresh => {
-            if let Some(ref s) = record.symbol_refresh {
-                print!(
-                    " gen={}→{} symbols={}",
-                    s.previous_generation, s.new_generation, s.symbols_generated
-                );
-            }
-        }
-        EvidenceEventType::WalRecovery => {
-            if let Some(ref w) = record.wal_recovery {
-                print!(
-                    " commits={} versions={} discarded={} valid={}/{}",
-                    w.commits_replayed,
-                    w.versions_replayed,
-                    w.records_discarded,
-                    w.wal_valid_bytes,
-                    w.wal_total_bytes
-                );
-                if w.used_checkpoint {
-                    if let Some(seq) = w.checkpoint_commit_seq {
-                        print!(" checkpoint_seq={seq}");
-                    }
-                }
-            }
-        }
-        EvidenceEventType::TxnAborted => {
-            if let Some(ref t) = record.txn_aborted {
-                let reason = serde_json::to_value(t.reason)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_owned))
-                    .unwrap_or_else(|| format!("{:?}", t.reason));
-                print!(" txn_id={} reason={reason}", t.txn_id);
-                if let Some(ref detail) = t.detail {
-                    print!(" detail=\"{detail}\"");
-                }
-            }
-        }
-        EvidenceEventType::VersionGc => {
-            if let Some(ref gc) = record.version_gc {
-                print!(
-                    " block_id={} versions_freed={} oldest_retained_commit_seq={}",
-                    gc.block_id, gc.versions_freed, gc.oldest_retained_commit_seq
-                );
-            }
-        }
-        EvidenceEventType::SnapshotAdvanced => {
-            if let Some(ref s) = record.snapshot_advanced {
-                print!(
-                    " old_commit_seq={} new_commit_seq={} versions_eligible={}",
-                    s.old_commit_seq, s.new_commit_seq, s.versions_eligible
-                );
-            }
-        }
-        EvidenceEventType::FlushBatch => {
-            if let Some(ref f) = record.flush_batch {
-                print!(
-                    " blocks_flushed={} bytes_written={} flush_duration_us={}",
-                    f.blocks_flushed, f.bytes_written, f.flush_duration_us
-                );
-            }
-        }
-        EvidenceEventType::BackpressureActivated => {
-            if let Some(ref b) = record.backpressure_activated {
-                print!(
-                    " dirty_ratio={:.4} threshold={:.4}",
-                    b.dirty_ratio, b.threshold
-                );
-            }
-        }
-        EvidenceEventType::DirtyBlockDiscarded => {
-            if let Some(ref d) = record.dirty_block_discarded {
-                let reason = serde_json::to_value(d.reason)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_owned))
-                    .unwrap_or_else(|| format!("{:?}", d.reason));
-                print!(
-                    " block_id={} txn_id={} reason={reason}",
-                    d.block_id, d.txn_id
-                );
-            }
-        }
+        | EvidenceEventType::RepairFailed => print_repair_payload(record),
+        EvidenceEventType::ScrubCycleComplete => print_scrub_cycle_payload(record),
+        EvidenceEventType::PolicyDecision => print_policy_payload(record),
+        EvidenceEventType::SymbolRefresh => print_symbol_refresh_payload(record),
+        EvidenceEventType::WalRecovery => print_wal_recovery_payload(record),
+        EvidenceEventType::TxnAborted => print_txn_aborted_payload(record),
+        EvidenceEventType::VersionGc => print_version_gc_payload(record),
+        EvidenceEventType::SnapshotAdvanced => print_snapshot_advanced_payload(record),
+        EvidenceEventType::FlushBatch => print_flush_batch_payload(record),
+        EvidenceEventType::BackpressureActivated => print_backpressure_payload(record),
+        EvidenceEventType::DirtyBlockDiscarded => print_dirty_block_discarded_payload(record),
         EvidenceEventType::DurabilityPolicyChanged => {
-            if let Some(ref d) = record.durability_policy_changed {
-                print!(
-                    " old_overhead={:.4} new_overhead={:.4} posterior=({:.3},{:.3},{:.4})",
-                    d.old_overhead,
-                    d.new_overhead,
-                    d.posterior_alpha,
-                    d.posterior_beta,
-                    d.posterior_mean
-                );
-            }
+            print_durability_policy_changed_payload(record);
         }
-        EvidenceEventType::RefreshPolicyChanged => {
-            if let Some(ref p) = record.refresh_policy_changed {
-                print!(
-                    " policy=\"{}\"->\"{}\" policy_group={}",
-                    p.old_policy, p.new_policy, p.block_group
-                );
+        EvidenceEventType::RefreshPolicyChanged => print_refresh_policy_changed_payload(record),
+    }
+}
+
+fn print_corruption_payload(record: &EvidenceRecord) {
+    if let Some(c) = record.corruption.as_ref() {
+        print!(
+            " blocks_affected={} kind={} severity={}",
+            c.blocks_affected, c.corruption_kind, c.severity
+        );
+    }
+}
+
+fn print_repair_payload(record: &EvidenceRecord) {
+    if let Some(r) = record.repair.as_ref() {
+        print!(
+            " corrupt={} symbols={}/{} verify={}",
+            r.corrupt_count, r.symbols_used, r.symbols_available, r.verify_pass
+        );
+        if let Some(reason) = r.reason.as_ref() {
+            print!(" reason=\"{reason}\"");
+        }
+    }
+}
+
+fn print_scrub_cycle_payload(record: &EvidenceRecord) {
+    if let Some(s) = record.scrub_cycle.as_ref() {
+        print!(
+            " scanned={} corrupt={} io_errors={} findings={}",
+            s.blocks_scanned, s.blocks_corrupt, s.blocks_io_error, s.findings_count
+        );
+    }
+}
+
+fn print_policy_payload(record: &EvidenceRecord) {
+    if let Some(p) = record.policy.as_ref() {
+        print!(
+            " posterior={:.4} overhead={:.3} risk_bound={:.1e} decision=\"{}\"",
+            p.corruption_posterior, p.overhead_ratio, p.risk_bound, p.decision
+        );
+    }
+}
+
+fn print_symbol_refresh_payload(record: &EvidenceRecord) {
+    if let Some(s) = record.symbol_refresh.as_ref() {
+        print!(
+            " gen={}→{} symbols={}",
+            s.previous_generation, s.new_generation, s.symbols_generated
+        );
+    }
+}
+
+fn print_wal_recovery_payload(record: &EvidenceRecord) {
+    if let Some(w) = record.wal_recovery.as_ref() {
+        print!(
+            " commits={} versions={} discarded={} valid={}/{}",
+            w.commits_replayed,
+            w.versions_replayed,
+            w.records_discarded,
+            w.wal_valid_bytes,
+            w.wal_total_bytes
+        );
+        if w.used_checkpoint {
+            if let Some(seq) = w.checkpoint_commit_seq {
+                print!(" checkpoint_seq={seq}");
             }
         }
     }
+}
 
-    println!();
+fn print_txn_aborted_payload(record: &EvidenceRecord) {
+    if let Some(t) = record.txn_aborted.as_ref() {
+        let reason = serde_json::to_value(t.reason)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_else(|| format!("{:?}", t.reason));
+        print!(" txn_id={} reason={reason}", t.txn_id);
+        if let Some(detail) = t.detail.as_ref() {
+            print!(" detail=\"{detail}\"");
+        }
+    }
+}
+
+fn print_version_gc_payload(record: &EvidenceRecord) {
+    if let Some(gc) = record.version_gc.as_ref() {
+        print!(
+            " block_id={} versions_freed={} oldest_retained_commit_seq={}",
+            gc.block_id, gc.versions_freed, gc.oldest_retained_commit_seq
+        );
+    }
+}
+
+fn print_snapshot_advanced_payload(record: &EvidenceRecord) {
+    if let Some(s) = record.snapshot_advanced.as_ref() {
+        print!(
+            " old_commit_seq={} new_commit_seq={} versions_eligible={}",
+            s.old_commit_seq, s.new_commit_seq, s.versions_eligible
+        );
+    }
+}
+
+fn print_flush_batch_payload(record: &EvidenceRecord) {
+    if let Some(f) = record.flush_batch.as_ref() {
+        print!(
+            " blocks_flushed={} bytes_written={} flush_duration_us={}",
+            f.blocks_flushed, f.bytes_written, f.flush_duration_us
+        );
+    }
+}
+
+fn print_backpressure_payload(record: &EvidenceRecord) {
+    if let Some(b) = record.backpressure_activated.as_ref() {
+        print!(
+            " dirty_ratio={:.4} threshold={:.4}",
+            b.dirty_ratio, b.threshold
+        );
+    }
+}
+
+fn print_dirty_block_discarded_payload(record: &EvidenceRecord) {
+    if let Some(d) = record.dirty_block_discarded.as_ref() {
+        let reason = serde_json::to_value(d.reason)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_else(|| format!("{:?}", d.reason));
+        print!(
+            " block_id={} txn_id={} reason={reason}",
+            d.block_id, d.txn_id
+        );
+    }
+}
+
+fn print_durability_policy_changed_payload(record: &EvidenceRecord) {
+    if let Some(d) = record.durability_policy_changed.as_ref() {
+        print!(
+            " old_overhead={:.4} new_overhead={:.4} posterior=({:.3},{:.3},{:.4})",
+            d.old_overhead, d.new_overhead, d.posterior_alpha, d.posterior_beta, d.posterior_mean
+        );
+    }
+}
+
+fn print_refresh_policy_changed_payload(record: &EvidenceRecord) {
+    if let Some(p) = record.refresh_policy_changed.as_ref() {
+        print!(
+            " policy=\"{}\"->\"{}\" policy_group={}",
+            p.old_policy, p.new_policy, p.block_group
+        );
+    }
 }
 
 fn parity(json: bool) -> Result<()> {

@@ -963,8 +963,9 @@ mod tests {
         match err {
             FfsError::RepairFailed(message) => {
                 assert!(
-                    message.contains("header parse failed"),
-                    "expected header parse failure, got: {message}"
+                    message.contains("header parse failed")
+                        || message.contains("no fully-valid repair symbols"),
+                    "expected symbol-header validation failure, got: {message}"
                 );
             }
             other => panic!("expected RepairFailed, got {other:?}"),

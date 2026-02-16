@@ -452,14 +452,24 @@ pub enum MemoryPressure {
 
 impl MemoryPressure {
     #[must_use]
-    fn target_ratio(self) -> f64 {
+    const fn target_fraction(self) -> (usize, usize) {
         match self {
-            Self::None => 1.0,
-            Self::Low => 0.9,
-            Self::Medium => 0.7,
-            Self::High => 0.5,
-            Self::Critical => 0.2,
+            Self::None => (10, 10),
+            Self::Low => (9, 10),
+            Self::Medium => (7, 10),
+            Self::High => (5, 10),
+            Self::Critical => (2, 10),
         }
+    }
+
+    #[must_use]
+    fn target_capacity(self, max_capacity: usize) -> usize {
+        let (numerator, denominator) = self.target_fraction();
+        let rounded = max_capacity
+            .saturating_mul(numerator)
+            .saturating_add(denominator / 2)
+            / denominator;
+        rounded.clamp(1, max_capacity)
     }
 }
 
@@ -744,8 +754,7 @@ impl ArcState {
 
     fn set_pressure_level(&mut self, pressure: MemoryPressure) {
         self.pressure_level = pressure;
-        let requested = ((self.max_capacity as f64) * pressure.target_ratio()).round() as usize;
-        let target = requested.clamp(1, self.max_capacity);
+        let target = pressure.target_capacity(self.max_capacity);
         self.set_target_capacity(target);
     }
 
@@ -1862,6 +1871,7 @@ impl<D: BlockDevice> ArcCache<D> {
                     discarded.push(block.0);
                 }
             }
+            drop(guard);
             discarded
         };
         let discarded_blocks = discarded_block_ids.len();
@@ -1911,88 +1921,7 @@ impl<D: BlockDevice> ArcCache<D> {
 
                     thread::sleep(config.interval);
                     cycle_seq = cycle_seq.saturating_add(1);
-
-                    let metrics = cache.metrics();
-                    let dirty_ratio = metrics.dirty_ratio();
-                    let (in_flight_blocks, committed_blocks) = cache.dirty_state_counts();
-                    let committed_dirty_ratio = if metrics.capacity == 0 {
-                        0.0
-                    } else {
-                        committed_blocks as f64 / metrics.capacity as f64
-                    };
-                    trace!(
-                        event = "flush_daemon_tick",
-                        cycle_seq,
-                        dirty_blocks = metrics.dirty_blocks,
-                        in_flight_blocks,
-                        committed_blocks,
-                        dirty_bytes = metrics.dirty_bytes,
-                        dirty_ratio,
-                        committed_dirty_ratio,
-                        oldest_dirty_age_ticks = metrics.oldest_dirty_age_ticks.unwrap_or(0)
-                    );
-
-                    if committed_blocks == 0 {
-                        trace!(
-                            event = "flush_daemon_sleep",
-                            cycle_seq,
-                            interval_ms = config.interval.as_millis()
-                        );
-                        continue;
-                    }
-
-                    let flush_res = if committed_dirty_ratio > config.high_watermark {
-                        if committed_dirty_ratio > config.critical_watermark {
-                            warn!(
-                                event = "flush_backpressure_critical",
-                                cycle_seq,
-                                dirty_ratio = committed_dirty_ratio,
-                                critical_watermark = config.critical_watermark
-                            );
-                            warn!(
-                                event = "backpressure_activated",
-                                source = "flush_daemon",
-                                level = "critical",
-                                cycle_seq,
-                                dirty_ratio = committed_dirty_ratio,
-                                threshold = config.critical_watermark
-                            );
-                        } else {
-                            warn!(
-                                event = "flush_backpressure_high",
-                                cycle_seq,
-                                dirty_ratio = committed_dirty_ratio,
-                                high_watermark = config.high_watermark
-                            );
-                            warn!(
-                                event = "backpressure_activated",
-                                source = "flush_daemon",
-                                level = "high",
-                                cycle_seq,
-                                dirty_ratio = committed_dirty_ratio,
-                                threshold = config.high_watermark
-                            );
-                        }
-                        cache.flush_dirty(&cx).map(|()| committed_blocks)
-                    } else {
-                        cache.flush_dirty_batch(&cx, config.batch_size)
-                    };
-
-                    if let Err(err) = flush_res {
-                        error!(
-                            event = "flush_batch_failed",
-                            cycle_seq,
-                            error = %err,
-                            attempted_blocks = metrics.dirty_blocks,
-                            attempted_bytes = metrics.dirty_bytes
-                        );
-                    }
-
-                    trace!(
-                        event = "flush_daemon_sleep",
-                        cycle_seq,
-                        interval_ms = config.interval.as_millis()
-                    );
+                    cache.run_flush_daemon_cycle(&cx, &config, cycle_seq);
                 }
 
                 if let Err(err) = cache.flush_dirty(&cx) {
@@ -2009,6 +1938,90 @@ impl<D: BlockDevice> ArcCache<D> {
             stop,
             join: Some(join),
         })
+    }
+
+    fn run_flush_daemon_cycle(&self, cx: &Cx, config: &FlushDaemonConfig, cycle_seq: u64) {
+        let metrics = self.metrics();
+        let dirty_ratio = metrics.dirty_ratio();
+        let (in_flight_blocks, committed_blocks) = self.dirty_state_counts();
+        let committed_dirty_ratio = if metrics.capacity == 0 {
+            0.0
+        } else {
+            committed_blocks as f64 / metrics.capacity as f64
+        };
+        trace!(
+            event = "flush_daemon_tick",
+            cycle_seq,
+            dirty_blocks = metrics.dirty_blocks,
+            in_flight_blocks,
+            committed_blocks,
+            dirty_bytes = metrics.dirty_bytes,
+            dirty_ratio,
+            committed_dirty_ratio,
+            oldest_dirty_age_ticks = metrics.oldest_dirty_age_ticks.unwrap_or(0)
+        );
+
+        if committed_blocks == 0 {
+            trace!(
+                event = "flush_daemon_sleep",
+                cycle_seq,
+                interval_ms = config.interval.as_millis()
+            );
+            return;
+        }
+
+        let flush_res = if committed_dirty_ratio > config.high_watermark {
+            if committed_dirty_ratio > config.critical_watermark {
+                warn!(
+                    event = "flush_backpressure_critical",
+                    cycle_seq,
+                    dirty_ratio = committed_dirty_ratio,
+                    critical_watermark = config.critical_watermark
+                );
+                warn!(
+                    event = "backpressure_activated",
+                    source = "flush_daemon",
+                    level = "critical",
+                    cycle_seq,
+                    dirty_ratio = committed_dirty_ratio,
+                    threshold = config.critical_watermark
+                );
+            } else {
+                warn!(
+                    event = "flush_backpressure_high",
+                    cycle_seq,
+                    dirty_ratio = committed_dirty_ratio,
+                    high_watermark = config.high_watermark
+                );
+                warn!(
+                    event = "backpressure_activated",
+                    source = "flush_daemon",
+                    level = "high",
+                    cycle_seq,
+                    dirty_ratio = committed_dirty_ratio,
+                    threshold = config.high_watermark
+                );
+            }
+            self.flush_dirty(cx).map(|()| committed_blocks)
+        } else {
+            self.flush_dirty_batch(cx, config.batch_size)
+        };
+
+        if let Err(err) = flush_res {
+            error!(
+                event = "flush_batch_failed",
+                cycle_seq,
+                error = %err,
+                attempted_blocks = metrics.dirty_blocks,
+                attempted_bytes = metrics.dirty_bytes
+            );
+        }
+
+        trace!(
+            event = "flush_daemon_sleep",
+            cycle_seq,
+            interval_ms = config.interval.as_millis()
+        );
     }
 
     fn flush_blocks(&self, cx: &Cx, flushes: &[FlushCandidate]) -> Result<()> {
@@ -3110,14 +3123,6 @@ mod tests {
         let cache = StdArc::new(
             ArcCache::new_with_policy(counted, 1200, ArcWritePolicy::WriteBack).expect("cache"),
         );
-        let daemon = cache
-            .start_flush_daemon(FlushDaemonConfig {
-                interval,
-                batch_size: 256,
-                ..FlushDaemonConfig::default()
-            })
-            .expect("start daemon");
-
         for i in 0..1000_u64 {
             let fill = u8::try_from(i & 0xFF).expect("u8");
             cache
@@ -3125,6 +3130,14 @@ mod tests {
                 .expect("write");
         }
         assert_eq!(cache.dirty_count(), 1000);
+
+        let daemon = cache
+            .start_flush_daemon(FlushDaemonConfig {
+                interval,
+                batch_size: 256,
+                ..FlushDaemonConfig::default()
+            })
+            .expect("start daemon");
 
         let deadline = Instant::now() + interval.saturating_mul(2) + Duration::from_millis(30);
         while Instant::now() < deadline {
