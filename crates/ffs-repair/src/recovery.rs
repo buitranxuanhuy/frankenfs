@@ -407,7 +407,7 @@ mod tests {
     use crate::codec::encode_group;
     use crate::symbol::RepairGroupDescExt;
     use ffs_block::BlockBuf;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
 
     struct MemBlockDevice {
@@ -475,6 +475,53 @@ mod tests {
 
         fn sync(&self, _cx: &Cx) -> Result<()> {
             Ok(())
+        }
+    }
+
+    /// Block device wrapper that injects deterministic read I/O errors.
+    struct FaultyBlockDevice {
+        inner: MemBlockDevice,
+        read_fail_blocks: HashSet<u64>,
+    }
+
+    impl FaultyBlockDevice {
+        fn new(
+            inner: MemBlockDevice,
+            read_fail_blocks: impl IntoIterator<Item = BlockNumber>,
+        ) -> Self {
+            let read_fail_blocks = read_fail_blocks.into_iter().map(|block| block.0).collect();
+            Self {
+                inner,
+                read_fail_blocks,
+            }
+        }
+    }
+
+    impl BlockDevice for FaultyBlockDevice {
+        fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
+            if self.read_fail_blocks.contains(&block.0) {
+                return Err(FfsError::Io(std::io::Error::other(format!(
+                    "simulated symbol read i/o error at block {}",
+                    block.0
+                ))));
+            }
+            self.inner.read_block(cx, block)
+        }
+
+        fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
+            self.inner.write_block(cx, block, data)
+        }
+
+        fn block_size(&self) -> u32 {
+            self.inner.block_size()
+        }
+
+        fn block_count(&self) -> u64 {
+            self.inner.block_count()
+        }
+
+        fn sync(&self, cx: &Cx) -> Result<()> {
+            self.inner.sync(cx)
         }
     }
 
@@ -660,6 +707,168 @@ mod tests {
             still_corrupt.as_slice(),
             originals[0].as_slice(),
             "block 0 unexpectedly restored despite insufficient redundancy"
+        );
+    }
+
+    #[test]
+    fn recovery_succeeds_with_partial_symbol_loss() {
+        let cx = Cx::for_testing();
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(7), BlockNumber(0), 64, 0, 8).expect("layout");
+        let source_first = BlockNumber(0);
+        let source_count = 8;
+
+        let originals = write_source_blocks(&cx, &device, source_first, source_count, block_size);
+        let symbols_available =
+            bootstrap_storage(&cx, &device, layout, source_first, source_count, 6);
+
+        // Simulate partial symbol loss by zeroing one raw symbol block.
+        let damaged_symbol_block = BlockNumber(layout.repair_start_block().0 + 1);
+        device
+            .write_block(&cx, damaged_symbol_block, &vec![0_u8; block_size as usize])
+            .expect("damage one symbol block");
+
+        let corrupt_idx = 3_u32;
+        let corrupt_block = BlockNumber(source_first.0 + u64::from(corrupt_idx));
+        device
+            .write_block(&cx, corrupt_block, &vec![0xAB; block_size as usize])
+            .expect("inject corruption");
+
+        let orchestrator = GroupRecoveryOrchestrator::new(
+            &device,
+            test_uuid(),
+            layout,
+            source_first,
+            source_count,
+        )
+        .expect("orchestrator");
+        let result = orchestrator.recover_from_indices(&cx, &[corrupt_idx]);
+        assert!(
+            result.is_success(),
+            "expected recovery success despite partial symbol loss: {:?}",
+            result.evidence
+        );
+        assert!(
+            result.evidence.symbols_available < symbols_available,
+            "expected fewer symbols after corruption: before={symbols_available} after={}",
+            result.evidence.symbols_available
+        );
+
+        let restored = device
+            .read_block(&cx, corrupt_block)
+            .expect("read restored");
+        assert_eq!(
+            restored.as_slice(),
+            originals[usize::try_from(corrupt_idx).expect("fits usize")].as_slice(),
+            "corrupt block should be restored exactly with remaining symbols"
+        );
+    }
+
+    #[test]
+    fn recovery_detects_stale_symbol_restore_via_blake3_mismatch() {
+        let cx = Cx::for_testing();
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(8), BlockNumber(0), 64, 0, 6).expect("layout");
+        let source_first = BlockNumber(0);
+        let source_count = 8;
+
+        let originals = write_source_blocks(&cx, &device, source_first, source_count, block_size);
+        let _symbols_available =
+            bootstrap_storage(&cx, &device, layout, source_first, source_count, 4);
+
+        // Update one source block after symbol generation; symbols are now stale.
+        let target_idx = 2_u32;
+        let target_block = BlockNumber(source_first.0 + u64::from(target_idx));
+        let new_bytes = deterministic_block(10_000, block_size);
+        let new_hash = blake3::hash(&new_bytes);
+        device
+            .write_block(&cx, target_block, &new_bytes)
+            .expect("write updated source data");
+
+        // Corrupt the updated block, then recover using stale symbols.
+        device
+            .write_block(&cx, target_block, &vec![0xEE; block_size as usize])
+            .expect("inject corruption on updated block");
+
+        let orchestrator = GroupRecoveryOrchestrator::new(
+            &device,
+            test_uuid(),
+            layout,
+            source_first,
+            source_count,
+        )
+        .expect("orchestrator");
+        let result = orchestrator.recover_from_indices(&cx, &[target_idx]);
+        assert!(
+            result.is_success(),
+            "expected decode success even with stale symbols: {:?}",
+            result.evidence
+        );
+
+        let restored = device.read_block(&cx, target_block).expect("read restored");
+        // Stale symbols can restore a previous value; assert mismatch against latest bytes.
+        let restored_hash = blake3::hash(restored.as_slice());
+        assert_ne!(
+            restored_hash, new_hash,
+            "expected stale-symbol restore to mismatch latest payload hash"
+        );
+        assert_eq!(
+            restored.as_slice(),
+            originals[usize::try_from(target_idx).expect("fits usize")].as_slice(),
+            "stale symbols should recover the pre-update payload"
+        );
+    }
+
+    #[test]
+    fn recovery_handles_symbol_read_io_errors_gracefully() {
+        let cx = Cx::for_testing();
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(9), BlockNumber(0), 64, 0, 4).expect("layout");
+        let source_first = BlockNumber(0);
+        let source_count = 8;
+
+        write_source_blocks(&cx, &device, source_first, source_count, block_size);
+        let _symbols_available =
+            bootstrap_storage(&cx, &device, layout, source_first, source_count, 4);
+
+        let corrupt_idx = 1_u32;
+        let corrupt_block = BlockNumber(source_first.0 + u64::from(corrupt_idx));
+        device
+            .write_block(&cx, corrupt_block, &vec![0xCD; block_size as usize])
+            .expect("inject corruption");
+
+        let repair_symbol_block = layout.repair_start_block();
+        let faulty = FaultyBlockDevice::new(device, [repair_symbol_block]);
+        let orchestrator = GroupRecoveryOrchestrator::new(
+            &faulty,
+            test_uuid(),
+            layout,
+            source_first,
+            source_count,
+        )
+        .expect("orchestrator");
+        let result = orchestrator.recover_from_indices(&cx, &[corrupt_idx]);
+
+        assert_eq!(result.evidence.outcome, RecoveryOutcome::Failed);
+        assert!(
+            result
+                .evidence
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("simulated symbol read i/o error"),
+            "expected explicit read I/O failure reason, got {:?}",
+            result.evidence.reason
+        );
+        assert!(
+            result.repaired_blocks.is_empty(),
+            "failed recovery must not report repaired blocks"
         );
     }
 

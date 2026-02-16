@@ -919,4 +919,55 @@ mod tests {
             torn_block.0
         );
     }
+
+    #[test]
+    fn storage_rejects_corrupted_symbol_header_metadata() {
+        let cx = Cx::for_testing();
+        let device = MemBlockDevice::new(256, 64);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(4), BlockNumber(0), 16, 0, 2).expect("layout");
+        let storage = RepairGroupStorage::new(&device, layout);
+
+        let bootstrap = make_desc(layout, 0, 32);
+        storage
+            .write_group_desc_ext(&cx, &bootstrap)
+            .expect("write bootstrap descriptor");
+
+        let mut desc_g1 = bootstrap;
+        desc_g1.repair_generation = 1;
+        let symbols_g1 = make_symbols(7_000, 4, usize::from(desc_g1.symbol_size));
+        storage
+            .write_symbols_for_desc(&cx, &desc_g1, &symbols_g1)
+            .expect("write generation 1 symbol blocks");
+        storage
+            .write_group_desc_ext(&cx, &desc_g1)
+            .expect("publish generation 1 descriptor");
+
+        // Corrupt symbol header metadata (magic/checksum bytes) on the first
+        // repair symbol block and verify we fail loudly.
+        let corrupt_block = desc_g1.repair_start_block;
+        let mut raw = device
+            .read_block(&cx, corrupt_block)
+            .expect("read symbol block")
+            .as_slice()
+            .to_vec();
+        raw[0] ^= 0xFF;
+        raw[24] ^= 0x01;
+        device
+            .write_block(&cx, corrupt_block, &raw)
+            .expect("write corrupted symbol header");
+
+        let err = storage
+            .read_repair_symbols(&cx)
+            .expect_err("corrupted symbol metadata must fail");
+        match err {
+            FfsError::RepairFailed(message) => {
+                assert!(
+                    message.contains("header parse failed"),
+                    "expected header parse failure, got: {message}"
+                );
+            }
+            other => panic!("expected RepairFailed, got {other:?}"),
+        }
+    }
 }
