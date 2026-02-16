@@ -55,7 +55,7 @@ criterion = { version = "0.5.1", features = ["html_reports"] }
 crossbeam-epoch = "0.9.18"
 hex = "0.4.3"
 insta = "1.42.1"
-libc = "0.2.181"
+libc = "0.2.180"
 memchr = "2.7.4"
 parking_lot = "0.12.3"
 proptest = "1.6.0"

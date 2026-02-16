@@ -193,6 +193,14 @@ pub fn decode_group(
             "symbol size mismatch for group {}: expected {expected}, got {actual}",
             group.0
         )),
+        DecodeError::SymbolEquationArityMismatch {
+            esi,
+            columns,
+            coefficients,
+        } => FfsError::RepairFailed(format!(
+            "malformed repair equation for group {}: esi={esi}, columns={columns}, coefficients={coefficients}",
+            group.0
+        )),
     })?;
 
     // Extract recovered blocks for the corrupt indices.
