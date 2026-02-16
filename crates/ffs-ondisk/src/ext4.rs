@@ -3655,6 +3655,21 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn parse_ext4_superblock_region_rejects_bad_magic() {
+        let mut sb = make_valid_sb();
+        sb[0x38..0x3A].copy_from_slice(&0x1234_u16.to_le_bytes());
+
+        let err = Ext4Superblock::parse_superblock_region(&sb).expect_err("reject");
+        assert!(matches!(
+            err,
+            ParseError::InvalidField {
+                field: "s_magic",
+                reason: "not an ext4 superblock"
+            }
+        ));
+    }
+
     /// Helper: build a minimal valid superblock buffer with required geometry.
     fn make_valid_sb() -> [u8; EXT4_SUPERBLOCK_SIZE] {
         let mut sb = [0_u8; EXT4_SUPERBLOCK_SIZE];

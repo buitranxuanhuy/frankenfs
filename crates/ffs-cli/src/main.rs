@@ -878,6 +878,82 @@ fn print_evidence_record(record: &EvidenceRecord) {
                 }
             }
         }
+        EvidenceEventType::TxnAborted => {
+            if let Some(ref t) = record.txn_aborted {
+                let reason = serde_json::to_value(t.reason)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| format!("{:?}", t.reason));
+                print!(" txn_id={} reason={reason}", t.txn_id);
+                if let Some(ref detail) = t.detail {
+                    print!(" detail=\"{detail}\"");
+                }
+            }
+        }
+        EvidenceEventType::VersionGc => {
+            if let Some(ref gc) = record.version_gc {
+                print!(
+                    " block_id={} versions_freed={} oldest_retained_commit_seq={}",
+                    gc.block_id, gc.versions_freed, gc.oldest_retained_commit_seq
+                );
+            }
+        }
+        EvidenceEventType::SnapshotAdvanced => {
+            if let Some(ref s) = record.snapshot_advanced {
+                print!(
+                    " old_commit_seq={} new_commit_seq={} versions_eligible={}",
+                    s.old_commit_seq, s.new_commit_seq, s.versions_eligible
+                );
+            }
+        }
+        EvidenceEventType::FlushBatch => {
+            if let Some(ref f) = record.flush_batch {
+                print!(
+                    " blocks_flushed={} bytes_written={} flush_duration_us={}",
+                    f.blocks_flushed, f.bytes_written, f.flush_duration_us
+                );
+            }
+        }
+        EvidenceEventType::BackpressureActivated => {
+            if let Some(ref b) = record.backpressure_activated {
+                print!(
+                    " dirty_ratio={:.4} threshold={:.4}",
+                    b.dirty_ratio, b.threshold
+                );
+            }
+        }
+        EvidenceEventType::DirtyBlockDiscarded => {
+            if let Some(ref d) = record.dirty_block_discarded {
+                let reason = serde_json::to_value(d.reason)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| format!("{:?}", d.reason));
+                print!(
+                    " block_id={} txn_id={} reason={reason}",
+                    d.block_id, d.txn_id
+                );
+            }
+        }
+        EvidenceEventType::DurabilityPolicyChanged => {
+            if let Some(ref d) = record.durability_policy_changed {
+                print!(
+                    " old_overhead={:.4} new_overhead={:.4} posterior=({:.3},{:.3},{:.4})",
+                    d.old_overhead,
+                    d.new_overhead,
+                    d.posterior_alpha,
+                    d.posterior_beta,
+                    d.posterior_mean
+                );
+            }
+        }
+        EvidenceEventType::RefreshPolicyChanged => {
+            if let Some(ref p) = record.refresh_policy_changed {
+                print!(
+                    " policy=\"{}\"->\"{}\" policy_group={}",
+                    p.old_policy, p.new_policy, p.block_group
+                );
+            }
+        }
     }
 
     println!();

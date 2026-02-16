@@ -57,6 +57,22 @@ pub enum EvidenceEventType {
     SymbolRefresh,
     /// WAL recovery completed (replay after crash or restart).
     WalRecovery,
+    /// MVCC transaction was aborted.
+    TxnAborted,
+    /// MVCC version garbage collection reclaimed old versions.
+    VersionGc,
+    /// Active snapshot watermark advanced.
+    SnapshotAdvanced,
+    /// Write-back cache flush completed.
+    FlushBatch,
+    /// Write-back cache backpressure activated.
+    BackpressureActivated,
+    /// Dirty block discarded from an aborted transaction.
+    DirtyBlockDiscarded,
+    /// Durability policy overhead changed.
+    DurabilityPolicyChanged,
+    /// Symbol refresh policy mode changed.
+    RefreshPolicyChanged,
 }
 
 // ── Detail structs ──────────────────────────────────────────────────────────
@@ -169,6 +185,119 @@ pub struct WalRecoveryDetail {
     pub checkpoint_commit_seq: Option<u64>,
 }
 
+/// Abort reason classification for MVCC transaction aborts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxnAbortReason {
+    /// First-committer-wins conflict with a newer committed writer.
+    FcwConflict,
+    /// SSI cycle detection aborted the transaction.
+    SsiCycle,
+    /// Deadline or timeout budget exceeded.
+    Timeout,
+    /// Explicit user-requested abort.
+    UserAbort,
+}
+
+/// Detail payload for MVCC transaction-aborted events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxnAbortedDetail {
+    /// Aborted transaction ID.
+    pub txn_id: u64,
+    /// Classified abort reason.
+    pub reason: TxnAbortReason,
+    /// Optional diagnostic message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Detail payload for MVCC version-GC events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionGcDetail {
+    /// Logical block whose version chain was pruned.
+    pub block_id: u64,
+    /// Number of versions freed by this GC action.
+    pub versions_freed: u64,
+    /// Oldest retained commit sequence for the block after pruning.
+    pub oldest_retained_commit_seq: u64,
+}
+
+/// Detail payload for snapshot-watermark advance events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotAdvancedDetail {
+    /// Previous oldest active snapshot sequence.
+    pub old_commit_seq: u64,
+    /// New oldest active snapshot sequence after advance.
+    pub new_commit_seq: u64,
+    /// Number of versions now eligible for GC.
+    pub versions_eligible: u64,
+}
+
+/// Detail payload for write-back flush batch events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlushBatchDetail {
+    /// Number of blocks flushed to durable storage.
+    pub blocks_flushed: u64,
+    /// Total bytes written in the flush batch.
+    pub bytes_written: u64,
+    /// Flush duration in microseconds.
+    pub flush_duration_us: u64,
+}
+
+/// Detail payload for write-back backpressure events.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackpressureActivatedDetail {
+    /// Dirty block ratio at activation.
+    pub dirty_ratio: f64,
+    /// Threshold that triggered backpressure.
+    pub threshold: f64,
+}
+
+/// Discard reason for dirty-block discard events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirtyDiscardReason {
+    /// Dirty state discarded because owning transaction aborted.
+    Abort,
+}
+
+/// Detail payload for dirty-block-discard events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirtyBlockDiscardedDetail {
+    /// Logical block identifier.
+    pub block_id: u64,
+    /// Owning transaction identifier.
+    pub txn_id: u64,
+    /// Classified discard reason.
+    pub reason: DirtyDiscardReason,
+}
+
+/// Detail payload for durability-overhead policy changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DurabilityPolicyChangedDetail {
+    /// Previous durability overhead ratio.
+    pub old_overhead: f64,
+    /// New durability overhead ratio.
+    pub new_overhead: f64,
+    /// Posterior alpha parameter used by policy update.
+    pub posterior_alpha: f64,
+    /// Posterior beta parameter used by policy update.
+    pub posterior_beta: f64,
+    /// Posterior mean probability used by policy update.
+    pub posterior_mean: f64,
+}
+
+/// Detail payload for symbol refresh policy mode changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshPolicyChangedDetail {
+    /// Block group whose refresh policy changed.
+    pub block_group: u32,
+    /// Previous policy name.
+    pub old_policy: String,
+    /// New policy name.
+    pub new_policy: String,
+}
+
 // ── Evidence record ─────────────────────────────────────────────────────────
 
 /// A single evidence record in the JSONL ledger.
@@ -205,6 +334,30 @@ pub struct EvidenceRecord {
     /// WAL recovery detail (present when `event_type` is `WalRecovery`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wal_recovery: Option<WalRecoveryDetail>,
+    /// Transaction-aborted detail (present when `event_type` is `TxnAborted`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub txn_aborted: Option<TxnAbortedDetail>,
+    /// Version-GC detail (present when `event_type` is `VersionGc`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_gc: Option<VersionGcDetail>,
+    /// Snapshot-advanced detail (present when `event_type` is `SnapshotAdvanced`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_advanced: Option<SnapshotAdvancedDetail>,
+    /// Flush-batch detail (present when `event_type` is `FlushBatch`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flush_batch: Option<FlushBatchDetail>,
+    /// Backpressure detail (present when `event_type` is `BackpressureActivated`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backpressure_activated: Option<BackpressureActivatedDetail>,
+    /// Dirty-discard detail (present when `event_type` is `DirtyBlockDiscarded`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dirty_block_discarded: Option<DirtyBlockDiscardedDetail>,
+    /// Durability-policy detail (present when `event_type` is `DurabilityPolicyChanged`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub durability_policy_changed: Option<DurabilityPolicyChangedDetail>,
+    /// Refresh-policy detail (present when `event_type` is `RefreshPolicyChanged`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_policy_changed: Option<RefreshPolicyChangedDetail>,
 }
 
 impl EvidenceRecord {
@@ -220,6 +373,14 @@ impl EvidenceRecord {
             policy: None,
             symbol_refresh: None,
             wal_recovery: None,
+            txn_aborted: None,
+            version_gc: None,
+            snapshot_advanced: None,
+            flush_batch: None,
+            backpressure_activated: None,
+            dirty_block_discarded: None,
+            durability_policy_changed: None,
+            refresh_policy_changed: None,
         }
     }
 
@@ -284,6 +445,70 @@ impl EvidenceRecord {
     pub fn wal_recovery(detail: WalRecoveryDetail) -> Self {
         let mut r = Self::base(EvidenceEventType::WalRecovery, 0);
         r.wal_recovery = Some(detail);
+        r
+    }
+
+    /// Create a transaction-aborted evidence record.
+    #[must_use]
+    pub fn txn_aborted(detail: TxnAbortedDetail) -> Self {
+        let mut r = Self::base(EvidenceEventType::TxnAborted, 0);
+        r.txn_aborted = Some(detail);
+        r
+    }
+
+    /// Create a version-GC evidence record.
+    #[must_use]
+    pub fn version_gc(detail: VersionGcDetail) -> Self {
+        let mut r = Self::base(EvidenceEventType::VersionGc, 0);
+        r.version_gc = Some(detail);
+        r
+    }
+
+    /// Create a snapshot-advanced evidence record.
+    #[must_use]
+    pub fn snapshot_advanced(detail: SnapshotAdvancedDetail) -> Self {
+        let mut r = Self::base(EvidenceEventType::SnapshotAdvanced, 0);
+        r.snapshot_advanced = Some(detail);
+        r
+    }
+
+    /// Create a flush-batch evidence record.
+    #[must_use]
+    pub fn flush_batch(detail: FlushBatchDetail) -> Self {
+        let mut r = Self::base(EvidenceEventType::FlushBatch, 0);
+        r.flush_batch = Some(detail);
+        r
+    }
+
+    /// Create a backpressure-activated evidence record.
+    #[must_use]
+    pub fn backpressure_activated(detail: BackpressureActivatedDetail) -> Self {
+        let mut r = Self::base(EvidenceEventType::BackpressureActivated, 0);
+        r.backpressure_activated = Some(detail);
+        r
+    }
+
+    /// Create a dirty-block-discarded evidence record.
+    #[must_use]
+    pub fn dirty_block_discarded(detail: DirtyBlockDiscardedDetail) -> Self {
+        let mut r = Self::base(EvidenceEventType::DirtyBlockDiscarded, 0);
+        r.dirty_block_discarded = Some(detail);
+        r
+    }
+
+    /// Create a durability-policy-changed evidence record.
+    #[must_use]
+    pub fn durability_policy_changed(detail: DurabilityPolicyChangedDetail) -> Self {
+        let mut r = Self::base(EvidenceEventType::DurabilityPolicyChanged, 0);
+        r.durability_policy_changed = Some(detail);
+        r
+    }
+
+    /// Create a refresh-policy-changed evidence record.
+    #[must_use]
+    pub fn refresh_policy_changed(detail: RefreshPolicyChangedDetail) -> Self {
+        let mut r = Self::base(EvidenceEventType::RefreshPolicyChanged, detail.block_group);
+        r.refresh_policy_changed = Some(detail);
         r
     }
 
@@ -471,6 +696,71 @@ mod tests {
         }
     }
 
+    fn sample_txn_aborted_detail() -> TxnAbortedDetail {
+        TxnAbortedDetail {
+            txn_id: 77,
+            reason: TxnAbortReason::SsiCycle,
+            detail: Some("rw-antidependency cycle".to_owned()),
+        }
+    }
+
+    fn sample_version_gc_detail() -> VersionGcDetail {
+        VersionGcDetail {
+            block_id: 42,
+            versions_freed: 3,
+            oldest_retained_commit_seq: 11,
+        }
+    }
+
+    fn sample_snapshot_advanced_detail() -> SnapshotAdvancedDetail {
+        SnapshotAdvancedDetail {
+            old_commit_seq: 100,
+            new_commit_seq: 140,
+            versions_eligible: 12,
+        }
+    }
+
+    fn sample_flush_batch_detail() -> FlushBatchDetail {
+        FlushBatchDetail {
+            blocks_flushed: 64,
+            bytes_written: 262_144,
+            flush_duration_us: 9_500,
+        }
+    }
+
+    fn sample_backpressure_detail() -> BackpressureActivatedDetail {
+        BackpressureActivatedDetail {
+            dirty_ratio: 0.83,
+            threshold: 0.8,
+        }
+    }
+
+    fn sample_dirty_block_discarded_detail() -> DirtyBlockDiscardedDetail {
+        DirtyBlockDiscardedDetail {
+            block_id: 17,
+            txn_id: 99,
+            reason: DirtyDiscardReason::Abort,
+        }
+    }
+
+    fn sample_durability_policy_changed_detail() -> DurabilityPolicyChangedDetail {
+        DurabilityPolicyChangedDetail {
+            old_overhead: 0.05,
+            new_overhead: 0.08,
+            posterior_alpha: 20.0,
+            posterior_beta: 980.0,
+            posterior_mean: 0.02,
+        }
+    }
+
+    fn sample_refresh_policy_changed_detail() -> RefreshPolicyChangedDetail {
+        RefreshPolicyChangedDetail {
+            block_group: 4,
+            old_policy: "lazy".to_owned(),
+            new_policy: "eager".to_owned(),
+        }
+    }
+
     #[test]
     fn corruption_detected_round_trip() {
         let record = EvidenceRecord::corruption_detected(0, sample_corruption_detail())
@@ -586,6 +876,111 @@ mod tests {
         let parsed = EvidenceRecord::from_json(&json).expect("deserialize");
         assert_eq!(parsed.event_type, EvidenceEventType::SymbolRefresh);
         assert_eq!(parsed.symbol_refresh, Some(sample_symbol_refresh_detail()));
+    }
+
+    #[test]
+    fn txn_aborted_round_trip() {
+        let record =
+            EvidenceRecord::txn_aborted(sample_txn_aborted_detail()).with_timestamp(7_000_000);
+        let json = record.to_json().expect("serialize");
+        let parsed = EvidenceRecord::from_json(&json).expect("deserialize");
+        assert_eq!(parsed.event_type, EvidenceEventType::TxnAborted);
+        assert_eq!(parsed.txn_aborted, Some(sample_txn_aborted_detail()));
+    }
+
+    #[test]
+    fn version_gc_round_trip() {
+        let record =
+            EvidenceRecord::version_gc(sample_version_gc_detail()).with_timestamp(8_000_000);
+        let json = record.to_json().expect("serialize");
+        let parsed = EvidenceRecord::from_json(&json).expect("deserialize");
+        assert_eq!(parsed.event_type, EvidenceEventType::VersionGc);
+        assert_eq!(parsed.version_gc, Some(sample_version_gc_detail()));
+    }
+
+    #[test]
+    fn snapshot_advanced_round_trip() {
+        let record = EvidenceRecord::snapshot_advanced(sample_snapshot_advanced_detail())
+            .with_timestamp(9_000_000);
+        let json = record.to_json().expect("serialize");
+        let parsed = EvidenceRecord::from_json(&json).expect("deserialize");
+        assert_eq!(parsed.event_type, EvidenceEventType::SnapshotAdvanced);
+        assert_eq!(
+            parsed.snapshot_advanced,
+            Some(sample_snapshot_advanced_detail())
+        );
+    }
+
+    #[test]
+    fn flush_batch_round_trip() {
+        let record =
+            EvidenceRecord::flush_batch(sample_flush_batch_detail()).with_timestamp(10_000_000);
+        let json = record.to_json().expect("serialize");
+        let parsed = EvidenceRecord::from_json(&json).expect("deserialize");
+        assert_eq!(parsed.event_type, EvidenceEventType::FlushBatch);
+        assert_eq!(parsed.flush_batch, Some(sample_flush_batch_detail()));
+    }
+
+    #[test]
+    fn backpressure_activated_round_trip() {
+        let record = EvidenceRecord::backpressure_activated(sample_backpressure_detail())
+            .with_timestamp(11_000_000);
+        let json = record.to_json().expect("serialize");
+        let parsed = EvidenceRecord::from_json(&json).expect("deserialize");
+        assert_eq!(parsed.event_type, EvidenceEventType::BackpressureActivated);
+        let detail = parsed
+            .backpressure_activated
+            .expect("backpressure detail present");
+        assert!((detail.dirty_ratio - 0.83).abs() < 1e-15);
+        assert!((detail.threshold - 0.8).abs() < 1e-15);
+    }
+
+    #[test]
+    fn dirty_block_discarded_round_trip() {
+        let record = EvidenceRecord::dirty_block_discarded(sample_dirty_block_discarded_detail())
+            .with_timestamp(12_000_000);
+        let json = record.to_json().expect("serialize");
+        let parsed = EvidenceRecord::from_json(&json).expect("deserialize");
+        assert_eq!(parsed.event_type, EvidenceEventType::DirtyBlockDiscarded);
+        assert_eq!(
+            parsed.dirty_block_discarded,
+            Some(sample_dirty_block_discarded_detail())
+        );
+    }
+
+    #[test]
+    fn durability_policy_changed_round_trip() {
+        let record =
+            EvidenceRecord::durability_policy_changed(sample_durability_policy_changed_detail())
+                .with_timestamp(13_000_000);
+        let json = record.to_json().expect("serialize");
+        let parsed = EvidenceRecord::from_json(&json).expect("deserialize");
+        assert_eq!(
+            parsed.event_type,
+            EvidenceEventType::DurabilityPolicyChanged
+        );
+        let detail = parsed
+            .durability_policy_changed
+            .expect("durability policy detail present");
+        assert!((detail.old_overhead - 0.05).abs() < 1e-15);
+        assert!((detail.new_overhead - 0.08).abs() < 1e-15);
+        assert!((detail.posterior_alpha - 20.0).abs() < 1e-15);
+        assert!((detail.posterior_beta - 980.0).abs() < 1e-15);
+        assert!((detail.posterior_mean - 0.02).abs() < 1e-15);
+    }
+
+    #[test]
+    fn refresh_policy_changed_round_trip() {
+        let record = EvidenceRecord::refresh_policy_changed(sample_refresh_policy_changed_detail())
+            .with_timestamp(14_000_000);
+        let json = record.to_json().expect("serialize");
+        let parsed = EvidenceRecord::from_json(&json).expect("deserialize");
+        assert_eq!(parsed.event_type, EvidenceEventType::RefreshPolicyChanged);
+        assert_eq!(
+            parsed.refresh_policy_changed,
+            Some(sample_refresh_policy_changed_detail())
+        );
+        assert_eq!(parsed.block_group, 4);
     }
 
     #[test]
@@ -723,6 +1118,14 @@ mod tests {
         assert!(!json.contains("\"symbol_refresh\""));
         assert!(!json.contains("\"block_range\""));
         assert!(!json.contains("\"wal_recovery\""));
+        assert!(!json.contains("\"txn_aborted\""));
+        assert!(!json.contains("\"version_gc\""));
+        assert!(!json.contains("\"snapshot_advanced\""));
+        assert!(!json.contains("\"flush_batch\""));
+        assert!(!json.contains("\"backpressure_activated\""));
+        assert!(!json.contains("\"dirty_block_discarded\""));
+        assert!(!json.contains("\"durability_policy_changed\""));
+        assert!(!json.contains("\"refresh_policy_changed\""));
     }
 
     #[test]

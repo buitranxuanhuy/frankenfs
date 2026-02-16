@@ -1801,12 +1801,28 @@ impl<D: BlockDevice> ArcCache<D> {
                     dirty_ratio,
                     critical_watermark = DIRTY_CRITICAL_WATERMARK
                 );
+                warn!(
+                    event = "backpressure_activated",
+                    source = "commit_staged_txn",
+                    level = "critical",
+                    txn_id = txn_id.0,
+                    dirty_ratio,
+                    threshold = DIRTY_CRITICAL_WATERMARK
+                );
             } else if dirty_ratio > DIRTY_HIGH_WATERMARK {
                 warn!(
                     event = "flush_backpressure_high",
                     txn_id = txn_id.0,
                     dirty_ratio,
                     high_watermark = DIRTY_HIGH_WATERMARK
+                );
+                warn!(
+                    event = "backpressure_activated",
+                    source = "commit_staged_txn",
+                    level = "high",
+                    txn_id = txn_id.0,
+                    dirty_ratio,
+                    threshold = DIRTY_HIGH_WATERMARK
                 );
             }
         }
@@ -1833,26 +1849,36 @@ impl<D: BlockDevice> ArcCache<D> {
     /// Returns the number of discarded staged blocks.
     #[must_use]
     pub fn abort_staged_txn(&self, txn_id: TxnId) -> usize {
-        let discarded_blocks = {
+        let discarded_block_ids = {
             let mut guard = self.state.lock();
             let staged = guard.take_staged_txn(txn_id);
-            let discarded_blocks = staged.len();
+            let mut discarded = Vec::new();
             for block in staged.keys() {
                 let is_same_txn_inflight = guard.dirty.entry(*block).is_some_and(|entry| {
                     entry.txn_id == txn_id && matches!(entry.state, DirtyState::InFlight)
                 });
                 if is_same_txn_inflight {
                     guard.clear_dirty(*block);
+                    discarded.push(block.0);
                 }
             }
-            discarded_blocks
+            discarded
         };
+        let discarded_blocks = discarded_block_ids.len();
         if discarded_blocks > 0 {
             warn!(
                 event = "mvcc_discard_aborted_dirty",
                 txn_id = txn_id.0,
                 discarded_blocks
             );
+            for block_id in discarded_block_ids {
+                warn!(
+                    event = "dirty_block_discarded",
+                    block_id,
+                    txn_id = txn_id.0,
+                    reason = "abort"
+                );
+            }
         }
         discarded_blocks
     }
@@ -1923,12 +1949,28 @@ impl<D: BlockDevice> ArcCache<D> {
                                 dirty_ratio = committed_dirty_ratio,
                                 critical_watermark = config.critical_watermark
                             );
+                            warn!(
+                                event = "backpressure_activated",
+                                source = "flush_daemon",
+                                level = "critical",
+                                cycle_seq,
+                                dirty_ratio = committed_dirty_ratio,
+                                threshold = config.critical_watermark
+                            );
                         } else {
                             warn!(
                                 event = "flush_backpressure_high",
                                 cycle_seq,
                                 dirty_ratio = committed_dirty_ratio,
                                 high_watermark = config.high_watermark
+                            );
+                            warn!(
+                                event = "backpressure_activated",
+                                source = "flush_daemon",
+                                level = "high",
+                                cycle_seq,
+                                dirty_ratio = committed_dirty_ratio,
+                                threshold = config.high_watermark
                             );
                         }
                         cache.flush_dirty(&cx).map(|()| committed_blocks)
@@ -2318,6 +2360,12 @@ impl<D: BlockDevice> ArcCache<D> {
             remaining_dirty_blocks = metrics.dirty_blocks,
             remaining_dirty_ratio = metrics.dirty_ratio()
         );
+        info!(
+            event = "flush_batch",
+            blocks_flushed = flushes.len(),
+            bytes_written = flush_bytes,
+            flush_duration_us = started.elapsed().as_micros()
+        );
 
         Ok(flushes.len())
     }
@@ -2396,6 +2444,12 @@ impl<D: BlockDevice> ArcCache<D> {
             remaining_dirty_blocks = metrics.dirty_blocks,
             remaining_dirty_bytes = metrics.dirty_bytes,
             remaining_dirty_ratio = metrics.dirty_ratio()
+        );
+        info!(
+            event = "flush_batch",
+            blocks_flushed = flushes.len(),
+            bytes_written = flush_bytes,
+            flush_duration_us = started.elapsed().as_micros()
         );
 
         Ok(())

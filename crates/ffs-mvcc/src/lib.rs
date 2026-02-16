@@ -537,6 +537,15 @@ impl MvccStore {
         for block in txn.writes.keys() {
             let latest = self.latest_commit_seq(*block);
             if latest > txn.snapshot.high {
+                warn!(
+                    target: "ffs::mvcc::evidence",
+                    event = "txn_aborted",
+                    txn_id = txn.id.0,
+                    reason = "fcw_conflict",
+                    block = block.0,
+                    snapshot_commit_seq = txn.snapshot.high.0,
+                    observed_commit_seq = latest.0
+                );
                 return Err(CommitError::Conflict {
                     block: *block,
                     snapshot: txn.snapshot.high,
@@ -544,7 +553,7 @@ impl MvccStore {
                 });
             }
             if let Some(cap) = chain_cap {
-                self.enforce_chain_pressure(*block, cap)?;
+                self.enforce_chain_pressure(txn.id, *block, cap)?;
             }
         }
 
@@ -606,6 +615,15 @@ impl MvccStore {
         for block in txn.writes.keys() {
             let latest = self.latest_commit_seq(*block);
             if latest > txn.snapshot.high {
+                warn!(
+                    target: "ffs::mvcc::evidence",
+                    event = "txn_aborted",
+                    txn_id = txn.id.0,
+                    reason = "fcw_conflict",
+                    block = block.0,
+                    snapshot_commit_seq = txn.snapshot.high.0,
+                    observed_commit_seq = latest.0
+                );
                 return Err(CommitError::Conflict {
                     block: *block,
                     snapshot: txn.snapshot.high,
@@ -613,7 +631,7 @@ impl MvccStore {
                 });
             }
             if let Some(cap) = chain_cap {
-                self.enforce_chain_pressure(*block, cap)?;
+                self.enforce_chain_pressure(txn.id, *block, cap)?;
             }
         }
 
@@ -756,6 +774,16 @@ impl MvccStore {
                     action = "abort",
                     "ssi_conflict"
                 );
+                warn!(
+                    target: "ffs::mvcc::evidence",
+                    event = "txn_aborted",
+                    txn_id = txn.id.0,
+                    reason = "ssi_cycle",
+                    block = block.0,
+                    read_version = read_version.0,
+                    write_version = write_version.0,
+                    concurrent_txn = concurrent_txn.0
+                );
                 return Err(CommitError::SsiConflict {
                     pivot_block: block,
                     read_version,
@@ -799,6 +827,7 @@ impl MvccStore {
 
     fn enforce_chain_pressure(
         &mut self,
+        txn_id: TxnId,
         block: BlockNumber,
         max_len: usize,
     ) -> Result<(), CommitError> {
@@ -833,6 +862,7 @@ impl MvccStore {
             let new_watermark = self
                 .watermark()
                 .unwrap_or_else(|| self.current_snapshot().high);
+            let versions_eligible = self.versions_eligible_at_watermark(new_watermark);
             info!(
                 target: "ffs::mvcc::gc",
                 block = block.0,
@@ -840,6 +870,14 @@ impl MvccStore {
                 remaining_refs,
                 new_watermark = new_watermark.0,
                 "chain_pressure_force_advance_oldest_snapshot"
+            );
+            info!(
+                target: "ffs::mvcc::evidence",
+                event = "snapshot_advanced",
+                old_commit_seq = forced_snapshot.0,
+                new_commit_seq = new_watermark.0,
+                versions_eligible,
+                trigger = "chain_pressure"
             );
             if !self.chain_trim_blocked_by_snapshot(block, new_watermark) {
                 return Ok(());
@@ -854,6 +892,16 @@ impl MvccStore {
             critical_len,
             watermark = watermark.0,
             "chain_backpressure_reject"
+        );
+        warn!(
+            target: "ffs::mvcc::evidence",
+            event = "txn_aborted",
+            txn_id = txn_id.0,
+            reason = "timeout",
+            block = block.0,
+            chain_len,
+            cap = max_len,
+            watermark = watermark.0
         );
         Err(CommitError::ChainBackpressure {
             block,
@@ -978,6 +1026,22 @@ impl MvccStore {
         }
     }
 
+    fn versions_eligible_at_watermark(&self, watermark: CommitSeq) -> u64 {
+        self.versions
+            .values()
+            .map(|versions| {
+                if versions.len() <= 1 {
+                    return 0_u64;
+                }
+                let mut trim = 0_usize;
+                while trim + 1 < versions.len() && versions[trim + 1].commit_seq <= watermark {
+                    trim += 1;
+                }
+                u64::try_from(trim).unwrap_or(u64::MAX)
+            })
+            .sum()
+    }
+
     fn collect_cow_deferred_frees(
         cow_writes: &BTreeMap<BlockNumber, CowRewriteIntent>,
         mut cow_orphans: BTreeSet<BlockNumber>,
@@ -1082,7 +1146,7 @@ impl MvccStore {
 
     pub fn prune_versions_older_than(&mut self, watermark: CommitSeq) {
         let mut retired_versions = Vec::new();
-        for versions in self.versions.values_mut() {
+        for (block, versions) in &mut self.versions {
             if versions.len() <= 1 {
                 continue;
             }
@@ -1099,6 +1163,15 @@ impl MvccStore {
             if keep_from > 0 {
                 retired_versions.extend(versions.drain(0..keep_from));
                 Self::ensure_chain_head_full(versions);
+                let oldest_retained_commit_seq =
+                    versions.first().map_or(watermark.0, |v| v.commit_seq.0);
+                info!(
+                    target: "ffs::mvcc::evidence",
+                    event = "version_gc",
+                    block_id = block.0,
+                    versions_freed = u64::try_from(keep_from).unwrap_or(u64::MAX),
+                    oldest_retained_commit_seq
+                );
             }
         }
         if !retired_versions.is_empty() {
@@ -1150,6 +1223,7 @@ impl MvccStore {
     /// was already fully released (a logic error by the caller, but not
     /// fatal).
     pub fn release_snapshot(&mut self, snapshot: Snapshot) -> bool {
+        let old_watermark = self.watermark();
         if let Some(count) = self.active_snapshots.get_mut(&snapshot.high) {
             *count -= 1;
             let count_after = *count;
@@ -1165,6 +1239,22 @@ impl MvccStore {
                     ref_count_after = count_after,
                     "snapshot_release (inline)"
                 );
+            }
+            if let Some(old_commit_seq) = old_watermark.map(|wm| wm.0) {
+                let new_watermark = self
+                    .watermark()
+                    .unwrap_or_else(|| self.current_snapshot().high);
+                if new_watermark.0 > old_commit_seq {
+                    let versions_eligible = self.versions_eligible_at_watermark(new_watermark);
+                    info!(
+                        target: "ffs::mvcc::evidence",
+                        event = "snapshot_advanced",
+                        old_commit_seq,
+                        new_commit_seq = new_watermark.0,
+                        versions_eligible,
+                        trigger = "release_snapshot"
+                    );
+                }
             }
             true
         } else {

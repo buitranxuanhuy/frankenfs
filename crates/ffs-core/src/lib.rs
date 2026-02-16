@@ -6204,6 +6204,18 @@ mod tests {
     }
 
     #[test]
+    fn open_fs_rejects_bad_superblock_magic() {
+        let mut image = build_ext4_image(2);
+        let sb_off = EXT4_SUPERBLOCK_OFFSET;
+        image[sb_off + 0x38..sb_off + 0x3A].copy_from_slice(&0_u16.to_le_bytes());
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+
+        let err = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap_err();
+        assert!(matches!(err, FfsError::Format(_)));
+    }
+
+    #[test]
     fn open_fs_skip_validation() {
         // Build an image with bad features (should fail validation but pass with skip)
         let mut image = build_ext4_image(2);
@@ -6538,6 +6550,12 @@ mod tests {
         image
     }
 
+    fn set_group_desc_free_counts(image: &mut [u8], free_blocks: u16, free_inodes: u16) {
+        let gd_off: usize = 4096;
+        image[gd_off + 0x0C..gd_off + 0x0E].copy_from_slice(&free_blocks.to_le_bytes());
+        image[gd_off + 0x0E..gd_off + 0x10].copy_from_slice(&free_inodes.to_le_bytes());
+    }
+
     fn write_jbd2_header(block: &mut [u8], block_type: u32, sequence: u32) {
         const JBD2_MAGIC: u32 = 0xC03B_3998;
         block[0..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
@@ -6691,6 +6709,100 @@ mod tests {
         assert_eq!(gd.inode_table, 4);
     }
 
+    #[test]
+    fn read_inode_rejects_corrupted_group_desc_inode_table_pointer() {
+        let mut image = build_ext4_image_with_inode();
+        let gd_off: usize = 4096;
+        image[gd_off + 8..gd_off + 12].copy_from_slice(&10_000_u32.to_le_bytes());
+
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let err = fs.read_inode(&cx, InodeNumber(2)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FfsError::Io(_) | FfsError::Corruption { .. } | FfsError::InvalidGeometry(_)
+            ),
+            "unexpected error variant: {err:?}"
+        );
+    }
+
+    #[test]
+    fn read_block_bitmap_rejects_corrupted_group_desc_pointer() {
+        let mut image = build_ext4_image_with_inode();
+        let gd_off: usize = 4096;
+        image[gd_off..gd_off + 4].copy_from_slice(&10_000_u32.to_le_bytes());
+
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let err = fs.read_block_bitmap(&cx, GroupNumber(0)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FfsError::Io(_) | FfsError::Corruption { .. } | FfsError::InvalidGeometry(_)
+            ),
+            "unexpected error variant: {err:?}"
+        );
+    }
+
+    #[test]
+    fn free_space_summary_detects_block_bitmap_corruption() {
+        let mut clean_image = build_ext4_image_with_inode();
+        set_group_desc_free_counts(&mut clean_image, 64, 128);
+
+        let cx = Cx::for_testing();
+        let fs_clean = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(clean_image.clone())),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let baseline = fs_clean.free_space_summary(&cx).unwrap();
+        assert!(!baseline.blocks_mismatch);
+        assert!(!baseline.inodes_mismatch);
+
+        clean_image[2 * 4096] |= 0x01; // Corrupt block bitmap: consume one free block bit.
+        let fs_corrupt = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(clean_image)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let summary = fs_corrupt.free_space_summary(&cx).unwrap();
+        assert!(summary.blocks_mismatch);
+        assert!(!summary.inodes_mismatch);
+    }
+
+    #[test]
+    fn free_space_summary_detects_inode_bitmap_corruption() {
+        let mut clean_image = build_ext4_image_with_inode();
+        set_group_desc_free_counts(&mut clean_image, 64, 128);
+
+        let cx = Cx::for_testing();
+        let fs_clean = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(clean_image.clone())),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let baseline = fs_clean.free_space_summary(&cx).unwrap();
+        assert!(!baseline.blocks_mismatch);
+        assert!(!baseline.inodes_mismatch);
+
+        clean_image[3 * 4096] |= 0x01; // Corrupt inode bitmap: consume one free inode bit.
+        let fs_corrupt = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(clean_image)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let summary = fs_corrupt.free_space_summary(&cx).unwrap();
+        assert!(!summary.blocks_mismatch);
+        assert!(summary.inodes_mismatch);
+    }
+
     // ── Device-based extent mapping tests ─────────────────────────────
 
     /// Build an ext4 image with file inodes that have extent trees.
@@ -6824,6 +6936,43 @@ mod tests {
         let inode = fs.read_inode(&cx, InodeNumber(12)).unwrap();
         let phys = fs.resolve_extent(&cx, &inode, 0).unwrap();
         assert_eq!(phys, Some(12));
+    }
+
+    #[test]
+    fn resolve_extent_index_rejects_corrupted_child_depth() {
+        let mut image = build_ext4_image_with_extents();
+        let child_block_off = 11 * 4096;
+        image[child_block_off + 6..child_block_off + 8].copy_from_slice(&1_u16.to_le_bytes());
+
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let inode = fs.read_inode(&cx, InodeNumber(12)).unwrap();
+        let err = fs.resolve_extent(&cx, &inode, 0).unwrap_err();
+        assert!(
+            matches!(err, FfsError::Corruption { .. } | FfsError::Format(_)),
+            "unexpected error variant: {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_extent_rejects_corrupted_inode_extent_root() {
+        let mut image = build_ext4_image_with_extents();
+        let inode11_off: usize = 4 * 4096 + 10 * 256;
+        let extent_root_off = inode11_off + 0x28;
+        image[extent_root_off..extent_root_off + 2].copy_from_slice(&0_u16.to_le_bytes());
+
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let inode = fs.read_inode(&cx, InodeNumber(11)).unwrap();
+        let err = fs.resolve_extent(&cx, &inode, 0).unwrap_err();
+        assert!(
+            matches!(err, FfsError::Corruption { .. } | FfsError::Format(_)),
+            "unexpected error variant: {err:?}"
+        );
     }
 
     #[test]
