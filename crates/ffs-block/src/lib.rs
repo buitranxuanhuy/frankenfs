@@ -440,6 +440,38 @@ impl CacheMetrics {
     }
 }
 
+/// Memory pressure levels used to adapt cache target size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryPressure {
+    None,
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl MemoryPressure {
+    #[must_use]
+    fn target_ratio(self) -> f64 {
+        match self {
+            Self::None => 1.0,
+            Self::Low => 0.9,
+            Self::Medium => 0.7,
+            Self::High => 0.5,
+            Self::Critical => 0.2,
+        }
+    }
+}
+
+/// Snapshot of cache pressure state.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CachePressureReport {
+    pub current_size: usize,
+    pub target_size: usize,
+    pub dirty_count: usize,
+    pub eviction_rate: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "s3fifo", allow(dead_code))]
 enum ArcList {
@@ -564,7 +596,12 @@ impl DirtyTracker {
 
 #[derive(Debug)]
 struct ArcState {
+    /// Active target capacity in blocks (may be reduced under pressure).
     capacity: usize,
+    /// Nominal maximum capacity configured at cache creation.
+    max_capacity: usize,
+    /// Last applied memory pressure level.
+    pressure_level: MemoryPressure,
     /// Target size for the T1 list.
     #[cfg(not(feature = "s3fifo"))]
     p: usize,
@@ -600,6 +637,12 @@ struct ArcState {
     access_count: HashMap<BlockNumber, u8>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PressureEvictionBatch {
+    evicted_blocks: usize,
+    evicted_bytes: usize,
+}
+
 impl ArcState {
     #[cfg(feature = "s3fifo")]
     fn s3_capacity_split(capacity: usize) -> (usize, usize, usize) {
@@ -618,6 +661,8 @@ impl ArcState {
         let (small_capacity, main_capacity, ghost_capacity) = Self::s3_capacity_split(capacity);
         Self {
             capacity,
+            max_capacity: capacity,
+            pressure_level: MemoryPressure::None,
             #[cfg(not(feature = "s3fifo"))]
             p: 0,
             t1: VecDeque::new(),
@@ -680,6 +725,87 @@ impl ArcState {
                 }
             },
         }
+    }
+
+    fn pressure_report(&self) -> CachePressureReport {
+        let total_accesses = self.hits.saturating_add(self.misses);
+        let eviction_rate = if total_accesses == 0 {
+            0.0
+        } else {
+            self.evictions as f64 / total_accesses as f64
+        };
+        CachePressureReport {
+            current_size: self.resident_len(),
+            target_size: self.capacity,
+            dirty_count: self.dirty.dirty_count(),
+            eviction_rate,
+        }
+    }
+
+    fn set_pressure_level(&mut self, pressure: MemoryPressure) {
+        self.pressure_level = pressure;
+        let requested = ((self.max_capacity as f64) * pressure.target_ratio()).round() as usize;
+        let target = requested.clamp(1, self.max_capacity);
+        self.set_target_capacity(target);
+    }
+
+    fn restore_target_capacity(&mut self) {
+        self.set_target_capacity(self.max_capacity);
+    }
+
+    fn set_target_capacity(&mut self, target: usize) {
+        self.capacity = target.clamp(1, self.max_capacity);
+    }
+
+    fn trim_to_capacity(&mut self) -> PressureEvictionBatch {
+        let mut batch = PressureEvictionBatch::default();
+        while self.resident_len() > self.capacity {
+            let Some(victim) = self.next_pressure_victim() else {
+                // All candidates are dirty; keep data durable and stop shrinking.
+                break;
+            };
+            let from_t1 = Self::remove_from_list(&mut self.t1, victim);
+            let from_t2 = if from_t1 {
+                false
+            } else {
+                Self::remove_from_list(&mut self.t2, victim)
+            };
+            if !from_t1 && !from_t2 {
+                let _ = self.loc.remove(&victim);
+                continue;
+            }
+            let freed_bytes = self.resident.get(&victim).map_or(0, Vec::len);
+            if from_t1 {
+                self.b1.push_back(victim);
+                self.loc.insert(victim, ArcList::B1);
+            } else {
+                self.b2.push_back(victim);
+                self.loc.insert(victim, ArcList::B2);
+            }
+            self.evictions = self.evictions.saturating_add(1);
+            self.evict_resident(victim);
+            batch.evicted_blocks = batch.evicted_blocks.saturating_add(1);
+            batch.evicted_bytes = batch.evicted_bytes.saturating_add(freed_bytes);
+        }
+        while self.b1.len() > self.capacity {
+            if let Some(victim) = self.b1.pop_front() {
+                let _ = self.loc.remove(&victim);
+            }
+        }
+        while self.b2.len() > self.capacity {
+            if let Some(victim) = self.b2.pop_front() {
+                let _ = self.loc.remove(&victim);
+            }
+        }
+        batch
+    }
+
+    fn next_pressure_victim(&self) -> Option<BlockNumber> {
+        self.t1
+            .iter()
+            .copied()
+            .find(|block| !self.is_dirty(*block))
+            .or_else(|| self.t2.iter().copied().find(|block| !self.is_dirty(*block)))
     }
 
     fn remove_from_list(list: &mut VecDeque<BlockNumber>, key: BlockNumber) -> bool {
@@ -1488,6 +1614,91 @@ impl<D: BlockDevice> ArcCache<D> {
     #[must_use]
     pub fn write_policy(&self) -> ArcWritePolicy {
         self.write_policy
+    }
+
+    /// Apply a memory-pressure signal and adjust cache target size.
+    ///
+    /// This reduces (or restores) the active target capacity and evicts clean
+    /// cold entries when possible. Dirty entries are never evicted.
+    #[must_use]
+    pub fn memory_pressure_callback(&self, pressure: MemoryPressure) -> CachePressureReport {
+        let (old_pressure, old_target, new_target, batch, report) = {
+            let mut guard = self.state.lock();
+            let old_pressure = guard.pressure_level;
+            let old_target = guard.capacity;
+            guard.set_pressure_level(pressure);
+            let batch = guard.trim_to_capacity();
+            (
+                old_pressure,
+                old_target,
+                guard.capacity,
+                batch,
+                guard.pressure_report(),
+            )
+        };
+
+        if old_pressure != pressure {
+            info!(
+                event = "cache_pressure_level_change",
+                old_level = ?old_pressure,
+                new_level = ?pressure
+            );
+        }
+        if old_target != new_target {
+            debug!(event = "cache_target_size_change", old_target, new_target);
+        }
+        if batch.evicted_blocks > 0 {
+            debug!(
+                event = "cache_pressure_evict_batch",
+                evicted_blocks = batch.evicted_blocks,
+                evicted_bytes = batch.evicted_bytes
+            );
+        }
+        report
+    }
+
+    /// Restore cache target size to the configured nominal capacity.
+    #[must_use]
+    pub fn restore_target_size(&self) -> CachePressureReport {
+        let (old_level, old_target, new_target, batch, report) = {
+            let mut guard = self.state.lock();
+            let old_level = guard.pressure_level;
+            let old_target = guard.capacity;
+            guard.pressure_level = MemoryPressure::None;
+            guard.restore_target_capacity();
+            let batch = guard.trim_to_capacity();
+            (
+                old_level,
+                old_target,
+                guard.capacity,
+                batch,
+                guard.pressure_report(),
+            )
+        };
+        if old_level != MemoryPressure::None {
+            info!(
+                event = "cache_pressure_level_change",
+                old_level = ?old_level,
+                new_level = ?MemoryPressure::None
+            );
+        }
+        if old_target != new_target {
+            debug!(event = "cache_target_size_change", old_target, new_target);
+        }
+        if batch.evicted_blocks > 0 {
+            debug!(
+                event = "cache_pressure_evict_batch",
+                evicted_blocks = batch.evicted_blocks,
+                evicted_bytes = batch.evicted_bytes
+            );
+        }
+        report
+    }
+
+    /// Current cache pressure snapshot.
+    #[must_use]
+    pub fn pressure_report(&self) -> CachePressureReport {
+        self.state.lock().pressure_report()
     }
 
     fn dirty_state_counts(&self) -> (usize, usize) {
@@ -3101,6 +3312,99 @@ mod tests {
         assert_eq!(m.misses, 1);
         assert_eq!(m.hits, 1);
         assert!((m.hit_ratio() - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn arc_cache_pressure_reduces_and_restores_target_size() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 16);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let cache = ArcCache::new(dev, 10).expect("cache");
+
+        for block in 0..6_u64 {
+            let _ = cache
+                .read_block(&cx, BlockNumber(block))
+                .expect("warm read");
+        }
+
+        let reduced = cache.memory_pressure_callback(MemoryPressure::High);
+        assert_eq!(reduced.target_size, 5);
+        assert_eq!(cache.metrics().capacity, 5);
+
+        let restored = cache.restore_target_size();
+        assert_eq!(restored.target_size, 10);
+        assert_eq!(cache.metrics().capacity, 10);
+    }
+
+    #[test]
+    fn arc_cache_pressure_prefers_evicting_cold_clean_entries() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 8);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let cache = ArcCache::new(dev, 4).expect("cache");
+
+        // Build ARC state where block 0 is hot (in T2) and 1/2/3 are colder (in T1).
+        for block in [0_u64, 1, 2, 3] {
+            let _ = cache.read_block(&cx, BlockNumber(block)).expect("read");
+        }
+        let _ = cache.read_block(&cx, BlockNumber(0)).expect("hot touch");
+
+        let report = cache.memory_pressure_callback(MemoryPressure::High);
+        assert_eq!(report.target_size, 2);
+        assert!(report.current_size <= 2);
+
+        let before = cache.metrics();
+        let _ = cache
+            .read_block(&cx, BlockNumber(0))
+            .expect("read hot block");
+        let after_hot = cache.metrics();
+        assert_eq!(
+            after_hot.hits,
+            before.hits.saturating_add(1),
+            "hot block should remain resident under pressure"
+        );
+
+        let _ = cache
+            .read_block(&cx, BlockNumber(1))
+            .expect("read colder block");
+        let after_cold = cache.metrics();
+        assert_eq!(
+            after_cold.misses,
+            after_hot.misses.saturating_add(1),
+            "cold block should be evicted first under pressure"
+        );
+    }
+
+    #[test]
+    fn arc_cache_pressure_preserves_dirty_entries_until_flushed() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 32);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let cache = ArcCache::new_with_policy(dev, 10, ArcWritePolicy::WriteBack).expect("cache");
+
+        for block in 0..6_u64 {
+            let payload = vec![u8::try_from(block).expect("block fits u8"); 4096];
+            cache
+                .write_block(&cx, BlockNumber(block), &payload)
+                .expect("write");
+        }
+
+        let report = cache.memory_pressure_callback(MemoryPressure::Critical);
+        let metrics = cache.metrics();
+        assert_eq!(report.target_size, 2);
+        assert_eq!(metrics.capacity, 2);
+        assert_eq!(metrics.dirty_blocks, 6);
+        assert!(
+            metrics.resident > metrics.capacity,
+            "dirty entries must not be evicted under pressure"
+        );
+
+        cache.flush_dirty(&cx).expect("flush dirty");
+        let post_flush_report = cache.memory_pressure_callback(MemoryPressure::Critical);
+        let post_flush_metrics = cache.metrics();
+        assert_eq!(post_flush_metrics.dirty_blocks, 0);
+        assert!(post_flush_metrics.resident <= post_flush_metrics.capacity);
+        assert!(post_flush_report.current_size <= post_flush_report.target_size);
     }
 
     // ── Concurrency stress tests ────────────────────────────────────────
