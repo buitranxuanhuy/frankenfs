@@ -5,7 +5,7 @@
 # - create a fresh base image and copy to a work image
 # - mount the work image read-write and execute core write operations
 # - cleanly unmount and remount read-only to verify persistence
-# - best-effort crash mini-harness with abrupt mount-process termination
+# - deterministic SIGKILL crash/recovery harness with baseline + in-flight checks
 
 cd "$(dirname "$0")/../.."
 REPO_ROOT="$(pwd)"
@@ -22,6 +22,9 @@ e2e_print_env
 CURRENT_MOUNT_PID=""
 CURRENT_MOUNT_LOG=""
 CURRENT_MOUNT_POINT=""
+BASELINE_FILE_COUNT="${BASELINE_FILE_COUNT:-500}"
+CRASH_WRITER_RUNTIME_SECS="${CRASH_WRITER_RUNTIME_SECS:-2}"
+CRASH_WRITER_SLEEP_SECS="${CRASH_WRITER_SLEEP_SECS:-0.01}"
 
 create_rw_ext4_image() {
     local image_path="$1"
@@ -193,6 +196,31 @@ stop_mount() {
     CURRENT_MOUNT_POINT=""
 }
 
+require_python3_for_crash_phase() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        e2e_skip "python3 is required for deterministic crash/recovery validation"
+    fi
+}
+
+wait_for_pid_exit() {
+    local pid="$1"
+    local timeout_seconds="${2:-10}"
+    local label="${3:-process}"
+    local elapsed_ticks=0
+
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 0.2
+        elapsed_ticks=$((elapsed_ticks + 1))
+        if [[ $elapsed_ticks -ge $((timeout_seconds * 5)) ]]; then
+            e2e_log "$label did not exit after ${timeout_seconds}s; sending SIGKILL"
+            kill -9 "$pid" 2>/dev/null || true
+            break
+        fi
+    done
+
+    wait "$pid" 2>/dev/null || true
+}
+
 e2e_step "Phase 1: Build ffs-cli"
 e2e_assert cargo build -p ffs-cli --release
 
@@ -274,53 +302,289 @@ if mountpoint -q "$MOUNT_RO" 2>/dev/null; then
     e2e_fail "Failed to unmount RO mount point: $MOUNT_RO"
 fi
 
-e2e_step "Phase 5: best-effort crash/recovery mini-harness"
+e2e_step "Phase 5: deterministic SIGKILL crash/recovery harness"
 MOUNT_CRASH="$E2E_TEMP_DIR/mnt_crash"
 if start_mount rw "$WORK_IMAGE" "$MOUNT_CRASH" 1; then
-    e2e_assert bash -lc "printf 'crash-path-write\n' > '$MOUNT_CRASH/crash_marker.txt'"
-    e2e_assert_file "$MOUNT_CRASH/crash_marker.txt"
-    HAVE_FSYNC_MARKER=0
-    if command -v python3 >/dev/null 2>&1; then
-        e2e_assert python3 -c "import os; p='$MOUNT_CRASH/fsync_marker.txt'; f=open(p, 'wb'); f.write(b'fsync-path-write\\n'); f.flush(); os.fsync(f.fileno()); f.close()"
-        e2e_assert_file "$MOUNT_CRASH/fsync_marker.txt"
-        HAVE_FSYNC_MARKER=1
-    else
-        e2e_log "python3 unavailable; skipping explicit fsync marker write"
-    fi
-    e2e_assert bash -lc "printf 'non-fsync-write\n' > '$MOUNT_CRASH/non_fsync_marker.txt'"
-    e2e_assert_file "$MOUNT_CRASH/non_fsync_marker.txt"
+    require_python3_for_crash_phase
 
+    CRASH_ARTIFACT_DIR="$E2E_LOG_DIR/sigkill_crash"
+    e2e_assert mkdir -p "$CRASH_ARTIFACT_DIR"
+    BASELINE_MANIFEST="$CRASH_ARTIFACT_DIR/baseline_checksums.json"
+    INFLIGHT_EVENTS="$CRASH_ARTIFACT_DIR/inflight_events.jsonl"
+    INFLIGHT_WRITER_LOG="$CRASH_ARTIFACT_DIR/inflight_writer.log"
+    CRASH_VERIFY_REPORT="$CRASH_ARTIFACT_DIR/recovery_verify_report.json"
+
+    e2e_step "Phase 5.1: write + fsync baseline dataset"
+    e2e_log "Baseline file count: $BASELINE_FILE_COUNT"
+    e2e_assert python3 - "$MOUNT_CRASH" "$BASELINE_MANIFEST" "$BASELINE_FILE_COUNT" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import sys
+
+mount = pathlib.Path(sys.argv[1])
+manifest = pathlib.Path(sys.argv[2])
+count = int(sys.argv[3])
+root = mount / "sigkill_baseline"
+root.mkdir(parents=True, exist_ok=True)
+checksums: dict[str, str] = {}
+
+for idx in range(count):
+    rel = f"sigkill_baseline/base_{idx:04d}.txt"
+    payload = (
+        f"baseline:{idx:04d}\n".encode("utf-8")
+        + bytes(((idx + off) % 251 for off in range(1536)))
+    )
+    path = mount / rel
+    with path.open("wb") as fh:
+        fh.write(payload)
+        fh.flush()
+        os.fsync(fh.fileno())
+    checksums[rel] = hashlib.sha256(payload).hexdigest()
+
+dir_fd = os.open(str(root), os.O_RDONLY)
+try:
+    os.fsync(dir_fd)
+finally:
+    os.close(dir_fd)
+
+manifest.write_text(json.dumps(checksums, indent=2, sort_keys=True), encoding="utf-8")
+PY
+    e2e_assert_file "$BASELINE_MANIFEST"
+    e2e_run wc -l "$BASELINE_MANIFEST"
+
+    e2e_step "Phase 5.2: start continuous in-flight writer"
+    python3 - "$MOUNT_CRASH" "$INFLIGHT_EVENTS" "$CRASH_WRITER_SLEEP_SECS" >"$INFLIGHT_WRITER_LOG" 2>&1 <<'PY' &
+import hashlib
+import json
+import os
+import pathlib
+import sys
+import time
+
+mount = pathlib.Path(sys.argv[1])
+event_path = pathlib.Path(sys.argv[2])
+sleep_seconds = float(sys.argv[3])
+root = mount / "sigkill_inflight"
+root.mkdir(parents=True, exist_ok=True)
+event_path.parent.mkdir(parents=True, exist_ok=True)
+
+def payload_for(idx: int, mode: str) -> bytes:
+    header = f"idx={idx:06d};mode={mode};".encode("utf-8")
+    body = bytes(((idx * 17 + off) % 251 for off in range(4096 - len(header))))
+    return header + body
+
+with event_path.open("a", encoding="utf-8") as events:
+    idx = 0
+    while True:
+        mode = "fsync" if idx % 3 == 0 else "async"
+        rel = f"sigkill_inflight/file_{idx:06d}_{mode}.bin"
+        path = mount / rel
+        payload = payload_for(idx, mode)
+        events.write(
+            json.dumps(
+                {
+                    "event": "planned",
+                    "path": rel,
+                    "idx": idx,
+                    "mode": mode,
+                    "size": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        events.flush()
+
+        try:
+            with path.open("wb") as fh:
+                split = len(payload) // 2
+                fh.write(payload[:split])
+                fh.flush()
+                time.sleep(sleep_seconds)
+                fh.write(payload[split:])
+                fh.flush()
+                if mode == "fsync":
+                    os.fsync(fh.fileno())
+                    events.write(
+                        json.dumps({"event": "fsync_done", "path": rel}, sort_keys=True) + "\n"
+                    )
+                    events.flush()
+            events.write(json.dumps({"event": "write_done", "path": rel}, sort_keys=True) + "\n")
+            events.flush()
+        except OSError as exc:
+            events.write(
+                json.dumps(
+                    {"event": "writer_exit", "idx": idx, "error": str(exc)},
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+            events.flush()
+            break
+
+        idx += 1
+        time.sleep(sleep_seconds)
+PY
+    INFLIGHT_WRITER_PID=$!
+    e2e_log "In-flight writer PID: $INFLIGHT_WRITER_PID"
+
+    sleep "$CRASH_WRITER_RUNTIME_SECS"
+
+    e2e_step "Phase 5.3: SIGKILL mount daemon"
     e2e_log "Simulating abrupt crash: kill -9 $CURRENT_MOUNT_PID"
     kill -9 "$CURRENT_MOUNT_PID" 2>/dev/null || true
     wait "$CURRENT_MOUNT_PID" 2>/dev/null || true
     CURRENT_MOUNT_PID=""
     e2e_unmount "$MOUNT_CRASH"
+    wait_for_pid_exit "$INFLIGHT_WRITER_PID" 10 "in-flight writer"
 
-    e2e_step "Phase 5.1: inspect after crash"
+    e2e_assert_file "$INFLIGHT_EVENTS"
+    e2e_assert_file "$INFLIGHT_WRITER_LOG"
+
+    e2e_step "Phase 5.4: inspect after crash"
     e2e_assert cargo run -p ffs-cli --release -- inspect "$WORK_IMAGE" --json
 
-    e2e_step "Phase 5.2: remount after crash"
+    e2e_step "Phase 5.5: remount read-only and verify invariants"
     if start_mount ro "$WORK_IMAGE" "$MOUNT_RO" 1; then
-        if [[ "$HAVE_FSYNC_MARKER" -eq 1 ]]; then
-            e2e_assert grep -Fxq "fsync-path-write" "$MOUNT_RO/fsync_marker.txt"
-        fi
-        if [[ -f "$MOUNT_RO/non_fsync_marker.txt" ]]; then
-            e2e_assert grep -Fxq "non-fsync-write" "$MOUNT_RO/non_fsync_marker.txt"
-        else
-            e2e_log "non_fsync_marker.txt absent after crash (allowed for non-fsync write)"
-        fi
+        e2e_assert python3 - "$MOUNT_RO" "$BASELINE_MANIFEST" "$INFLIGHT_EVENTS" "$CRASH_VERIFY_REPORT" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import sys
+
+mount = pathlib.Path(sys.argv[1])
+baseline_manifest = pathlib.Path(sys.argv[2])
+events_path = pathlib.Path(sys.argv[3])
+report_path = pathlib.Path(sys.argv[4])
+
+def payload_for(idx: int, mode: str) -> bytes:
+    header = f"idx={idx:06d};mode={mode};".encode("utf-8")
+    body = bytes(((idx * 17 + off) % 251 for off in range(4096 - len(header))))
+    return header + body
+
+baseline = json.loads(baseline_manifest.read_text(encoding="utf-8"))
+events: list[dict[str, object]] = []
+for line in events_path.read_text(encoding="utf-8").splitlines():
+    if line.strip():
+        events.append(json.loads(line))
+
+planned: dict[str, dict[str, object]] = {}
+fsynced: set[str] = set()
+for event in events:
+    kind = event.get("event")
+    path = event.get("path")
+    if isinstance(path, str):
+        if kind == "planned":
+            planned[path] = event
+        elif kind == "fsync_done":
+            fsynced.add(path)
+
+errors: list[str] = []
+baseline_verified = 0
+for rel, expected_sha in baseline.items():
+    path = mount / rel
+    if not path.is_file():
+        errors.append(f"missing baseline file: {rel}")
+        continue
+    data = path.read_bytes()
+    actual_sha = hashlib.sha256(data).hexdigest()
+    if actual_sha != expected_sha:
+        errors.append(f"baseline checksum mismatch: {rel}")
+    else:
+        baseline_verified += 1
+
+inflight_root = mount / "sigkill_inflight"
+existing_inflight: list[str] = []
+if inflight_root.exists():
+    for file_path in sorted(inflight_root.rglob("*.bin")):
+        existing_inflight.append(file_path.relative_to(mount).as_posix())
+
+for rel in existing_inflight:
+    planned_event = planned.get(rel)
+    if planned_event is None:
+        errors.append(f"unexpected inflight file (no planned record): {rel}")
+        continue
+    idx = int(planned_event["idx"])
+    mode = str(planned_event["mode"])
+    expected = payload_for(idx, mode)
+    actual = (mount / rel).read_bytes()
+    if actual == expected:
+        continue
+    # For non-fsync writes, allow clean prefix truncation after SIGKILL.
+    if mode != "fsync" and expected.startswith(actual):
+        continue
+    errors.append(
+        f"inflight file contains unexpected bytes: {rel} (len={len(actual)} expected={len(expected)})"
+    )
+
+for rel in sorted(fsynced):
+    planned_event = planned.get(rel)
+    if planned_event is None:
+        errors.append(f"fsync marker without planned record: {rel}")
+        continue
+    path = mount / rel
+    if not path.is_file():
+        errors.append(f"fsync file missing after crash: {rel}")
+        continue
+    idx = int(planned_event["idx"])
+    mode = str(planned_event["mode"])
+    if mode != "fsync":
+        errors.append(f"fsync marker recorded for async file: {rel}")
+        continue
+    expected = payload_for(idx, mode)
+    actual = path.read_bytes()
+    if actual != expected:
+        errors.append(f"fsync file checksum mismatch after crash: {rel}")
+
+# Walk all regular files to ensure directory entries are readable.
+for root_dir, _, names in os.walk(mount):
+    for name in names:
+        full = pathlib.Path(root_dir) / name
+        rel = full.relative_to(mount).as_posix()
+        try:
+            _ = full.read_bytes()
+        except OSError as exc:
+            errors.append(f"failed to read file during consistency walk: {rel}: {exc}")
+
+report = {
+    "baseline_file_count": len(baseline),
+    "baseline_verified": baseline_verified,
+    "planned_inflight_records": len(planned),
+    "fsynced_records": len(fsynced),
+    "existing_inflight_files": len(existing_inflight),
+    "errors": errors,
+}
+report_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+
+if errors:
+    for entry in errors:
+        print(entry)
+    sys.exit(1)
+PY
+
+        e2e_assert_file "$CRASH_VERIFY_REPORT"
+        e2e_run cat "$CRASH_VERIFY_REPORT"
         log_tree "$MOUNT_RO" "Post-crash remount directory tree"
         stop_mount "$MOUNT_RO"
+        if grep -qiE "ext4 filesystem state: clean|unclean shutdown detected|recovery performed|journal.*replay" "$CURRENT_MOUNT_LOG"; then
+            e2e_log "Crash recovery evidence found in remount log"
+        else
+            e2e_fail "Missing crash recovery evidence in remount log ($CURRENT_MOUNT_LOG)"
+        fi
     else
         if grep -qiE "journal|replay|recover|unsupported|not yet supported|failed to recover" "$CURRENT_MOUNT_LOG"; then
-            e2e_log "Post-crash remount failed with explicit recovery diagnostic (acceptable for Phase B)"
+            e2e_log "Post-crash remount failed with explicit recovery diagnostic (phase-gated fallback)"
             e2e_run tail -n 120 "$CURRENT_MOUNT_LOG" || true
         else
             e2e_fail "Post-crash remount failed without clear recovery diagnostic"
         fi
     fi
 else
-    e2e_log "Skipping Phase 5 crash mini-harness because RW mount could not be established in this environment."
+    e2e_log "Skipping Phase 5 crash harness because RW mount could not be established in this environment."
 fi
 
 e2e_pass

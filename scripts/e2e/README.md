@@ -51,7 +51,7 @@ The ext4 read-write smoke suite exercises:
 2. RW operations: create/write/overwrite, mkdir/rmdir, rename, unlink
 3. Metadata checks (phase-gated): chmod verification and mtime monotonicity
 4. Clean shutdown persistence: remount read-only and re-verify post-unmount state
-5. Best-effort crash phase: SIGKILL mount process, inspect image, and verify remount or explicit recovery diagnostic
+5. Deterministic crash phase: write + fsync 500 baseline files, run continuous in-flight writes, SIGKILL mount daemon, remount read-only, and verify baseline + fsync durability invariants
 
 The btrfs read-write smoke suite exercises:
 
@@ -85,6 +85,9 @@ artifacts/e2e/20260212_161500_ffs_smoke/
 | `RUST_LOG` | `info` | Rust log level (trace, debug, info, warn, error) |
 | `RUST_BACKTRACE` | `1` | Enable backtraces on panic |
 | `SKIP_MOUNT` | `0` | Set to `1` to skip FUSE mount tests |
+| `BASELINE_FILE_COUNT` | `500` | Number of fsync-backed baseline files written before SIGKILL phase |
+| `CRASH_WRITER_RUNTIME_SECS` | `2` | Duration to run background in-flight writer before sending SIGKILL |
+| `CRASH_WRITER_SLEEP_SECS` | `0.01` | Per-write pacing interval for crash in-flight writer |
 
 ## Requirements
 
