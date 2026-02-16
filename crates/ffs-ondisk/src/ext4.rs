@@ -3663,10 +3663,8 @@ mod tests {
         let err = Ext4Superblock::parse_superblock_region(&sb).expect_err("reject");
         assert!(matches!(
             err,
-            ParseError::InvalidField {
-                field: "s_magic",
-                reason: "not an ext4 superblock"
-            }
+            ParseError::InvalidMagic { expected, actual }
+                if expected == u64::from(EXT4_SUPER_MAGIC) && actual == u64::from(0x1234_u16)
         ));
     }
 
