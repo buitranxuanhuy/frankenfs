@@ -319,6 +319,7 @@ cargo bench -p ffs-harness
 
 # Record reproducible hyperfine baseline artifacts
 scripts/benchmark_record.sh --compare
+# Writes Markdown + hyperfine JSON under baselines/, and structured metrics at artifacts/baselines/perf_baseline.json
 ```
 
 ### Development Gates

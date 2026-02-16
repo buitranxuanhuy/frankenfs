@@ -21,10 +21,14 @@ What this does:
 4. Writes artifacts to:
    - `baselines/baseline-YYYYMMDD.md`
    - `baselines/hyperfine/YYYYMMDD/*.json`
+   - `artifacts/baselines/perf_baseline.json`
+   - `artifacts/baselines/perf_baseline-YYYYMMDD.json`
 
-## Regression Policy (p95)
+`perf_baseline.json` always carries the full target operation matrix; operations not yet automated in the benchmark harness are emitted with `"status": "pending"` so progress is explicit and machine-auditable.
+
+## Regression Policy (p99)
 
 - Warn if regression is greater than 10%.
-- Fail if regression is greater than 25%.
+- Fail if regression is greater than 20%.
 
-`--compare` checks current p95 values against the latest prior baseline directory under `baselines/hyperfine/`.
+`--compare` checks current p99 values against the latest prior baseline directory under `baselines/hyperfine/`.

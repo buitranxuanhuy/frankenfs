@@ -10,18 +10,23 @@ COMPARE=0
 VERIFY_GOLDEN=1
 DATE_TAG="$(date -u +%Y%m%d)"
 REF_IMAGE="conformance/golden/ext4_8mb_reference.ext4"
+P99_WARN_THRESHOLD=10
+P99_FAIL_THRESHOLD=20
+PERF_BASELINE_PATH="artifacts/baselines/perf_baseline.json"
 
 usage() {
     cat <<'USAGE'
 Usage:
-  scripts/benchmark_record.sh [--date YYYYMMDD] [--warmup N] [--runs N] [--compare] [--skip-verify-golden]
+  scripts/benchmark_record.sh [--date YYYYMMDD] [--warmup N] [--runs N] [--compare] [--skip-verify-golden] [--p99-fail-threshold N] [--out-json PATH]
 
 Options:
   --date YYYYMMDD          Override date-tag for output paths (default: today)
   --warmup N               Hyperfine warmup runs (default: 3)
   --runs N                 Hyperfine measured runs (default: 10)
-  --compare                Compare current p95 against latest prior baseline (warn >10%, fail >25%)
+  --compare                Compare current p99 against latest prior baseline (warn >10%, fail >20%)
   --skip-verify-golden     Skip scripts/verify_golden.sh preflight
+  --p99-fail-threshold N   Fail compare if p99 regression exceeds N percent (default: 20)
+  --out-json PATH          Structured baseline JSON output path (default: artifacts/baselines/perf_baseline.json)
   -h, --help               Show this help
 USAGE
 }
@@ -51,6 +56,16 @@ while [ $# -gt 0 ]; do
             VERIFY_GOLDEN=0
             shift
             ;;
+        --p99-fail-threshold)
+            [ $# -ge 2 ] || { echo "missing value for --p99-fail-threshold" >&2; exit 2; }
+            P99_FAIL_THRESHOLD="$2"
+            shift 2
+            ;;
+        --out-json)
+            [ $# -ge 2 ] || { echo "missing value for --out-json" >&2; exit 2; }
+            PERF_BASELINE_PATH="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -65,8 +80,13 @@ done
 
 OUT_DIR="baselines/hyperfine/${DATE_TAG}"
 REPORT_PATH="baselines/baseline-${DATE_TAG}.md"
+if [[ "$PERF_BASELINE_PATH" == *.json ]]; then
+    PERF_BASELINE_DATED_PATH="${PERF_BASELINE_PATH%.json}-${DATE_TAG}.json"
+else
+    PERF_BASELINE_DATED_PATH="${PERF_BASELINE_PATH}-${DATE_TAG}.json"
+fi
 
-mkdir -p "$OUT_DIR"
+mkdir -p "$OUT_DIR" "$(dirname "$PERF_BASELINE_PATH")"
 
 if [ -n "${CARGO_TARGET_DIR:-}" ]; then
     TARGET_DIR="${CARGO_TARGET_DIR}"
@@ -98,35 +118,49 @@ HARNESS_BIN="${TARGET_DIR}/release/ffs-harness"
 declare -a BENCH_LABELS=()
 declare -a BENCH_COMMANDS=()
 declare -a BENCH_FILES=()
+declare -a BENCH_OPERATIONS=()
+declare -a BENCH_PAYLOAD_MB=()
 declare -a SKIPPED_LABELS=()
 
 add_bench() {
     BENCH_LABELS+=("$1")
     BENCH_COMMANDS+=("$2")
     BENCH_FILES+=("$3")
+    BENCH_OPERATIONS+=("$4")
+    BENCH_PAYLOAD_MB+=("${5:-0}")
 }
 
 add_bench "ffs-cli parity --json" \
     "${CLI_BIN} parity --json" \
-    "ffs_cli_parity.json"
+    "ffs_cli_parity.json" \
+    "metadata_parity_cli" \
+    "0"
 
 add_bench "ffs-harness parity" \
     "${HARNESS_BIN} parity" \
-    "ffs_harness_parity.json"
+    "ffs_harness_parity.json" \
+    "metadata_parity_harness" \
+    "0"
 
 add_bench "ffs-harness check-fixtures" \
     "${HARNESS_BIN} check-fixtures" \
-    "ffs_harness_check_fixtures.json"
+    "ffs_harness_check_fixtures.json" \
+    "fixture_validation" \
+    "0"
 
 if [ -f "$REF_IMAGE" ]; then
     probe_stderr="${OUT_DIR}/ffs_cli_inspect_probe.stderr"
     if "$CLI_BIN" inspect "$REF_IMAGE" --json >/dev/null 2>"$probe_stderr"; then
         add_bench "ffs-cli inspect ext4_8mb_reference.ext4 --json" \
             "${CLI_BIN} inspect ${REF_IMAGE} --json" \
-            "ffs_cli_inspect_ext4_8mb_reference.json"
+            "ffs_cli_inspect_ext4_8mb_reference.json" \
+            "read_metadata_inspect_ext4_reference" \
+            "8"
         add_bench "ffs-cli scrub ext4_8mb_reference.ext4 --json" \
             "${CLI_BIN} scrub ${REF_IMAGE} --json" \
-            "ffs_cli_scrub_ext4_8mb_reference.json"
+            "ffs_cli_scrub_ext4_8mb_reference.json" \
+            "read_metadata_scrub_ext4_reference" \
+            "8"
     else
         probe_reason="$(tr '\n' ' ' < "$probe_stderr" | sed 's/[[:space:]]\+/ /g' | sed 's/^ //; s/ $//')"
         SKIPPED_LABELS+=("ffs-cli inspect ext4_8mb_reference.ext4 --json (unsupported by current parser: ${probe_reason})")
@@ -145,18 +179,32 @@ json_stddev() {
     jq -r '.results[0].stddev' "$1"
 }
 
-json_p95() {
-    jq -r '
+json_percentile() {
+    local json_file="$1"
+    local percentile="$2"
+    jq -r --argjson p "$percentile" '
         .results[0].times as $times
         | ($times | length) as $n
         | if $n == 0 then
               0
           else
               ($times | sort) as $sorted
-              | ((($n - 1) * 0.95) | floor) as $idx
+              | ((($n - 1) * $p) | floor) as $idx
               | $sorted[$idx]
           end
-    ' "$1"
+    ' "$json_file"
+}
+
+json_p50() {
+    json_percentile "$1" 0.50
+}
+
+json_p95() {
+    json_percentile "$1" 0.95
+}
+
+json_p99() {
+    json_percentile "$1" 0.99
 }
 
 valid_number() {
@@ -170,6 +218,30 @@ valid_number() {
 
 sec_to_ms() {
     awk -v v="$1" 'BEGIN { printf "%.3f", v * 1000.0 }'
+}
+
+sec_to_us() {
+    awk -v v="$1" 'BEGIN { printf "%.0f", v * 1000000.0 }'
+}
+
+ops_per_sec() {
+    awk -v v="$1" 'BEGIN {
+        if (v <= 0) {
+            printf "0";
+        } else {
+            printf "%.6f", 1.0 / v;
+        }
+    }'
+}
+
+mb_per_sec() {
+    awk -v mb="$1" -v sec="$2" 'BEGIN {
+        if (mb <= 0 || sec <= 0) {
+            printf "0";
+        } else {
+            printf "%.6f", mb / sec;
+        }
+    }'
 }
 
 pct_change() {
@@ -198,6 +270,194 @@ for i in "${!BENCH_LABELS[@]}"; do
         "$cmd" | tee "$txt_file"
 done
 echo ""
+
+write_perf_baseline_json() {
+    local tmp_measurements
+    tmp_measurements="$(mktemp)"
+    for i in "${!BENCH_LABELS[@]}"; do
+        local json_file="${OUT_DIR}/${BENCH_FILES[$i]}"
+        local mean_s
+        local p50_s
+        local p95_s
+        local p99_s
+        local p50_us
+        local p95_us
+        local p99_us
+        local throughput_ops_sec
+        local throughput_mb_sec
+        mean_s="$(json_mean "$json_file")"
+        p50_s="$(json_p50 "$json_file")"
+        p95_s="$(json_p95 "$json_file")"
+        p99_s="$(json_p99 "$json_file")"
+        p50_us="$(sec_to_us "$p50_s")"
+        p95_us="$(sec_to_us "$p95_s")"
+        p99_us="$(sec_to_us "$p99_s")"
+        throughput_ops_sec="$(ops_per_sec "$mean_s")"
+        throughput_mb_sec="$(mb_per_sec "${BENCH_PAYLOAD_MB[$i]}" "$mean_s")"
+
+        jq -n \
+            --arg operation "${BENCH_OPERATIONS[$i]}" \
+            --arg metric "latency" \
+            --arg command "${BENCH_COMMANDS[$i]}" \
+            --arg source_json "$json_file" \
+            --argjson p50_us "$p50_us" \
+            --argjson p95_us "$p95_us" \
+            --argjson p99_us "$p99_us" \
+            --argjson throughput_ops_sec "$throughput_ops_sec" \
+            --argjson throughput_mb_sec "$throughput_mb_sec" \
+            '{
+                operation: $operation,
+                metric: $metric,
+                command: $command,
+                source_json: $source_json,
+                p50_us: $p50_us,
+                p95_us: $p95_us,
+                p99_us: $p99_us,
+                throughput_ops_sec: $throughput_ops_sec,
+                throughput_mb_sec: $throughput_mb_sec,
+                status: "measured"
+            }' >> "$tmp_measurements"
+    done
+
+    local measured_json
+    local measurements_json
+    measured_json="$(jq -s '.' "$tmp_measurements")"
+    local pending_json='[
+      {
+        "operation": "write_seq_4k",
+        "metric": "latency",
+        "command": "",
+        "source_json": "",
+        "p50_us": 0,
+        "p95_us": 0,
+        "p99_us": 0,
+        "throughput_ops_sec": 0,
+        "throughput_mb_sec": 0,
+        "status": "pending",
+        "reason": "write-path benchmark scenario not yet automated in benchmark_record.sh"
+      },
+      {
+        "operation": "write_random_4k",
+        "metric": "latency",
+        "command": "",
+        "source_json": "",
+        "p50_us": 0,
+        "p95_us": 0,
+        "p99_us": 0,
+        "throughput_ops_sec": 0,
+        "throughput_mb_sec": 0,
+        "status": "pending",
+        "reason": "write-path benchmark scenario not yet automated in benchmark_record.sh"
+      },
+      {
+        "operation": "fsync_single_write",
+        "metric": "latency",
+        "command": "",
+        "source_json": "",
+        "p50_us": 0,
+        "p95_us": 0,
+        "p99_us": 0,
+        "throughput_ops_sec": 0,
+        "throughput_mb_sec": 0,
+        "status": "pending",
+        "reason": "fsync benchmark scenario not yet automated in benchmark_record.sh"
+      },
+      {
+        "operation": "fsync_batch_100",
+        "metric": "latency",
+        "command": "",
+        "source_json": "",
+        "p50_us": 0,
+        "p95_us": 0,
+        "p99_us": 0,
+        "throughput_ops_sec": 0,
+        "throughput_mb_sec": 0,
+        "status": "pending",
+        "reason": "fsync benchmark scenario not yet automated in benchmark_record.sh"
+      },
+      {
+        "operation": "mount_cold",
+        "metric": "latency",
+        "command": "",
+        "source_json": "",
+        "p50_us": 0,
+        "p95_us": 0,
+        "p99_us": 0,
+        "throughput_ops_sec": 0,
+        "throughput_mb_sec": 0,
+        "status": "pending",
+        "reason": "mount latency scenario not yet automated in benchmark_record.sh"
+      },
+      {
+        "operation": "mount_warm",
+        "metric": "latency",
+        "command": "",
+        "source_json": "",
+        "p50_us": 0,
+        "p95_us": 0,
+        "p99_us": 0,
+        "throughput_ops_sec": 0,
+        "throughput_mb_sec": 0,
+        "status": "pending",
+        "reason": "mount latency scenario not yet automated in benchmark_record.sh"
+      },
+      {
+        "operation": "mount_recovery",
+        "metric": "latency",
+        "command": "",
+        "source_json": "",
+        "p50_us": 0,
+        "p95_us": 0,
+        "p99_us": 0,
+        "throughput_ops_sec": 0,
+        "throughput_mb_sec": 0,
+        "status": "pending",
+        "reason": "mount recovery scenario not yet automated in benchmark_record.sh"
+      }
+    ]'
+    measurements_json="$(jq -n --argjson measured "$measured_json" --argjson pending "$pending_json" '$measured + $pending')"
+
+    jq -n \
+        --arg generated_at "$date_iso" \
+        --arg date_tag "$DATE_TAG" \
+        --arg commit "$git_sha" \
+        --arg branch "$git_branch" \
+        --arg cpu_model "$cpu_model" \
+        --arg kernel "$kernel_ver" \
+        --arg rustc "$rustc_ver" \
+        --arg cargo "$cargo_ver" \
+        --arg hyperfine "$hyperfine_ver" \
+        --argjson warmup_runs "$WARMUP" \
+        --argjson measured_runs "$RUNS" \
+        --argjson p99_fail_threshold_percent "$P99_FAIL_THRESHOLD" \
+        --argjson measurements "$measurements_json" \
+        --argjson measured_count "$(jq 'map(select(.status == "measured")) | length' <<<"$measurements_json")" \
+        --argjson pending_count "$(jq 'map(select(.status == "pending")) | length' <<<"$measurements_json")" \
+        '{
+            generated_at: $generated_at,
+            date_tag: $date_tag,
+            commit: $commit,
+            branch: $branch,
+            environment: {
+                cpu_model: $cpu_model,
+                kernel: $kernel,
+                rustc: $rustc,
+                cargo: $cargo,
+                hyperfine: $hyperfine
+            },
+            warmup_runs: $warmup_runs,
+            measured_runs: $measured_runs,
+            p99_fail_threshold_percent: $p99_fail_threshold_percent,
+            measurement_coverage: {
+                measured_count: $measured_count,
+                pending_count: $pending_count
+            },
+            measurements: $measurements
+        }' > "$PERF_BASELINE_PATH"
+
+    cp "$PERF_BASELINE_PATH" "$PERF_BASELINE_DATED_PATH"
+    rm -f "$tmp_measurements"
+}
 
 cpu_model="$(awk -F': ' '/^model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null || true)"
 if [ -z "${cpu_model}" ]; then
@@ -252,19 +512,25 @@ date_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo ""
     echo "## Hyperfine Summary"
     echo ""
-    echo "| Command | Mean (ms) | Stddev (ms) | p95 (ms) | JSON |"
-    echo "|---|---:|---:|---:|---|"
+    echo "| Command | Mean (ms) | Stddev (ms) | p50 (ms) | p95 (ms) | p99 (ms) | JSON |"
+    echo "|---|---:|---:|---:|---:|---:|---|"
     for i in "${!BENCH_LABELS[@]}"; do
         json_file="${OUT_DIR}/${BENCH_FILES[$i]}"
         mean_s="$(json_mean "$json_file")"
         std_s="$(json_stddev "$json_file")"
+        p50_s="$(json_p50 "$json_file")"
         p95_s="$(json_p95 "$json_file")"
+        p99_s="$(json_p99 "$json_file")"
         mean_ms="$(sec_to_ms "$mean_s")"
         std_ms="$(sec_to_ms "$std_s")"
+        p50_ms="$(sec_to_ms "$p50_s")"
         p95_ms="$(sec_to_ms "$p95_s")"
-        echo "| ${BENCH_LABELS[$i]} | ${mean_ms} | ${std_ms} | ${p95_ms} | \`${json_file}\` |"
+        p99_ms="$(sec_to_ms "$p99_s")"
+        echo "| ${BENCH_LABELS[$i]} | ${mean_ms} | ${std_ms} | ${p50_ms} | ${p95_ms} | ${p99_ms} | \`${json_file}\` |"
     done
 } > "$REPORT_PATH"
+
+write_perf_baseline_json
 
 COMPARE_STATUS=0
 COMPARE_SUMMARY=""
@@ -278,8 +544,8 @@ if [ "$COMPARE" -eq 1 ]; then
     if [ -n "$previous_tag" ]; then
         previous_dir="baselines/hyperfine/${previous_tag}"
         COMPARE_SUMMARY+="## Regression Check (vs ${previous_tag})"$'\n\n'
-        COMPARE_SUMMARY+="Thresholds: warn if p95 regresses >10%; fail if >25%."$'\n\n'
-        COMPARE_SUMMARY+="| Command | Baseline p95 (ms) | Current p95 (ms) | Delta % | Status |"$'\n'
+        COMPARE_SUMMARY+="Thresholds: warn if p99 regresses >${P99_WARN_THRESHOLD}%; fail if >${P99_FAIL_THRESHOLD}%."$'\n\n'
+        COMPARE_SUMMARY+="| Command | Baseline p99 (ms) | Current p99 (ms) | Delta % | Status |"$'\n'
         COMPARE_SUMMARY+="|---|---:|---:|---:|---|"$'\n'
 
         for i in "${!BENCH_LABELS[@]}"; do
@@ -290,29 +556,29 @@ if [ "$COMPARE" -eq 1 ]; then
                 continue
             fi
 
-            cur_p95_s="$(json_p95 "$cur_json" 2>/dev/null || true)"
-            prev_p95_s="$(json_p95 "$prev_json" 2>/dev/null || true)"
-            if [ -z "$cur_p95_s" ] || [ -z "$prev_p95_s" ] || ! valid_number "$cur_p95_s" || ! valid_number "$prev_p95_s"; then
+            cur_p99_s="$(json_p99 "$cur_json" 2>/dev/null || true)"
+            prev_p99_s="$(json_p99 "$prev_json" 2>/dev/null || true)"
+            if [ -z "$cur_p99_s" ] || [ -z "$prev_p99_s" ] || ! valid_number "$cur_p99_s" || ! valid_number "$prev_p99_s"; then
                 COMPARE_SUMMARY+="| ${BENCH_LABELS[$i]} | n/a | n/a | n/a | SKIP (invalid hyperfine JSON) |"$'\n'
                 continue
             fi
-            if awk -v base="$prev_p95_s" 'BEGIN { exit !(base <= 0.0) }'; then
-                COMPARE_SUMMARY+="| ${BENCH_LABELS[$i]} | n/a | n/a | n/a | SKIP (baseline p95 <= 0) |"$'\n'
+            if awk -v base="$prev_p99_s" 'BEGIN { exit !(base <= 0.0) }'; then
+                COMPARE_SUMMARY+="| ${BENCH_LABELS[$i]} | n/a | n/a | n/a | SKIP (baseline p99 <= 0) |"$'\n'
                 continue
             fi
 
-            cur_p95_ms="$(sec_to_ms "$cur_p95_s")"
-            prev_p95_ms="$(sec_to_ms "$prev_p95_s")"
-            delta_pct="$(pct_change "$prev_p95_s" "$cur_p95_s")"
+            cur_p99_ms="$(sec_to_ms "$cur_p99_s")"
+            prev_p99_ms="$(sec_to_ms "$prev_p99_s")"
+            delta_pct="$(pct_change "$prev_p99_s" "$cur_p99_s")"
 
             status="OK"
-            if awk -v d="$delta_pct" 'BEGIN { exit !(d > 25.0) }'; then
+            if awk -v d="$delta_pct" -v threshold="$P99_FAIL_THRESHOLD" 'BEGIN { exit !(d > threshold) }'; then
                 status="FAIL"
                 COMPARE_STATUS=1
-            elif awk -v d="$delta_pct" 'BEGIN { exit !(d > 10.0) }'; then
+            elif awk -v d="$delta_pct" -v threshold="$P99_WARN_THRESHOLD" 'BEGIN { exit !(d > threshold) }'; then
                 status="WARN"
             fi
-            COMPARE_SUMMARY+="| ${BENCH_LABELS[$i]} | ${prev_p95_ms} | ${cur_p95_ms} | ${delta_pct}% | ${status} |"$'\n'
+            COMPARE_SUMMARY+="| ${BENCH_LABELS[$i]} | ${prev_p99_ms} | ${cur_p99_ms} | ${delta_pct}% | ${status} |"$'\n'
         done
     else
         COMPARE_SUMMARY+="## Regression Check"$'\n\n'
@@ -326,6 +592,8 @@ if [ "$COMPARE" -eq 1 ]; then
 fi
 
 echo "Wrote baseline report: ${REPORT_PATH}"
+echo "Wrote structured baseline JSON: ${PERF_BASELINE_PATH}"
+echo "Wrote dated structured baseline JSON: ${PERF_BASELINE_DATED_PATH}"
 echo "Wrote hyperfine exports:"
 for i in "${!BENCH_LABELS[@]}"; do
     echo "  - ${OUT_DIR}/${BENCH_FILES[$i]}"
