@@ -1,0 +1,10 @@
+# Curated generic subset for FrankenFS E2E tracking (bd-32yn.7).
+# Keep this list intentionally small and deterministic in early development.
+
+generic/001
+generic/013
+generic/030
+generic/035
+generic/068
+generic/112
+generic/231

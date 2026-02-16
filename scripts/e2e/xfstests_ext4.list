@@ -1,0 +1,7 @@
+# Curated ext4 subset for FrankenFS E2E tracking (bd-32yn.7).
+# These are compatibility-oriented canary tests; expand as support grows.
+
+ext4/001
+ext4/003
+ext4/005
+ext4/013

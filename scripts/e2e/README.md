@@ -19,6 +19,9 @@ End-to-end smoke tests for FrankenFS that exercise user-facing workflows.
 
 # Run deterministic 5% corruption auto-repair E2E
 ./scripts/e2e/ffs_repair_5pct_e2e.sh
+
+# Plan/run curated xfstests generic+ext4 subsets
+./scripts/e2e/ffs_xfstests_e2e.sh
 ```
 
 ## What It Tests
@@ -69,6 +72,13 @@ The 5% repair E2E suite exercises:
 3. Full before/after block digest equivalence checks
 4. Structured evidence ledger capture and artifact export
 
+The xfstests E2E suite exercises:
+
+1. Curated generic/ext4 subset selection from tracked list files
+2. Planning artifacts for CI (`selected_tests.txt`, `summary.json`)
+3. Optional direct `xfstests check` execution when a configured checkout is available
+4. Safe skip/fail behavior via strictness toggle
+
 ## Output
 
 Test artifacts are stored in `artifacts/e2e/<timestamp>/`:
@@ -90,6 +100,11 @@ artifacts/e2e/20260212_161500_ffs_smoke/
 | `BASELINE_FILE_COUNT` | `500` | Number of fsync-backed baseline files written before SIGKILL phase |
 | `CRASH_WRITER_RUNTIME_SECS` | `2` | Duration to run background in-flight writer before sending SIGKILL |
 | `CRASH_WRITER_SLEEP_SECS` | `0.01` | Per-write pacing interval for crash in-flight writer |
+| `XFSTESTS_MODE` | `auto` | `auto`, `plan`, or `run` for `ffs_xfstests_e2e.sh` |
+| `XFSTESTS_DIR` | *(unset)* | Path to xfstests checkout containing `check` |
+| `XFSTESTS_DRY_RUN` | `1` | In run mode, pass `-n` to `check` (selection validation without executing tests) |
+| `XFSTESTS_FILTER` | `all` | Select `all`, `generic`, or `ext4` curated subsets |
+| `XFSTESTS_STRICT` | `0` | If `1`, missing xfstests prerequisites fail instead of skip |
 
 ## Requirements
 
@@ -99,6 +114,7 @@ artifacts/e2e/20260212_161500_ffs_smoke/
 - `/dev/fuse` accessible (for mount tests)
 - `fusermount` or `fusermount3` (for unmounting)
 - `mountpoint` utility (used for readiness checks)
+- Optional for xfstests execution mode: an `xfstests-dev` checkout with built prerequisites
 
 ## Skipping Mount Tests
 
@@ -156,6 +172,16 @@ The E2E tests can be run in CI by:
 2. Running with mount tests skipped (if FUSE not available):
    ```bash
    SKIP_MOUNT=1 ./scripts/e2e/ffs_smoke.sh
+   ```
+
+3. Running xfstests subset planning (CI-safe, no xfstests checkout required):
+   ```bash
+   XFSTESTS_MODE=plan ./scripts/e2e/ffs_xfstests_e2e.sh
+   ```
+
+4. Running xfstests subset execution (requires configured checkout):
+   ```bash
+   XFSTESTS_MODE=run XFSTESTS_DIR=/path/to/xfstests-dev ./scripts/e2e/ffs_xfstests_e2e.sh
    ```
 
 ## Adding New Tests

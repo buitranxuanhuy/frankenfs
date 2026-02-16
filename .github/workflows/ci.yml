@@ -118,6 +118,13 @@ jobs:
       - name: Run smoke E2E
         run: ./scripts/e2e/ffs_smoke.sh
 
+      - name: Run xfstests subset planning (bd-32yn.7)
+        env:
+          XFSTESTS_MODE: plan
+          XFSTESTS_FILTER: all
+          XFSTESTS_STRICT: 1
+        run: ./scripts/e2e/ffs_xfstests_e2e.sh
+
       - name: Upload diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -129,6 +136,8 @@ jobs:
             conformance/golden/*.json
             conformance/fixtures/checksums.sha256
             artifacts/e2e/**/*.log
+            artifacts/e2e/**/xfstests/*.json
+            artifacts/e2e/**/xfstests/*.txt
 
   # Warn if goldens are modified in a PR
   golden-change-check:
