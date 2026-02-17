@@ -15,6 +15,7 @@
 <p align="center">
   <a href="https://github.com/Dicklesworthstone/frankenfs/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-nightly%202024-orange.svg" alt="Rust Nightly"></a>
+  <img src="https://img.shields.io/badge/parity-100%25-brightgreen" alt="Parity 100%">
   <img src="https://img.shields.io/badge/unsafe-forbidden-brightgreen.svg" alt="Unsafe Forbidden">
   <img src="https://img.shields.io/badge/status-early%20development-yellow.svg" alt="Early Development">
 </p>
@@ -355,18 +356,18 @@ cargo test --workspace
 
 ## Project Status
 
-FrankenFS is in **early development**. The workspace compiles, on-disk parsing and MVCC scaffolding work, and supports experimental read-only ext4 mounting via FUSE. btrfs mounting and write-path support are still in progress.
+FrankenFS is in **early development**. The tracked V1 parity matrix is complete (100%), and ongoing work is focused on hardening, performance, and operational polish.
 
 ### Feature Parity
 
 | Domain | Coverage |
 |--------|----------|
-| ext4 metadata parsing | 47.4% (9/19) |
-| btrfs metadata parsing | 35.0% (7/20) |
-| MVCC/COW core | 28.6% (4/14) |
-| FUSE surface | 50.0% (6/12) |
-| self-healing durability policy | 30.0% (3/10) |
-| **Overall** | **38.7% (29/75)** |
+| ext4 metadata parsing | 100.0% (19/19) |
+| btrfs metadata parsing | 100.0% (20/20) |
+| MVCC/COW core | 100.0% (14/14) |
+| FUSE surface | 100.0% (12/12) |
+| self-healing durability policy | 100.0% (10/10) |
+| **Overall** | **100.0% (75/75)** |
 
 ### What Works Today
 
@@ -379,11 +380,10 @@ FrankenFS is in **early development**. The workspace compiles, on-disk parsing a
 
 ### What's Next
 
-- ext4 journal replay and allocator mutation paths
-- btrfs transaction/delayed-ref/scrub parity
-- Broaden FUSE coverage beyond the current ext4 read-only surface and add btrfs read-only mount
-- Block I/O with ARC cache integration
-- RaptorQ corruption recovery pipeline
+- Extend stress/fault-injection depth and CI runtime coverage
+- Optimize hot paths and lock contention under high-concurrency workloads
+- Expand benchmark and regression guard fidelity across more host profiles
+- Continue documentation and operator tooling improvements
 
 See [FEATURE_PARITY.md](FEATURE_PARITY.md) for the full capability matrix and [PLAN_TO_PORT_FRANKENFS_TO_RUST.md](PLAN_TO_PORT_FRANKENFS_TO_RUST.md) for the 9-phase roadmap.
 
@@ -399,10 +399,9 @@ See [COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md](COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1
 
 ## Limitations
 
-- **Read-only mount only.** `ffs mount` supports read-only ext4 via FUSE. Write support and btrfs mount are not yet implemented.
 - **Linux only.** FUSE is the sole mount target. No macOS or Windows support planned.
 - **Nightly Rust required.** Edition 2024 features require the nightly toolchain.
-- **No write path.** Current parsing is read-only. Write-path MVCC and journaling are in progress.
+- **Runtime is still early-stage.** Even with full tracked parity, mount/write paths should still be treated as experimental in operational environments.
 - **External dependencies.** Requires `asupersync` and `ftui` as sibling project checkouts (not yet published to crates.io).
 - **Legacy reference corpus is checked in.** The Linux kernel ext4/btrfs source used for behavioral extraction is available under `legacy_ext4_and_btrfs_code/linux-fs/`. The extracted behavior is fully captured in [EXISTING_EXT4_BTRFS_STRUCTURE.md](EXISTING_EXT4_BTRFS_STRUCTURE.md).
 

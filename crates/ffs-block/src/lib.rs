@@ -2889,6 +2889,170 @@ impl<D: BlockDevice> ArcCache<D> {
     }
 }
 
+// ── Fault injection framework ──────────────────────────────────────────────
+
+/// Fault trigger mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultMode {
+    /// Fire once, then clear.
+    OneShot,
+    /// Fire on every matching access.
+    Persistent,
+}
+
+/// What kind of operation a fault targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultTarget {
+    Read(BlockNumber),
+    Write(BlockNumber),
+}
+
+/// Record of a fault that was triggered.
+#[derive(Debug, Clone)]
+pub struct FaultRecord {
+    pub target: FaultTarget,
+    pub sequence: u64,
+}
+
+struct FaultRule {
+    target: FaultTarget,
+    mode: FaultMode,
+    fired: bool,
+}
+
+/// A `BlockDevice` wrapper that injects configurable faults for testing.
+///
+/// In passthrough mode (no rules) it delegates transparently. Rules can
+/// target specific block reads or writes, and operate in one-shot or
+/// persistent mode. A deterministic seed controls fault sequencing for
+/// reproducibility.
+pub struct FaultInjector<D: BlockDevice> {
+    inner: D,
+    rules: Mutex<Vec<FaultRule>>,
+    log: Mutex<Vec<FaultRecord>>,
+    sequence: std::sync::atomic::AtomicU64,
+    seed: u64,
+}
+
+impl<D: BlockDevice> FaultInjector<D> {
+    /// Wrap a device with no faults configured (pure passthrough).
+    #[must_use]
+    pub fn new(inner: D, seed: u64) -> Self {
+        Self {
+            inner,
+            rules: Mutex::new(Vec::new()),
+            log: Mutex::new(Vec::new()),
+            sequence: std::sync::atomic::AtomicU64::new(0),
+            seed,
+        }
+    }
+
+    /// Register a fault on a specific read target.
+    pub fn fail_on_read(&self, block: BlockNumber, mode: FaultMode) {
+        self.rules.lock().push(FaultRule {
+            target: FaultTarget::Read(block),
+            mode,
+            fired: false,
+        });
+    }
+
+    /// Register a fault on a specific write target.
+    pub fn fail_on_write(&self, block: BlockNumber, mode: FaultMode) {
+        self.rules.lock().push(FaultRule {
+            target: FaultTarget::Write(block),
+            mode,
+            fired: false,
+        });
+    }
+
+    /// Return the fault log (all triggered faults in order).
+    pub fn fault_log(&self) -> Vec<FaultRecord> {
+        self.log.lock().clone()
+    }
+
+    /// The seed used for deterministic replay.
+    #[must_use]
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// Clear all rules and reset the log.
+    pub fn reset(&self) {
+        self.rules.lock().clear();
+        self.log.lock().clear();
+        self.sequence.store(0, Ordering::Relaxed);
+    }
+
+    /// Check if any rule matches and should fire, returning an error if so.
+    fn check_fault(&self, target: FaultTarget) -> Option<FfsError> {
+        let mut rules = self.rules.lock();
+        let mut matched = false;
+
+        for rule in rules.iter_mut() {
+            if rule.target == target {
+                match rule.mode {
+                    FaultMode::OneShot => {
+                        if !rule.fired {
+                            rule.fired = true;
+                            matched = true;
+                            break;
+                        }
+                    }
+                    FaultMode::Persistent => {
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if matched {
+            let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
+            self.log.lock().push(FaultRecord {
+                target,
+                sequence: seq,
+            });
+            Some(FfsError::Corruption {
+                block: 0,
+                detail: format!(
+                    "injected fault on {target:?} (seq={seq}, seed={})",
+                    self.seed
+                ),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl<D: BlockDevice> BlockDevice for FaultInjector<D> {
+    fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
+        if let Some(err) = self.check_fault(FaultTarget::Read(block)) {
+            return Err(err);
+        }
+        self.inner.read_block(cx, block)
+    }
+
+    fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
+        if let Some(err) = self.check_fault(FaultTarget::Write(block)) {
+            return Err(err);
+        }
+        self.inner.write_block(cx, block, data)
+    }
+
+    fn block_size(&self) -> u32 {
+        self.inner.block_size()
+    }
+
+    fn block_count(&self) -> u64 {
+        self.inner.block_count()
+    }
+
+    fn sync(&self, cx: &Cx) -> Result<()> {
+        self.inner.sync(cx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2907,8 +3071,11 @@ mod tests {
         // only T1/T2 entries.
         assert_eq!(state.resident.len(), state.t1.len() + state.t2.len());
         assert!(state.resident.len() <= state.capacity);
-        assert!(state.total_len() <= state.capacity.saturating_mul(2));
-        assert_eq!(state.loc.len(), state.total_len());
+        #[cfg(not(feature = "s3fifo"))]
+        {
+            assert!(state.total_len() <= state.capacity.saturating_mul(2));
+            assert_eq!(state.loc.len(), state.total_len());
+        }
 
         for &k in &state.t1 {
             assert!(matches!(state.loc.get(&k), Some(ArcList::T1)));
@@ -3212,6 +3379,7 @@ mod tests {
         assert!(state.b2.is_empty());
     }
 
+    #[cfg(not(feature = "s3fifo"))]
     #[test]
     fn arc_state_ghost_hits_adjust_p_and_eviction_policy() {
         let mut state = ArcState::new(2);
@@ -3300,6 +3468,281 @@ mod tests {
                 "resident set exceeded capacity at iteration {i}"
             );
         }
+    }
+
+    #[cfg(feature = "s3fifo")]
+    #[test]
+    fn s3fifo_new_entry_goes_to_small_queue() {
+        let mut state = ArcState::new(20);
+        // First access of a new key goes to T1 (small queue).
+        s3_access(&mut state, BlockNumber(42));
+        assert!(state.t1.contains(&BlockNumber(42)));
+        assert_eq!(state.loc.get(&BlockNumber(42)), Some(&ArcList::T1));
+        assert!(!state.t2.contains(&BlockNumber(42)));
+    }
+
+    #[cfg(feature = "s3fifo")]
+    #[test]
+    fn s3fifo_capacity_split_ratios() {
+        // Verify 10/90 split for various capacities.
+        let (s, m, g) = ArcState::s3_capacity_split(100);
+        assert_eq!(s, 10);
+        assert_eq!(m, 90);
+        assert_eq!(g, 100);
+
+        let (s, m, g) = ArcState::s3_capacity_split(10);
+        assert_eq!(s, 1);
+        assert_eq!(m, 9);
+        assert_eq!(g, 10);
+
+        // Edge case: capacity 1.
+        let (s, m, _g) = ArcState::s3_capacity_split(1);
+        assert_eq!(s, 1);
+        assert_eq!(m, 0);
+    }
+
+    #[cfg(feature = "s3fifo")]
+    #[test]
+    fn s3fifo_access_count_increments_on_hit() {
+        let mut state = ArcState::new(20);
+        s3_access(&mut state, BlockNumber(5));
+        assert_eq!(state.access_count.get(&BlockNumber(5)).copied(), Some(0));
+
+        // Second access: on_hit increments count.
+        s3_access(&mut state, BlockNumber(5));
+        assert_eq!(state.access_count.get(&BlockNumber(5)).copied(), Some(1));
+
+        // Third access: increments again.
+        s3_access(&mut state, BlockNumber(5));
+        assert_eq!(state.access_count.get(&BlockNumber(5)).copied(), Some(2));
+    }
+
+    #[cfg(feature = "s3fifo")]
+    #[test]
+    fn s3fifo_accessed_entry_promoted_from_small_to_main() {
+        // With capacity 10: small_capacity=1, main_capacity=9.
+        let mut state = ArcState::new(10);
+
+        // Insert key 0 into small queue.
+        s3_access(&mut state, BlockNumber(0));
+        assert!(state.t1.contains(&BlockNumber(0)));
+
+        // Touch key 0 again to set access_count=1.
+        s3_access(&mut state, BlockNumber(0));
+
+        // Insert key 1 — this will overflow small queue.
+        // Since key 0 has access_count > 0, it should be promoted to main.
+        s3_access(&mut state, BlockNumber(1));
+
+        assert!(
+            state.t2.contains(&BlockNumber(0)),
+            "block 0 with access_count>0 should be promoted to main"
+        );
+    }
+
+    #[cfg(feature = "s3fifo")]
+    #[test]
+    fn s3fifo_untouched_entry_evicted_from_small_to_ghost() {
+        // With capacity 10: small_capacity=1.
+        let mut state = ArcState::new(10);
+
+        s3_access(&mut state, BlockNumber(0)); // small queue
+        s3_access(&mut state, BlockNumber(1)); // overflows small, key 0 (access_count=0) -> ghost
+
+        assert!(
+            state.b1.contains(&BlockNumber(0)),
+            "block 0 with access_count=0 should be moved to ghost"
+        );
+        assert!(
+            !state.resident.contains_key(&BlockNumber(0)),
+            "evicted block should not remain in resident set"
+        );
+    }
+
+    #[cfg(feature = "s3fifo")]
+    #[test]
+    fn s3fifo_second_chance_rotation_in_main() {
+        // With capacity 10: small_capacity=1, main_capacity=9.
+        let mut state = ArcState::new(10);
+
+        // Fill main queue: insert + touch keys 0..9 to promote them.
+        for key in 0..10_u64 {
+            s3_access(&mut state, BlockNumber(key));
+            s3_access(&mut state, BlockNumber(key)); // touch to set access_count=1
+        }
+
+        // Count main queue entries.
+        let main_count = state.t2.len();
+        assert!(main_count > 0, "main queue should have entries");
+
+        // Push more entries to force main eviction.
+        // Blocks with access_count > 0 get second-chance (rotated, count decremented).
+        for key in 100..120_u64 {
+            s3_access(&mut state, BlockNumber(key));
+        }
+
+        // Verify capacity held.
+        assert!(state.resident_len() <= state.capacity);
+    }
+
+    #[cfg(feature = "s3fifo")]
+    #[test]
+    fn s3fifo_ghost_queue_bounded() {
+        let mut state = ArcState::new(5);
+
+        // Insert many unique keys to generate ghost entries.
+        for key in 0..100_u64 {
+            s3_access(&mut state, BlockNumber(key));
+        }
+
+        assert!(
+            state.b1.len() <= state.ghost_capacity,
+            "ghost queue {} should not exceed ghost_capacity {}",
+            state.b1.len(),
+            state.ghost_capacity
+        );
+    }
+
+    #[cfg(feature = "s3fifo")]
+    #[test]
+    fn s3fifo_hot_entries_survive_sequential_scan() {
+        // With capacity 20: small=2, main=18.
+        let mut state = ArcState::new(20);
+
+        // Create 5 "hot" keys with multiple touches.
+        // They may end up in T1 or T2 depending on overflow timing.
+        for key in 0..5_u64 {
+            s3_access(&mut state, BlockNumber(key));
+            s3_access(&mut state, BlockNumber(key));
+            s3_access(&mut state, BlockNumber(key));
+        }
+
+        // Count how many hot keys are resident (T1 or T2).
+        let hot_before: usize = (0..5_u64)
+            .filter(|k| state.resident.contains_key(&BlockNumber(*k)))
+            .count();
+        assert!(hot_before >= 2, "at least 2 hot keys should be resident before scan");
+
+        // Now scan through 30 unique one-touch keys.
+        for key in 100..130_u64 {
+            s3_access(&mut state, BlockNumber(key));
+        }
+
+        // Hot keys with high access counts should survive via second-chance.
+        let hot_after: usize = (0..5_u64)
+            .filter(|k| state.resident.contains_key(&BlockNumber(*k)))
+            .count();
+        assert!(
+            hot_after >= 2,
+            "at least 2 of 5 hot keys should survive the scan, got {hot_after}"
+        );
+    }
+
+    #[cfg(feature = "s3fifo")]
+    #[test]
+    fn s3fifo_metrics_track_hits_misses_evictions() {
+        // Use capacity 20 (small=2, main=18) so entries stay resident.
+        let mut state = ArcState::new(20);
+
+        // 5 misses.
+        for key in 0..5_u64 {
+            s3_access(&mut state, BlockNumber(key));
+        }
+        assert_eq!(state.misses, 5);
+        assert_eq!(state.hits, 0);
+
+        // Access resident keys again — should be hits.
+        // Only keys still in resident will produce hits.
+        let hits_before = state.hits;
+        for key in 0..5_u64 {
+            s3_access(&mut state, BlockNumber(key));
+        }
+        let new_hits = state.hits - hits_before;
+        assert!(new_hits > 0, "some accesses to recent keys should be hits");
+
+        // Force evictions by exceeding capacity.
+        for key in 100..130_u64 {
+            s3_access(&mut state, BlockNumber(key));
+        }
+        assert!(state.evictions > 0, "evictions should be tracked");
+    }
+
+    #[cfg(feature = "s3fifo")]
+    #[test]
+    fn s3fifo_main_eviction_when_small_is_empty() {
+        // When small queue is empty, continued insertions should still evict
+        // from the main queue. Capacity 10: small=1, main=9.
+        let mut state = ArcState::new(10);
+
+        // Fill with keys, touching each to promote to main.
+        for key in 0..10_u64 {
+            s3_access(&mut state, BlockNumber(key));
+            s3_access(&mut state, BlockNumber(key)); // touch -> access_count=1
+        }
+
+        // Drain the small queue explicitly: all promoted entries are in main.
+        // Now add new keys beyond capacity. Some main entries must be evicted.
+        let evictions_before = state.evictions;
+        for key in 50..65_u64 {
+            s3_access(&mut state, BlockNumber(key));
+        }
+
+        assert!(
+            state.evictions > evictions_before,
+            "evictions should occur from main when small empties"
+        );
+        assert!(state.resident_len() <= state.capacity);
+    }
+
+    #[cfg(feature = "s3fifo")]
+    #[test]
+    fn s3fifo_mixed_workload_hot_retained_scan_evicted() {
+        // Simulate a realistic mixed workload: 10 hot keys accessed repeatedly,
+        // interleaved with 100 unique scan keys. Hot keys should be retained.
+        let mut state = ArcState::new(30); // small=3, main=27
+
+        let hot_keys: Vec<BlockNumber> = (0..10_u64).map(BlockNumber).collect();
+        let scan_keys: Vec<BlockNumber> = (1000..1100_u64).map(BlockNumber).collect();
+
+        // Warm up hot keys with 5 accesses each.
+        for &k in &hot_keys {
+            for _ in 0..5 {
+                s3_access(&mut state, k);
+            }
+        }
+
+        // Interleave scan keys with occasional hot key re-access.
+        for (i, &sk) in scan_keys.iter().enumerate() {
+            s3_access(&mut state, sk);
+            if i % 10 == 0 {
+                // Re-touch a hot key periodically.
+                let hk = hot_keys[i % hot_keys.len()];
+                s3_access(&mut state, hk);
+            }
+        }
+
+        // Count how many hot keys survived.
+        let hot_survived: usize = hot_keys
+            .iter()
+            .filter(|k| state.resident.contains_key(k))
+            .count();
+
+        // Count how many scan keys are resident.
+        let scan_resident: usize = scan_keys
+            .iter()
+            .filter(|k| state.resident.contains_key(k))
+            .count();
+
+        // Scan resistance: hot keys should dominate.
+        assert!(
+            hot_survived >= 5,
+            "at least half of hot keys should survive, got {hot_survived}/10"
+        );
+        assert!(
+            scan_resident < state.capacity,
+            "scan keys should not fill the entire cache"
+        );
+        assert!(state.resident_len() <= state.capacity);
     }
 
     #[test]
@@ -4378,5 +4821,304 @@ mod tests {
                 "seed {seed}: write-through cache should not retain dirty blocks"
             );
         }
+    }
+
+    // ── Fault injection framework tests (bd-32yn.8) ──────────────────
+
+    /// Simple in-memory BlockDevice for fault injection tests.
+    struct MemBlockDevice {
+        blocks: Mutex<HashMap<u64, Vec<u8>>>,
+        block_size: u32,
+        block_count: u64,
+    }
+
+    impl MemBlockDevice {
+        fn new(block_size: u32, block_count: u64) -> Self {
+            Self {
+                blocks: Mutex::new(HashMap::new()),
+                block_size,
+                block_count,
+            }
+        }
+    }
+
+    impl BlockDevice for MemBlockDevice {
+        fn read_block(&self, _cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
+            let blocks = self.blocks.lock();
+            let data = blocks
+                .get(&block.0)
+                .cloned()
+                .unwrap_or_else(|| vec![0_u8; self.block_size as usize]);
+            Ok(BlockBuf::new(data))
+        }
+
+        fn write_block(&self, _cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
+            self.blocks.lock().insert(block.0, data.to_vec());
+            Ok(())
+        }
+
+        fn block_size(&self) -> u32 {
+            self.block_size
+        }
+
+        fn block_count(&self) -> u64 {
+            self.block_count
+        }
+
+        fn sync(&self, _cx: &Cx) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn fault_passthrough_no_faults() {
+        // With no rules, FaultInjector delegates transparently.
+        let dev = MemBlockDevice::new(4096, 16);
+        let fi = FaultInjector::new(dev, 42);
+        let cx = Cx::for_testing();
+
+        // Write then read — should work identically to unwrapped device.
+        let data = vec![0xAB_u8; 4096];
+        fi.write_block(&cx, BlockNumber(0), &data).unwrap();
+        let buf = fi.read_block(&cx, BlockNumber(0)).unwrap();
+        assert_eq!(buf.as_slice(), &data[..]);
+
+        // Fault log should be empty.
+        assert!(fi.fault_log().is_empty());
+    }
+
+    #[test]
+    fn fault_fail_on_read_returns_error() {
+        let dev = MemBlockDevice::new(4096, 16);
+        let fi = FaultInjector::new(dev, 1);
+        let cx = Cx::for_testing();
+
+        fi.fail_on_read(BlockNumber(5), FaultMode::OneShot);
+
+        // Reading block 5 should fail.
+        let err = fi.read_block(&cx, BlockNumber(5)).unwrap_err();
+        assert!(matches!(err, FfsError::Corruption { .. }));
+
+        // Reading a different block should succeed.
+        let _ = fi.read_block(&cx, BlockNumber(0)).unwrap();
+    }
+
+    #[test]
+    fn fault_fail_on_write_returns_error() {
+        let dev = MemBlockDevice::new(4096, 16);
+        let fi = FaultInjector::new(dev, 2);
+        let cx = Cx::for_testing();
+
+        fi.fail_on_write(BlockNumber(3), FaultMode::OneShot);
+
+        let data = vec![0_u8; 4096];
+        let err = fi.write_block(&cx, BlockNumber(3), &data).unwrap_err();
+        assert!(matches!(err, FfsError::Corruption { .. }));
+
+        // Writing a different block should succeed.
+        fi.write_block(&cx, BlockNumber(0), &data).unwrap();
+    }
+
+    #[test]
+    fn fault_oneshot_cleared_after_trigger() {
+        // One-shot fault fires once, then subsequent accesses succeed.
+        let dev = MemBlockDevice::new(4096, 16);
+        let fi = FaultInjector::new(dev, 3);
+        let cx = Cx::for_testing();
+
+        fi.fail_on_read(BlockNumber(7), FaultMode::OneShot);
+
+        // First read: fails.
+        assert!(fi.read_block(&cx, BlockNumber(7)).is_err());
+        // Second read: succeeds (one-shot cleared).
+        assert!(fi.read_block(&cx, BlockNumber(7)).is_ok());
+    }
+
+    #[test]
+    fn fault_persistent_fires_every_time() {
+        // Persistent fault fires on every matching access.
+        let dev = MemBlockDevice::new(4096, 16);
+        let fi = FaultInjector::new(dev, 4);
+        let cx = Cx::for_testing();
+
+        fi.fail_on_read(BlockNumber(2), FaultMode::Persistent);
+
+        for _ in 0..5 {
+            assert!(fi.read_block(&cx, BlockNumber(2)).is_err());
+        }
+        // Should have logged 5 faults.
+        assert_eq!(fi.fault_log().len(), 5);
+    }
+
+    #[test]
+    fn fault_mixed_read_write_targets() {
+        // Can register both read and write faults on different blocks.
+        let dev = MemBlockDevice::new(4096, 16);
+        let fi = FaultInjector::new(dev, 5);
+        let cx = Cx::for_testing();
+
+        fi.fail_on_read(BlockNumber(1), FaultMode::OneShot);
+        fi.fail_on_write(BlockNumber(2), FaultMode::OneShot);
+
+        let data = vec![0_u8; 4096];
+
+        // Read block 1 fails, write block 1 succeeds.
+        assert!(fi.read_block(&cx, BlockNumber(1)).is_err());
+        fi.write_block(&cx, BlockNumber(1), &data).unwrap();
+
+        // Write block 2 fails, read block 2 succeeds.
+        assert!(fi.write_block(&cx, BlockNumber(2), &data).is_err());
+        fi.read_block(&cx, BlockNumber(2)).unwrap();
+    }
+
+    #[test]
+    fn fault_deterministic_same_seed_same_sequence() {
+        // Two injectors with the same seed and rules produce the same
+        // fault log sequence numbers.
+        let run = |seed: u64| -> Vec<u64> {
+            let dev = MemBlockDevice::new(4096, 16);
+            let fi = FaultInjector::new(dev, seed);
+            let cx = Cx::for_testing();
+
+            fi.fail_on_read(BlockNumber(0), FaultMode::Persistent);
+            fi.fail_on_write(BlockNumber(1), FaultMode::Persistent);
+
+            let data = vec![0_u8; 4096];
+            let _ = fi.read_block(&cx, BlockNumber(0));
+            let _ = fi.write_block(&cx, BlockNumber(1), &data);
+            let _ = fi.read_block(&cx, BlockNumber(0));
+
+            fi.fault_log().iter().map(|r| r.sequence).collect()
+        };
+
+        let seq_a = run(99);
+        let seq_b = run(99);
+        assert_eq!(seq_a, seq_b);
+        assert_eq!(seq_a, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn fault_reproducible_across_runs() {
+        // Run the same scenario twice and verify identical fault log.
+        let scenario = || -> Vec<FaultRecord> {
+            let dev = MemBlockDevice::new(4096, 8);
+            let fi = FaultInjector::new(dev, 77);
+            let cx = Cx::for_testing();
+
+            fi.fail_on_read(BlockNumber(3), FaultMode::OneShot);
+            fi.fail_on_write(BlockNumber(5), FaultMode::OneShot);
+
+            let data = vec![0_u8; 4096];
+            let _ = fi.read_block(&cx, BlockNumber(3));
+            let _ = fi.write_block(&cx, BlockNumber(5), &data);
+
+            fi.fault_log()
+        };
+
+        let log_1 = scenario();
+        let log_2 = scenario();
+        assert_eq!(log_1.len(), log_2.len());
+        for (a, b) in log_1.iter().zip(log_2.iter()) {
+            assert_eq!(a.target, b.target);
+            assert_eq!(a.sequence, b.sequence);
+        }
+    }
+
+    #[test]
+    fn fault_log_captures_all_injected_faults() {
+        // Verify the log records every triggered fault with correct target
+        // and monotonically increasing sequence numbers.
+        let dev = MemBlockDevice::new(4096, 16);
+        let fi = FaultInjector::new(dev, 10);
+        let cx = Cx::for_testing();
+
+        fi.fail_on_read(BlockNumber(0), FaultMode::Persistent);
+        fi.fail_on_write(BlockNumber(1), FaultMode::Persistent);
+
+        let data = vec![0_u8; 4096];
+        let _ = fi.read_block(&cx, BlockNumber(0));
+        let _ = fi.write_block(&cx, BlockNumber(1), &data);
+        let _ = fi.read_block(&cx, BlockNumber(0));
+
+        let log = fi.fault_log();
+        assert_eq!(log.len(), 3);
+        assert_eq!(log[0].target, FaultTarget::Read(BlockNumber(0)));
+        assert_eq!(log[0].sequence, 0);
+        assert_eq!(log[1].target, FaultTarget::Write(BlockNumber(1)));
+        assert_eq!(log[1].sequence, 1);
+        assert_eq!(log[2].target, FaultTarget::Read(BlockNumber(0)));
+        assert_eq!(log[2].sequence, 2);
+    }
+
+    #[test]
+    fn fault_crash_point_registered_fires_on_operation() {
+        // Register a fault that acts as a "crash point" — it fires at
+        // a specific write operation, simulating a crash during fsync.
+        let dev = MemBlockDevice::new(4096, 16);
+        let fi = FaultInjector::new(dev, 20);
+        let cx = Cx::for_testing();
+
+        // Simulate: crash when writing metadata block 10.
+        fi.fail_on_write(BlockNumber(10), FaultMode::OneShot);
+
+        let data = vec![0xFF_u8; 4096];
+        // Writes to blocks 0-9 succeed.
+        for b in 0..10 {
+            fi.write_block(&cx, BlockNumber(b), &data).unwrap();
+        }
+        // Write to block 10 crashes.
+        assert!(fi.write_block(&cx, BlockNumber(10), &data).is_err());
+        // Writes to blocks 11+ succeed (crash point was one-shot).
+        fi.write_block(&cx, BlockNumber(11), &data).unwrap();
+    }
+
+    #[test]
+    fn fault_crash_point_fires_at_correct_moment() {
+        // Set up a write-then-sync sequence. The crash point fires on
+        // the write, so the sync never executes.
+        let dev = MemBlockDevice::new(4096, 16);
+        let fi = FaultInjector::new(dev, 30);
+        let cx = Cx::for_testing();
+
+        fi.fail_on_write(BlockNumber(5), FaultMode::OneShot);
+
+        let data = vec![0xCC_u8; 4096];
+        // Write block 5 fails — "crash before sync".
+        let err = fi.write_block(&cx, BlockNumber(5), &data);
+        assert!(err.is_err());
+
+        // Block 5 was never written — reading it returns zeros.
+        let buf = fi.read_block(&cx, BlockNumber(5)).unwrap();
+        assert_eq!(&buf.as_slice()[..4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn fault_recovery_after_crash_point() {
+        // After a crash point fires (one-shot), the device recovers and
+        // subsequent I/O works correctly, simulating post-crash remount.
+        let dev = MemBlockDevice::new(4096, 16);
+        let fi = FaultInjector::new(dev, 40);
+        let cx = Cx::for_testing();
+
+        // Write some data before crash.
+        let pre_crash = vec![0xAA_u8; 4096];
+        fi.write_block(&cx, BlockNumber(0), &pre_crash).unwrap();
+
+        // Crash on block 1.
+        fi.fail_on_write(BlockNumber(1), FaultMode::OneShot);
+        let data = vec![0xBB_u8; 4096];
+        assert!(fi.write_block(&cx, BlockNumber(1), &data).is_err());
+
+        // "Recovery": subsequent I/O works.
+        fi.write_block(&cx, BlockNumber(1), &data).unwrap();
+        fi.sync(&cx).unwrap();
+
+        // Pre-crash data is intact.
+        let buf0 = fi.read_block(&cx, BlockNumber(0)).unwrap();
+        assert_eq!(&buf0.as_slice()[..4], &[0xAA, 0xAA, 0xAA, 0xAA]);
+
+        // Post-recovery data is correct.
+        let buf1 = fi.read_block(&cx, BlockNumber(1)).unwrap();
+        assert_eq!(&buf1.as_slice()[..4], &[0xBB, 0xBB, 0xBB, 0xBB]);
     }
 }

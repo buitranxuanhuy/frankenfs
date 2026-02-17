@@ -1743,4 +1743,158 @@ mod tests {
         assert_eq!(&target.as_slice()[..128], &[0xCC; 128]);
         assert_eq!(&target.as_slice()[128..], &[0_u8; 384]);
     }
+
+    // ── bd-1xe.5: ext4 read path journal replay tests ───────────────────
+
+    // Journal Replay Test 1: Replay empty journal — no-op
+    #[test]
+    fn readpath_replay_empty_journal_noop() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let region = JournalRegion {
+            start: BlockNumber(10),
+            blocks: 8,
+        };
+
+        // Journal region contains all zeros (no valid JBD2 headers).
+        let out = replay_jbd2(&cx, &dev, region).expect("replay empty journal should succeed");
+
+        assert!(
+            out.committed_sequences.is_empty(),
+            "empty journal should have no committed sequences"
+        );
+        assert_eq!(out.stats.replayed_blocks, 0);
+        assert_eq!(out.stats.descriptor_blocks, 0);
+        assert_eq!(out.stats.commit_blocks, 0);
+    }
+
+    // Journal Replay Test 2: Replay single committed transaction — blocks written back
+    #[test]
+    fn readpath_replay_single_committed_transaction() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let region = JournalRegion {
+            start: BlockNumber(10),
+            blocks: 8,
+        };
+
+        // Build a single committed transaction: descriptor + payload + commit
+        let descriptor = descriptor_block(512, 42, &[(7, JBD2_TAG_FLAG_LAST)]);
+        dev.raw_write(BlockNumber(10), descriptor);
+        dev.raw_write(BlockNumber(11), vec![0xDE; 512]); // payload for target block 7
+        dev.raw_write(BlockNumber(12), commit_block(512, 42));
+
+        // Verify target block is initially zeros.
+        let before = dev.read_block(&cx, BlockNumber(7)).expect("read before");
+        assert_eq!(before.as_slice(), &[0_u8; 512], "target should be zero before replay");
+
+        let out = replay_jbd2(&cx, &dev, region).expect("replay");
+
+        // Verify target block now contains the journal payload.
+        let after = dev.read_block(&cx, BlockNumber(7)).expect("read after");
+        assert_eq!(after.as_slice(), &[0xDE; 512], "target should have journal payload");
+        assert_eq!(out.committed_sequences, vec![42]);
+        assert_eq!(out.stats.replayed_blocks, 1);
+    }
+
+    // Journal Replay Test 3: Replay aborted transaction — blocks discarded
+    #[test]
+    fn readpath_replay_aborted_transaction_discarded() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let region = JournalRegion {
+            start: BlockNumber(10),
+            blocks: 8,
+        };
+
+        // Descriptor + payload but NO commit block → incomplete/aborted transaction.
+        let descriptor = descriptor_block(512, 99, &[(4, JBD2_TAG_FLAG_LAST)]);
+        dev.raw_write(BlockNumber(10), descriptor);
+        dev.raw_write(BlockNumber(11), vec![0xFF; 512]);
+        // No commit block at BlockNumber(12).
+
+        let out = replay_jbd2(&cx, &dev, region).expect("replay");
+
+        // Target block should remain untouched.
+        let target = dev.read_block(&cx, BlockNumber(4)).expect("read");
+        assert_eq!(target.as_slice(), &[0_u8; 512], "aborted txn should not modify target");
+        assert!(out.committed_sequences.is_empty());
+        assert_eq!(out.stats.incomplete_transactions, 1);
+        assert_eq!(out.stats.replayed_blocks, 0);
+    }
+
+    // Journal Replay Test 4: Replay with torn write — partial transaction discarded
+    #[test]
+    fn readpath_replay_torn_write_partial_discarded() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let region = JournalRegion {
+            start: BlockNumber(10),
+            blocks: 16,
+        };
+
+        // First transaction: complete (descriptor + 2 payloads + commit).
+        let desc1 = descriptor_block(512, 10, &[(3, 0), (4, JBD2_TAG_FLAG_LAST)]);
+        dev.raw_write(BlockNumber(10), desc1);
+        dev.raw_write(BlockNumber(11), vec![0xAA; 512]); // payload for block 3
+        dev.raw_write(BlockNumber(12), vec![0xBB; 512]); // payload for block 4
+        dev.raw_write(BlockNumber(13), commit_block(512, 10));
+
+        // Second transaction: torn (descriptor + payload, no commit).
+        let desc2 = descriptor_block(512, 11, &[(5, JBD2_TAG_FLAG_LAST)]);
+        dev.raw_write(BlockNumber(14), desc2);
+        dev.raw_write(BlockNumber(15), vec![0xCC; 512]);
+        // Missing commit for seq=11.
+
+        let out = replay_jbd2(&cx, &dev, region).expect("replay");
+
+        // First transaction's blocks should be replayed.
+        let b3 = dev.read_block(&cx, BlockNumber(3)).expect("read block 3");
+        assert_eq!(b3.as_slice(), &[0xAA; 512], "complete txn block 3 should be written");
+        let b4 = dev.read_block(&cx, BlockNumber(4)).expect("read block 4");
+        assert_eq!(b4.as_slice(), &[0xBB; 512], "complete txn block 4 should be written");
+
+        // Second transaction's block should NOT be replayed.
+        let b5 = dev.read_block(&cx, BlockNumber(5)).expect("read block 5");
+        assert_eq!(b5.as_slice(), &[0_u8; 512], "torn txn block 5 should be untouched");
+
+        assert_eq!(out.committed_sequences, vec![10]);
+        assert_eq!(out.stats.replayed_blocks, 2);
+        assert_eq!(out.stats.incomplete_transactions, 1);
+    }
+
+    // Journal Replay Test 5: Replay ordering — transactions applied in sequence order
+    #[test]
+    fn readpath_replay_ordering_sequence_order() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let region = JournalRegion {
+            start: BlockNumber(10),
+            blocks: 16,
+        };
+
+        // Two committed transactions writing to the SAME target block.
+        // Seq 20 writes 0xAA, Seq 21 writes 0xBB.
+        // After replay, target should contain 0xBB (later sequence wins).
+        let desc1 = descriptor_block(512, 20, &[(6, JBD2_TAG_FLAG_LAST)]);
+        dev.raw_write(BlockNumber(10), desc1);
+        dev.raw_write(BlockNumber(11), vec![0xAA; 512]);
+        dev.raw_write(BlockNumber(12), commit_block(512, 20));
+
+        let desc2 = descriptor_block(512, 21, &[(6, JBD2_TAG_FLAG_LAST)]);
+        dev.raw_write(BlockNumber(13), desc2);
+        dev.raw_write(BlockNumber(14), vec![0xBB; 512]);
+        dev.raw_write(BlockNumber(15), commit_block(512, 21));
+
+        let out = replay_jbd2(&cx, &dev, region).expect("replay");
+
+        let target = dev.read_block(&cx, BlockNumber(6)).expect("read target");
+        assert_eq!(
+            target.as_slice(),
+            &[0xBB; 512],
+            "later sequence (21) should overwrite earlier sequence (20)"
+        );
+        assert_eq!(out.committed_sequences, vec![20, 21]);
+        assert_eq!(out.stats.replayed_blocks, 2);
+    }
 }

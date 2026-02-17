@@ -4261,6 +4261,153 @@ mod tests {
         );
     }
 
+    /// Edge case: an empty transaction commits successfully and does not
+    /// mutate any version chains.
+    #[test]
+    fn edge_empty_transaction_commit_preserves_version_state() {
+        let mut store = MvccStore::new();
+        let before = store.current_snapshot().high;
+        eprintln!(
+            "scenario=edge_empty_transaction_commit before_commit_seq={} version_count={}",
+            before.0,
+            store.version_count()
+        );
+
+        let empty = store.begin();
+        assert_eq!(empty.pending_writes(), 0, "transaction should be empty");
+        let committed = store
+            .commit(empty)
+            .expect("empty transaction should commit");
+
+        assert_eq!(committed, CommitSeq(before.0 + 1));
+        assert_eq!(store.current_snapshot().high, committed);
+        assert_eq!(
+            store.version_count(),
+            0,
+            "empty transaction must not create block versions"
+        );
+    }
+
+    /// Edge case: reading and then writing the same block in a single
+    /// transaction is not a self-conflict under SSI.
+    #[test]
+    fn ssi_self_read_write_same_block_no_self_conflict() {
+        let mut store = MvccStore::new();
+        let block = BlockNumber(44);
+
+        let mut seed = store.begin();
+        seed.stage_write(block, vec![1]);
+        store.commit_ssi(seed).expect("seed");
+
+        let mut txn = store.begin();
+        let seen_version = store.latest_commit_seq(block);
+        txn.record_read(block, seen_version);
+        txn.stage_write(block, vec![2]);
+        eprintln!(
+            "scenario=ssi_self_conflict txn_id={} block={} seen_version={}",
+            txn.id().0,
+            block.0,
+            seen_version.0
+        );
+
+        let committed = store
+            .commit_ssi(txn)
+            .expect("self read-write should not trigger SSI conflict");
+        assert_eq!(committed, CommitSeq(2));
+        let latest = store.current_snapshot();
+        assert_eq!(
+            store
+                .read_visible(block, latest)
+                .expect("latest block visible"),
+            &[2]
+        );
+    }
+
+    /// Cascading-abort scenario: two dependent transactions read the same
+    /// stale source block and both must abort once that source is updated.
+    #[test]
+    fn ssi_cascading_abort_for_shared_stale_dependency() {
+        let mut store = MvccStore::new();
+        let source = BlockNumber(500);
+        let derived_a = BlockNumber(501);
+        let derived_b = BlockNumber(502);
+
+        // Seed source + derived outputs.
+        let mut seed = store.begin();
+        seed.stage_write(source, vec![1]);
+        seed.stage_write(derived_a, vec![10]);
+        seed.stage_write(derived_b, vec![10]);
+        store.commit_ssi(seed).expect("seed");
+
+        // Two dependents read the same source snapshot and compute outputs.
+        let mut dependent_a = store.begin();
+        let read_version = store.latest_commit_seq(source);
+        dependent_a.record_read(source, read_version);
+        dependent_a.stage_write(derived_a, vec![11]);
+
+        let mut dependent_b = store.begin();
+        dependent_b.record_read(source, read_version);
+        dependent_b.stage_write(derived_b, vec![12]);
+
+        // Upstream update invalidates both stale readers.
+        let mut upstream = store.begin();
+        upstream.stage_write(source, vec![2]);
+        store.commit_ssi(upstream).expect("upstream update");
+
+        eprintln!(
+            "scenario=ssi_cascading_abort source={} read_version={} current_snapshot={}",
+            source.0,
+            read_version.0,
+            store.current_snapshot().high.0
+        );
+
+        let abort_a = store.commit_ssi(dependent_a);
+        assert!(
+            matches!(
+                abort_a,
+                Err(CommitError::SsiConflict { pivot_block, .. }) if pivot_block == source
+            ),
+            "dependent A should abort on stale source read, got {abort_a:?}"
+        );
+
+        let abort_b = store.commit_ssi(dependent_b);
+        assert!(
+            matches!(
+                abort_b,
+                Err(CommitError::SsiConflict { pivot_block, .. }) if pivot_block == source
+            ),
+            "dependent B should abort on stale source read, got {abort_b:?}"
+        );
+
+        let snap_after_aborts = store.current_snapshot();
+        assert_eq!(
+            store
+                .read_visible(derived_a, snap_after_aborts)
+                .expect("derived_a visible"),
+            &[10]
+        );
+        assert_eq!(
+            store
+                .read_visible(derived_b, snap_after_aborts)
+                .expect("derived_b visible"),
+            &[10]
+        );
+
+        // Fresh retry after abort should succeed with the new source version.
+        let mut retry = store.begin();
+        let fresh_version = store.latest_commit_seq(source);
+        retry.record_read(source, fresh_version);
+        retry.stage_write(derived_a, vec![11]);
+        store.commit_ssi(retry).expect("retry after abort");
+        let latest = store.current_snapshot();
+        assert_eq!(
+            store
+                .read_visible(derived_a, latest)
+                .expect("retry value visible"),
+            &[11]
+        );
+    }
+
     /// SSI log pruning does not affect correctness for active transactions.
     #[test]
     fn ssi_log_pruning() {

@@ -14,8 +14,11 @@ source "$REPO_ROOT/scripts/e2e/lib.sh"
 
 export RUST_LOG="${RUST_LOG:-ffs=trace,fuser=debug}"
 export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
+export FFS_USE_RCH="${FFS_USE_RCH:-1}"
+export FFS_AUTO_UNMOUNT="${FFS_AUTO_UNMOUNT:-0}"
 export TMPDIR="${TMPDIR:-$REPO_ROOT/artifacts/tmp}"
 mkdir -p "$TMPDIR"
+FFS_CLI_BIN="${FFS_CLI_BIN:-$REPO_ROOT/target/release/ffs-cli}"
 
 e2e_init "ffs_btrfs_rw_smoke"
 e2e_print_env
@@ -129,7 +132,7 @@ capture_failure_diagnostics() {
     e2e_log "=== Failure diagnostics ==="
     if command -v dmesg >/dev/null 2>&1; then
         e2e_log "--- dmesg (tail -50) ---"
-        e2e_run dmesg | tail -50 || true
+        e2e_run bash -lc "dmesg | tail -50" || true
     fi
     if command -v journalctl >/dev/null 2>&1; then
         e2e_log "--- journalctl -n 50 ---"
@@ -184,6 +187,17 @@ run_case_shell() {
     run_case "$test_name" bash -lc "$shell_cmd"
 }
 
+run_case_cargo() {
+    local test_name="$1"
+    shift
+
+    if [[ "$FFS_USE_RCH" == "1" ]] && command -v rch >/dev/null 2>&1; then
+        run_case "$test_name" rch exec -- cargo "$@"
+    else
+        run_case "$test_name" cargo "$@"
+    fi
+}
+
 expect_case_failure() {
     local test_name="$1"
     shift
@@ -235,13 +249,16 @@ start_mount() {
     if [[ ! -r /dev/fuse ]] || [[ ! -w /dev/fuse ]]; then
         skip_suite "/dev/fuse not accessible"
     fi
+    if ! command -v mountpoint >/dev/null 2>&1; then
+        skip_suite "mountpoint utility not found"
+    fi
 
     mkdir -p "$mount_point"
     E2E_MOUNT_POINT="$mount_point"
     CURRENT_MOUNT_POINT="$mount_point"
     CURRENT_MOUNT_LOG="$E2E_LOG_DIR/mount_${mode}_$(basename "$mount_point").log"
 
-    local cmd=(cargo run -p ffs-cli --release -- mount "$image" "$mount_point")
+    local cmd=("$FFS_CLI_BIN" mount "$image" "$mount_point")
     if [[ "$mode" == "rw" ]]; then
         cmd+=(--rw)
     fi
@@ -277,6 +294,9 @@ start_mount() {
 
     if grep -qiE "allow_other only allowed if 'user_allow_other' is set" "$CURRENT_MOUNT_LOG"; then
         skip_suite "FUSE present but user_allow_other is not enabled in /etc/fuse.conf"
+    fi
+    if grep -qiE "Permission denied|Operation not permitted" "$CURRENT_MOUNT_LOG"; then
+        skip_suite "FUSE mount not permitted in this environment"
     fi
     if [[ "$mode" == "rw" ]] && grep -qiE "btrfs read-write mount is not yet supported|read-write mount is not yet supported" "$CURRENT_MOUNT_LOG"; then
         skip_suite "btrfs read-write mount is not yet supported in this build"
@@ -333,7 +353,7 @@ prepare_btrfs_images() {
     run_case "image_allocate_256mb" dd if=/dev/zero of="$base_image" bs=1M count=256 status=none
     run_case "image_mkfs_btrfs" mkfs.btrfs -f "$base_image"
 
-    if e2e_run cargo run -p ffs-cli --release -- inspect "$base_image" --json; then
+    if e2e_run "$FFS_CLI_BIN" inspect "$base_image" --json; then
         e2e_log "Fresh mkfs.btrfs image is inspectable by current FrankenFS parser."
     else
         e2e_log "Fresh mkfs.btrfs image is not inspectable yet; falling back to fixture image."
@@ -347,13 +367,14 @@ prepare_btrfs_images() {
 }
 
 e2e_step "Phase 1: Build ffs-cli"
-run_case "build_ffs_cli" cargo build -p ffs-cli --release
+run_case_cargo "build_ffs_cli" build -p ffs-cli --release
+run_case "build_ffs_cli_binary_exists" test -x "$FFS_CLI_BIN"
 
 e2e_step "Phase 2: Prepare btrfs test image"
 BASE_IMAGE="$E2E_TEMP_DIR/base.btrfs"
 WORK_IMAGE="$E2E_TEMP_DIR/work.btrfs"
 prepare_btrfs_images "$BASE_IMAGE" "$WORK_IMAGE"
-run_case "inspect_work_image" cargo run -p ffs-cli --release -- inspect "$WORK_IMAGE" --json
+run_case "inspect_work_image" "$FFS_CLI_BIN" inspect "$WORK_IMAGE" --json
 
 GEN_BEFORE="$(super_generation "$WORK_IMAGE")"
 ROOT_BEFORE="$(super_root_bytenr "$WORK_IMAGE")"
@@ -418,13 +439,16 @@ ROOT_AFTER="$(super_root_bytenr "$WORK_IMAGE")"
 e2e_log "Post-write superblock generation=$GEN_AFTER root_bytenr=$ROOT_AFTER"
 
 if [[ -n "$GEN_BEFORE" ]] && [[ -n "$GEN_AFTER" ]]; then
-    if (( GEN_AFTER < GEN_BEFORE )); then
-        fail_suite "cow_generation_monotonic" 0 "generation regressed: before=$GEN_BEFORE after=$GEN_AFTER"
+    if (( GEN_AFTER <= GEN_BEFORE )); then
+        fail_suite "cow_generation_advances" 0 "generation did not advance: before=$GEN_BEFORE after=$GEN_AFTER"
     fi
-    record_test "cow_generation_monotonic" "pass" 0 "generation before=$GEN_BEFORE after=$GEN_AFTER"
+    record_test "cow_generation_advances" "pass" 0 "generation before=$GEN_BEFORE after=$GEN_AFTER"
 fi
 if [[ -n "$ROOT_BEFORE" ]] && [[ -n "$ROOT_AFTER" ]]; then
-    record_test "cow_root_recorded" "pass" 0 "root before=$ROOT_BEFORE after=$ROOT_AFTER"
+    if [[ "$ROOT_BEFORE" == "$ROOT_AFTER" ]]; then
+        fail_suite "cow_root_changed" 0 "root bytenr unchanged after writes: before=$ROOT_BEFORE after=$ROOT_AFTER"
+    fi
+    record_test "cow_root_changed" "pass" 0 "root before=$ROOT_BEFORE after=$ROOT_AFTER"
 fi
 
 e2e_step "Phase 4: Remount RO and verify persistence"

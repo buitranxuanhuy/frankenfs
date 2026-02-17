@@ -2869,6 +2869,750 @@ mod tests {
         }
     }
 
+    fn lcg_next(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        *state
+    }
+
+    fn payload_from_rng(rand: u64, case: usize) -> Vec<u8> {
+        let case_u64 = u64::try_from(case).expect("case should fit u64");
+        (rand ^ case_u64).to_le_bytes().to_vec()
+    }
+
+    fn assert_extent_non_overlap(
+        allocations: &BTreeMap<u64, ExtentAllocation>,
+        candidate: ExtentAllocation,
+        seed: u64,
+        case: usize,
+    ) {
+        for existing in allocations.values() {
+            let candidate_end = candidate
+                .bytenr
+                .checked_add(candidate.num_bytes)
+                .expect("candidate extent end overflow");
+            let existing_end = existing
+                .bytenr
+                .checked_add(existing.num_bytes)
+                .expect("existing extent end overflow");
+            let disjoint = candidate_end <= existing.bytenr || existing_end <= candidate.bytenr;
+            assert!(
+                disjoint,
+                "overlapping extents detected seed={seed:#x} case={case}: candidate={candidate:?} existing={existing:?}"
+            );
+        }
+    }
+
+    fn run_cow_property(seed: u64, cases: usize) {
+        let mut tree = InMemoryCowBtrfsTree::new(5).expect("tree");
+        let mut model = BTreeMap::<u64, Vec<u8>>::new();
+        let mut state = seed;
+
+        for case in 0..cases {
+            let rand = lcg_next(&mut state);
+            let objectid = (rand % 256) + 1;
+            let key = test_key(objectid);
+            let payload = payload_from_rng(rand, case);
+
+            match rand % 3 {
+                0 => {
+                    let result = tree.insert(key, &payload);
+                    if result.is_ok() {
+                        model.insert(objectid, payload.clone());
+                    } else {
+                        assert_eq!(
+                            result.expect_err("duplicate insert should fail"),
+                            BtrfsMutationError::KeyAlreadyExists
+                        );
+                    }
+                }
+                1 => {
+                    let result = tree.update(&key, &payload);
+                    if let std::collections::btree_map::Entry::Occupied(mut entry) =
+                        model.entry(objectid)
+                    {
+                        result.expect("update existing key");
+                        entry.insert(payload.clone());
+                    } else {
+                        assert_eq!(
+                            result.expect_err("update on missing key should fail"),
+                            BtrfsMutationError::KeyNotFound
+                        );
+                    }
+                }
+                _ => {
+                    let result = tree.delete(&key);
+                    if model.remove(&objectid).is_some() {
+                        result.expect("delete existing key");
+                    } else {
+                        assert_eq!(
+                            result.expect_err("delete on missing key should fail"),
+                            BtrfsMutationError::KeyNotFound
+                        );
+                    }
+                }
+            }
+
+            tree.validate_invariants()
+                .expect("tree invariants after random operation");
+            let observed = tree
+                .range(&test_key(0), &test_key(u64::MAX))
+                .expect("full tree range");
+            let observed_pairs = observed
+                .into_iter()
+                .map(|(entry_key, data)| (entry_key.objectid, data))
+                .collect::<Vec<_>>();
+            let model_pairs = model
+                .iter()
+                .map(|(objectid, data)| (*objectid, data.clone()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                observed_pairs, model_pairs,
+                "cow model mismatch seed={seed:#x} case={case}"
+            );
+        }
+    }
+
+    fn run_allocator_property(seed: u64, cases: usize) {
+        let mut alloc = BtrfsExtentAllocator::new(99).expect("allocator");
+        let bg_a = 0x1_0000_u64;
+        let bg_b = 0x5_0000_u64;
+        alloc.add_block_group(bg_a, make_data_bg(bg_a, 0x40_000));
+        alloc.add_block_group(bg_b, make_data_bg(bg_b, 0x40_000));
+
+        let mut expected_used = BTreeMap::from([(bg_a, 0_u64), (bg_b, 0_u64)]);
+        let mut live = BTreeMap::<u64, ExtentAllocation>::new();
+        let mut state = seed;
+        let sizes = [4096_u64, 8192, 12_288, 16_384];
+
+        for case in 0..cases {
+            let rand = lcg_next(&mut state);
+            let should_free = (rand & 1) == 1 && !live.is_empty();
+
+            if should_free {
+                let idx = usize::try_from(rand).expect("rand should fit usize") % live.len();
+                let extent = *live
+                    .values()
+                    .nth(idx)
+                    .expect("index into live allocation set");
+                alloc
+                    .free_extent(extent.bytenr, extent.num_bytes, false)
+                    .expect("free extent");
+                live.remove(&extent.bytenr);
+                let used = expected_used
+                    .get_mut(&extent.block_group_start)
+                    .expect("expected block group key");
+                *used = used.saturating_sub(extent.num_bytes);
+            } else {
+                let size_idx = usize::try_from(rand).expect("rand should fit usize") % sizes.len();
+                let size = sizes[size_idx];
+                if let Ok(extent) = alloc.alloc_data(size) {
+                    assert_extent_non_overlap(&live, extent, seed, case);
+                    live.insert(extent.bytenr, extent);
+                    let used = expected_used
+                        .get_mut(&extent.block_group_start)
+                        .expect("expected block group key");
+                    *used = used.saturating_add(extent.num_bytes);
+                }
+            }
+
+            for (bg, used) in &expected_used {
+                let observed = alloc.block_group(*bg).expect("block group").used_bytes;
+                assert_eq!(
+                    observed, *used,
+                    "allocator accounting mismatch seed={seed:#x} case={case} block_group={bg:#x}"
+                );
+            }
+        }
+
+        alloc
+            .flush_delayed_refs(usize::MAX)
+            .expect("flush delayed refs");
+        for extent in live.values() {
+            let key = ExtentKey {
+                bytenr: extent.bytenr,
+                num_bytes: extent.num_bytes,
+            };
+            assert_eq!(
+                alloc.extent_refcount(key),
+                1,
+                "live extent must have refcount=1 seed={seed:#x}"
+            );
+        }
+    }
+
+    fn run_delayed_ref_property(seed: u64, cases: usize) {
+        let mut queue = DelayedRefQueue::new();
+        let mut model = BTreeMap::<ExtentKey, u64>::new();
+        let extents = (0_u64..64)
+            .map(|idx| ExtentKey {
+                bytenr: 0x10_0000 + idx * 4096,
+                num_bytes: 4096,
+            })
+            .collect::<Vec<_>>();
+
+        let mut state = seed;
+        for case in 0..cases {
+            let rand = lcg_next(&mut state);
+            let extent_idx = usize::try_from(rand).expect("rand should fit usize") % extents.len();
+            let extent = extents[extent_idx];
+            let current = model.get(&extent).copied().unwrap_or(0);
+            let delete = (rand & 1) == 1 && current > 0;
+            let ref_type = match rand % 4 {
+                0 => BtrfsRef::DataExtent {
+                    root: BTRFS_FS_TREE_OBJECTID,
+                    objectid: extent.bytenr,
+                    offset: extent.num_bytes,
+                },
+                1 => BtrfsRef::SharedDataExtent {
+                    parent: extent.bytenr,
+                },
+                2 => BtrfsRef::TreeBlock {
+                    root: BTRFS_EXTENT_TREE_OBJECTID,
+                    owner: extent.bytenr,
+                    offset: extent.num_bytes,
+                    level: 0,
+                },
+                _ => BtrfsRef::SharedTreeBlock {
+                    parent: extent.bytenr,
+                    level: 0,
+                },
+            };
+            let action = if delete {
+                RefAction::Delete
+            } else {
+                RefAction::Insert
+            };
+            queue.queue(extent, ref_type, action);
+
+            if delete {
+                let updated = current - 1;
+                if updated == 0 {
+                    model.remove(&extent);
+                } else {
+                    model.insert(extent, updated);
+                }
+            } else {
+                model.insert(extent, current + 1);
+            }
+
+            if case % 250 == 0 {
+                assert_eq!(
+                    queue.pending_count(),
+                    case + 1,
+                    "queue size mismatch seed={seed:#x} case={case}"
+                );
+            }
+        }
+
+        let mut observed = BTreeMap::new();
+        let flushed = queue
+            .flush(usize::MAX, &mut observed)
+            .expect("flush delayed refs");
+        assert_eq!(flushed, cases);
+        assert_eq!(observed, model);
+    }
+
+    fn run_transaction_property(seed: u64, cases: usize) {
+        let cx = Cx::for_request();
+        let mut harness = TxPropertyHarness::new();
+        let mut state = seed;
+
+        for case in 0..cases {
+            let rand = lcg_next(&mut state);
+            match rand % 4 {
+                0 => harness.commit_single(rand, case, &cx),
+                1 => harness.abort_single(rand, case, &cx),
+                2 => harness.commit_disjoint_pair(rand, case, &cx),
+                _ => harness.conflict_pair(rand, case, &cx),
+            }
+            harness.assert_sample_visible(rand, seed, case);
+        }
+
+        harness.assert_all_visible();
+    }
+
+    #[derive(Debug, Default)]
+    struct TxPropertyHarness {
+        store: MvccStore,
+        expected: BTreeMap<u64, Vec<u8>>,
+        expected_commit_seq: u64,
+    }
+
+    impl TxPropertyHarness {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn commit_single(&mut self, rand: u64, case: usize, cx: &Cx) {
+            let tree_id = if (rand & 1) == 0 {
+                BTRFS_FS_TREE_OBJECTID
+            } else {
+                BTRFS_EXTENT_TREE_OBJECTID
+            };
+            let block = BlockNumber(0x20_000 + (rand % 128));
+            let payload = payload_from_rng(rand.rotate_left(7), case);
+            let mut txn = BtrfsTransaction::begin(&mut self.store, 100 + rand, cx)
+                .expect("begin transaction");
+            txn.stage_tree_root(
+                tree_id,
+                TreeRoot {
+                    bytenr: 0x1000_0000 + rand,
+                    level: u8::try_from(rand % 3).expect("level should fit u8"),
+                },
+            );
+            txn.stage_block_write(block, payload.clone())
+                .expect("stage write");
+            let seq = txn.commit(&mut self.store, cx).expect("commit transaction");
+            self.expected_commit_seq = self.expected_commit_seq.saturating_add(1);
+            assert_eq!(seq.0, self.expected_commit_seq);
+            self.expected.insert(block.0, payload);
+        }
+
+        fn abort_single(&mut self, rand: u64, case: usize, cx: &Cx) {
+            let block = BlockNumber(0x21_000 + (rand % 128));
+            let mut txn = BtrfsTransaction::begin(&mut self.store, 200 + rand, cx)
+                .expect("begin transaction");
+            txn.stage_tree_root(
+                BTRFS_FS_TREE_OBJECTID,
+                TreeRoot {
+                    bytenr: 0x2000_0000 + rand,
+                    level: 1,
+                },
+            );
+            txn.stage_block_write(block, payload_from_rng(rand, case))
+                .expect("stage write");
+            let _ = txn.abort();
+        }
+
+        fn commit_disjoint_pair(&mut self, rand: u64, case: usize, cx: &Cx) {
+            let mut tx1 =
+                BtrfsTransaction::begin(&mut self.store, 300 + rand, cx).expect("begin tx1");
+            let mut tx2 =
+                BtrfsTransaction::begin(&mut self.store, 300 + rand, cx).expect("begin tx2");
+            let block1 = BlockNumber(0x22_000 + (rand % 64));
+            let block2 = BlockNumber(0x23_000 + (rand % 64));
+            let payload1 = payload_from_rng(rand, case);
+            let payload2 = payload_from_rng(rand.rotate_left(13), case);
+
+            tx1.stage_tree_root(
+                BTRFS_FS_TREE_OBJECTID,
+                TreeRoot {
+                    bytenr: 0x3000_0000 + rand,
+                    level: 0,
+                },
+            );
+            tx1.stage_block_write(block1, payload1.clone())
+                .expect("stage tx1 write");
+
+            tx2.stage_tree_root(
+                BTRFS_EXTENT_TREE_OBJECTID,
+                TreeRoot {
+                    bytenr: 0x3100_0000 + rand,
+                    level: 0,
+                },
+            );
+            tx2.stage_block_write(block2, payload2.clone())
+                .expect("stage tx2 write");
+
+            let s1 = tx1.commit(&mut self.store, cx).expect("commit tx1");
+            let s2 = tx2.commit(&mut self.store, cx).expect("commit tx2");
+            self.expected_commit_seq = self.expected_commit_seq.saturating_add(2);
+            assert_eq!(s2.0, self.expected_commit_seq);
+            assert_eq!(s1.0 + 1, s2.0);
+            self.expected.insert(block1.0, payload1);
+            self.expected.insert(block2.0, payload2);
+        }
+
+        fn conflict_pair(&mut self, rand: u64, case: usize, cx: &Cx) {
+            let mut tx1 =
+                BtrfsTransaction::begin(&mut self.store, 400 + rand, cx).expect("begin tx1");
+            let mut tx2 =
+                BtrfsTransaction::begin(&mut self.store, 400 + rand, cx).expect("begin tx2");
+            let block = BlockNumber(0x24_000 + (rand % 64));
+            let payload1 = payload_from_rng(rand, case);
+            let payload2 = payload_from_rng(rand.rotate_right(11), case);
+
+            tx1.stage_tree_root(
+                BTRFS_FS_TREE_OBJECTID,
+                TreeRoot {
+                    bytenr: 0x3200_0000 + rand,
+                    level: 1,
+                },
+            );
+            tx2.stage_tree_root(
+                BTRFS_FS_TREE_OBJECTID,
+                TreeRoot {
+                    bytenr: 0x3210_0000 + rand,
+                    level: 1,
+                },
+            );
+            tx1.stage_block_write(block, payload1.clone())
+                .expect("stage tx1 write");
+            tx2.stage_block_write(block, payload2)
+                .expect("stage tx2 write");
+
+            let s1 = tx1.commit(&mut self.store, cx).expect("commit tx1");
+            self.expected_commit_seq = self.expected_commit_seq.saturating_add(1);
+            assert_eq!(s1.0, self.expected_commit_seq);
+            self.expected.insert(block.0, payload1);
+
+            let err = tx2.commit(&mut self.store, cx).expect_err("tx2 conflict");
+            assert!(
+                matches!(
+                    err,
+                    BtrfsTransactionError::Commit(CommitError::Conflict { .. })
+                ),
+                "expected FCW conflict, got {err:?}"
+            );
+        }
+
+        fn assert_sample_visible(&self, rand: u64, seed: u64, case: usize) {
+            if self.expected.is_empty() {
+                return;
+            }
+            let sample_idx =
+                usize::try_from(rand).expect("rand should fit usize") % self.expected.len();
+            let (block, payload) = self
+                .expected
+                .iter()
+                .nth(sample_idx)
+                .expect("sample expected payload");
+            let snapshot = self.store.current_snapshot();
+            let observed = self
+                .store
+                .read_visible(BlockNumber(*block), snapshot)
+                .expect("sample payload should be visible");
+            assert_eq!(
+                observed, *payload,
+                "transaction sample mismatch seed={seed:#x} case={case} block={block}"
+            );
+        }
+
+        fn assert_all_visible(&self) {
+            let snapshot = self.store.current_snapshot();
+            for (block, payload) in &self.expected {
+                let observed = self
+                    .store
+                    .read_visible(BlockNumber(*block), snapshot)
+                    .expect("payload should be visible");
+                assert_eq!(observed, *payload);
+            }
+        }
+    }
+
+    #[test]
+    fn property_cow_seed_01_1000_cases() {
+        run_cow_property(0x000A_11CE_0001, 1000);
+    }
+
+    #[test]
+    fn property_cow_seed_02_1000_cases() {
+        run_cow_property(0x000A_11CE_0002, 1000);
+    }
+
+    #[test]
+    fn property_cow_seed_03_1000_cases() {
+        run_cow_property(0x000A_11CE_0003, 1000);
+    }
+
+    #[test]
+    fn property_cow_seed_04_1000_cases() {
+        run_cow_property(0x000A_11CE_0004, 1000);
+    }
+
+    #[test]
+    fn property_cow_seed_05_1000_cases() {
+        run_cow_property(0x000A_11CE_0005, 1000);
+    }
+
+    #[test]
+    fn property_allocator_seed_01_1000_cases() {
+        run_allocator_property(0xB00C_A001, 1000);
+    }
+
+    #[test]
+    fn property_allocator_seed_02_1000_cases() {
+        run_allocator_property(0xB00C_A002, 1000);
+    }
+
+    #[test]
+    fn property_delayed_refs_seed_01_1000_cases() {
+        run_delayed_ref_property(0xC001_D001, 1000);
+    }
+
+    #[test]
+    fn property_delayed_refs_seed_02_1000_cases() {
+        run_delayed_ref_property(0xC001_D002, 1000);
+    }
+
+    #[test]
+    fn property_transactions_seed_01_1000_cases() {
+        run_transaction_property(0xD00D_1001, 1000);
+    }
+
+    #[test]
+    fn integration_create_path_commits_inode_dir_and_extent_data() {
+        let cx = Cx::for_request();
+        let mut store = MvccStore::new();
+        let mut alloc = BtrfsExtentAllocator::new(1).expect("allocator");
+        alloc.add_block_group(0x1_0000, make_data_bg(0x1_0000, 0x20_000));
+        let extent = alloc.alloc_data(4096).expect("allocate data extent");
+        alloc
+            .flush_delayed_refs(usize::MAX)
+            .expect("flush delayed refs");
+        assert_eq!(
+            alloc.extent_refcount(ExtentKey {
+                bytenr: extent.bytenr,
+                num_bytes: extent.num_bytes
+            }),
+            1
+        );
+
+        let mut txn = BtrfsTransaction::begin(&mut store, 1, &cx).expect("begin transaction");
+        txn.stage_tree_root(
+            BTRFS_FS_TREE_OBJECTID,
+            TreeRoot {
+                bytenr: 0x5000_0000,
+                level: 1,
+            },
+        );
+        txn.stage_block_write(BlockNumber(30_001), b"inode:256:size=11".to_vec())
+            .expect("stage inode");
+        txn.stage_block_write(BlockNumber(30_002), b"dir:/file.txt->256".to_vec())
+            .expect("stage directory entry");
+        txn.stage_block_write(BlockNumber(30_003), b"hello world".to_vec())
+            .expect("stage file payload");
+        txn.queue_delayed_ref(
+            ExtentKey {
+                bytenr: extent.bytenr,
+                num_bytes: extent.num_bytes,
+            },
+            BtrfsRef::DataExtent {
+                root: BTRFS_FS_TREE_OBJECTID,
+                objectid: 256,
+                offset: 0,
+            },
+            RefAction::Insert,
+        );
+
+        let seq = txn.commit(&mut store, &cx).expect("commit");
+        assert_eq!(seq, CommitSeq(1));
+        let snapshot = store.current_snapshot();
+        assert_eq!(
+            store
+                .read_visible(BlockNumber(30_001), snapshot)
+                .expect("inode visible"),
+            b"inode:256:size=11".to_vec()
+        );
+        assert_eq!(
+            store
+                .read_visible(BlockNumber(30_002), snapshot)
+                .expect("dir entry visible"),
+            b"dir:/file.txt->256".to_vec()
+        );
+        assert_eq!(
+            store
+                .read_visible(BlockNumber(30_003), snapshot)
+                .expect("payload visible"),
+            b"hello world".to_vec()
+        );
+    }
+
+    #[test]
+    fn integration_delete_path_frees_extent_and_updates_directory() {
+        let cx = Cx::for_request();
+        let mut store = MvccStore::new();
+        let mut alloc = BtrfsExtentAllocator::new(2).expect("allocator");
+        alloc.add_block_group(0x1_0000, make_data_bg(0x1_0000, 0x20_000));
+        let extent = alloc.alloc_data(4096).expect("allocate data extent");
+        alloc
+            .flush_delayed_refs(usize::MAX)
+            .expect("flush delayed refs");
+
+        let mut create_tx = BtrfsTransaction::begin(&mut store, 2, &cx).expect("begin create");
+        create_tx.stage_tree_root(
+            BTRFS_FS_TREE_OBJECTID,
+            TreeRoot {
+                bytenr: 0x5100_0000,
+                level: 1,
+            },
+        );
+        create_tx
+            .stage_block_write(BlockNumber(31_001), b"dir:/tmp.bin->512".to_vec())
+            .expect("stage dir entry");
+        create_tx
+            .stage_block_write(BlockNumber(31_002), b"inode:512:size=4096".to_vec())
+            .expect("stage inode");
+        create_tx.commit(&mut store, &cx).expect("commit create");
+
+        alloc
+            .free_extent(extent.bytenr, extent.num_bytes, false)
+            .expect("free data extent");
+        alloc
+            .flush_delayed_refs(usize::MAX)
+            .expect("flush delayed refs");
+        assert_eq!(
+            alloc.extent_refcount(ExtentKey {
+                bytenr: extent.bytenr,
+                num_bytes: extent.num_bytes
+            }),
+            0
+        );
+
+        let mut delete_tx = BtrfsTransaction::begin(&mut store, 3, &cx).expect("begin delete");
+        delete_tx.stage_tree_root(
+            BTRFS_FS_TREE_OBJECTID,
+            TreeRoot {
+                bytenr: 0x5200_0000,
+                level: 1,
+            },
+        );
+        delete_tx
+            .stage_block_write(BlockNumber(31_001), b"dir:/tmp.bin-><deleted>".to_vec())
+            .expect("stage dir tombstone");
+        delete_tx
+            .stage_block_write(BlockNumber(31_002), b"inode:512:<deleted>".to_vec())
+            .expect("stage inode tombstone");
+        delete_tx.commit(&mut store, &cx).expect("commit delete");
+
+        let snapshot = store.current_snapshot();
+        assert_eq!(
+            store
+                .read_visible(BlockNumber(31_001), snapshot)
+                .expect("dir tombstone visible"),
+            b"dir:/tmp.bin-><deleted>".to_vec()
+        );
+        assert_eq!(
+            store
+                .read_visible(BlockNumber(31_002), snapshot)
+                .expect("inode tombstone visible"),
+            b"inode:512:<deleted>".to_vec()
+        );
+    }
+
+    #[test]
+    fn integration_overwrite_path_replaces_extent_and_payload_atomically() {
+        let cx = Cx::for_request();
+        let mut store = MvccStore::new();
+        let mut alloc = BtrfsExtentAllocator::new(4).expect("allocator");
+        alloc.add_block_group(0x1_0000, make_data_bg(0x1_0000, 0x40_000));
+
+        let old_extent = alloc.alloc_data(4096).expect("allocate old extent");
+        alloc
+            .flush_delayed_refs(usize::MAX)
+            .expect("flush old extent delayed refs");
+
+        let mut tx1 = BtrfsTransaction::begin(&mut store, 4, &cx).expect("begin tx1");
+        tx1.stage_tree_root(
+            BTRFS_FS_TREE_OBJECTID,
+            TreeRoot {
+                bytenr: 0x5300_0000,
+                level: 1,
+            },
+        );
+        tx1.stage_block_write(BlockNumber(32_001), b"payload:old".to_vec())
+            .expect("stage old payload");
+        tx1.commit(&mut store, &cx).expect("commit tx1");
+
+        let new_extent = alloc.alloc_data(4096).expect("allocate new extent");
+        alloc
+            .free_extent(old_extent.bytenr, old_extent.num_bytes, false)
+            .expect("free old extent");
+        alloc
+            .flush_delayed_refs(usize::MAX)
+            .expect("flush overwrite delayed refs");
+        assert_eq!(
+            alloc.extent_refcount(ExtentKey {
+                bytenr: old_extent.bytenr,
+                num_bytes: old_extent.num_bytes
+            }),
+            0
+        );
+        assert_eq!(
+            alloc.extent_refcount(ExtentKey {
+                bytenr: new_extent.bytenr,
+                num_bytes: new_extent.num_bytes
+            }),
+            1
+        );
+
+        let mut tx2 = BtrfsTransaction::begin(&mut store, 5, &cx).expect("begin tx2");
+        tx2.stage_tree_root(
+            BTRFS_FS_TREE_OBJECTID,
+            TreeRoot {
+                bytenr: 0x5400_0000,
+                level: 1,
+            },
+        );
+        tx2.stage_block_write(BlockNumber(32_001), b"payload:new".to_vec())
+            .expect("stage new payload");
+        tx2.commit(&mut store, &cx).expect("commit tx2");
+
+        let snapshot = store.current_snapshot();
+        assert_eq!(
+            store
+                .read_visible(BlockNumber(32_001), snapshot)
+                .expect("new payload visible"),
+            b"payload:new".to_vec()
+        );
+    }
+
+    #[test]
+    fn integration_rename_path_moves_directory_entry_without_inode_rewrite() {
+        let cx = Cx::for_request();
+        let mut store = MvccStore::new();
+
+        let mut tx1 = BtrfsTransaction::begin(&mut store, 6, &cx).expect("begin tx1");
+        tx1.stage_tree_root(
+            BTRFS_FS_TREE_OBJECTID,
+            TreeRoot {
+                bytenr: 0x5500_0000,
+                level: 1,
+            },
+        );
+        tx1.stage_block_write(BlockNumber(33_001), b"dir:/old-name->900".to_vec())
+            .expect("stage old dir entry");
+        tx1.stage_block_write(BlockNumber(33_002), b"inode:900:size=128".to_vec())
+            .expect("stage inode");
+        tx1.commit(&mut store, &cx).expect("commit tx1");
+
+        let mut tx2 = BtrfsTransaction::begin(&mut store, 7, &cx).expect("begin tx2");
+        tx2.stage_tree_root(
+            BTRFS_FS_TREE_OBJECTID,
+            TreeRoot {
+                bytenr: 0x5600_0000,
+                level: 1,
+            },
+        );
+        tx2.stage_block_write(BlockNumber(33_001), b"dir:/old-name-><deleted>".to_vec())
+            .expect("stage old dir tombstone");
+        tx2.stage_block_write(BlockNumber(33_003), b"dir:/new-name->900".to_vec())
+            .expect("stage new dir entry");
+        tx2.commit(&mut store, &cx).expect("commit tx2");
+
+        let snapshot = store.current_snapshot();
+        assert_eq!(
+            store
+                .read_visible(BlockNumber(33_001), snapshot)
+                .expect("old entry tombstone visible"),
+            b"dir:/old-name-><deleted>".to_vec()
+        );
+        assert_eq!(
+            store
+                .read_visible(BlockNumber(33_003), snapshot)
+                .expect("new entry visible"),
+            b"dir:/new-name->900".to_vec()
+        );
+        assert_eq!(
+            store
+                .read_visible(BlockNumber(33_002), snapshot)
+                .expect("inode still visible"),
+            b"inode:900:size=128".to_vec()
+        );
+    }
+
     #[test]
     fn parse_root_item_smoke() {
         let mut root = vec![0_u8; 239];
@@ -3383,5 +4127,917 @@ mod tests {
             flags: BTRFS_BLOCK_GROUP_DATA,
         };
         assert_eq!(bg.free_bytes(), 700);
+    }
+
+    // ── bd-375.6: btrfs read path unit tests ────────────────────────────
+
+    // Tree Walk Test 1: Walk root tree — all items iterated in key order
+    #[test]
+    fn readpath_walk_root_tree_key_order() {
+        let logical = 0x4000_u64;
+        let chunks = identity_chunks();
+
+        // Build a leaf containing 3 ROOT_ITEM entries for different tree objectids.
+        let mut leaf = vec![0_u8; NODESIZE as usize];
+        write_header(&mut leaf, logical, 3, 0, BTRFS_ROOT_TREE_OBJECTID, 10);
+
+        // ROOT_ITEM for FS tree (objectid=5)
+        let root_payload_a = {
+            let mut p = vec![0_u8; 239];
+            p[176..184].copy_from_slice(&0xAAAA_0000_u64.to_le_bytes());
+            p[238] = 0; // level
+            p
+        };
+        // ROOT_ITEM for extent tree (objectid=2)
+        let root_payload_b = {
+            let mut p = vec![0_u8; 239];
+            p[176..184].copy_from_slice(&0xBBBB_0000_u64.to_le_bytes());
+            p[238] = 1;
+            p
+        };
+        // ROOT_ITEM for chunk tree (objectid=3)
+        let root_payload_c = {
+            let mut p = vec![0_u8; 239];
+            p[176..184].copy_from_slice(&0xCCCC_0000_u64.to_le_bytes());
+            p[238] = 0;
+            p
+        };
+
+        // Items placed in key order: objectid 2, 3, 5 (all type ROOT_ITEM=132)
+        let data_region = NODESIZE as usize - 239 * 3;
+        write_leaf_item(
+            &mut leaf,
+            0,
+            BTRFS_EXTENT_TREE_OBJECTID,
+            BTRFS_ITEM_ROOT_ITEM,
+            u32::try_from(data_region).unwrap(),
+            239,
+        );
+        leaf[data_region..data_region + 239].copy_from_slice(&root_payload_b);
+
+        write_leaf_item(
+            &mut leaf,
+            1,
+            BTRFS_CHUNK_TREE_OBJECTID,
+            BTRFS_ITEM_ROOT_ITEM,
+            u32::try_from(data_region + 239).unwrap(),
+            239,
+        );
+        leaf[data_region + 239..data_region + 478].copy_from_slice(&root_payload_c);
+
+        write_leaf_item(
+            &mut leaf,
+            2,
+            BTRFS_FS_TREE_OBJECTID,
+            BTRFS_ITEM_ROOT_ITEM,
+            u32::try_from(data_region + 478).unwrap(),
+            239,
+        );
+        leaf[data_region + 478..data_region + 717].copy_from_slice(&root_payload_a);
+
+        let blocks: HashMap<u64, Vec<u8>> = [(logical, leaf)].into();
+        let mut read = |phys: u64| -> Result<Vec<u8>, ParseError> {
+            blocks.get(&phys).cloned().ok_or(ParseError::InvalidField {
+                field: "physical",
+                reason: "block not in test image",
+            })
+        };
+
+        let entries = walk_tree(&mut read, &chunks, logical, NODESIZE).expect("walk root tree");
+        assert_eq!(entries.len(), 3, "expected 3 root tree items");
+
+        // Verify strict key ordering: objectid 2 < 3 < 5
+        assert_eq!(entries[0].key.objectid, BTRFS_EXTENT_TREE_OBJECTID);
+        assert_eq!(entries[1].key.objectid, BTRFS_CHUNK_TREE_OBJECTID);
+        assert_eq!(entries[2].key.objectid, BTRFS_FS_TREE_OBJECTID);
+
+        for entry in &entries {
+            assert_eq!(entry.key.item_type, BTRFS_ITEM_ROOT_ITEM);
+            let parsed = parse_root_item(&entry.data).expect("parse root item payload");
+            assert_ne!(parsed.bytenr, 0, "root item bytenr should be non-zero");
+        }
+
+        // Verify specific root items were parsed correctly
+        let fs_root = parse_root_item(&entries[2].data).expect("parse FS root");
+        assert_eq!(fs_root.bytenr, 0xAAAA_0000);
+        assert_eq!(fs_root.level, 0);
+    }
+
+    // Tree Walk Test 2: Walk extent tree — all extents found for given inode
+    #[test]
+    fn readpath_walk_extent_tree_finds_extents_for_inode() {
+        let logical = 0x4000_u64;
+        let chunks = identity_chunks();
+
+        // Build a leaf with an INODE_ITEM and two EXTENT_DATA items for inode 256,
+        // plus an unrelated item for inode 257.
+        let mut leaf = vec![0_u8; NODESIZE as usize];
+        write_header(&mut leaf, logical, 4, 0, BTRFS_FS_TREE_OBJECTID, 10);
+
+        // Inode 256 INODE_ITEM (160 bytes)
+        let inode_payload = vec![0_u8; 160];
+        let inode_off = 3200_u32;
+        write_leaf_item(&mut leaf, 0, 256, BTRFS_ITEM_INODE_ITEM, inode_off, 160);
+        leaf[inode_off as usize..(inode_off + 160) as usize].copy_from_slice(&inode_payload);
+
+        // Inode 256 EXTENT_DATA at offset 0 (inline, 21 + 11 = 32 bytes)
+        let inline_payload = {
+            let mut p = vec![0_u8; 32];
+            p[20] = BTRFS_FILE_EXTENT_INLINE;
+            p[21..32].copy_from_slice(b"hello world");
+            p
+        };
+        let ext0_off = 3000_u32;
+        write_leaf_item(&mut leaf, 1, 256, BTRFS_ITEM_EXTENT_DATA, ext0_off, 32);
+        // Set key offset to 0 (file offset)
+        let base1 = HEADER_SIZE + 1 * ITEM_SIZE;
+        leaf[base1 + 9..base1 + 17].copy_from_slice(&0_u64.to_le_bytes());
+        leaf[ext0_off as usize..(ext0_off + 32) as usize].copy_from_slice(&inline_payload);
+
+        // Inode 256 EXTENT_DATA at offset 4096 (regular, 53 bytes)
+        let reg_payload = {
+            let mut p = vec![0_u8; 53];
+            p[20] = BTRFS_FILE_EXTENT_REG;
+            p[21..29].copy_from_slice(&0x10_000_u64.to_le_bytes()); // disk_bytenr
+            p[29..37].copy_from_slice(&4096_u64.to_le_bytes()); // disk_num_bytes
+            p[37..45].copy_from_slice(&0_u64.to_le_bytes()); // offset
+            p[45..53].copy_from_slice(&4096_u64.to_le_bytes()); // num_bytes
+            p
+        };
+        let ext1_off = 3040_u32;
+        write_leaf_item(&mut leaf, 2, 256, BTRFS_ITEM_EXTENT_DATA, ext1_off, 53);
+        let base2 = HEADER_SIZE + 2 * ITEM_SIZE;
+        leaf[base2 + 9..base2 + 17].copy_from_slice(&4096_u64.to_le_bytes());
+        leaf[ext1_off as usize..(ext1_off + 53) as usize].copy_from_slice(&reg_payload);
+
+        // Inode 257 INODE_ITEM (unrelated)
+        let ext2_off = 3100_u32;
+        write_leaf_item(&mut leaf, 3, 257, BTRFS_ITEM_INODE_ITEM, ext2_off, 160);
+
+        let blocks: HashMap<u64, Vec<u8>> = [(logical, leaf)].into();
+        let mut read = |phys: u64| -> Result<Vec<u8>, ParseError> {
+            blocks.get(&phys).cloned().ok_or(ParseError::InvalidField {
+                field: "physical",
+                reason: "block not in test image",
+            })
+        };
+
+        let all_entries = walk_tree(&mut read, &chunks, logical, NODESIZE).expect("walk");
+
+        // Filter for inode 256 EXTENT_DATA items
+        let extents: Vec<_> = all_entries
+            .iter()
+            .filter(|e| e.key.objectid == 256 && e.key.item_type == BTRFS_ITEM_EXTENT_DATA)
+            .collect();
+
+        assert_eq!(extents.len(), 2, "expected 2 extent_data items for inode 256");
+        assert_eq!(extents[0].key.offset, 0, "first extent at file offset 0");
+        assert_eq!(
+            extents[1].key.offset, 4096,
+            "second extent at file offset 4096"
+        );
+
+        // Verify inline extent
+        let inline = parse_extent_data(&extents[0].data).expect("parse inline");
+        match inline {
+            BtrfsExtentData::Inline { data, .. } => {
+                assert_eq!(data, b"hello world", "inline extent data mismatch");
+            }
+            _ => panic!("expected inline extent, got regular"),
+        }
+
+        // Verify regular extent
+        let regular = parse_extent_data(&extents[1].data).expect("parse regular");
+        match regular {
+            BtrfsExtentData::Regular {
+                disk_bytenr,
+                num_bytes,
+                ..
+            } => {
+                assert_eq!(disk_bytenr, 0x10_000);
+                assert_eq!(num_bytes, 4096);
+            }
+            _ => panic!("expected regular extent, got inline"),
+        }
+    }
+
+    // Tree Walk Test 3: Walk directory tree — all dir entries found
+    #[test]
+    fn readpath_walk_directory_tree_finds_dir_entries() {
+        let logical = 0x4000_u64;
+        let chunks = identity_chunks();
+
+        // Build a leaf with DIR_ITEM entries for a parent directory (objectid=256).
+        let mut leaf = vec![0_u8; NODESIZE as usize];
+
+        // Build two DIR_ITEM payloads
+        let name_a = b"file.txt";
+        let dir_entry_a = {
+            let mut d = vec![0_u8; 30 + name_a.len()];
+            d[0..8].copy_from_slice(&257_u64.to_le_bytes()); // child objectid
+            d[8] = BTRFS_ITEM_INODE_ITEM; // child key type
+            d[17..25].copy_from_slice(&1_u64.to_le_bytes()); // transid
+            d[25..27].copy_from_slice(&0_u16.to_le_bytes()); // data_len
+            let nl = u16::try_from(name_a.len()).unwrap();
+            d[27..29].copy_from_slice(&nl.to_le_bytes()); // name_len
+            d[29] = BTRFS_FT_REG_FILE; // file type
+            d[30..30 + name_a.len()].copy_from_slice(name_a);
+            d
+        };
+
+        let name_b = b"subdir";
+        let dir_entry_b = {
+            let mut d = vec![0_u8; 30 + name_b.len()];
+            d[0..8].copy_from_slice(&258_u64.to_le_bytes());
+            d[8] = BTRFS_ITEM_INODE_ITEM;
+            d[17..25].copy_from_slice(&1_u64.to_le_bytes());
+            d[25..27].copy_from_slice(&0_u16.to_le_bytes());
+            let nl = u16::try_from(name_b.len()).unwrap();
+            d[27..29].copy_from_slice(&nl.to_le_bytes());
+            d[29] = BTRFS_FT_DIR;
+            d[30..30 + name_b.len()].copy_from_slice(name_b);
+            d
+        };
+
+        // Place two leaf items
+        let entry_a_len = u32::try_from(dir_entry_a.len()).unwrap();
+        let entry_b_len = u32::try_from(dir_entry_b.len()).unwrap();
+        let off_a = 3500_u32;
+        let off_b = off_a + entry_a_len;
+
+        write_header(&mut leaf, logical, 2, 0, BTRFS_FS_TREE_OBJECTID, 10);
+        write_leaf_item(&mut leaf, 0, 256, BTRFS_ITEM_DIR_ITEM, off_a, entry_a_len);
+        write_leaf_item(&mut leaf, 1, 256, BTRFS_ITEM_DIR_ITEM, off_b, entry_b_len);
+        // Set different key offsets (hash of name) so they are distinct items
+        let base0 = HEADER_SIZE;
+        leaf[base0 + 9..base0 + 17].copy_from_slice(&100_u64.to_le_bytes());
+        let base1 = HEADER_SIZE + ITEM_SIZE;
+        leaf[base1 + 9..base1 + 17].copy_from_slice(&200_u64.to_le_bytes());
+
+        leaf[off_a as usize..(off_a + entry_a_len) as usize].copy_from_slice(&dir_entry_a);
+        leaf[off_b as usize..(off_b + entry_b_len) as usize].copy_from_slice(&dir_entry_b);
+
+        let blocks: HashMap<u64, Vec<u8>> = [(logical, leaf)].into();
+        let mut read = |phys: u64| -> Result<Vec<u8>, ParseError> {
+            blocks.get(&phys).cloned().ok_or(ParseError::InvalidField {
+                field: "physical",
+                reason: "block not in test image",
+            })
+        };
+
+        let entries = walk_tree(&mut read, &chunks, logical, NODESIZE).expect("walk");
+
+        // Filter DIR_ITEM entries
+        let dir_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| e.key.item_type == BTRFS_ITEM_DIR_ITEM)
+            .collect();
+        assert_eq!(dir_entries.len(), 2);
+
+        let parsed_a = parse_dir_items(&dir_entries[0].data).expect("parse dir_item a");
+        assert_eq!(parsed_a.len(), 1);
+        assert_eq!(parsed_a[0].child_objectid, 257);
+        assert_eq!(parsed_a[0].file_type, BTRFS_FT_REG_FILE);
+        assert_eq!(parsed_a[0].name, b"file.txt");
+
+        let parsed_b = parse_dir_items(&dir_entries[1].data).expect("parse dir_item b");
+        assert_eq!(parsed_b.len(), 1);
+        assert_eq!(parsed_b[0].child_objectid, 258);
+        assert_eq!(parsed_b[0].file_type, BTRFS_FT_DIR);
+        assert_eq!(parsed_b[0].name, b"subdir");
+    }
+
+    // Tree Walk Test 4: Walk with corrupt node — CRC mismatch detected
+    #[test]
+    fn readpath_walk_corrupt_node_crc_mismatch() {
+        // Build a valid tree block with correct CRC, then corrupt it.
+        let mut block = vec![0_u8; NODESIZE as usize];
+        write_header(&mut block, 0x4000, 0, 0, BTRFS_FS_TREE_OBJECTID, 10);
+
+        // Compute valid CRC32C and store it
+        let csum = ffs_types::crc32c(&block[0x20..]);
+        block[0..4].copy_from_slice(&csum.to_le_bytes());
+
+        // Verify the block passes CRC check before corruption
+        verify_tree_block_checksum(&block, ffs_types::BTRFS_CSUM_TYPE_CRC32C)
+            .expect("CRC should be valid before corruption");
+
+        // Corrupt a byte in the payload area
+        block[0x50] ^= 0xFF;
+
+        // Now CRC check should fail
+        let err =
+            verify_tree_block_checksum(&block, ffs_types::BTRFS_CSUM_TYPE_CRC32C).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "tree_block_csum",
+                    reason: "CRC32C checksum mismatch",
+                }
+            ),
+            "expected CRC mismatch error, got: {err:?}"
+        );
+    }
+
+    // Tree Walk Test 5: Walk empty tree — no items, no error
+    #[test]
+    fn readpath_walk_empty_tree_no_items() {
+        let logical = 0x8000_u64;
+        let chunks = identity_chunks();
+
+        let mut leaf = vec![0_u8; NODESIZE as usize];
+        write_header(&mut leaf, logical, 0, 0, BTRFS_FS_TREE_OBJECTID, 1);
+
+        let blocks: HashMap<u64, Vec<u8>> = [(logical, leaf)].into();
+        let mut read = |phys: u64| -> Result<Vec<u8>, ParseError> {
+            blocks.get(&phys).cloned().ok_or(ParseError::InvalidField {
+                field: "physical",
+                reason: "block not in test image",
+            })
+        };
+
+        let entries = walk_tree(&mut read, &chunks, logical, NODESIZE).expect("walk empty tree");
+        assert!(entries.is_empty(), "empty tree should yield no items");
+    }
+
+    // Extent Read Test 6: Read inline extent — small file data correct
+    #[test]
+    fn readpath_parse_inline_extent_small_file() {
+        let file_data = b"tiny inline file";
+        let mut payload = vec![0_u8; 21 + file_data.len()];
+        // generation(8) + ram_bytes(8) + compression(1) + encryption(1) + other_encoding(2) + type(1)
+        payload[0..8].copy_from_slice(&1_u64.to_le_bytes()); // generation
+        payload[8..16].copy_from_slice(&(file_data.len() as u64).to_le_bytes()); // ram_bytes
+        payload[16] = 0; // compression = none
+        payload[17] = 0; // encryption
+        payload[18..20].copy_from_slice(&0_u16.to_le_bytes()); // other_encoding
+        payload[20] = BTRFS_FILE_EXTENT_INLINE; // type
+        payload[21..].copy_from_slice(file_data);
+
+        let parsed = parse_extent_data(&payload).expect("parse inline extent");
+        match parsed {
+            BtrfsExtentData::Inline { compression, data } => {
+                assert_eq!(compression, 0, "should be uncompressed");
+                assert_eq!(data, file_data, "inline data mismatch");
+            }
+            BtrfsExtentData::Regular { .. } => panic!("expected inline extent, got regular"),
+        }
+    }
+
+    // Extent Read Test 7: Read regular extent — block data correct
+    #[test]
+    fn readpath_parse_regular_extent_block_data() {
+        let mut payload = [0_u8; 53];
+        payload[0..8].copy_from_slice(&5_u64.to_le_bytes()); // generation
+        payload[8..16].copy_from_slice(&8192_u64.to_le_bytes()); // ram_bytes
+        payload[16] = 0; // compression
+        payload[20] = BTRFS_FILE_EXTENT_REG;
+        payload[21..29].copy_from_slice(&0x20_0000_u64.to_le_bytes()); // disk_bytenr
+        payload[29..37].copy_from_slice(&8192_u64.to_le_bytes()); // disk_num_bytes
+        payload[37..45].copy_from_slice(&0_u64.to_le_bytes()); // extent_offset
+        payload[45..53].copy_from_slice(&8192_u64.to_le_bytes()); // num_bytes
+
+        let parsed = parse_extent_data(&payload).expect("parse regular extent");
+        match parsed {
+            BtrfsExtentData::Regular {
+                extent_type,
+                compression,
+                disk_bytenr,
+                disk_num_bytes,
+                extent_offset,
+                num_bytes,
+            } => {
+                assert_eq!(extent_type, BTRFS_FILE_EXTENT_REG);
+                assert_eq!(compression, 0);
+                assert_eq!(disk_bytenr, 0x20_0000);
+                assert_eq!(disk_num_bytes, 8192);
+                assert_eq!(extent_offset, 0);
+                assert_eq!(num_bytes, 8192);
+            }
+            BtrfsExtentData::Inline { .. } => panic!("expected regular extent, got inline"),
+        }
+    }
+
+    // Extent Read Test 8: Read compressed extent — compression field correct
+    #[test]
+    fn readpath_parse_compressed_extent_fields() {
+        let mut payload = [0_u8; 53];
+        payload[0..8].copy_from_slice(&3_u64.to_le_bytes()); // generation
+        payload[8..16].copy_from_slice(&16384_u64.to_le_bytes()); // ram_bytes (uncompressed)
+        payload[16] = 1; // compression = zlib
+        payload[20] = BTRFS_FILE_EXTENT_REG;
+        payload[21..29].copy_from_slice(&0x30_0000_u64.to_le_bytes()); // disk_bytenr
+        payload[29..37].copy_from_slice(&4096_u64.to_le_bytes()); // disk_num_bytes (compressed)
+        payload[37..45].copy_from_slice(&0_u64.to_le_bytes()); // extent_offset
+        payload[45..53].copy_from_slice(&16384_u64.to_le_bytes()); // num_bytes
+
+        let parsed = parse_extent_data(&payload).expect("parse compressed extent");
+        match parsed {
+            BtrfsExtentData::Regular {
+                extent_type,
+                compression,
+                disk_bytenr,
+                disk_num_bytes,
+                num_bytes,
+                ..
+            } => {
+                assert_eq!(extent_type, BTRFS_FILE_EXTENT_REG);
+                assert_eq!(compression, 1, "compression should be zlib (1)");
+                assert_eq!(disk_bytenr, 0x30_0000);
+                assert_eq!(
+                    disk_num_bytes, 4096,
+                    "compressed on-disk size should be smaller"
+                );
+                assert_eq!(num_bytes, 16384, "logical extent size");
+            }
+            BtrfsExtentData::Inline { .. } => panic!("expected regular extent, got inline"),
+        }
+    }
+
+    // Extent Read Test 9: Read prealloc extent — zeros returned
+    #[test]
+    fn readpath_parse_prealloc_extent_zeros() {
+        let mut payload = [0_u8; 53];
+        payload[0..8].copy_from_slice(&2_u64.to_le_bytes()); // generation
+        payload[8..16].copy_from_slice(&65536_u64.to_le_bytes()); // ram_bytes
+        payload[16] = 0; // no compression
+        payload[20] = BTRFS_FILE_EXTENT_PREALLOC;
+        // Prealloc extents have a disk_bytenr pointing to allocated but unwritten space.
+        payload[21..29].copy_from_slice(&0x40_0000_u64.to_le_bytes()); // disk_bytenr
+        payload[29..37].copy_from_slice(&65536_u64.to_le_bytes()); // disk_num_bytes
+        payload[37..45].copy_from_slice(&0_u64.to_le_bytes()); // extent_offset
+        payload[45..53].copy_from_slice(&65536_u64.to_le_bytes()); // num_bytes
+
+        let parsed = parse_extent_data(&payload).expect("parse prealloc extent");
+        match parsed {
+            BtrfsExtentData::Regular {
+                extent_type,
+                compression,
+                disk_bytenr,
+                num_bytes,
+                ..
+            } => {
+                assert_eq!(
+                    extent_type, BTRFS_FILE_EXTENT_PREALLOC,
+                    "should be PREALLOC type"
+                );
+                assert_eq!(compression, 0, "prealloc extents are uncompressed");
+                assert_eq!(disk_bytenr, 0x40_0000);
+                assert_eq!(num_bytes, 65536);
+            }
+            BtrfsExtentData::Inline { .. } => panic!("expected prealloc extent, got inline"),
+        }
+    }
+
+    // Directory Listing Test 10: List root directory — all entries present
+    #[test]
+    fn readpath_list_root_directory_all_entries() {
+        // Build a DIR_ITEM payload with 3 entries packed together
+        let names: &[(&[u8], u64, u8)] = &[
+            (b"bin", 257, BTRFS_FT_DIR),
+            (b"etc", 258, BTRFS_FT_DIR),
+            (b"init", 259, BTRFS_FT_REG_FILE),
+        ];
+
+        // Build separate DIR_ITEM payloads for each name (each is a separate leaf item)
+        let mut payloads = Vec::new();
+        for &(name, child_oid, ftype) in names {
+            let mut d = vec![0_u8; 30 + name.len()];
+            d[0..8].copy_from_slice(&child_oid.to_le_bytes());
+            d[8] = BTRFS_ITEM_INODE_ITEM;
+            d[17..25].copy_from_slice(&1_u64.to_le_bytes()); // transid
+            d[25..27].copy_from_slice(&0_u16.to_le_bytes()); // data_len
+            let nl = u16::try_from(name.len()).unwrap();
+            d[27..29].copy_from_slice(&nl.to_le_bytes());
+            d[29] = ftype;
+            d[30..30 + name.len()].copy_from_slice(name);
+            payloads.push(d);
+        }
+
+        // Parse each payload independently
+        for (i, &(name, child_oid, ftype)) in names.iter().enumerate() {
+            let parsed = parse_dir_items(&payloads[i]).expect("parse dir entry");
+            assert_eq!(parsed.len(), 1);
+            assert_eq!(parsed[0].child_objectid, child_oid);
+            assert_eq!(parsed[0].file_type, ftype);
+            assert_eq!(parsed[0].name, name);
+        }
+
+        // Also test parsing two entries concatenated in a single DIR_ITEM payload
+        let mut combined = payloads[0].clone();
+        combined.extend_from_slice(&payloads[1]);
+        let parsed_combined = parse_dir_items(&combined).expect("parse combined dir entries");
+        assert_eq!(parsed_combined.len(), 2);
+        assert_eq!(parsed_combined[0].name, b"bin");
+        assert_eq!(parsed_combined[1].name, b"etc");
+    }
+
+    // Directory Listing Test 11: List subdirectory — correct entries, correct types
+    #[test]
+    fn readpath_list_subdirectory_correct_types() {
+        // Build DIR_ITEM payloads for a subdirectory with various file types
+        let entries: &[(&[u8], u64, u8)] = &[
+            (b"regular.dat", 300, BTRFS_FT_REG_FILE),
+            (b"nested", 301, BTRFS_FT_DIR),
+            (b"link", 302, BTRFS_FT_SYMLINK),
+            (b"socket", 303, BTRFS_FT_SOCK),
+        ];
+
+        for &(name, child_oid, ftype) in entries {
+            let mut d = vec![0_u8; 30 + name.len()];
+            d[0..8].copy_from_slice(&child_oid.to_le_bytes());
+            d[8] = BTRFS_ITEM_INODE_ITEM;
+            d[17..25].copy_from_slice(&1_u64.to_le_bytes());
+            d[25..27].copy_from_slice(&0_u16.to_le_bytes());
+            let nl = u16::try_from(name.len()).unwrap();
+            d[27..29].copy_from_slice(&nl.to_le_bytes());
+            d[29] = ftype;
+            d[30..30 + name.len()].copy_from_slice(name);
+
+            let parsed = parse_dir_items(&d).expect("parse dir entry");
+            assert_eq!(parsed.len(), 1, "each payload has one entry");
+            assert_eq!(
+                parsed[0].child_objectid, child_oid,
+                "child objectid mismatch for {name:?}"
+            );
+            assert_eq!(
+                parsed[0].file_type, ftype,
+                "file type mismatch for {name:?}"
+            );
+            assert_eq!(parsed[0].name, name, "name mismatch");
+        }
+    }
+
+    // Directory Listing Test 12: List empty directory — no entries (beyond . and ..)
+    #[test]
+    fn readpath_list_empty_directory_no_entries() {
+        // An empty directory has no DIR_ITEM payloads (. and .. are implicit in btrfs).
+        // parse_dir_items with empty input should return an empty vec.
+        let parsed = parse_dir_items(&[]).expect("parse empty dir items");
+        assert!(
+            parsed.is_empty(),
+            "empty directory should have no dir item entries"
+        );
+    }
+
+    // Logical-Physical Mapping Test 13: Single-device mapping — logical → physical correct
+    #[test]
+    fn readpath_single_device_mapping_correct() {
+        // Single chunk: logical range [1MiB, 9MiB) maps to physical [2MiB, 10MiB)
+        let chunks = vec![BtrfsChunkEntry {
+            key: BtrfsKey {
+                objectid: 256,
+                item_type: 228,
+                offset: 0x10_0000, // logical start = 1 MiB
+            },
+            length: 0x80_0000, // 8 MiB
+            owner: 2,
+            stripe_len: 0x1_0000,
+            chunk_type: 1, // DATA
+            io_align: 4096,
+            io_width: 4096,
+            sector_size: 4096,
+            num_stripes: 1,
+            sub_stripes: 0,
+            stripes: vec![BtrfsStripe {
+                devid: 1,
+                offset: 0x20_0000, // physical start = 2 MiB
+                dev_uuid: [0; 16],
+            }],
+        }];
+
+        // Test exact start of chunk
+        let m0 = map_logical_to_physical(&chunks, 0x10_0000)
+            .expect("no error")
+            .expect("should map");
+        assert_eq!(m0.devid, 1);
+        assert_eq!(m0.physical, 0x20_0000, "start of chunk maps to start of stripe");
+
+        // Test middle of chunk
+        let m1 = map_logical_to_physical(&chunks, 0x10_0000 + 0x4_0000)
+            .expect("no error")
+            .expect("should map");
+        assert_eq!(m1.physical, 0x20_0000 + 0x4_0000);
+
+        // Test end-1 of chunk
+        let m2 = map_logical_to_physical(&chunks, 0x10_0000 + 0x80_0000 - 1)
+            .expect("no error")
+            .expect("should map");
+        assert_eq!(m2.physical, 0x20_0000 + 0x80_0000 - 1);
+
+        // Test just past end — should be None
+        let m3 = map_logical_to_physical(&chunks, 0x10_0000 + 0x80_0000).expect("no error");
+        assert!(m3.is_none(), "address past chunk end should not map");
+
+        // Test before start — should be None
+        let m4 = map_logical_to_physical(&chunks, 0x0F_FFFF).expect("no error");
+        assert!(m4.is_none(), "address before chunk start should not map");
+    }
+
+    // Logical-Physical Mapping Test 14: sys_chunk mapping — bootstrap chunks resolve
+    #[test]
+    fn readpath_sys_chunk_mapping_bootstrap_resolves() {
+        // Build a sys_chunk_array entry manually, parse it, then use for mapping.
+        // disk_key (17) + chunk_fixed (48) + 1 stripe (32) = 97 bytes
+        let mut sys_array = vec![0_u8; 97];
+
+        // disk_key: objectid=256, type=228 (CHUNK_ITEM), offset=0x100_0000 (logical start 16 MiB)
+        sys_array[0..8].copy_from_slice(&256_u64.to_le_bytes());
+        sys_array[8] = 228;
+        sys_array[9..17].copy_from_slice(&0x100_0000_u64.to_le_bytes());
+
+        // chunk header: length=8MiB, owner=2, stripe_len=64K, type=SYSTEM(2)
+        let c = 17;
+        sys_array[c..c + 8].copy_from_slice(&(8 * 1024 * 1024_u64).to_le_bytes()); // length
+        sys_array[c + 8..c + 16].copy_from_slice(&2_u64.to_le_bytes()); // owner
+        sys_array[c + 16..c + 24].copy_from_slice(&(64 * 1024_u64).to_le_bytes()); // stripe_len
+        sys_array[c + 24..c + 32].copy_from_slice(&2_u64.to_le_bytes()); // chunk_type
+        sys_array[c + 32..c + 36].copy_from_slice(&4096_u32.to_le_bytes()); // io_align
+        sys_array[c + 36..c + 40].copy_from_slice(&4096_u32.to_le_bytes()); // io_width
+        sys_array[c + 40..c + 44].copy_from_slice(&4096_u32.to_le_bytes()); // sector_size
+        sys_array[c + 44..c + 46].copy_from_slice(&1_u16.to_le_bytes()); // num_stripes
+        sys_array[c + 46..c + 48].copy_from_slice(&0_u16.to_le_bytes()); // sub_stripes
+
+        // stripe: devid=1, offset=0x80_0000 (physical start 8 MiB)
+        let s = c + 48;
+        sys_array[s..s + 8].copy_from_slice(&1_u64.to_le_bytes()); // devid
+        sys_array[s + 8..s + 16].copy_from_slice(&0x80_0000_u64.to_le_bytes()); // offset
+
+        // Parse the sys_chunk_array
+        let chunks = parse_sys_chunk_array(&sys_array).expect("parse sys_chunk_array");
+        assert_eq!(chunks.len(), 1, "should parse one chunk");
+        assert_eq!(chunks[0].key.offset, 0x100_0000);
+        assert_eq!(chunks[0].length, 8 * 1024 * 1024);
+        assert_eq!(chunks[0].stripes[0].offset, 0x80_0000);
+
+        // Use the parsed chunks for logical → physical mapping
+        let mapping = map_logical_to_physical(&chunks, 0x100_0000 + 0x1000)
+            .expect("no error")
+            .expect("should resolve via bootstrap chunks");
+        assert_eq!(mapping.devid, 1);
+        assert_eq!(
+            mapping.physical,
+            0x80_0000 + 0x1000,
+            "bootstrap chunk should resolve logical to physical"
+        );
+
+        // Verify unmapped address outside the sys_chunk range
+        let miss = map_logical_to_physical(&chunks, 0x200_0000).expect("no error");
+        assert!(miss.is_none(), "address outside sys_chunk should not map");
+    }
+
+    // ── bd-29z.2: btrfs write path unit tests ───────────────────────────
+
+    // Extent Allocation Test 1: Allocate extent returns valid block range
+    #[test]
+    fn writepath_alloc_extent_returns_valid_block_range() {
+        let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");
+        let bg_start = 0x10_0000_u64;
+        let bg_size = 0x100_000_u64; // 1 MiB
+        alloc.add_block_group(bg_start, make_data_bg(bg_start, bg_size));
+
+        let extent = alloc.alloc_data(4096).expect("alloc data");
+
+        // Returned bytenr must lie within the block group
+        assert!(
+            extent.bytenr >= bg_start,
+            "bytenr {:#x} should be >= block group start {bg_start:#x}",
+            extent.bytenr
+        );
+        assert!(
+            extent.bytenr + extent.num_bytes <= bg_start + bg_size,
+            "extent end {:#x} should not exceed block group end {:#x}",
+            extent.bytenr + extent.num_bytes,
+            bg_start + bg_size
+        );
+        assert_eq!(extent.num_bytes, 4096, "allocated size should match request");
+        assert_eq!(extent.block_group_start, bg_start);
+    }
+
+    // Extent Allocation Test 2: Free extent returns blocks to free space
+    #[test]
+    fn writepath_free_extent_returns_blocks_to_free_space() {
+        let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");
+        let bg_start = 0x10_0000_u64;
+        let bg_size = 0x100_000_u64;
+        alloc.add_block_group(bg_start, make_data_bg(bg_start, bg_size));
+
+        let a1 = alloc.alloc_data(8192).expect("alloc");
+        let bg_after_alloc = alloc.block_group(bg_start).expect("bg").clone();
+        assert_eq!(bg_after_alloc.used_bytes, 8192);
+        assert_eq!(bg_after_alloc.free_bytes(), bg_size - 8192);
+
+        alloc
+            .free_extent(a1.bytenr, a1.num_bytes, false)
+            .expect("free");
+        let bg_after_free = alloc.block_group(bg_start).expect("bg");
+        assert_eq!(bg_after_free.used_bytes, 0, "used should be zero after free");
+        assert_eq!(
+            bg_after_free.free_bytes(),
+            bg_size,
+            "all space should be free"
+        );
+    }
+
+    // Extent Allocation Test 3: Double-free detected — error returned
+    #[test]
+    fn writepath_double_free_detected() {
+        let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");
+        alloc.add_block_group(0x10_0000, make_data_bg(0x10_0000, 0x100_000));
+
+        let a1 = alloc.alloc_data(4096).expect("alloc");
+        alloc
+            .free_extent(a1.bytenr, a1.num_bytes, false)
+            .expect("first free should succeed");
+
+        // Second free of the same extent should fail (key already deleted from extent tree).
+        let err = alloc
+            .free_extent(a1.bytenr, a1.num_bytes, false)
+            .expect_err("double free should be detected");
+        assert_eq!(
+            err,
+            BtrfsMutationError::KeyNotFound,
+            "double free should return KeyNotFound, got: {err:?}"
+        );
+    }
+
+    // Extent Allocation Test 4: Allocate when full — ENOSPC returned
+    #[test]
+    fn writepath_alloc_when_full_enospc() {
+        let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");
+        // Block group with only 256 bytes of space.
+        alloc.add_block_group(0x10_0000, make_data_bg(0x10_0000, 256));
+
+        // First allocation fits.
+        alloc.alloc_data(128).expect("first alloc should fit");
+
+        // Second allocation exceeds remaining space.
+        let result = alloc.alloc_data(256);
+        assert!(
+            result.is_err(),
+            "allocating beyond capacity should fail (ENOSPC)"
+        );
+    }
+
+    // Extent Allocation Test 5: Allocation respects block group boundaries
+    #[test]
+    fn writepath_alloc_respects_block_group_boundaries() {
+        let mut alloc = BtrfsExtentAllocator::new(1).expect("alloc");
+        let data_bg = 0x10_0000_u64;
+        let meta_bg = 0x20_0000_u64;
+        alloc.add_block_group(data_bg, make_data_bg(data_bg, 0x100_000));
+        alloc.add_block_group(meta_bg, make_meta_bg(meta_bg, 0x100_000));
+
+        // Data allocation lands in data block group.
+        let data_ext = alloc.alloc_data(4096).expect("data alloc");
+        assert_eq!(
+            data_ext.block_group_start, data_bg,
+            "data extent should come from data block group"
+        );
+        assert!(data_ext.bytenr >= data_bg && data_ext.bytenr < data_bg + 0x100_000);
+
+        // Metadata allocation lands in metadata block group.
+        let meta_ext = alloc.alloc_metadata(4096).expect("meta alloc");
+        assert_eq!(
+            meta_ext.block_group_start, meta_bg,
+            "metadata extent should come from metadata block group"
+        );
+        assert!(meta_ext.bytenr >= meta_bg && meta_ext.bytenr < meta_bg + 0x100_000);
+
+        // Verify no cross-contamination: data BG only has data usage, meta BG only meta.
+        let data_used = alloc.block_group(data_bg).expect("data bg").used_bytes;
+        let meta_used = alloc.block_group(meta_bg).expect("meta bg").used_bytes;
+        assert_eq!(data_used, 4096, "data bg should only have data allocation");
+        assert_eq!(
+            meta_used, 4096,
+            "meta bg should only have metadata allocation"
+        );
+    }
+
+    // COW Test 6: COW write preserves original block, allocates new
+    #[test]
+    fn writepath_cow_write_preserves_original() {
+        let mut tree = InMemoryCowBtrfsTree::new(5).expect("tree");
+        let key = test_key(42);
+
+        tree.insert(key, b"original").expect("insert");
+        let root_v1 = tree.root_block();
+        let snapshot_v1 = tree.node_snapshot(root_v1).expect("snapshot v1");
+
+        // Update (COW write) should allocate a new root, old root preserved.
+        tree.update(&key, b"modified").expect("update");
+        let root_v2 = tree.root_block();
+
+        assert_ne!(root_v1, root_v2, "COW update should allocate new root");
+        assert_eq!(
+            tree.node_snapshot(root_v1).expect("old snapshot"),
+            snapshot_v1,
+            "original root node must be preserved after COW"
+        );
+
+        // New root should contain modified data.
+        let entries = tree.range(&key, &key).expect("point query");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, b"modified");
+        tree.validate_invariants().expect("invariants");
+    }
+
+    // COW Test 7: COW chain produces version chain (multiple updates tracked)
+    #[test]
+    fn writepath_cow_chain_produces_version_chain() {
+        let mut tree = InMemoryCowBtrfsTree::new(5).expect("tree");
+        let key = test_key(100);
+        let mut root_versions = Vec::new();
+
+        // Insert initial value.
+        tree.insert(key, b"v1").expect("insert");
+        root_versions.push(tree.root_block());
+
+        // Perform 4 updates, capturing root at each step.
+        for version in 2..=5 {
+            let payload = format!("v{version}");
+            tree.update(&key, payload.as_bytes()).expect("update");
+            root_versions.push(tree.root_block());
+        }
+
+        // All root versions should be distinct (COW semantics).
+        let unique_roots: HashSet<u64> = root_versions.iter().copied().collect();
+        assert_eq!(
+            unique_roots.len(),
+            root_versions.len(),
+            "each COW write should produce a distinct root: {root_versions:?}"
+        );
+
+        // Deferred free list should have entries from retired nodes.
+        assert!(
+            !tree.deferred_free_blocks().is_empty(),
+            "COW chain should record deferred frees for retired nodes"
+        );
+
+        // Current value should be the latest.
+        let entries = tree.range(&key, &key).expect("point query");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, b"v5");
+        tree.validate_invariants().expect("invariants");
+    }
+
+    // COW Test 8: COW with MVCC — different transactions see different versions
+    #[test]
+    fn writepath_cow_with_mvcc_different_txns_see_versions() {
+        let cx = Cx::for_request();
+        let mut store = MvccStore::new();
+        let block = BlockNumber(0x5000);
+
+        // Transaction 1: write "version-A".
+        let mut tx1 = BtrfsTransaction::begin(&mut store, 1, &cx).expect("begin tx1");
+        tx1.stage_tree_root(
+            BTRFS_FS_TREE_OBJECTID,
+            TreeRoot {
+                bytenr: 0x100_0000,
+                level: 0,
+            },
+        );
+        tx1.stage_block_write(block, b"version-A".to_vec())
+            .expect("stage A");
+        let seq1 = tx1.commit(&mut store, &cx).expect("commit tx1");
+        let snap_after_a = store.current_snapshot();
+
+        // Transaction 2: overwrite with "version-B".
+        let mut tx2 = BtrfsTransaction::begin(&mut store, 2, &cx).expect("begin tx2");
+        tx2.stage_tree_root(
+            BTRFS_FS_TREE_OBJECTID,
+            TreeRoot {
+                bytenr: 0x200_0000,
+                level: 0,
+            },
+        );
+        tx2.stage_block_write(block, b"version-B".to_vec())
+            .expect("stage B");
+        let seq2 = tx2.commit(&mut store, &cx).expect("commit tx2");
+        let snap_after_b = store.current_snapshot();
+
+        // Verify monotonic commit sequence.
+        assert!(seq2.0 > seq1.0, "commit sequence should be monotonic");
+
+        // Snapshot after tx1 should see "version-A".
+        let data_a = store
+            .read_visible(block, snap_after_a)
+            .expect("version-A should be visible at snap_after_a");
+        assert_eq!(
+            data_a,
+            b"version-A".to_vec(),
+            "snap_after_a should see version-A"
+        );
+
+        // Snapshot after tx2 should see "version-B".
+        let data_b = store
+            .read_visible(block, snap_after_b)
+            .expect("version-B should be visible at snap_after_b");
+        assert_eq!(
+            data_b,
+            b"version-B".to_vec(),
+            "snap_after_b should see version-B"
+        );
     }
 }

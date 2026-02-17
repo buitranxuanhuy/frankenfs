@@ -26,6 +26,7 @@ use ffs_types::{
     BlockNumber, ByteOffset, CommitSeq, EXT4_EXTENTS_FL, GroupNumber, InodeNumber, ParseError,
     Snapshot, TxnId,
 };
+use ffs_xattr::{XattrStorage, XattrWriteAccess};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -3401,6 +3402,8 @@ pub enum RequestOp {
     Symlink,
     Fallocate,
     Setattr,
+    Setxattr,
+    Removexattr,
     Write,
 }
 
@@ -3419,6 +3422,8 @@ impl RequestOp {
                 | Self::Symlink
                 | Self::Fallocate
                 | Self::Setattr
+                | Self::Setxattr
+                | Self::Removexattr
                 | Self::Write
                 | Self::Fsync
                 | Self::Fsyncdir
@@ -3465,6 +3470,17 @@ pub struct SetAttrRequest {
     pub atime: Option<SystemTime>,
     /// New modification time.
     pub mtime: Option<SystemTime>,
+}
+
+/// How `setxattr` should treat pre-existing attributes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XattrSetMode {
+    /// Create if missing, replace if existing.
+    Set,
+    /// Fail with `EEXIST` if the attribute already exists.
+    Create,
+    /// Fail with `ENODATA`/`ENOATTR` if the attribute does not exist.
+    Replace,
 }
 
 /// Filesystem statistics returned by `statfs`.
@@ -3576,6 +3592,25 @@ pub trait FsOps: Send + Sync {
     }
 
     // ── Write operations (default: return ReadOnly) ─────────────────────
+
+    /// Create, replace, or upsert one extended attribute.
+    fn setxattr(
+        &self,
+        _cx: &Cx,
+        _ino: InodeNumber,
+        _name: &str,
+        _value: &[u8],
+        _mode: XattrSetMode,
+    ) -> ffs_error::Result<()> {
+        Err(FfsError::ReadOnly)
+    }
+
+    /// Remove one extended attribute.
+    ///
+    /// Returns `true` if the attribute existed and was removed.
+    fn removexattr(&self, _cx: &Cx, _ino: InodeNumber, _name: &str) -> ffs_error::Result<bool> {
+        Err(FfsError::ReadOnly)
+    }
 
     /// Create a regular file in directory `parent` with name `name`.
     ///
@@ -5369,6 +5404,153 @@ impl OpenFs {
 
         Ok(attr)
     }
+
+    /// Set or replace one ext4 xattr.
+    #[allow(clippy::significant_drop_tightening)]
+    fn ext4_setxattr(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        name: &str,
+        value: &[u8],
+        mode: XattrSetMode,
+    ) -> ffs_error::Result<()> {
+        let alloc_mutex = self.require_alloc_state()?;
+        let block_dev = self.block_device_adapter();
+        let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
+
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let csum_seed = sb.csum_seed();
+
+        let mut inode = self.read_inode(cx, ino)?;
+        let mut external_block = if inode.file_acl != 0 {
+            Some(self.read_block_vec(cx, BlockNumber(inode.file_acl))?)
+        } else {
+            None
+        };
+
+        let existing = ffs_xattr::get_xattr(&inode, external_block.as_deref(), name)?;
+        match mode {
+            XattrSetMode::Create if existing.is_some() => return Err(FfsError::Exists),
+            XattrSetMode::Replace if existing.is_none() => {
+                return Err(FfsError::NotFound(name.to_owned()));
+            }
+            XattrSetMode::Set | XattrSetMode::Create | XattrSetMode::Replace => {}
+        }
+
+        let access = XattrWriteAccess {
+            // The FUSE mount uses `default_permissions`, so ownership checks are
+            // expected to have already happened in-kernel.
+            is_owner: true,
+            has_cap_fowner: false,
+            has_cap_sys_admin: false,
+        };
+        let storage = ffs_xattr::set_xattr(
+            &mut inode,
+            external_block.as_deref_mut(),
+            name,
+            value,
+            access,
+        )?;
+
+        if matches!(storage, XattrStorage::External) && inode.file_acl == 0 {
+            // We currently do not allocate a new external xattr block here.
+            return Err(FfsError::NoSpace);
+        }
+
+        if let Some(block) = external_block {
+            block_dev.write_block(cx, BlockNumber(inode.file_acl), &block)?;
+        }
+
+        ffs_inode::touch_ctime(&mut inode, tstamp_secs, tstamp_nanos);
+
+        let alloc = alloc_mutex.lock();
+        ffs_inode::write_inode(
+            cx,
+            &block_dev,
+            &alloc.geo,
+            &alloc.groups,
+            ino,
+            &inode,
+            csum_seed,
+        )?;
+
+        trace!(
+            target: "ffs::write",
+            op = "setxattr",
+            ino = ino.0,
+            name,
+            value_len = value.len(),
+            storage = ?storage,
+            "xattr updated"
+        );
+
+        Ok(())
+    }
+
+    /// Remove one ext4 xattr.
+    #[allow(clippy::significant_drop_tightening)]
+    fn ext4_removexattr(&self, cx: &Cx, ino: InodeNumber, name: &str) -> ffs_error::Result<bool> {
+        let alloc_mutex = self.require_alloc_state()?;
+        let block_dev = self.block_device_adapter();
+        let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
+
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let csum_seed = sb.csum_seed();
+
+        let mut inode = self.read_inode(cx, ino)?;
+        let old_acl = inode.file_acl;
+        let mut external_block = if old_acl != 0 {
+            Some(self.read_block_vec(cx, BlockNumber(old_acl))?)
+        } else {
+            None
+        };
+
+        let access = XattrWriteAccess {
+            // The FUSE mount uses `default_permissions`, so ownership checks are
+            // expected to have already happened in-kernel.
+            is_owner: true,
+            has_cap_fowner: false,
+            has_cap_sys_admin: false,
+        };
+        let removed =
+            ffs_xattr::remove_xattr(&mut inode, external_block.as_deref_mut(), name, access)?;
+        if !removed {
+            return Ok(false);
+        }
+
+        if let Some(block) = external_block {
+            // Persist any external block updates even if `file_acl` was cleared.
+            block_dev.write_block(cx, BlockNumber(old_acl), &block)?;
+        }
+
+        ffs_inode::touch_ctime(&mut inode, tstamp_secs, tstamp_nanos);
+
+        let alloc = alloc_mutex.lock();
+        ffs_inode::write_inode(
+            cx,
+            &block_dev,
+            &alloc.geo,
+            &alloc.groups,
+            ino,
+            &inode,
+            csum_seed,
+        )?;
+
+        trace!(
+            target: "ffs::write",
+            op = "removexattr",
+            ino = ino.0,
+            name,
+            "xattr removed"
+        );
+
+        Ok(true)
+    }
 }
 
 // ── FsOps for OpenFs (device-based ext4 adapter) ──────────────────────────
@@ -5551,6 +5733,27 @@ impl FsOps for OpenFs {
                 let _ = (cx, ino, name);
                 Ok(None)
             }
+        }
+    }
+
+    fn setxattr(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        name: &str,
+        value: &[u8],
+        mode: XattrSetMode,
+    ) -> ffs_error::Result<()> {
+        match &self.flavor {
+            FsFlavor::Ext4(_) => self.ext4_setxattr(cx, ino, name, value, mode),
+            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+        }
+    }
+
+    fn removexattr(&self, cx: &Cx, ino: InodeNumber, name: &str) -> ffs_error::Result<bool> {
+        match &self.flavor {
+            FsFlavor::Ext4(_) => self.ext4_removexattr(cx, ino, name),
+            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
         }
     }
 
@@ -7197,6 +7400,70 @@ mod tests {
         let sb = fs.ext4_superblock().expect("ext4 superblock");
         assert_eq!(sb.last_orphan, 0);
         assert_eq!(sb.state & EXT4_ORPHAN_FS, 0);
+    }
+
+    #[test]
+    fn readpath_orphan_empty_list_no_orphans() {
+        // When s_last_orphan == 0, the orphan list is empty.
+        let image = build_ext4_image_with_extents();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let opts = OpenOptions {
+            skip_validation: true,
+            ..OpenOptions::default()
+        };
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &opts).unwrap();
+
+        let orphans = fs.read_ext4_orphan_list(&cx).unwrap();
+        assert_eq!(orphans.head, 0);
+        assert!(orphans.inodes.is_empty());
+        assert_eq!(orphans.count(), 0);
+    }
+
+    #[test]
+    fn readpath_orphan_inode_allocated_but_in_list() {
+        // An inode with links_count > 0 still appears in the orphan list
+        // (truncate-recovery case). The read path reports it regardless of
+        // allocation status — recovery semantics are handled separately.
+        let mut image = build_ext4_image_with_orphan_chain(&[11]);
+        set_test_inode_links_count(&mut image, 11, 2);
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let opts = OpenOptions {
+            skip_validation: true,
+            ..OpenOptions::default()
+        };
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &opts).unwrap();
+
+        let orphans = fs.read_ext4_orphan_list(&cx).unwrap();
+        assert_eq!(orphans.head, 11);
+        assert_eq!(orphans.inodes, vec![InodeNumber(11)]);
+        assert_eq!(orphans.count(), 1);
+
+        let inode = fs.read_inode(&cx, InodeNumber(11)).unwrap();
+        assert_eq!(inode.links_count, 2);
+    }
+
+    #[test]
+    fn readpath_orphan_chain_multi_element_order() {
+        // Verify that a multi-element orphan chain is traversed in on-disk
+        // linked-list order and the correct next-pointers are followed.
+        let image = build_ext4_image_with_orphan_chain(&[13, 11, 12]);
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let opts = OpenOptions {
+            skip_validation: true,
+            ..OpenOptions::default()
+        };
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &opts).unwrap();
+
+        let orphans = fs.read_ext4_orphan_list(&cx).unwrap();
+        assert_eq!(orphans.head, 13);
+        assert_eq!(
+            orphans.inodes,
+            vec![InodeNumber(13), InodeNumber(11), InodeNumber(12)]
+        );
+        assert_eq!(orphans.count(), 3);
     }
 
     #[test]
@@ -10236,6 +10503,14 @@ mod tests {
             .setattr(&cx, root, &SetAttrRequest::default())
             .unwrap_err();
         assert_eq!(err.to_errno(), libc::EROFS);
+
+        let err = fs
+            .setxattr(&cx, root, "user.test", b"value", XattrSetMode::Set)
+            .unwrap_err();
+        assert_eq!(err.to_errno(), libc::EROFS);
+
+        let err = fs.removexattr(&cx, root, "user.test").unwrap_err();
+        assert_eq!(err.to_errno(), libc::EROFS);
     }
 
     #[test]
@@ -10623,6 +10898,99 @@ mod tests {
     }
 
     #[test]
+    fn write_setxattr_replace_and_remove_roundtrip() {
+        let Some(fs) = open_writable_ext4() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        let attr = fs
+            .create(&cx, root, OsStr::new("xattr_roundtrip.txt"), 0o644, 0, 0)
+            .expect("create");
+        let ino = attr.ino;
+
+        fs.setxattr(&cx, ino, "user.mime", b"text/plain", XattrSetMode::Set)
+            .expect("setxattr create-or-replace");
+        assert_eq!(
+            fs.getxattr(&cx, ino, "user.mime").expect("getxattr"),
+            Some(b"text/plain".to_vec())
+        );
+
+        fs.setxattr(
+            &cx,
+            ino,
+            "user.mime",
+            b"application/octet-stream",
+            XattrSetMode::Replace,
+        )
+        .expect("setxattr replace");
+        assert_eq!(
+            fs.getxattr(&cx, ino, "user.mime")
+                .expect("getxattr after replace"),
+            Some(b"application/octet-stream".to_vec())
+        );
+
+        assert!(
+            fs.removexattr(&cx, ino, "user.mime")
+                .expect("removexattr first call")
+        );
+        assert_eq!(fs.getxattr(&cx, ino, "user.mime").expect("getxattr"), None);
+        assert!(
+            !fs.removexattr(&cx, ino, "user.mime")
+                .expect("removexattr second call")
+        );
+    }
+
+    #[test]
+    fn write_setxattr_respects_create_and_replace_modes() {
+        let Some(fs) = open_writable_ext4() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        let attr = fs
+            .create(&cx, root, OsStr::new("xattr_modes.txt"), 0o644, 0, 0)
+            .expect("create");
+        let ino = attr.ino;
+
+        fs.setxattr(&cx, ino, "user.color", b"blue", XattrSetMode::Create)
+            .expect("initial create");
+
+        let err = fs
+            .setxattr(&cx, ino, "user.color", b"green", XattrSetMode::Create)
+            .unwrap_err();
+        assert_eq!(err.to_errno(), libc::EEXIST);
+
+        let err = fs
+            .setxattr(&cx, ino, "user.missing", b"x", XattrSetMode::Replace)
+            .unwrap_err();
+        assert_eq!(err.to_errno(), libc::ENOENT);
+    }
+
+    #[test]
+    fn write_setxattr_reports_enospc_when_inline_region_is_exhausted() {
+        let Some(fs) = open_writable_ext4() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        let attr = fs
+            .create(&cx, root, OsStr::new("xattr_enospc.txt"), 0o644, 0, 0)
+            .expect("create");
+
+        // Our ext4 write path does not yet allocate new external xattr blocks,
+        // so oversized values should fail when they do not fit inline.
+        let large_value = vec![0xAB_u8; 512];
+        let err = fs
+            .setxattr(&cx, attr.ino, "user.large", &large_value, XattrSetMode::Set)
+            .unwrap_err();
+        assert_eq!(err.to_errno(), libc::ENOSPC);
+    }
+
+    #[test]
     fn write_rmdir_non_empty_returns_enotempty() {
         let Some(fs) = open_writable_ext4() else {
             return;
@@ -10688,6 +11056,22 @@ mod tests {
         assert_eq!(err.to_errno(), libc::EROFS);
 
         let err = fs.fsyncdir(&cx, InodeNumber(2), 0, false).unwrap_err();
+        assert_eq!(err.to_errno(), libc::EROFS);
+
+        let err = fs
+            .setxattr(
+                &cx,
+                InodeNumber(11),
+                "user.read_only",
+                b"value",
+                XattrSetMode::Set,
+            )
+            .unwrap_err();
+        assert_eq!(err.to_errno(), libc::EROFS);
+
+        let err = fs
+            .removexattr(&cx, InodeNumber(11), "user.read_only")
+            .unwrap_err();
         assert_eq!(err.to_errno(), libc::EROFS);
 
         fs.flush(&cx, InodeNumber(11), 0, 0)
@@ -11517,6 +11901,330 @@ mod tests {
         assert_eq!(gate.check(RequestOp::Read), BackpressureDecision::Proceed);
     }
 
+    // ── Graceful degradation unit tests (bd-3tz.3) ────────────────────
+
+    #[test]
+    fn degrade_level_normal_all_subsystems_active() {
+        // At Normal level, no subsystem is degraded: background runs,
+        // cache at full size, writes are not throttled, not read-only.
+        let level = DegradationLevel::Normal;
+        assert!(!level.should_pause_background());
+        assert!(!level.should_reduce_cache());
+        assert!(!level.should_throttle_writes());
+        assert!(!level.should_read_only());
+        assert_eq!(level.label(), "normal");
+        assert_eq!(u8::from(level), 0);
+    }
+
+    #[test]
+    fn degrade_level_warning_pauses_background_only() {
+        // Warning: background tasks paused, but caches full, writes
+        // unthrottled, not read-only.
+        let level = DegradationLevel::Warning;
+        assert!(level.should_pause_background());
+        assert!(!level.should_reduce_cache());
+        assert!(!level.should_throttle_writes());
+        assert!(!level.should_read_only());
+        assert_eq!(level.label(), "warning");
+    }
+
+    #[test]
+    fn degrade_level_degraded_reduces_cache() {
+        // Degraded: background paused + cache reduced, writes still OK.
+        let level = DegradationLevel::Degraded;
+        assert!(level.should_pause_background());
+        assert!(level.should_reduce_cache());
+        assert!(!level.should_throttle_writes());
+        assert!(!level.should_read_only());
+        assert_eq!(level.label(), "degraded");
+    }
+
+    #[test]
+    fn degrade_level_critical_throttles_writes() {
+        // Critical: background paused + cache reduced + writes throttled.
+        let level = DegradationLevel::Critical;
+        assert!(level.should_pause_background());
+        assert!(level.should_reduce_cache());
+        assert!(level.should_throttle_writes());
+        assert!(!level.should_read_only());
+        assert_eq!(level.label(), "critical");
+    }
+
+    #[test]
+    fn degrade_level_emergency_read_only() {
+        // Emergency: everything degraded + read-only mode.
+        let level = DegradationLevel::Emergency;
+        assert!(level.should_pause_background());
+        assert!(level.should_reduce_cache());
+        assert!(level.should_throttle_writes());
+        assert!(level.should_read_only());
+        assert_eq!(level.label(), "emergency");
+    }
+
+    #[test]
+    fn degrade_fsm_walks_all_thresholds_upward() {
+        // Escalate through every level boundary in sequence and verify
+        // each transition is immediate (no hysteresis on escalation).
+        let pressure = Arc::new(SystemPressure::new());
+        let fsm = DegradationFsm::new(Arc::clone(&pressure), 3);
+        assert_eq!(fsm.level(), DegradationLevel::Normal);
+
+        // Normal → Warning (headroom 0.4 maps to degradation_level 1)
+        pressure.set_headroom(0.4);
+        let t = fsm.tick().expect("should transition to Warning");
+        assert_eq!(t.from, DegradationLevel::Normal);
+        assert_eq!(t.to, DegradationLevel::Warning);
+
+        // Warning → Degraded (headroom 0.2 maps to degradation_level 2)
+        pressure.set_headroom(0.2);
+        let t = fsm.tick().expect("should transition to Degraded");
+        assert_eq!(t.from, DegradationLevel::Warning);
+        assert_eq!(t.to, DegradationLevel::Degraded);
+
+        // Degraded → Critical (headroom 0.1 maps to degradation_level 3)
+        pressure.set_headroom(0.1);
+        let t = fsm.tick().expect("should transition to Critical");
+        assert_eq!(t.from, DegradationLevel::Degraded);
+        assert_eq!(t.to, DegradationLevel::Critical);
+
+        // Critical → Emergency (headroom 0.02 maps to degradation_level 4)
+        pressure.set_headroom(0.02);
+        let t = fsm.tick().expect("should transition to Emergency");
+        assert_eq!(t.from, DegradationLevel::Critical);
+        assert_eq!(t.to, DegradationLevel::Emergency);
+
+        assert_eq!(fsm.transition_count(), 4);
+    }
+
+    #[test]
+    fn degrade_fsm_walks_all_thresholds_downward() {
+        // Start at Emergency and recover through each level, requiring
+        // `recovery_samples` consecutive improved ticks at each step.
+        let pressure = Arc::new(SystemPressure::new());
+        let fsm = DegradationFsm::new(Arc::clone(&pressure), 2);
+
+        // Escalate to Emergency.
+        pressure.set_headroom(0.02);
+        fsm.tick();
+        assert_eq!(fsm.level(), DegradationLevel::Emergency);
+
+        // Recover to Critical: headroom 0.1 → level 3, need 2 ticks.
+        pressure.set_headroom(0.1);
+        assert!(fsm.tick().is_none()); // recovery_count=1
+        let t = fsm.tick().expect("should de-escalate to Critical");
+        assert_eq!(t.to, DegradationLevel::Critical);
+
+        // Recover to Degraded: headroom 0.2 → level 2, need 2 ticks.
+        pressure.set_headroom(0.2);
+        assert!(fsm.tick().is_none());
+        let t = fsm.tick().expect("should de-escalate to Degraded");
+        assert_eq!(t.to, DegradationLevel::Degraded);
+
+        // Recover to Warning: headroom 0.4 → level 1, need 2 ticks.
+        pressure.set_headroom(0.4);
+        assert!(fsm.tick().is_none());
+        let t = fsm.tick().expect("should de-escalate to Warning");
+        assert_eq!(t.to, DegradationLevel::Warning);
+
+        // Recover to Normal: headroom 0.8 → level 0, need 2 ticks.
+        pressure.set_headroom(0.8);
+        assert!(fsm.tick().is_none());
+        let t = fsm.tick().expect("should de-escalate to Normal");
+        assert_eq!(t.to, DegradationLevel::Normal);
+    }
+
+    #[test]
+    fn degrade_fsm_no_oscillation_borderline_pressure() {
+        // Simulate borderline pressure that alternates between two
+        // adjacent levels. Hysteresis should prevent flickering.
+        let pressure = Arc::new(SystemPressure::new());
+        let fsm = DegradationFsm::new(Arc::clone(&pressure), 3);
+
+        // Escalate to Degraded.
+        pressure.set_headroom(0.2);
+        fsm.tick();
+        assert_eq!(fsm.level(), DegradationLevel::Degraded);
+
+        // Now alternate: 1 tick at Warning headroom, 1 tick at Degraded.
+        // With recovery_samples=3, the level should never de-escalate.
+        for _ in 0..10 {
+            pressure.set_headroom(0.4); // Warning-level headroom
+            assert!(fsm.tick().is_none());
+            assert_eq!(fsm.level(), DegradationLevel::Degraded);
+
+            pressure.set_headroom(0.2); // back to Degraded headroom
+            fsm.tick();
+            assert_eq!(fsm.level(), DegradationLevel::Degraded);
+        }
+
+        // After 10 alternations, still no transition occurred beyond the
+        // initial escalation.
+        assert_eq!(fsm.transition_count(), 1);
+    }
+
+    #[test]
+    fn degrade_gate_critical_throttles_all_write_variants() {
+        // At Critical level, every write operation should be throttled
+        // while every read operation should proceed.
+        let pressure = Arc::new(SystemPressure::with_headroom(0.1));
+        let fsm = Arc::new(DegradationFsm::new(Arc::clone(&pressure), 1));
+        fsm.tick();
+        assert_eq!(fsm.level(), DegradationLevel::Critical);
+        let gate = BackpressureGate::new(fsm);
+
+        // All write variants → Throttle.
+        let write_ops = [
+            RequestOp::Create,
+            RequestOp::Mkdir,
+            RequestOp::Unlink,
+            RequestOp::Rmdir,
+            RequestOp::Rename,
+            RequestOp::Link,
+            RequestOp::Symlink,
+            RequestOp::Fallocate,
+            RequestOp::Setattr,
+            RequestOp::Setxattr,
+            RequestOp::Removexattr,
+            RequestOp::Write,
+            RequestOp::Fsync,
+            RequestOp::Fsyncdir,
+        ];
+        for op in write_ops {
+            assert_eq!(
+                gate.check(op),
+                BackpressureDecision::Throttle,
+                "write op {op:?} should be throttled at Critical"
+            );
+        }
+
+        // All read variants → Proceed.
+        let read_ops = [
+            RequestOp::Getattr,
+            RequestOp::Statfs,
+            RequestOp::Getxattr,
+            RequestOp::Lookup,
+            RequestOp::Listxattr,
+            RequestOp::Flush,
+            RequestOp::Open,
+            RequestOp::Opendir,
+            RequestOp::Read,
+            RequestOp::Readdir,
+            RequestOp::Readlink,
+        ];
+        for op in read_ops {
+            assert_eq!(
+                gate.check(op),
+                BackpressureDecision::Proceed,
+                "read op {op:?} should proceed at Critical"
+            );
+        }
+    }
+
+    #[test]
+    fn degrade_gate_warning_all_ops_proceed() {
+        // At Warning level, all operations (read and write) proceed.
+        let pressure = Arc::new(SystemPressure::with_headroom(0.4));
+        let fsm = Arc::new(DegradationFsm::new(Arc::clone(&pressure), 1));
+        fsm.tick();
+        assert_eq!(fsm.level(), DegradationLevel::Warning);
+        let gate = BackpressureGate::new(fsm);
+
+        assert_eq!(gate.check(RequestOp::Read), BackpressureDecision::Proceed);
+        assert_eq!(gate.check(RequestOp::Write), BackpressureDecision::Proceed);
+        assert_eq!(gate.check(RequestOp::Create), BackpressureDecision::Proceed);
+        assert_eq!(gate.check(RequestOp::Mkdir), BackpressureDecision::Proceed);
+        assert_eq!(gate.check(RequestOp::Fsync), BackpressureDecision::Proceed);
+    }
+
+    #[test]
+    fn degrade_cx_pressure_visible_through_budget() {
+        // Cx with attached SystemPressure: updates from the
+        // ComputeBudget are visible through the Cx's pressure handle.
+        let pressure = Arc::new(SystemPressure::with_headroom(0.6));
+        let cx = Cx::for_testing().with_pressure(Arc::clone(&pressure));
+
+        let p = cx.pressure().expect("pressure attached");
+        assert_eq!(p.degradation_level(), 0); // Normal at 0.6
+
+        // External update simulating increased load.
+        pressure.set_headroom(0.1);
+        assert_eq!(p.degradation_level(), 3); // Critical
+        assert!(p.headroom() < 0.15);
+
+        // Recover.
+        pressure.set_headroom(0.8);
+        assert_eq!(p.degradation_level(), 0); // Back to Normal
+    }
+
+    #[test]
+    fn degrade_budget_headroom_reflects_set_value() {
+        // ComputeBudget's pressure handle updates are reflected in
+        // the headroom getter without requiring a /proc sample.
+        let pressure = Arc::new(SystemPressure::new());
+        let budget = ComputeBudget::new(Arc::clone(&pressure));
+
+        // Manually set headroom (bypasses /proc).
+        pressure.set_headroom(0.42);
+        assert!((budget.current_headroom() - 0.42).abs() < f32::EPSILON);
+        assert!(std::ptr::eq(
+            budget.pressure().as_ref(),
+            pressure.as_ref()
+        ));
+    }
+
+    #[test]
+    fn degrade_pressure_cpu_headroom_mapping() {
+        // Verify that specific headroom values map to the correct
+        // SystemPressure degradation levels.
+        let p = SystemPressure::new();
+
+        let thresholds: [(f32, u8, &str); 5] = [
+            (0.8, 0, "normal"),
+            (0.35, 1, "warning"),
+            (0.2, 2, "degraded"),
+            (0.08, 3, "critical"),
+            (0.01, 4, "emergency"),
+        ];
+
+        for (headroom, expected_level, expected_label) in &thresholds {
+            p.set_headroom(*headroom);
+            assert_eq!(
+                p.degradation_level(),
+                *expected_level,
+                "headroom {headroom} should map to level {expected_level}"
+            );
+            assert_eq!(p.level_label(), *expected_label);
+        }
+    }
+
+    #[test]
+    fn degrade_monitor_multi_sample_drives_transitions() {
+        // PressureMonitor.sample() both reads system load AND ticks
+        // the FSM. Verify that multiple samples with changing pressure
+        // drive level transitions correctly.
+        let pressure = Arc::new(SystemPressure::new());
+        let monitor = PressureMonitor::new(Arc::clone(&pressure), 1);
+
+        assert_eq!(monitor.level(), DegradationLevel::Normal);
+        assert_eq!(monitor.sample_count(), 0);
+
+        // Force pressure down, then sample to tick FSM.
+        pressure.set_headroom(0.02);
+        monitor.sample();
+        // After sample, level_cache should have been updated via tick.
+        // Note: sample() reads /proc which may override our headroom,
+        // so re-set and tick directly.
+        pressure.set_headroom(0.02);
+        monitor.fsm().tick();
+        assert_eq!(monitor.level(), DegradationLevel::Emergency);
+        assert!(monitor.sample_count() >= 1);
+
+        // Recover: with recovery_samples=1, one improved tick suffices.
+        pressure.set_headroom(0.8);
+        monitor.fsm().tick();
+        assert_eq!(monitor.level(), DegradationLevel::Normal);
+    }
+
     #[test]
     fn request_op_is_write() {
         assert!(!RequestOp::Getattr.is_write());
@@ -11540,6 +12248,8 @@ mod tests {
         assert!(RequestOp::Symlink.is_write());
         assert!(RequestOp::Fallocate.is_write());
         assert!(RequestOp::Setattr.is_write());
+        assert!(RequestOp::Setxattr.is_write());
+        assert!(RequestOp::Removexattr.is_write());
         assert!(RequestOp::Write.is_write());
         assert!(RequestOp::Fsync.is_write());
         assert!(RequestOp::Fsyncdir.is_write());

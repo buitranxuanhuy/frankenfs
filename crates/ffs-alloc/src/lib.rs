@@ -1504,4 +1504,119 @@ mod tests {
         let gd = Ext4GroupDesc::parse_from_bytes(gdt_raw.as_slice(), pctx.desc_size).unwrap();
         assert_eq!(gd.free_blocks_count, original_free);
     }
+
+    // ── bd-1xe.5: ext4 read path allocator bitmap tests ─────────────────
+
+    // Allocator Bitmap Test 6: Read block bitmap — free/used status correct
+    #[test]
+    fn readpath_block_bitmap_free_used_correct() {
+        let mut bm = vec![0u8; 128]; // 1024 bits
+
+        // Mark blocks 0-9 as used (typical for metadata reservation).
+        for i in 0..10 {
+            bitmap_set(&mut bm, i);
+        }
+
+        // Verify used blocks report correctly.
+        for i in 0..10 {
+            assert!(
+                bitmap_get(&bm, i),
+                "block {i} should be used (allocated)"
+            );
+        }
+
+        // Verify free blocks report correctly.
+        for i in 10..64 {
+            assert!(
+                !bitmap_get(&bm, i),
+                "block {i} should be free"
+            );
+        }
+    }
+
+    // Allocator Bitmap Test 7: Read inode bitmap — free/used status correct
+    #[test]
+    fn readpath_inode_bitmap_free_used_correct() {
+        let mut bm = vec![0u8; 32]; // 256 bits (inodes_per_group)
+
+        // Mark inodes 0-10 as allocated (root inode + reserved + first user inodes).
+        for i in 0..11 {
+            bitmap_set(&mut bm, i);
+        }
+
+        // Verify allocated inodes.
+        for i in 0..11 {
+            assert!(bitmap_get(&bm, i), "inode {i} should be allocated");
+        }
+
+        // Verify free inodes.
+        for i in 11..32 {
+            assert!(!bitmap_get(&bm, i), "inode {i} should be free");
+        }
+
+        // Free count should match.
+        assert_eq!(
+            bitmap_count_free(&bm, 256),
+            256 - 11,
+            "free inode count should be total minus allocated"
+        );
+    }
+
+    // Allocator Bitmap Test 8: Free block count matches bitmap popcount
+    #[test]
+    fn readpath_free_block_count_matches_popcount() {
+        let blocks_per_group: u32 = 8192;
+        let mut bm = vec![0u8; (blocks_per_group / 8) as usize];
+
+        // Allocate specific blocks: 0, 1, 2 (superblock/GDT), 100, 200, 500
+        let allocated = [0, 1, 2, 100, 200, 500];
+        for &b in &allocated {
+            bitmap_set(&mut bm, b);
+        }
+
+        let free = bitmap_count_free(&bm, blocks_per_group);
+        let expected_free = blocks_per_group - u32::try_from(allocated.len()).unwrap();
+        assert_eq!(
+            free, expected_free,
+            "free count ({free}) should equal blocks_per_group ({blocks_per_group}) minus allocated ({})",
+            allocated.len()
+        );
+
+        // Double-check by counting set bits manually.
+        let used: u32 = (0..blocks_per_group)
+            .filter(|&i| bitmap_get(&bm, i))
+            .count()
+            .try_into()
+            .unwrap();
+        assert_eq!(used, u32::try_from(allocated.len()).unwrap());
+        assert_eq!(free + used, blocks_per_group);
+    }
+
+    // Allocator Bitmap Test 9: Reserved blocks excluded from free count
+    #[test]
+    fn readpath_reserved_blocks_excluded_from_free() {
+        let blocks_per_group: u32 = 64;
+        let mut bm = vec![0u8; (blocks_per_group / 8) as usize]; // 8 bytes
+
+        // Reserve first 5 blocks (superblock, GDT, bitmaps, inode table).
+        let reserved_count = 5_u32;
+        for i in 0..reserved_count {
+            bitmap_set(&mut bm, i);
+        }
+
+        let free = bitmap_count_free(&bm, blocks_per_group);
+        assert_eq!(
+            free,
+            blocks_per_group - reserved_count,
+            "reserved blocks should not count as free"
+        );
+
+        // Find first free block — should skip reserved.
+        let first_free = bitmap_find_free(&bm, blocks_per_group, 0);
+        assert_eq!(
+            first_free,
+            Some(reserved_count),
+            "first free block should be after reserved area"
+        );
+    }
 }

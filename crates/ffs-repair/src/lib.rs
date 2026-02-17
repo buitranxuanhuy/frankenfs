@@ -7,6 +7,7 @@
 
 pub mod autopilot;
 pub mod codec;
+pub mod decision;
 pub mod demo;
 pub mod evidence;
 pub mod pipeline;

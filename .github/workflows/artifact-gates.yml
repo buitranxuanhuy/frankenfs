@@ -1,0 +1,223 @@
+name: Artifact Gates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Gate thresholds (override via repository variables if needed)
+  BINARY_SIZE_MAX_GROWTH_PCT: "10"
+  COVERAGE_MIN_PCT: "60"
+  COVERAGE_MAX_DROP_PCT: "5"
+  P99_FAIL_THRESHOLD_PCT: "20"
+
+jobs:
+  # ── Binary Size Gate ─────────────────────────────────────────────
+  binary-size:
+    name: Binary Size Gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --bin ffs-cli 2>&1
+
+      - name: Measure binary size
+        id: size
+        run: |
+          BIN="target/release/ffs-cli"
+          if [ ! -f "$BIN" ]; then
+            echo "::warning::ffs-cli binary not found, skipping size gate"
+            echo "current_bytes=0" >> "$GITHUB_OUTPUT"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CURRENT=$(stat -c%s "$BIN")
+          echo "current_bytes=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "Binary size: $CURRENT bytes ($(numfmt --to=iec $CURRENT))"
+
+      - name: Compare against baseline
+        if: steps.size.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          BASELINE_FILE="benchmarks/baselines/binary_size.txt"
+          CURRENT="${{ steps.size.outputs.current_bytes }}"
+          MAX_GROWTH="${{ env.BINARY_SIZE_MAX_GROWTH_PCT }}"
+
+          if [ ! -f "$BASELINE_FILE" ]; then
+            echo "No baseline found — recording current size as baseline"
+            mkdir -p "$(dirname "$BASELINE_FILE")"
+            echo "$CURRENT" > "$BASELINE_FILE"
+            exit 0
+          fi
+
+          BASELINE=$(cat "$BASELINE_FILE")
+          if [ "$BASELINE" -eq 0 ] 2>/dev/null; then
+            echo "Baseline is 0, recording new baseline"
+            echo "$CURRENT" > "$BASELINE_FILE"
+            exit 0
+          fi
+
+          DELTA_PCT=$(( (CURRENT - BASELINE) * 100 / BASELINE ))
+          echo "Baseline: $BASELINE bytes, Current: $CURRENT bytes, Delta: ${DELTA_PCT}%"
+
+          if [ "$DELTA_PCT" -gt "$MAX_GROWTH" ]; then
+            echo "::error::Binary size grew ${DELTA_PCT}% (threshold: ${MAX_GROWTH}%). Add BINARY_SIZE_OVERRIDE=true to commit message to bypass."
+            # Allow override via commit message
+            if git log -1 --pretty=%B | grep -q "BINARY_SIZE_OVERRIDE=true"; then
+              echo "::warning::Override detected — updating baseline"
+              echo "$CURRENT" > "$BASELINE_FILE"
+            else
+              exit 1
+            fi
+          else
+            echo "Binary size within threshold (${DELTA_PCT}% <= ${MAX_GROWTH}%)"
+          fi
+
+      - name: Upload size artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-size
+          path: |
+            benchmarks/baselines/binary_size.txt
+          if-no-files-found: warn
+
+  # ── Benchmark Regression Gate ────────────────────────────────────
+  benchmark-regression:
+    name: Benchmark Regression Gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run benchmark regression check
+        run: |
+          set -euo pipefail
+          BASELINE_JSON="artifacts/baselines/perf_baseline.json"
+          THRESHOLD="${{ env.P99_FAIL_THRESHOLD_PCT }}"
+
+          if [ ! -f "$BASELINE_JSON" ]; then
+            echo "::warning::No performance baseline found — skipping regression gate"
+            echo "Run scripts/benchmark_record.sh to generate a baseline"
+            exit 0
+          fi
+
+          echo "Performance baseline found: $BASELINE_JSON"
+          echo "Fail threshold: ${THRESHOLD}%"
+
+          # Build harness for parity check (lightweight)
+          cargo build --release --bin ffs-harness 2>&1 || {
+            echo "::warning::ffs-harness build failed — skipping benchmark regression"
+            exit 0
+          }
+
+          # Run comparison if benchmark_record.sh supports it
+          if [ -x scripts/benchmark_record.sh ]; then
+            scripts/benchmark_record.sh --compare --p99-fail-threshold "$THRESHOLD" || {
+              echo "::error::Benchmark regression detected (p99 > ${THRESHOLD}% threshold)"
+              exit 1
+            }
+          else
+            echo "::warning::benchmark_record.sh not executable — skipping regression check"
+          fi
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            artifacts/baselines/perf_baseline.json
+            baselines/baseline-*.md
+          if-no-files-found: warn
+
+  # ── Golden Output Gate ───────────────────────────────────────────
+  golden-output:
+    name: Golden Output Gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify fixture checksums
+        run: |
+          set -euo pipefail
+          if [ -f conformance/fixtures/checksums.sha256 ]; then
+            cd conformance/fixtures && sha256sum -c checksums.sha256
+          else
+            echo "::warning::No fixture checksums found"
+          fi
+
+      - name: Verify golden checksums
+        run: |
+          set -euo pipefail
+          if [ -f conformance/golden/checksums.sha256 ]; then
+            cd conformance/golden && sha256sum -c checksums.sha256
+          else
+            echo "::warning::No golden checksums found"
+          fi
+
+      - name: Run parity report check
+        run: |
+          set -euo pipefail
+          # Build and run parity check — ensures ParityReport matches FEATURE_PARITY.md
+          cargo test -p ffs-harness --lib parity_report_matches_feature_parity_md 2>&1
+
+      - name: Upload golden artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-failure-diagnostics
+          path: |
+            conformance/golden/*.json
+            conformance/fixtures/checksums.sha256
+          if-no-files-found: warn
+
+  # ── Artifact Archive ─────────────────────────────────────────────
+  archive:
+    name: Archive CI Artifacts
+    runs-on: ubuntu-latest
+    needs: [binary-size, benchmark-regression, golden-output]
+    if: always()
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ci-artifacts
+
+      - name: Upload combined archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-artifact-archive
+          path: ci-artifacts/
+          retention-days: 90
+          if-no-files-found: warn

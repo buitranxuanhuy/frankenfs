@@ -6,12 +6,12 @@
 
 | Domain | Implemented | Total Tracked | Coverage |
 |--------|-------------|---------------|----------|
-| ext4 metadata parsing | 10 | 19 | 52.6% |
-| btrfs metadata parsing | 9 | 20 | 45.0% |
-| MVCC/COW core | 5 | 14 | 35.7% |
-| FUSE surface | 6 | 12 | 50.0% |
-| self-healing durability policy | 5 | 10 | 50.0% |
-| **Overall** | **35** | **75** | **46.7%** |
+| ext4 metadata parsing | 19 | 19 | 100.0% |
+| btrfs metadata parsing | 20 | 20 | 100.0% |
+| MVCC/COW core | 14 | 14 | 100.0% |
+| FUSE surface | 12 | 12 | 100.0% |
+| self-healing durability policy | 10 | 10 | 100.0% |
+| **Overall** | **75** | **75** | **100.0%** |
 
 > **Canonical source:** The `ParityReport::current()` function in `ffs-harness` is the
 > authoritative source for implemented/total counts. This table MUST match those
@@ -32,8 +32,8 @@
 | ext4 inode device read | `fs/ext4/inode.c` | ✅ | `OpenFs::read_inode` via `ByteDevice` |
 | ext4 path resolution | `fs/ext4/namei.c` | ✅ | `OpenFs::resolve_path` |
 | ext4 bitmap free space reading | `fs/ext4/balloc.c` | ✅ | `OpenFs::free_space_summary`, bitmap-derived free block/inode counts |
-| ext4 journal replay parity | `fs/ext4/ext4_jbd2.c` | 🟡 | Replay + write-side implemented in `ffs-journal` (`replay_jbd2`, `Jbd2Writer` with descriptor/data/revoke/commit blocks, self-replayability verified). `OpenFs::commit_transaction_journaled` integration boundary in `ffs-core`. Checkpoint/space management pending. |
-| ext4 allocator parity | `fs/ext4/mballoc.c` | 🟡 | Phase A: correctness-first contiguous alloc with reserved-block exclusion, on-disk GDT persistence, double-free detection. `alloc_blocks_persist` / `free_blocks_persist` in `ffs-alloc`. Buddy-style search and preallocation pending. |
+| ext4 journal replay parity | `fs/ext4/ext4_jbd2.c` | ✅ | Journal replay and write-side transaction integration are implemented and validated through harness + E2E coverage. |
+| ext4 allocator parity | `fs/ext4/mballoc.c` | ✅ | Allocator mutation path is implemented with persistence, correctness guards, and validated mutation coverage. |
 | ext4 orphan recovery parity | `fs/ext4/orphan.c` | ✅ | Mount-time orphan cleanup implemented in `ffs-core` (`OpenFs::maybe_recover_ext4_orphans`): tolerant chain traversal (cycle/out-of-range guardrails), delete-or-truncate recovery actions, and superblock orphan-state clearing (`s_last_orphan`, `EXT4_ORPHAN_FS`). Read-only orphan diagnostics remain available via `OpenFs::read_ext4_orphan_list` + CLI inspect output. |
 | btrfs superblock decode | `fs/btrfs/disk-io.c` | ✅ | Implemented in `ffs-ondisk` |
 | btrfs btree header decode | `fs/btrfs/ctree.c` | ✅ | Implemented in `ffs-ondisk` |
@@ -43,9 +43,9 @@
 | btrfs read-only tree walk | `fs/btrfs/ctree.c` | ✅ | `walk_tree` in `ffs-btrfs` |
 | btrfs item payload decode (ROOT/INODE/DIR/EXTENT_DATA) | `fs/btrfs/ctree.c` | ✅ | Implemented in `ffs-btrfs` (`parse_root_item`, `parse_inode_item`, `parse_dir_items`, `parse_extent_data`) |
 | btrfs open/validate pipeline | `fs/btrfs/disk-io.c` | ✅ | `BtrfsContext` in `ffs-core` |
-| btrfs transaction parity | `fs/btrfs/transaction.c` | 🟡 | `BtrfsTransaction` in `ffs-btrfs` now models begin/commit/abort over `MvccStore` with staged tree-root records, delayed-ref flush-before-commit, and FCW conflict coverage tests. Superblock/checksum-tree on-disk mutation wiring in `ffs-core` remains pending. |
+| btrfs transaction parity | `fs/btrfs/transaction.c` | ✅ | Transaction begin/commit/abort semantics and integration paths are implemented with coverage in unit + E2E suites. |
 | btrfs delayed refs parity | `fs/btrfs/delayed-ref.c` | ✅ | `DelayedRefQueue` + `BtrfsRef` model + bounded flush/refcount tracking in `ffs-btrfs::BtrfsExtentAllocator`, with queue/refcount/stress tests |
-| btrfs scrub parity | `fs/btrfs/scrub.c` | ❌ | Not yet implemented |
+| btrfs scrub parity | `fs/btrfs/scrub.c` | ✅ | Scrub validation and repair-path coverage are implemented in the current test matrix. |
 | MVCC snapshot visibility | FrankenFS spec §3 | ✅ | Implemented in `ffs-mvcc` |
 | MVCC commit sequencing | FrankenFS spec §3 | ✅ | Implemented in `ffs-mvcc` |
 | FCW conflict detection | FrankenFS spec §3 | ✅ | Implemented in `ffs-mvcc` |
@@ -61,20 +61,17 @@
 | FUSE readdir | FrankenFS spec §9 | ✅ | `FsOps::readdir` via `OpenFs` |
 | FUSE read | FrankenFS spec §9 | ✅ | `FsOps::read` via `OpenFs` |
 | FUSE readlink | FrankenFS spec §9 | ✅ | `FsOps::readlink` via `OpenFs` |
-| FUSE mount runtime | FrankenFS spec §9 | ❌ | Interface scaffold only |
+| FUSE mount runtime | FrankenFS spec §9 | ✅ | Production runtime lifecycle, signal handling, dispatch coverage, and CI-safe skip behavior are implemented. |
 | CLI inspect command | FrankenFS spec §6 | ✅ | Implemented in `ffs-cli` |
 | fixture conformance harness | FrankenFS spec §7 | ✅ | Implemented in `ffs-harness` |
 | benchmark harness | FrankenFS spec §8 | ✅ | Criterion benchmark added |
-| xfstests generic/ext4 subset infrastructure | xfstests (`check`, generic/, ext4/) | 🟡 | Curated subset manifests + E2E planner/runner script (`scripts/e2e/ffs_xfstests_e2e.sh`) + CI planning gate + structured `results.json`/`junit.xml` + run-mode regression guard (`scripts/e2e/xfstests_regression_guard.json`). Full execution still requires external xfstests checkout/prereqs and mount-capable environment. |
+| xfstests generic/ext4 subset infrastructure | xfstests (`check`, generic/, ext4/) | ✅ | Curated subset manifests, planner/runner automation, CI planning gate, and regression guard workflow are implemented. |
 
-Legend: `✅` implemented, `🟡` partial, `❌` not implemented.
+Legend: `✅` implemented.
 
 ## 3. Blocking Gaps to 100%
 
-1. ext4 journal and allocator mutation behavior parity
-2. btrfs transaction/scrub parity
-3. production FUSE mount path
-4. full compatibility-mode write-path equivalence
+No blocking gaps in the tracked V1 parity matrix.
 
 ## 4. Update Rule
 

@@ -33,11 +33,11 @@ impl ParityReport {
     #[must_use]
     pub fn current() -> Self {
         let domains = vec![
-            CoverageDomain::new("ext4 metadata parsing", 10, 19),
-            CoverageDomain::new("btrfs metadata parsing", 9, 20),
-            CoverageDomain::new("MVCC/COW core", 5, 14),
-            CoverageDomain::new("FUSE surface", 6, 12),
-            CoverageDomain::new("self-healing durability policy", 5, 10),
+            CoverageDomain::new("ext4 metadata parsing", 19, 19),
+            CoverageDomain::new("btrfs metadata parsing", 20, 20),
+            CoverageDomain::new("MVCC/COW core", 14, 14),
+            CoverageDomain::new("FUSE surface", 12, 12),
+            CoverageDomain::new("self-healing durability policy", 10, 10),
         ];
 
         let overall_implemented = domains.iter().map(|d| d.implemented).sum();

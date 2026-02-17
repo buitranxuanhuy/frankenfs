@@ -8,7 +8,7 @@
 use asupersync::Cx;
 use ffs_core::{
     BackpressureDecision, BackpressureGate, FileType as FfsFileType, FsOps, InodeAttr, RequestOp,
-    SetAttrRequest,
+    SetAttrRequest, XattrSetMode,
 };
 use ffs_error::FfsError;
 use ffs_types::InodeNumber;
@@ -37,6 +37,8 @@ const MIN_SEQUENTIAL_READS_FOR_BATCH: u32 = 2;
 const COALESCED_FETCH_MULTIPLIER: u32 = 4;
 const MAX_COALESCED_READ_SIZE: u32 = 256 * 1024;
 const MAX_PENDING_READAHEAD_ENTRIES: usize = 64;
+const XATTR_FLAG_CREATE: i32 = 0x1;
+const XATTR_FLAG_REPLACE: i32 = 0x2;
 
 // ── Error type ──────────────────────────────────────────────────────────────
 
@@ -591,6 +593,31 @@ impl FrankenFuse {
         libc::ENOATTR
     }
 
+    fn parse_setxattr_mode(flags: i32, position: u32) -> Result<XattrSetMode, c_int> {
+        if position != 0 {
+            return Err(libc::EINVAL);
+        }
+
+        let known = XATTR_FLAG_CREATE | XATTR_FLAG_REPLACE;
+        if flags & !known != 0 {
+            return Err(libc::EINVAL);
+        }
+
+        let create = flags & XATTR_FLAG_CREATE != 0;
+        let replace = flags & XATTR_FLAG_REPLACE != 0;
+        if create && replace {
+            return Err(libc::EINVAL);
+        }
+
+        if create {
+            Ok(XattrSetMode::Create)
+        } else if replace {
+            Ok(XattrSetMode::Replace)
+        } else {
+            Ok(XattrSetMode::Set)
+        }
+    }
+
     fn encode_xattr_names(names: &[String]) -> Vec<u8> {
         let total_len = names.iter().map(|name| name.len() + 1).sum();
         let mut bytes = Vec::with_capacity(total_len);
@@ -959,6 +986,97 @@ impl Filesystem for FrankenFuse {
                     &FuseErrorContext {
                         error: &e,
                         operation: "getxattr",
+                        ino,
+                        offset: None,
+                    },
+                    reply,
+                );
+            }
+        }
+    }
+
+    fn setxattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        position: u32,
+        reply: ReplyEmpty,
+    ) {
+        if self.inner.read_only {
+            reply.error(libc::EROFS);
+            return;
+        }
+        if self.should_shed(RequestOp::Setxattr) {
+            warn!(ino, "backpressure: shedding setxattr");
+            reply.error(libc::EBUSY);
+            return;
+        }
+        let Some(name) = name.to_str() else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+        let Ok(mode) = Self::parse_setxattr_mode(flags, position) else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+
+        let cx = Self::cx_for_request();
+        match self.with_request_scope(&cx, RequestOp::Setxattr, |cx| {
+            self.inner
+                .ops
+                .setxattr(cx, InodeNumber(ino), name, value, mode)
+        }) {
+            Ok(()) => reply.ok(),
+            Err(e) => {
+                if matches!(mode, XattrSetMode::Replace)
+                    && matches!(e, FfsError::NotFound(_))
+                    && self.inner.ops.getattr(&cx, InodeNumber(ino)).is_ok()
+                {
+                    reply.error(Self::missing_xattr_errno());
+                    return;
+                }
+                Self::reply_error_empty(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "setxattr",
+                        ino,
+                        offset: None,
+                    },
+                    reply,
+                );
+            }
+        }
+    }
+
+    fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        if self.inner.read_only {
+            reply.error(libc::EROFS);
+            return;
+        }
+        if self.should_shed(RequestOp::Removexattr) {
+            warn!(ino, "backpressure: shedding removexattr");
+            reply.error(libc::EBUSY);
+            return;
+        }
+        let Some(name) = name.to_str() else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+
+        let cx = Self::cx_for_request();
+        match self.with_request_scope(&cx, RequestOp::Removexattr, |cx| {
+            self.inner.ops.removexattr(cx, InodeNumber(ino), name)
+        }) {
+            Ok(true) => reply.ok(),
+            Ok(false) => reply.error(Self::missing_xattr_errno()),
+            Err(e) => {
+                Self::reply_error_empty(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "removexattr",
                         ino,
                         offset: None,
                     },
@@ -1918,6 +2036,43 @@ mod tests {
 
         #[cfg(not(target_os = "linux"))]
         assert_eq!(FrankenFuse::missing_xattr_errno(), libc::ENOATTR);
+    }
+
+    #[test]
+    fn parse_setxattr_mode_defaults_to_set() {
+        assert_eq!(
+            FrankenFuse::parse_setxattr_mode(0, 0).unwrap(),
+            XattrSetMode::Set
+        );
+    }
+
+    #[test]
+    fn parse_setxattr_mode_accepts_create_and_replace_flags() {
+        assert_eq!(
+            FrankenFuse::parse_setxattr_mode(XATTR_FLAG_CREATE, 0).unwrap(),
+            XattrSetMode::Create
+        );
+        assert_eq!(
+            FrankenFuse::parse_setxattr_mode(XATTR_FLAG_REPLACE, 0).unwrap(),
+            XattrSetMode::Replace
+        );
+    }
+
+    #[test]
+    fn parse_setxattr_mode_rejects_invalid_flag_combinations() {
+        assert_eq!(
+            FrankenFuse::parse_setxattr_mode(XATTR_FLAG_CREATE | XATTR_FLAG_REPLACE, 0)
+                .unwrap_err(),
+            libc::EINVAL
+        );
+        assert_eq!(
+            FrankenFuse::parse_setxattr_mode(0x40, 0).unwrap_err(),
+            libc::EINVAL
+        );
+        assert_eq!(
+            FrankenFuse::parse_setxattr_mode(XATTR_FLAG_CREATE, 1).unwrap_err(),
+            libc::EINVAL
+        );
     }
 
     #[test]

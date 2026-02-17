@@ -567,6 +567,7 @@ dependencies = [
  "ffs-mvcc",
  "ffs-ondisk",
  "ffs-types",
+ "ffs-xattr",
  "libc",
  "parking_lot",
  "serde",

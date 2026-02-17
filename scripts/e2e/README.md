@@ -11,11 +11,17 @@ End-to-end smoke tests for FrankenFS that exercise user-facing workflows.
 # Run ext4 read-write smoke + crash checks
 ./scripts/e2e/ffs_ext4_rw_smoke.sh
 
+# Run ext4 read-only round-trip (debugfs reference vs FUSE view)
+./scripts/e2e/ffs_ext4_ro_roundtrip.sh
+
 # Run btrfs read-write smoke + persistence checks
 ./scripts/e2e/ffs_btrfs_rw_smoke.sh
 
 # Run btrfs read-only FUSE smoke
 ./scripts/e2e/ffs_btrfs_ro_smoke.sh
+
+# Run production FUSE runtime E2E suite
+./scripts/e2e/ffs_fuse_production.sh
 
 # Run write-back durability scenarios
 ./scripts/e2e/ffs_writeback_e2e.sh
@@ -45,6 +51,16 @@ The smoke test exercises:
    - Read file contents
    - Unmount cleanly
 
+The production FUSE runtime suite exercises:
+
+1. Mount lifecycle checks for RW/RO startup and clean teardown
+2. Concurrent read/write worker probes against mounted ext4 fixtures
+3. Xattr operations (`set`, `get`, `list`, `remove`) for runtime surface validation
+4. SIGTERM shutdown durability verification with remount validation
+5. Throughput/latency baseline capture to `perf_baseline.json`
+6. Optional btrfs inspect smoke when `mkfs.btrfs` is available
+7. JUnit report generation at `artifacts/e2e/<timestamp>_ffs_fuse_production/junit.xml`
+
 The write-back E2E suite exercises:
 
 1. Basic flush correctness (1000 committed blocks)
@@ -68,6 +84,16 @@ The ext4 read-write smoke suite exercises:
 3. Metadata checks (phase-gated): chmod verification and mtime monotonicity
 4. Clean shutdown persistence: remount read-only and re-verify post-unmount state
 5. Deterministic crash phase: write + fsync 500 baseline files, run continuous in-flight writes, SIGKILL mount daemon, remount read-only, and verify baseline + fsync durability invariants
+
+The ext4 read-only round-trip suite exercises:
+
+1. Fixture lifecycle: use configured/default ext4 fixture image (or create deterministic fallback)
+2. Reference extraction: `debugfs rdump` of the full filesystem tree to a host-side reference directory
+3. Metadata assertions: `ffs inspect --json` checks for superblock fields, free-space accounting consistency, and orphan diagnostics shape
+4. Read-only FUSE mount and full tree walk comparison against reference extraction
+5. Per-file BLAKE3 digest comparison (`b3sum`) between reference tree and mounted view
+6. Journal replay reporting check when crash recovery is triggered by the image state
+7. Runtime guard: suite fails if elapsed duration exceeds configured bound (default 30 seconds)
 
 The btrfs read-write smoke suite exercises:
 
@@ -120,13 +146,16 @@ artifacts/e2e/20260212_161500_ffs_smoke/
 | `RUST_LOG` | `info` | Rust log level (trace, debug, info, warn, error) |
 | `RUST_BACKTRACE` | `1` | Enable backtraces on panic |
 | `SKIP_MOUNT` | `0` | Set to `1` to skip FUSE mount tests |
-| `FFS_AUTO_UNMOUNT` | `0` (for ext4 RW smoke) | Passed through to `ffs mount`; set `0` to avoid implicit `allow_other` on rootless fuse3 setups |
+| `FFS_AUTO_UNMOUNT` | `0` (for ext4 RW smoke, btrfs RW smoke, and fuse production) | Passed through to `ffs mount`; set `0` to avoid implicit `allow_other` on rootless fuse3 setups |
+| `FFS_ALLOW_OTHER` | `0` | For `ffs_fuse_production.sh`: if `1`, passes `--allow-other` to `ffs mount` |
 | `FFS_CLI_BIN` | `target/release/ffs-cli` | Path to local `ffs-cli` binary used by RW mount/inspect steps |
+| `EXT4_ROUNDTRIP_IMAGE` | *(unset)* | Optional path to ext4 image for `ffs_ext4_ro_roundtrip.sh`; if unset, defaults to `tests/fixtures/images/ext4_small.img` and falls back to generated image when missing |
+| `EXT4_ROUNDTRIP_MAX_SECS` | `30` | Max allowed runtime (seconds) for `ffs_ext4_ro_roundtrip.sh` |
 | `BASELINE_FILE_COUNT` | `500` | Number of fsync-backed baseline files written before SIGKILL phase |
 | `CRASH_WRITER_RUNTIME_SECS` | `2` | Duration to run background in-flight writer before sending SIGKILL |
 | `CRASH_WRITER_SLEEP_SECS` | `0.01` | Per-write pacing interval for crash in-flight writer |
 | `FFS_REPAIR_LOCAL_ARTIFACT_FALLBACK` | `0` | For `ffs_repair_recovery_smoke.sh`: if `1`, re-run repair test locally when rch offload does not materialize artifact files |
-| `FFS_USE_RCH` | `1` | For `ffs_degradation_stress.sh`: offload cargo commands via `rch exec -- cargo ...` when available |
+| `FFS_USE_RCH` | `1` | For `ffs_degradation_stress.sh`, `ffs_fuse_production.sh`, `ffs_btrfs_rw_smoke.sh`, and `ffs_ext4_ro_roundtrip.sh`: offload cargo commands via `rch exec -- cargo ...` when available |
 | `FFS_RUN_MOUNT_STRESS` | `0` | For `ffs_degradation_stress.sh`: if `1`, attempt optional live FUSE mount pressure probe |
 | `DEGRADATION_STRESS_DURATION_SECS` | `20` | Duration for host `stress-ng` probe in `ffs_degradation_stress.sh` |
 | `DEGRADATION_STRESS_CPU_WORKERS` | `4` | CPU workers for host `stress-ng` probe in `ffs_degradation_stress.sh` |
@@ -144,7 +173,9 @@ artifacts/e2e/20260212_161500_ffs_smoke/
 ## Requirements
 
 - Rust toolchain (nightly)
+- `python3` (used by concurrency/perf probes in `ffs_fuse_production.sh`)
 - `mkfs.ext4` and `debugfs` (e2fsprogs)
+- `b3sum` (required by `ffs_ext4_ro_roundtrip.sh` for BLAKE3 digest verification)
 - `mkfs.btrfs` and `btrfs` (btrfs-progs)
 - `/dev/fuse` accessible (for mount tests)
 - `fusermount` or `fusermount3` (for unmounting)
