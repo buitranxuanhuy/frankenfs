@@ -10445,6 +10445,44 @@ mod tests {
     }
 
     #[test]
+    fn write_link_rejected_at_emlink_limit() {
+        let Some(fs) = open_writable_ext4() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        let src = fs
+            .create(&cx, root, OsStr::new("emlink_src.txt"), 0o644, 0, 0)
+            .expect("create source");
+
+        let mut inode = fs.read_inode(&cx, src.ino).expect("read source inode");
+        inode.links_count = 65_000;
+
+        let sb = fs.ext4_superblock().expect("ext4 superblock");
+        let csum_seed = sb.csum_seed();
+        let block_dev = fs.block_device_adapter();
+        let alloc_mutex = fs.require_alloc_state().expect("alloc state");
+        let alloc = alloc_mutex.lock();
+        ffs_inode::write_inode(
+            &cx,
+            &block_dev,
+            &alloc.geo,
+            &alloc.groups,
+            src.ino,
+            &inode,
+            csum_seed,
+        )
+        .expect("persist nlink update");
+        drop(alloc);
+
+        let err = fs
+            .link(&cx, src.ino, root, OsStr::new("emlink_dst.txt"))
+            .unwrap_err();
+        assert_eq!(err.to_errno(), libc::EMLINK);
+    }
+
+    #[test]
     fn write_symlink_fast_target_roundtrip() {
         let Some(fs) = open_writable_ext4() else {
             return;
