@@ -14,23 +14,29 @@ use ffs_error::FfsError;
 use ffs_types::InodeNumber;
 use fuser::{
     FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request, TimeOrNow,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
+    Request, TimeOrNow,
 };
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::os::raw::c_int;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Default TTL for cached attributes and entries.
 ///
 /// Read-only images are immutable, so a generous TTL is safe.
 const ATTR_TTL: Duration = Duration::from_secs(60);
+const MIN_SEQUENTIAL_READS_FOR_BATCH: u32 = 2;
+const COALESCED_FETCH_MULTIPLIER: u32 = 4;
+const MAX_COALESCED_READ_SIZE: u32 = 256 * 1024;
+const MAX_PENDING_READAHEAD_ENTRIES: usize = 64;
 
 // ── Error type ──────────────────────────────────────────────────────────────
 
@@ -254,6 +260,145 @@ pub struct MetricsSnapshot {
     pub bytes_read: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessDirection {
+    Forward,
+    Backward,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AccessPattern {
+    last_offset: u64,
+    last_size: u32,
+    sequential_count: u32,
+    direction: AccessDirection,
+}
+
+#[derive(Debug, Default)]
+struct AccessPredictor {
+    history: Mutex<BTreeMap<u64, AccessPattern>>,
+}
+
+impl AccessPredictor {
+    fn fetch_size(&self, ino: InodeNumber, offset: u64, requested: u32) -> u32 {
+        let guard = match self.history.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let pattern = guard.get(&ino.0).copied();
+        drop(guard);
+
+        let Some(pattern) = pattern else {
+            return requested;
+        };
+        let next_forward_offset = pattern
+            .last_offset
+            .saturating_add(u64::from(pattern.last_size));
+        let should_batch = pattern.direction == AccessDirection::Forward
+            && pattern.last_size == requested
+            && pattern.sequential_count >= MIN_SEQUENTIAL_READS_FOR_BATCH
+            && next_forward_offset == offset;
+        if should_batch {
+            requested
+                .saturating_mul(COALESCED_FETCH_MULTIPLIER)
+                .min(MAX_COALESCED_READ_SIZE)
+        } else {
+            requested
+        }
+    }
+
+    fn record_read(&self, ino: InodeNumber, offset: u64, size: u32) {
+        if size == 0 {
+            return;
+        }
+        {
+            let mut guard = match self.history.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            {
+                let entry = guard.entry(ino.0).or_insert(AccessPattern {
+                    last_offset: offset,
+                    last_size: size,
+                    sequential_count: 1,
+                    direction: AccessDirection::Forward,
+                });
+
+                let next_forward_offset =
+                    entry.last_offset.saturating_add(u64::from(entry.last_size));
+                let next_backward_offset = offset.saturating_add(u64::from(size));
+
+                if entry.last_size == size && next_forward_offset == offset {
+                    entry.sequential_count = entry.sequential_count.saturating_add(1);
+                    entry.direction = AccessDirection::Forward;
+                } else if entry.last_size == size && next_backward_offset == entry.last_offset {
+                    entry.sequential_count = entry.sequential_count.saturating_add(1);
+                    entry.direction = AccessDirection::Backward;
+                } else {
+                    entry.sequential_count = 1;
+                    entry.direction = AccessDirection::Forward;
+                }
+                entry.last_offset = offset;
+                entry.last_size = size;
+            }
+            drop(guard);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ReadaheadManager {
+    pending: Mutex<BTreeMap<(u64, u64), Vec<u8>>>,
+    max_pending: usize,
+}
+
+impl ReadaheadManager {
+    fn new(max_pending: usize) -> Self {
+        Self {
+            pending: Mutex::new(BTreeMap::new()),
+            max_pending: max_pending.max(1),
+        }
+    }
+
+    fn insert(&self, ino: InodeNumber, offset: u64, data: Vec<u8>) {
+        if data.is_empty() {
+            return;
+        }
+        let mut guard = match self.pending.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.insert((ino.0, offset), data);
+        while guard.len() > self.max_pending {
+            if let Some(key) = guard.keys().next().copied() {
+                let _ = guard.remove(&key);
+            } else {
+                break;
+            }
+        }
+        drop(guard);
+    }
+
+    fn take(&self, ino: InodeNumber, offset: u64, requested_len: usize) -> Option<Vec<u8>> {
+        let mut guard = match self.pending.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut cached = guard.remove(&(ino.0, offset))?;
+        if cached.len() <= requested_len {
+            drop(guard);
+            return Some(cached);
+        }
+
+        let tail = cached.split_off(requested_len);
+        let consumed = u64::try_from(cached.len()).unwrap_or(u64::MAX);
+        let next_offset = offset.saturating_add(consumed);
+        guard.insert((ino.0, next_offset), tail);
+        drop(guard);
+        Some(cached)
+    }
+}
+
 // ── Shared FUSE inner state ─────────────────────────────────────────────────
 
 /// Thread-safe shared state for the FUSE backend.
@@ -268,6 +413,8 @@ struct FuseInner {
     thread_count: usize,
     read_only: bool,
     backpressure: Option<BackpressureGate>,
+    access_predictor: AccessPredictor,
+    readahead: ReadaheadManager,
 }
 
 impl std::fmt::Debug for FuseInner {
@@ -328,6 +475,8 @@ impl FrankenFuse {
                 thread_count,
                 read_only: options.read_only,
                 backpressure: None,
+                access_predictor: AccessPredictor::default(),
+                readahead: ReadaheadManager::new(MAX_PENDING_READAHEAD_ENTRIES),
             }),
         }
     }
@@ -348,6 +497,8 @@ impl FrankenFuse {
                 thread_count,
                 read_only: options.read_only,
                 backpressure: Some(gate),
+                access_predictor: AccessPredictor::default(),
+                readahead: ReadaheadManager::new(MAX_PENDING_READAHEAD_ENTRIES),
             }),
         }
     }
@@ -478,6 +629,63 @@ impl FrankenFuse {
             }
         }
     }
+
+    fn read_with_readahead(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        byte_offset: u64,
+        size: u32,
+    ) -> ffs_error::Result<Vec<u8>> {
+        let requested_len = usize::try_from(size).unwrap_or(usize::MAX);
+        self.with_request_scope(cx, RequestOp::Read, |cx| {
+            if let Some(prefetched) = self.inner.readahead.take(ino, byte_offset, requested_len) {
+                trace!(
+                    target: "ffs::fuse::io",
+                    event = "readahead_hit",
+                    ino = ino.0,
+                    offset = byte_offset,
+                    bytes = prefetched.len()
+                );
+                self.inner.access_predictor.record_read(
+                    ino,
+                    byte_offset,
+                    u32::try_from(prefetched.len()).unwrap_or(u32::MAX),
+                );
+                return Ok(prefetched);
+            }
+
+            let fetch_size = self
+                .inner
+                .access_predictor
+                .fetch_size(ino, byte_offset, size);
+            let fetched = self.inner.ops.read(cx, ino, byte_offset, fetch_size)?;
+            let served_len = requested_len.min(fetched.len());
+            let mut served = fetched;
+            let tail = served.split_off(served_len);
+
+            self.inner.access_predictor.record_read(
+                ino,
+                byte_offset,
+                u32::try_from(served.len()).unwrap_or(u32::MAX),
+            );
+
+            if !tail.is_empty() {
+                let consumed = u64::try_from(served_len).unwrap_or(u64::MAX);
+                let prefetch_offset = byte_offset.saturating_add(consumed);
+                let prefetch_bytes = tail.len();
+                self.inner.readahead.insert(ino, prefetch_offset, tail);
+                debug!(
+                    target: "ffs::fuse::io",
+                    event = "readahead_queued",
+                    ino = ino.0,
+                    offset = prefetch_offset,
+                    bytes = prefetch_bytes
+                );
+            }
+            Ok(served)
+        })
+    }
 }
 
 impl Filesystem for FrankenFuse {
@@ -503,6 +711,33 @@ impl Filesystem for FrankenFuse {
                     },
                     reply,
                 );
+            }
+        }
+    }
+
+    fn statfs(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyStatfs) {
+        let cx = Self::cx_for_request();
+        match self.with_request_scope(&cx, RequestOp::Statfs, |cx| {
+            self.inner.ops.statfs(cx, InodeNumber(ino))
+        }) {
+            Ok(stats) => reply.statfs(
+                stats.blocks,
+                stats.blocks_free,
+                stats.blocks_available,
+                stats.files,
+                stats.files_free,
+                stats.block_size,
+                stats.name_max,
+                stats.fragment_size,
+            ),
+            Err(e) => {
+                let ctx = FuseErrorContext {
+                    error: &e,
+                    operation: "statfs",
+                    ino,
+                    offset: None,
+                };
+                reply.error(ctx.log_and_errno());
             }
         }
     }
@@ -574,9 +809,7 @@ impl Filesystem for FrankenFuse {
         let cx = Self::cx_for_request();
         // Clamp negative offsets to 0 (shouldn't happen in practice).
         let byte_offset = u64::try_from(offset).unwrap_or(0);
-        match self.with_request_scope(&cx, RequestOp::Read, |cx| {
-            self.inner.ops.read(cx, InodeNumber(ino), byte_offset, size)
-        }) {
+        match self.read_with_readahead(&cx, InodeNumber(ino), byte_offset, size) {
             Ok(data) => {
                 self.inner
                     .metrics
@@ -657,6 +890,44 @@ impl Filesystem for FrankenFuse {
                         error: &e,
                         operation: "readlink",
                         ino,
+                        offset: None,
+                    },
+                    reply,
+                );
+            }
+        }
+    }
+
+    fn symlink(
+        &mut self,
+        req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        link: &Path,
+        reply: ReplyEntry,
+    ) {
+        if self.inner.read_only {
+            reply.error(libc::EROFS);
+            return;
+        }
+        if self.should_shed(RequestOp::Symlink) {
+            warn!(parent, "backpressure: shedding symlink");
+            reply.error(libc::EBUSY);
+            return;
+        }
+        let cx = Self::cx_for_request();
+        match self.with_request_scope(&cx, RequestOp::Symlink, |cx| {
+            self.inner
+                .ops
+                .symlink(cx, InodeNumber(parent), name, link, req.uid(), req.gid())
+        }) {
+            Ok(attr) => reply.entry(&ATTR_TTL, &to_file_attr(&attr), 0),
+            Err(e) => {
+                Self::reply_error_entry(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "symlink",
+                        ino: parent,
                         offset: None,
                     },
                     reply,
@@ -930,6 +1201,44 @@ impl Filesystem for FrankenFuse {
         }
     }
 
+    fn link(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        newparent: u64,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        if self.inner.read_only {
+            reply.error(libc::EROFS);
+            return;
+        }
+        if self.should_shed(RequestOp::Link) {
+            warn!(ino, "backpressure: shedding link");
+            reply.error(libc::EBUSY);
+            return;
+        }
+        let cx = Self::cx_for_request();
+        match self.with_request_scope(&cx, RequestOp::Link, |cx| {
+            self.inner
+                .ops
+                .link(cx, InodeNumber(ino), InodeNumber(newparent), newname)
+        }) {
+            Ok(attr) => reply.entry(&ATTR_TTL, &to_file_attr(&attr), 0),
+            Err(e) => {
+                Self::reply_error_entry(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "link",
+                        ino,
+                        offset: None,
+                    },
+                    reply,
+                );
+            }
+        }
+    }
+
     fn write(
         &mut self,
         _req: &Request<'_>,
@@ -964,6 +1273,56 @@ impl Filesystem for FrankenFuse {
                     &FuseErrorContext {
                         error: &e,
                         operation: "write",
+                        ino,
+                        offset: Some(byte_offset),
+                    },
+                    reply,
+                );
+            }
+        }
+    }
+
+    fn fallocate(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        length: i64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        if self.inner.read_only {
+            reply.error(libc::EROFS);
+            return;
+        }
+        if self.should_shed(RequestOp::Fallocate) {
+            warn!(ino, "backpressure: shedding fallocate");
+            reply.error(libc::EBUSY);
+            return;
+        }
+
+        let Ok(byte_offset) = u64::try_from(offset) else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+        let Ok(byte_length) = u64::try_from(length) else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+
+        let cx = Self::cx_for_request();
+        match self.with_request_scope(&cx, RequestOp::Fallocate, |cx| {
+            self.inner
+                .ops
+                .fallocate(cx, InodeNumber(ino), byte_offset, byte_length, mode)
+        }) {
+            Ok(()) => reply.ok(),
+            Err(e) => {
+                Self::reply_error_empty(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "fallocate",
                         ino,
                         offset: Some(byte_offset),
                     },
@@ -1561,6 +1920,181 @@ mod tests {
         assert_eq!(FrankenFuse::missing_xattr_errno(), libc::ENOATTR);
     }
 
+    #[test]
+    fn access_predictor_doubles_fetch_size_for_forward_sequence() {
+        let predictor = AccessPredictor::default();
+        let ino = InodeNumber(11);
+        let size = 4096_u32;
+
+        assert_eq!(predictor.fetch_size(ino, 0, size), size);
+        predictor.record_read(ino, 0, size);
+        assert_eq!(predictor.fetch_size(ino, u64::from(size), size), size);
+
+        predictor.record_read(ino, u64::from(size), size);
+        assert_eq!(
+            predictor.fetch_size(ino, u64::from(size) * 2, size),
+            size.saturating_mul(COALESCED_FETCH_MULTIPLIER)
+                .min(MAX_COALESCED_READ_SIZE)
+        );
+    }
+
+    #[test]
+    fn readahead_manager_partial_take_requeues_tail() {
+        let manager = ReadaheadManager::new(8);
+        let ino = InodeNumber(5);
+
+        manager.insert(ino, 100, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(manager.take(ino, 100, 4), Some(vec![1, 2, 3, 4]));
+        assert_eq!(manager.take(ino, 104, 8), Some(vec![5, 6]));
+    }
+
+    #[test]
+    fn readahead_manager_caps_pending_entries() {
+        let manager = ReadaheadManager::new(2);
+        let ino = InodeNumber(9);
+
+        manager.insert(ino, 0, vec![0]);
+        manager.insert(ino, 8, vec![1]);
+        manager.insert(ino, 16, vec![2]);
+
+        assert_eq!(manager.take(ino, 0, 1), None);
+        assert_eq!(manager.take(ino, 8, 1), Some(vec![1]));
+        assert_eq!(manager.take(ino, 16, 1), Some(vec![2]));
+    }
+
+    struct CountingReadFs {
+        data: Vec<u8>,
+        read_calls: Arc<AtomicU64>,
+    }
+
+    impl CountingReadFs {
+        fn new(data: Vec<u8>, read_calls: Arc<AtomicU64>) -> Self {
+            Self { data, read_calls }
+        }
+    }
+
+    impl FsOps for CountingReadFs {
+        fn getattr(&self, _cx: &Cx, _ino: InodeNumber) -> ffs_error::Result<InodeAttr> {
+            Err(FfsError::NotFound("stub".into()))
+        }
+
+        fn lookup(
+            &self,
+            _cx: &Cx,
+            _parent: InodeNumber,
+            _name: &OsStr,
+        ) -> ffs_error::Result<InodeAttr> {
+            Err(FfsError::NotFound("stub".into()))
+        }
+
+        fn readdir(
+            &self,
+            _cx: &Cx,
+            _ino: InodeNumber,
+            _offset: u64,
+        ) -> ffs_error::Result<Vec<FfsDirEntry>> {
+            Ok(vec![])
+        }
+
+        fn read(
+            &self,
+            _cx: &Cx,
+            _ino: InodeNumber,
+            offset: u64,
+            size: u32,
+        ) -> ffs_error::Result<Vec<u8>> {
+            self.read_calls.fetch_add(1, Ordering::Relaxed);
+            let start = usize::try_from(offset).unwrap_or(usize::MAX);
+            if start >= self.data.len() {
+                return Ok(vec![]);
+            }
+            let requested = usize::try_from(size).unwrap_or(usize::MAX);
+            let end = start.saturating_add(requested).min(self.data.len());
+            Ok(self.data[start..end].to_vec())
+        }
+
+        fn readlink(&self, _cx: &Cx, _ino: InodeNumber) -> ffs_error::Result<Vec<u8>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn sequential_reads_use_prefetched_tail_without_extra_backend_call() {
+        let read_calls = Arc::new(AtomicU64::new(0));
+        let data: Vec<u8> = (0_u8..64).collect();
+        let fuse = FrankenFuse::new(Box::new(CountingReadFs::new(data, Arc::clone(&read_calls))));
+        let cx = Cx::for_testing();
+        let ino = InodeNumber(1);
+
+        assert_eq!(
+            fuse.read_with_readahead(&cx, ino, 0, 4).unwrap(),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(
+            fuse.read_with_readahead(&cx, ino, 4, 4).unwrap(),
+            vec![4, 5, 6, 7]
+        );
+        assert_eq!(
+            fuse.read_with_readahead(&cx, ino, 8, 4).unwrap(),
+            vec![8, 9, 10, 11]
+        );
+        assert_eq!(
+            fuse.read_with_readahead(&cx, ino, 12, 4).unwrap(),
+            vec![12, 13, 14, 15]
+        );
+
+        // The third read uses a doubled fetch and queues the tail for the
+        // fourth read, so only three backend reads are needed.
+        assert_eq!(read_calls.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn long_sequential_reads_exceed_two_x_call_reduction() {
+        let read_calls = Arc::new(AtomicU64::new(0));
+        let data: Vec<u8> = (0_u8..128).collect();
+        let fuse = FrankenFuse::new(Box::new(CountingReadFs::new(data, Arc::clone(&read_calls))));
+        let cx = Cx::for_testing();
+        let ino = InodeNumber(2);
+
+        for index in 0_u64..12 {
+            let offset = index * 4;
+            let expected_start = u8::try_from(offset).unwrap_or(u8::MAX);
+            let expected = vec![
+                expected_start,
+                expected_start.saturating_add(1),
+                expected_start.saturating_add(2),
+                expected_start.saturating_add(3),
+            ];
+            assert_eq!(
+                fuse.read_with_readahead(&cx, ino, offset, 4).unwrap(),
+                expected
+            );
+        }
+
+        // 12 logical reads complete with at most 5 backend reads, which is
+        // >2x reduction versus the unbatched baseline of 12 calls.
+        assert!(read_calls.load(Ordering::Relaxed) <= 5);
+    }
+
+    #[test]
+    fn non_sequential_reads_do_not_trigger_coalescing() {
+        let read_calls = Arc::new(AtomicU64::new(0));
+        let data: Vec<u8> = (0_u8..128).collect();
+        let fuse = FrankenFuse::new(Box::new(CountingReadFs::new(data, Arc::clone(&read_calls))));
+        let cx = Cx::for_testing();
+        let ino = InodeNumber(3);
+        let offsets = [0_u64, 32, 4, 48, 8, 64];
+
+        for offset in offsets {
+            let _ = fuse.read_with_readahead(&cx, ino, offset, 4).unwrap();
+        }
+
+        assert_eq!(
+            read_calls.load(Ordering::Relaxed),
+            u64::try_from(offsets.len()).unwrap_or(u64::MAX)
+        );
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum HookEvent {
         Begin(RequestOp),
@@ -1960,6 +2494,8 @@ mod tests {
             thread_count: 4,
             read_only: true,
             backpressure: None,
+            access_predictor: AccessPredictor::default(),
+            readahead: ReadaheadManager::new(MAX_PENDING_READAHEAD_ENTRIES),
         });
         let barrier = Arc::new(std::sync::Barrier::new(10));
 

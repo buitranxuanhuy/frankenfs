@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::OnceLock;
 use thiserror::Error;
 
 pub const EXT4_SUPERBLOCK_OFFSET: usize = 1024;
@@ -17,6 +18,150 @@ pub const BTRFS_CSUM_TYPE_CRC32C: u16 = 0;
 pub const BTRFS_CSUM_TYPE_XXHASH64: u16 = 1;
 pub const BTRFS_CSUM_TYPE_SHA256: u16 = 2;
 pub const BTRFS_CSUM_TYPE_BLAKE2B: u16 = 3;
+
+/// Runtime SIMD capabilities relevant to checksum acceleration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SimdCapabilities {
+    bits: u8,
+}
+
+impl SimdCapabilities {
+    const X86_SSE42: u8 = 1 << 0;
+    const X86_AVX2: u8 = 1 << 1;
+    const AARCH64_CRC: u8 = 1 << 2;
+    const AARCH64_NEON: u8 = 1 << 3;
+
+    fn set(&mut self, flag: u8, enabled: bool) {
+        if enabled {
+            self.bits |= flag;
+        }
+    }
+
+    #[must_use]
+    pub fn has_x86_sse42(self) -> bool {
+        (self.bits & Self::X86_SSE42) != 0
+    }
+
+    #[must_use]
+    pub fn has_x86_avx2(self) -> bool {
+        (self.bits & Self::X86_AVX2) != 0
+    }
+
+    #[must_use]
+    pub fn has_aarch64_crc(self) -> bool {
+        (self.bits & Self::AARCH64_CRC) != 0
+    }
+
+    #[must_use]
+    pub fn has_aarch64_neon(self) -> bool {
+        (self.bits & Self::AARCH64_NEON) != 0
+    }
+}
+
+/// Batch checksum algorithm selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksumAlgo {
+    /// CRC32C with a caller-provided seed.
+    Crc32c { seed: u32 },
+    /// Lower 32 bits of the BLAKE3 digest.
+    Blake3Truncated32,
+}
+
+static SIMD_CAPABILITIES: OnceLock<SimdCapabilities> = OnceLock::new();
+
+fn detect_simd_capabilities() -> SimdCapabilities {
+    let mut caps = SimdCapabilities::default();
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        caps.set(
+            SimdCapabilities::X86_SSE42,
+            std::arch::is_x86_feature_detected!("sse4.2"),
+        );
+        caps.set(
+            SimdCapabilities::X86_AVX2,
+            std::arch::is_x86_feature_detected!("avx2"),
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        caps.set(
+            SimdCapabilities::AARCH64_CRC,
+            std::arch::is_aarch64_feature_detected!("crc"),
+        );
+        caps.set(
+            SimdCapabilities::AARCH64_NEON,
+            std::arch::is_aarch64_feature_detected!("neon"),
+        );
+    }
+    caps
+}
+
+/// Detect and cache checksum-relevant SIMD capabilities.
+///
+/// This logs the detected capability matrix once on first use.
+#[must_use]
+pub fn simd_capabilities() -> SimdCapabilities {
+    *SIMD_CAPABILITIES.get_or_init(|| {
+        let caps = detect_simd_capabilities();
+        tracing::info!(
+            target: "ffs::checksum",
+            x86_sse42 = caps.has_x86_sse42(),
+            x86_avx2 = caps.has_x86_avx2(),
+            aarch64_crc = caps.has_aarch64_crc(),
+            aarch64_neon = caps.has_aarch64_neon(),
+            "detected checksum SIMD capabilities"
+        );
+        caps
+    })
+}
+
+/// Compute CRC32C over `data`.
+#[inline]
+#[must_use]
+pub fn crc32c(data: &[u8]) -> u32 {
+    let _ = simd_capabilities();
+    crc32c::crc32c(data)
+}
+
+/// Compute seeded CRC32C over `data`.
+#[inline]
+#[must_use]
+pub fn crc32c_append(seed: u32, data: &[u8]) -> u32 {
+    let _ = simd_capabilities();
+    crc32c::crc32c_append(seed, data)
+}
+
+/// Compute BLAKE3 digest over `data`.
+#[inline]
+#[must_use]
+pub fn blake3_hash(data: &[u8]) -> blake3::Hash {
+    let _ = simd_capabilities();
+    blake3::hash(data)
+}
+
+#[inline]
+fn blake3_truncated32(data: &[u8]) -> u32 {
+    let hash = blake3_hash(data);
+    let bytes = hash.as_bytes();
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+/// Compute checksums for multiple blocks in parallel.
+#[must_use]
+pub fn batch_checksum(blocks: &[&[u8]], algo: ChecksumAlgo) -> Vec<u32> {
+    use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+
+    match algo {
+        ChecksumAlgo::Crc32c { seed } => blocks
+            .par_iter()
+            .map(|block| crc32c_append(seed, block))
+            .collect(),
+        ChecksumAlgo::Blake3Truncated32 => blocks
+            .par_iter()
+            .map(|block| blake3_truncated32(block))
+            .collect(),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct BlockNumber(pub u64);
@@ -659,6 +804,57 @@ mod tests {
         assert!(BlockSize::new(131_072).is_err());
         // Invalid: zero
         assert!(BlockSize::new(0).is_err());
+    }
+
+    #[test]
+    fn checksum_wrappers_match_backend() {
+        let data = b"frankenfs-checksum-wrapper";
+        let seed = 0xA11C_E551;
+        assert_eq!(crc32c(data), ::crc32c::crc32c(data));
+        assert_eq!(
+            crc32c_append(seed, data),
+            ::crc32c::crc32c_append(seed, data)
+        );
+        assert_eq!(blake3_hash(data), ::blake3::hash(data));
+    }
+
+    #[test]
+    fn batch_checksum_crc32c_matches_scalar() {
+        let blocks: [&[u8]; 4] = [
+            b"alpha".as_slice(),
+            b"beta".as_slice(),
+            b"gamma".as_slice(),
+            b"delta".as_slice(),
+        ];
+        let seed = 0x1234_5678;
+        let expected: Vec<u32> = blocks
+            .iter()
+            .map(|block| crc32c_append(seed, block))
+            .collect();
+        let actual = batch_checksum(&blocks, ChecksumAlgo::Crc32c { seed });
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn batch_checksum_blake3_matches_scalar_truncation() {
+        let blocks: [&[u8]; 3] = [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()];
+        let expected: Vec<u32> = blocks
+            .iter()
+            .map(|block| {
+                let hash = blake3_hash(block);
+                let bytes = hash.as_bytes();
+                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+            })
+            .collect();
+        let actual = batch_checksum(&blocks, ChecksumAlgo::Blake3Truncated32);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn simd_capabilities_cached() {
+        let first = simd_capabilities();
+        let second = simd_capabilities();
+        assert_eq!(first, second);
     }
 
     #[test]

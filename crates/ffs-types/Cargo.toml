@@ -7,8 +7,12 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+blake3 = { workspace = true }
+crc32c = { workspace = true }
+rayon = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [lints]
 workspace = true

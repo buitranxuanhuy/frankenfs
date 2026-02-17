@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use ffs_types as crc32c;
 use ffs_types::{
     EXT4_EXTENTS_FL, EXT4_FAST_SYMLINK_MAX, EXT4_HUGE_FILE_FL, EXT4_INDEX_FL, EXT4_SUPER_MAGIC,
     EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, EXT4_XATTR_MAGIC, GroupNumber, InodeNumber,

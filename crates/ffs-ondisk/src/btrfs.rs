@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use ffs_types as crc32c;
 use ffs_types::{
     BTRFS_MAGIC, BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE, ParseError, read_fixed,
     read_le_u16, read_le_u32, read_le_u64, trim_nul_padded,

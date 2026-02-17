@@ -28,28 +28,216 @@ fn cx_checkpoint(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FfsError::Cancelled)
 }
 
+const DEFAULT_BLOCK_ALIGNMENT: usize = 4096;
+
+#[inline]
+fn normalized_alignment(requested: usize) -> usize {
+    if requested <= 1 {
+        1
+    } else if requested.is_power_of_two() {
+        requested
+    } else {
+        requested.next_power_of_two()
+    }
+}
+
+/// Owned byte buffer whose exposed slice starts at a requested alignment.
+///
+/// This type remains fully safe by keeping the original backing allocation and
+/// exposing an aligned subslice.
+#[derive(Debug, Clone)]
+pub struct AlignedVec {
+    storage: Vec<u8>,
+    start: usize,
+    len: usize,
+    alignment: usize,
+}
+
+impl AlignedVec {
+    #[must_use]
+    pub fn new(size: usize, alignment: usize) -> Self {
+        let alignment = normalized_alignment(alignment);
+        if size == 0 {
+            trace!(
+                target: "ffs::block::io",
+                event = "buffer_alloc",
+                size = 0,
+                alignment = alignment
+            );
+            return Self {
+                storage: Vec::new(),
+                start: 0,
+                len: 0,
+                alignment,
+            };
+        }
+
+        let padding = alignment.saturating_sub(1);
+        let storage_len = size.saturating_add(padding);
+        let storage = vec![0_u8; storage_len];
+        let base = storage.as_ptr() as usize;
+        let misalignment = base & (alignment - 1);
+        let start = if misalignment == 0 {
+            0
+        } else {
+            alignment - misalignment
+        };
+        debug_assert!(start + size <= storage.len());
+        trace!(
+            target: "ffs::block::io",
+            event = "buffer_alloc",
+            size = size,
+            alignment = alignment
+        );
+        Self {
+            storage,
+            start,
+            len: size,
+            alignment,
+        }
+    }
+
+    #[must_use]
+    pub fn from_vec(bytes: Vec<u8>, alignment: usize) -> Self {
+        let alignment = normalized_alignment(alignment);
+        if bytes.is_empty() {
+            return Self::new(0, alignment);
+        }
+
+        let len = bytes.len();
+        if (bytes.as_ptr() as usize) % alignment == 0 {
+            return Self {
+                storage: bytes,
+                start: 0,
+                len,
+                alignment,
+            };
+        }
+
+        trace!(
+            target: "ffs::block::io",
+            event = "copy_detected",
+            source = "vec",
+            dest = "aligned_vec",
+            size = len
+        );
+        let mut aligned = Self::new(len, alignment);
+        aligned.as_mut_slice().copy_from_slice(&bytes);
+        aligned
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.storage[self.start..self.start + self.len]
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        let start = self.start;
+        let end = start + self.len;
+        &mut self.storage[start..end]
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[must_use]
+    pub fn alignment(&self) -> usize {
+        self.alignment
+    }
+
+    #[must_use]
+    pub fn into_vec(self) -> Vec<u8> {
+        let Self {
+            storage,
+            start,
+            len,
+            alignment: _,
+        } = self;
+        if len == 0 {
+            return Vec::new();
+        }
+        if start == 0 && len == storage.len() {
+            return storage;
+        }
+        storage[start..start + len].to_vec()
+    }
+}
+
+impl PartialEq for AlignedVec {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for AlignedVec {}
+
 /// Owned block buffer.
 ///
 /// Invariant: length == device block size for the originating device.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockBuf {
-    bytes: Vec<u8>,
+    bytes: Arc<AlignedVec>,
 }
 
 impl BlockBuf {
     #[must_use]
     pub fn new(bytes: Vec<u8>) -> Self {
-        Self { bytes }
+        Self {
+            bytes: Arc::new(AlignedVec::from_vec(bytes, DEFAULT_BLOCK_ALIGNMENT)),
+        }
     }
 
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
-        &self.bytes
+        self.bytes.as_slice()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    #[must_use]
+    pub fn clone_ref(&self) -> Self {
+        Self {
+            bytes: Arc::clone(&self.bytes),
+        }
+    }
+
+    #[must_use]
+    pub fn zeroed(len: usize) -> Self {
+        Self {
+            bytes: Arc::new(AlignedVec::new(len, DEFAULT_BLOCK_ALIGNMENT)),
+        }
+    }
+
+    #[must_use]
+    pub fn alignment(&self) -> usize {
+        self.bytes.alignment()
+    }
+
+    pub fn make_mut(&mut self) -> &mut [u8] {
+        Arc::make_mut(&mut self.bytes).as_mut_slice()
     }
 
     #[must_use]
     pub fn into_inner(self) -> Vec<u8> {
-        self.bytes
+        match Arc::try_unwrap(self.bytes) {
+            Ok(bytes) => bytes.into_vec(),
+            Err(shared) => shared.as_slice().to_vec(),
+        }
     }
 }
 
@@ -183,6 +371,57 @@ pub trait BlockDevice: Send + Sync {
     /// Flush pending writes to stable storage.
     fn sync(&self, cx: &Cx) -> Result<()>;
 }
+
+/// Multi-block I/O helpers.
+///
+/// Default implementations preserve correctness by delegating to scalar
+/// operations, while allowing implementations to override for true vectored
+/// syscalls in the future.
+pub trait VectoredBlockDevice: BlockDevice {
+    fn read_vectored(&self, blocks: &[BlockNumber], bufs: &mut [BlockBuf], cx: &Cx) -> Result<()> {
+        cx_checkpoint(cx)?;
+        if blocks.len() != bufs.len() {
+            return Err(FfsError::Format(format!(
+                "read_vectored length mismatch: blocks={} bufs={}",
+                blocks.len(),
+                bufs.len()
+            )));
+        }
+        trace!(
+            target: "ffs::block::io",
+            event = "read_vectored",
+            block_count = blocks.len()
+        );
+        for (block, buf) in blocks.iter().copied().zip(bufs.iter_mut()) {
+            *buf = self.read_block(cx, block)?;
+        }
+        cx_checkpoint(cx)?;
+        Ok(())
+    }
+
+    fn write_vectored(&self, blocks: &[BlockNumber], bufs: &[BlockBuf], cx: &Cx) -> Result<()> {
+        cx_checkpoint(cx)?;
+        if blocks.len() != bufs.len() {
+            return Err(FfsError::Format(format!(
+                "write_vectored length mismatch: blocks={} bufs={}",
+                blocks.len(),
+                bufs.len()
+            )));
+        }
+        trace!(
+            target: "ffs::block::io",
+            event = "write_vectored",
+            block_count = blocks.len()
+        );
+        for (block, buf) in blocks.iter().copied().zip(bufs.iter()) {
+            self.write_block(cx, block, buf.as_slice())?;
+        }
+        cx_checkpoint(cx)?;
+        Ok(())
+    }
+}
+
+impl<T: BlockDevice + ?Sized> VectoredBlockDevice for T {}
 
 /// Cache-specific operations used by write-back control paths.
 pub trait BlockCache: BlockDevice {
@@ -320,15 +559,13 @@ impl<D: ByteDevice> BlockDevice for ByteBlockDevice<D> {
             .0
             .checked_mul(u64::from(self.block_size))
             .ok_or_else(|| FfsError::Format("block offset overflow".to_owned()))?;
-        let mut buf = vec![
-            0_u8;
-            usize::try_from(self.block_size).map_err(|_| {
-                FfsError::Format("block_size does not fit usize".to_owned())
-            })?
-        ];
-        self.inner.read_exact_at(cx, ByteOffset(offset), &mut buf)?;
+        let block_size = usize::try_from(self.block_size)
+            .map_err(|_| FfsError::Format("block_size does not fit usize".to_owned()))?;
+        let mut buf = BlockBuf::zeroed(block_size);
+        self.inner
+            .read_exact_at(cx, ByteOffset(offset), buf.make_mut())?;
         cx_checkpoint(cx)?;
-        Ok(BlockBuf::new(buf))
+        Ok(buf)
     }
 
     fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
@@ -532,7 +769,7 @@ impl DirtyEntry {
 #[derive(Debug, Clone)]
 struct FlushCandidate {
     block: BlockNumber,
-    data: Vec<u8>,
+    data: BlockBuf,
     txn_id: TxnId,
     commit_seq: CommitSeq,
 }
@@ -637,7 +874,7 @@ struct ArcState {
     b1: VecDeque<BlockNumber>,
     b2: VecDeque<BlockNumber>,
     loc: HashMap<BlockNumber, ArcList>,
-    resident: HashMap<BlockNumber, Vec<u8>>,
+    resident: HashMap<BlockNumber, BlockBuf>,
     /// Ordered dirty block tracking for write-back and durability accounting.
     dirty: DirtyTracker,
     /// Dirty payloads queued for retry after a failed flush attempt.
@@ -800,7 +1037,7 @@ impl ArcState {
                 let _ = self.loc.remove(&victim);
                 continue;
             }
-            let freed_bytes = self.resident.get(&victim).map_or(0, Vec::len);
+            let freed_bytes = self.resident.get(&victim).map_or(0, BlockBuf::len);
             if from_t1 {
                 self.b1.push_back(victim);
                 self.loc.insert(victim, ArcList::B1);
@@ -1835,17 +2072,19 @@ impl<D: BlockDevice> ArcCache<D> {
         let mut enforce_backpressure = false;
         let mut committed_blocks = 0_usize;
         let mut guard = self.state.lock();
-        for (block, data) in &staged {
-            if guard.resident.contains_key(block) {
-                guard.resident.insert(*block, data.clone());
-                guard.on_hit(*block);
+        for (block, data) in staged {
+            let payload = BlockBuf::new(data);
+            let payload_len = payload.len();
+            if guard.resident.contains_key(&block) {
+                guard.resident.insert(block, payload);
+                guard.on_hit(block);
             } else {
-                guard.on_miss_or_ghost_hit(*block);
-                guard.resident.insert(*block, data.clone());
+                guard.on_miss_or_ghost_hit(block);
+                guard.resident.insert(block, payload);
             }
             guard.mark_dirty(
-                *block,
-                data.len(),
+                block,
+                payload_len,
                 txn_id,
                 Some(commit_seq),
                 DirtyState::Committed,
@@ -2182,7 +2421,7 @@ impl<D: BlockDevice> ArcCache<D> {
                 }
             };
             self.inner
-                .write_block(cx, candidate.block, &candidate.data)?;
+                .write_block(cx, candidate.block, candidate.data.as_slice())?;
             if let Err(err) = lifecycle.mark_persisted(candidate.block, candidate.commit_seq) {
                 error!(
                     event = "mvcc_flush_commit_state_update_failed",
@@ -2270,10 +2509,10 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
         cx_checkpoint(cx)?;
         {
             let mut guard = self.state.lock();
-            if let Some(bytes) = guard.resident.get(&block).cloned() {
+            if let Some(buf) = guard.resident.get(&block).cloned() {
                 guard.on_hit(block);
                 drop(guard);
-                return Ok(BlockBuf::new(bytes));
+                return Ok(buf);
             }
         }
 
@@ -2287,7 +2526,7 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
             guard.on_hit(block);
         } else {
             guard.on_miss_or_ghost_hit(block);
-            guard.resident.insert(block, buf.as_slice().to_vec());
+            guard.resident.insert(block, buf.clone_ref());
         }
         let pending_flush = guard.take_pending_flush();
         drop(guard);
@@ -2304,13 +2543,14 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
 
         let mut enforce_backpressure = false;
         let mut guard = self.state.lock();
+        let payload = BlockBuf::new(data.to_vec());
         if guard.resident.contains_key(&block) {
             // Block already cached — just update data and touch for recency.
-            guard.resident.insert(block, data.to_vec());
+            guard.resident.insert(block, payload);
             guard.on_hit(block);
         } else {
             guard.on_miss_or_ghost_hit(block);
-            guard.resident.insert(block, data.to_vec());
+            guard.resident.insert(block, payload);
         }
 
         if matches!(self.write_policy, ArcWritePolicy::WriteBack) {
@@ -2660,7 +2900,7 @@ mod tests {
             state.on_hit(key);
         } else {
             state.on_miss_or_ghost_hit(key);
-            state.resident.insert(key, vec![0_u8]);
+            state.resident.insert(key, BlockBuf::new(vec![0_u8]));
         }
 
         // Invariants: loc is the source of truth for membership; resident contains
@@ -2879,6 +3119,79 @@ mod tests {
         let r2 = cache.read_block(&cx, BlockNumber(1)).expect("read2");
         assert_eq!(r1.as_slice(), &[3_u8; 4096]);
         assert_eq!(r2.as_slice(), &[3_u8; 4096]);
+    }
+
+    #[test]
+    fn block_buf_clone_ref_is_zero_copy_cow() {
+        let mut buf = BlockBuf::new(vec![1, 2, 3, 4]);
+        let clone = buf.clone_ref();
+        assert_eq!(clone.as_slice(), &[1, 2, 3, 4]);
+
+        // Mutating one shared reference triggers COW and preserves the clone.
+        buf.make_mut()[0] = 9;
+        assert_eq!(buf.as_slice(), &[9, 2, 3, 4]);
+        assert_eq!(clone.as_slice(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn block_buf_into_inner_round_trip() {
+        let buf = BlockBuf::new(vec![7, 8, 9]);
+        assert_eq!(buf.clone_ref().as_slice(), &[7, 8, 9]);
+        assert_eq!(buf.into_inner(), vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn aligned_vec_respects_requested_alignment() {
+        let aligned = AlignedVec::new(4096, 4096);
+        assert_eq!(aligned.len(), 4096);
+        assert_eq!(aligned.alignment(), 4096);
+        assert_eq!((aligned.as_slice().as_ptr() as usize) % 4096, 0);
+    }
+
+    #[test]
+    fn block_buf_uses_page_alignment() {
+        let buf = BlockBuf::new(vec![0xAA; 4096]);
+        assert_eq!(buf.alignment(), DEFAULT_BLOCK_ALIGNMENT);
+        assert_eq!(
+            (buf.as_slice().as_ptr() as usize) % DEFAULT_BLOCK_ALIGNMENT,
+            0
+        );
+    }
+
+    #[test]
+    fn vectored_io_round_trip_is_correct() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 8);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+
+        let blocks = [BlockNumber(1), BlockNumber(3)];
+        let writes = [
+            BlockBuf::new(vec![0x11; 4096]),
+            BlockBuf::new(vec![0x22; 4096]),
+        ];
+        dev.write_vectored(&blocks, &writes, &cx)
+            .expect("vectored write");
+
+        let mut reads = [BlockBuf::new(Vec::new()), BlockBuf::new(Vec::new())];
+        dev.read_vectored(&blocks, &mut reads, &cx)
+            .expect("vectored read");
+
+        assert_eq!(reads[0].as_slice(), writes[0].as_slice());
+        assert_eq!(reads[1].as_slice(), writes[1].as_slice());
+    }
+
+    #[test]
+    fn vectored_io_rejects_length_mismatch() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 4);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let blocks = [BlockNumber(0), BlockNumber(1)];
+        let writes = [BlockBuf::new(vec![0x44; 4096])];
+
+        let err = dev
+            .write_vectored(&blocks, &writes, &cx)
+            .expect_err("length mismatch should fail");
+        assert!(matches!(err, FfsError::Format(_)));
     }
 
     #[test]
@@ -3887,5 +4200,183 @@ mod tests {
         let m = cache.metrics();
         assert!(m.hits + m.misses > 0, "should have recorded some accesses");
         assert!(m.resident <= 4, "resident should not exceed capacity");
+    }
+
+    // ── Lab runtime deterministic concurrency tests ─────────────────────
+
+    use asupersync::lab::{LabConfig, LabRuntime};
+    use asupersync::types::Budget;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context as TaskContext, Poll};
+
+    struct YieldOnce {
+        yielded: bool,
+    }
+
+    impl Future for YieldOnce {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
+            if self.yielded {
+                Poll::Ready(())
+            } else {
+                self.yielded = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    async fn lab_yield_now() {
+        YieldOnce { yielded: false }.await;
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct LabCacheSummary {
+        hits: u64,
+        misses: u64,
+        resident: usize,
+        dirty_blocks: usize,
+        read_events: usize,
+    }
+
+    fn run_lab_arc_cache_scenario(seed: u64) -> LabCacheSummary {
+        const READERS: usize = 3;
+        const WRITERS: usize = 2;
+        const READ_OPS: usize = 40;
+        const WRITE_OPS: usize = 25;
+        const NUM_BLOCKS: usize = 8;
+        const BLOCK_SIZE: u32 = 4096;
+        const CAPACITY: usize = 4;
+
+        info!(
+            target: "ffs::block::lab",
+            event = "lab_seed",
+            seed = seed
+        );
+
+        let mut runtime = LabRuntime::new(LabConfig::new(seed).max_steps(200_000));
+        let region = runtime.state.create_root_region(Budget::INFINITE);
+
+        let mem = MemoryByteDevice::new(BLOCK_SIZE as usize * NUM_BLOCKS);
+        let dev = ByteBlockDevice::new(mem, BLOCK_SIZE).expect("device");
+        let cx = Cx::for_testing();
+        for block in 0..NUM_BLOCKS {
+            let seed_byte = u8::try_from(block).expect("block index fits u8");
+            dev.write_block(
+                &cx,
+                BlockNumber(u64::try_from(block).expect("block index fits u64")),
+                &vec![seed_byte; BLOCK_SIZE as usize],
+            )
+            .expect("seed write");
+        }
+
+        let cache = StdArc::new(ArcCache::new(dev, CAPACITY).expect("cache"));
+        let read_events = StdArc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+
+        for reader in 0..READERS {
+            let cache = StdArc::clone(&cache);
+            let read_events = StdArc::clone(&read_events);
+            let (task_id, _handle) = runtime
+                .state
+                .create_task(region, Budget::INFINITE, async move {
+                    let cx = Cx::for_testing();
+                    for step in 0..READ_OPS {
+                        let block_index = (reader + step) % NUM_BLOCKS;
+                        let block =
+                            BlockNumber(u64::try_from(block_index).expect("block index fits u64"));
+                        let buf = cache.read_block(&cx, block).expect("read");
+                        read_events
+                            .lock()
+                            .expect("read events lock not poisoned")
+                            .push(buf.as_slice()[0]);
+                        lab_yield_now().await;
+                    }
+                })
+                .expect("create reader task");
+            runtime.scheduler.lock().unwrap().schedule(task_id, 0);
+        }
+
+        for writer in 0..WRITERS {
+            let cache = StdArc::clone(&cache);
+            let (task_id, _handle) = runtime
+                .state
+                .create_task(region, Budget::INFINITE, async move {
+                    let cx = Cx::for_testing();
+                    for step in 0..WRITE_OPS {
+                        let block_index = (writer * 2 + step) % NUM_BLOCKS;
+                        let fill = u8::try_from((writer * 97 + step) & 0xFF).unwrap_or(0);
+                        let block =
+                            BlockNumber(u64::try_from(block_index).expect("block index fits u64"));
+                        cache
+                            .write_block(&cx, block, &vec![fill; BLOCK_SIZE as usize])
+                            .expect("write");
+                        lab_yield_now().await;
+                    }
+                })
+                .expect("create writer task");
+            runtime.scheduler.lock().unwrap().schedule(task_id, 0);
+        }
+
+        runtime.run_until_quiescent();
+
+        let observed_reads = StdArc::try_unwrap(read_events)
+            .expect("all read event handles dropped")
+            .into_inner()
+            .expect("read events lock not poisoned")
+            .len();
+        let metrics = cache.metrics();
+
+        LabCacheSummary {
+            hits: metrics.hits,
+            misses: metrics.misses,
+            resident: metrics.resident,
+            dirty_blocks: metrics.dirty_blocks,
+            read_events: observed_reads,
+        }
+    }
+
+    #[test]
+    fn lab_arc_cache_same_seed_is_deterministic() {
+        let first = run_lab_arc_cache_scenario(21);
+        let second = run_lab_arc_cache_scenario(21);
+        let third = run_lab_arc_cache_scenario(21);
+        assert_eq!(first, second, "same seed should produce same cache summary");
+        assert_eq!(second, third, "same seed should remain stable");
+    }
+
+    #[test]
+    fn lab_arc_cache_invariants_across_seeds() {
+        const READERS: usize = 3;
+        const WRITERS: usize = 2;
+        const READ_OPS: usize = 40;
+        const WRITE_OPS: usize = 25;
+        const EXPECTED_READS: usize = READERS * READ_OPS;
+        const EXPECTED_ACCESSES: usize = EXPECTED_READS + (WRITERS * WRITE_OPS);
+        const CAPACITY: usize = 4;
+
+        for seed in 0_u64..25 {
+            let summary = run_lab_arc_cache_scenario(seed);
+            assert_eq!(
+                summary.read_events, EXPECTED_READS,
+                "seed {seed}: all reader operations should complete"
+            );
+            assert_eq!(
+                summary.hits + summary.misses,
+                u64::try_from(EXPECTED_ACCESSES).expect("expected accesses fit u64"),
+                "seed {seed}: hit/miss accounting should match all cache accesses"
+            );
+            assert!(
+                summary.resident <= CAPACITY,
+                "seed {seed}: resident {} exceeds capacity {}",
+                summary.resident,
+                CAPACITY
+            );
+            assert_eq!(
+                summary.dirty_blocks, 0,
+                "seed {seed}: write-through cache should not retain dirty blocks"
+            );
+        }
     }
 }

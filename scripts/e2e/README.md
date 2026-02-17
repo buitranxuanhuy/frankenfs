@@ -20,6 +20,9 @@ End-to-end smoke tests for FrankenFS that exercise user-facing workflows.
 # Run write-back durability scenarios
 ./scripts/e2e/ffs_writeback_e2e.sh
 
+# Run graceful degradation stress suite
+./scripts/e2e/ffs_degradation_stress.sh
+
 # Run deterministic corruption-injection + recovery smoke
 ./scripts/e2e/ffs_repair_recovery_smoke.sh
 
@@ -50,6 +53,13 @@ The write-back E2E suite exercises:
 4. Abort lifecycle discard behavior
 5. Backpressure under sustained write load
 6. Concurrent commit/abort transactions with daemon flush
+
+The graceful degradation stress suite exercises:
+
+1. Deterministic degradation FSM and backpressure gates (`ffs-core` targeted tests)
+2. FUSE surface regression checks under the current backpressure wiring (`ffs-fuse` tests)
+3. Optional host pressure probe with `stress-ng` while monitor tests execute
+4. Optional live mount pressure probe (`FFS_RUN_MOUNT_STRESS=1`) that verifies reads stay functional under CPU stress
 
 The ext4 read-write smoke suite exercises:
 
@@ -116,6 +126,14 @@ artifacts/e2e/20260212_161500_ffs_smoke/
 | `CRASH_WRITER_RUNTIME_SECS` | `2` | Duration to run background in-flight writer before sending SIGKILL |
 | `CRASH_WRITER_SLEEP_SECS` | `0.01` | Per-write pacing interval for crash in-flight writer |
 | `FFS_REPAIR_LOCAL_ARTIFACT_FALLBACK` | `0` | For `ffs_repair_recovery_smoke.sh`: if `1`, re-run repair test locally when rch offload does not materialize artifact files |
+| `FFS_USE_RCH` | `1` | For `ffs_degradation_stress.sh`: offload cargo commands via `rch exec -- cargo ...` when available |
+| `FFS_RUN_MOUNT_STRESS` | `0` | For `ffs_degradation_stress.sh`: if `1`, attempt optional live FUSE mount pressure probe |
+| `DEGRADATION_STRESS_DURATION_SECS` | `20` | Duration for host `stress-ng` probe in `ffs_degradation_stress.sh` |
+| `DEGRADATION_STRESS_CPU_WORKERS` | `4` | CPU workers for host `stress-ng` probe in `ffs_degradation_stress.sh` |
+| `DEGRADATION_STRESS_VM_WORKERS` | `1` | VM workers for host `stress-ng` probe in `ffs_degradation_stress.sh` |
+| `DEGRADATION_STRESS_VM_BYTES` | `60%` | VM memory pressure setting for host `stress-ng` probe in `ffs_degradation_stress.sh` |
+| `DEGRADATION_MOUNT_STRESS_DURATION_SECS` | `15` | Duration for optional mount pressure probe in `ffs_degradation_stress.sh` |
+| `DEGRADATION_MOUNT_STRESS_CPU_WORKERS` | `4` | CPU workers for optional mount pressure probe in `ffs_degradation_stress.sh` |
 | `XFSTESTS_MODE` | `auto` | `auto`, `plan`, or `run` for `ffs_xfstests_e2e.sh` |
 | `XFSTESTS_DIR` | *(unset)* | Path to xfstests checkout containing `check` |
 | `XFSTESTS_DRY_RUN` | `1` | In run mode, pass `-n` to `check` (selection validation without executing tests) |

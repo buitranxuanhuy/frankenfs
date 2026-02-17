@@ -23,7 +23,8 @@ use ffs_ondisk::{
     parse_sys_chunk_array,
 };
 use ffs_types::{
-    BlockNumber, ByteOffset, CommitSeq, GroupNumber, InodeNumber, ParseError, Snapshot, TxnId,
+    BlockNumber, ByteOffset, CommitSeq, EXT4_EXTENTS_FL, GroupNumber, InodeNumber, ParseError,
+    Snapshot, TxnId,
 };
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
@@ -3378,6 +3379,7 @@ impl DirEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RequestOp {
     Getattr,
+    Statfs,
     Getxattr,
     Lookup,
     Listxattr,
@@ -3395,6 +3397,9 @@ pub enum RequestOp {
     Unlink,
     Rmdir,
     Rename,
+    Link,
+    Symlink,
+    Fallocate,
     Setattr,
     Write,
 }
@@ -3410,6 +3415,9 @@ impl RequestOp {
                 | Self::Unlink
                 | Self::Rmdir
                 | Self::Rename
+                | Self::Link
+                | Self::Symlink
+                | Self::Fallocate
                 | Self::Setattr
                 | Self::Write
                 | Self::Fsync
@@ -3457,6 +3465,27 @@ pub struct SetAttrRequest {
     pub atime: Option<SystemTime>,
     /// New modification time.
     pub mtime: Option<SystemTime>,
+}
+
+/// Filesystem statistics returned by `statfs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsStat {
+    /// Total data blocks in filesystem units.
+    pub blocks: u64,
+    /// Free data blocks.
+    pub blocks_free: u64,
+    /// Free blocks available to unprivileged callers.
+    pub blocks_available: u64,
+    /// Total inode count (or object count when available).
+    pub files: u64,
+    /// Free inode/object count.
+    pub files_free: u64,
+    /// Preferred block size in bytes.
+    pub block_size: u32,
+    /// Maximum filename length.
+    pub name_max: u32,
+    /// Fundamental fragment size in bytes.
+    pub fragment_size: u32,
 }
 
 /// VFS operations trait for filesystem access.
@@ -3513,6 +3542,13 @@ pub trait FsOps: Send + Sync {
     /// Returns the raw bytes of the symlink target. Returns
     /// `FfsError::Format` if `ino` is not a symlink.
     fn readlink(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<Vec<u8>>;
+
+    /// Return filesystem-level capacity and free-space statistics.
+    fn statfs(&self, _cx: &Cx, _ino: InodeNumber) -> ffs_error::Result<FsStat> {
+        Err(FfsError::UnsupportedFeature(
+            "statfs is not implemented by this backend".to_owned(),
+        ))
+    }
 
     /// List extended attribute names for an inode.
     ///
@@ -3599,6 +3635,42 @@ pub trait FsOps: Send + Sync {
         _offset: u64,
         _data: &[u8],
     ) -> ffs_error::Result<u32> {
+        Err(FfsError::ReadOnly)
+    }
+
+    /// Create a hard link to `ino` in `new_parent` under `new_name`.
+    fn link(
+        &self,
+        _cx: &Cx,
+        _ino: InodeNumber,
+        _new_parent: InodeNumber,
+        _new_name: &OsStr,
+    ) -> ffs_error::Result<InodeAttr> {
+        Err(FfsError::ReadOnly)
+    }
+
+    /// Create a symlink in `parent` named `name` targeting `target`.
+    fn symlink(
+        &self,
+        _cx: &Cx,
+        _parent: InodeNumber,
+        _name: &OsStr,
+        _target: &Path,
+        _uid: u32,
+        _gid: u32,
+    ) -> ffs_error::Result<InodeAttr> {
+        Err(FfsError::ReadOnly)
+    }
+
+    /// Preallocate or punch file space (POSIX `fallocate`-style).
+    fn fallocate(
+        &self,
+        _cx: &Cx,
+        _ino: InodeNumber,
+        _offset: u64,
+        _length: u64,
+        _mode: i32,
+    ) -> ffs_error::Result<()> {
         Err(FfsError::ReadOnly)
     }
 
@@ -3803,6 +3875,27 @@ fn inode_file_type(inode: &Ext4Inode) -> FileType {
         FileType::Socket
     } else {
         FileType::RegularFile // fallback for unknown types
+    }
+}
+
+/// Map inode mode bits to ext4 on-disk directory-entry file type tags.
+fn inode_dir_entry_file_type(inode: &Ext4Inode) -> Ext4FileType {
+    if inode.is_dir() {
+        Ext4FileType::Dir
+    } else if inode.is_symlink() {
+        Ext4FileType::Symlink
+    } else if inode.is_blkdev() {
+        Ext4FileType::Blkdev
+    } else if inode.is_chrdev() {
+        Ext4FileType::Chrdev
+    } else if inode.is_fifo() {
+        Ext4FileType::Fifo
+    } else if inode.is_socket() {
+        Ext4FileType::Sock
+    } else if inode.is_regular() {
+        Ext4FileType::RegFile
+    } else {
+        Ext4FileType::Unknown
     }
 }
 
@@ -4464,6 +4557,388 @@ impl OpenFs {
         Ok(())
     }
 
+    /// Create a hard link in `new_parent/new_name` to existing inode `ino`.
+    #[allow(clippy::significant_drop_tightening)]
+    fn ext4_link(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        new_parent: InodeNumber,
+        new_name: &[u8],
+    ) -> ffs_error::Result<InodeAttr> {
+        const EXT4_LINK_MAX: u16 = 65_000;
+        const EPERM_ERRNO: i32 = 1;
+        const EMLINK_ERRNO: i32 = 31;
+
+        let alloc_mutex = self.require_alloc_state()?;
+        let block_dev = self.block_device_adapter();
+        let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
+
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let csum_seed = sb.csum_seed();
+
+        let src_inode = self.read_inode(cx, ino)?;
+        if src_inode.is_dir() {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(EPERM_ERRNO)));
+        }
+        if src_inode.links_count >= EXT4_LINK_MAX {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                EMLINK_ERRNO,
+            )));
+        }
+
+        let new_parent_inode = self.read_inode(cx, new_parent)?;
+        if !new_parent_inode.is_dir() {
+            return Err(FfsError::NotDirectory);
+        }
+        if self.lookup_name(cx, &new_parent_inode, new_name)?.is_some() {
+            return Err(FfsError::Exists);
+        }
+
+        let mut src_upd = src_inode;
+        let mut alloc = alloc_mutex.lock();
+        self.ext4_add_dir_entry(
+            cx,
+            &block_dev,
+            &mut alloc,
+            new_parent,
+            &new_parent_inode,
+            new_name,
+            ino,
+            inode_dir_entry_file_type(&src_upd),
+            csum_seed,
+            tstamp_secs,
+            tstamp_nanos,
+        )?;
+
+        src_upd.links_count = src_upd.links_count.saturating_add(1);
+        ffs_inode::touch_ctime(&mut src_upd, tstamp_secs, tstamp_nanos);
+        ffs_inode::write_inode(
+            cx,
+            &block_dev,
+            &alloc.geo,
+            &alloc.groups,
+            ino,
+            &src_upd,
+            csum_seed,
+        )?;
+
+        debug!(
+            target: "ffs::write",
+            op = "link",
+            source_ino = ino.0,
+            parent = new_parent.0,
+            name = %String::from_utf8_lossy(new_name),
+            new_link_count = src_upd.links_count,
+            "hard link created"
+        );
+
+        Ok(inode_to_attr(sb, ino, &src_upd))
+    }
+
+    /// Create a symbolic link inode and directory entry.
+    #[allow(clippy::significant_drop_tightening)]
+    fn ext4_symlink(
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        name: &[u8],
+        target: &Path,
+        uid: u32,
+        gid: u32,
+    ) -> ffs_error::Result<InodeAttr> {
+        let alloc_mutex = self.require_alloc_state()?;
+        let block_dev = self.block_device_adapter();
+        let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
+        let target_bytes = target.as_os_str().as_encoded_bytes();
+        let fast_storage = target_bytes.len() <= ffs_types::EXT4_FAST_SYMLINK_MAX;
+
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let csum_seed = sb.csum_seed();
+
+        let parent_inode = self.read_inode(cx, parent)?;
+        if !parent_inode.is_dir() {
+            return Err(FfsError::NotDirectory);
+        }
+        if self.lookup_name(cx, &parent_inode, name)?.is_some() {
+            return Err(FfsError::Exists);
+        }
+
+        let (ino, mut symlink_inode) = {
+            let mut alloc = alloc_mutex.lock();
+            let parent_group = GroupNumber(
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    (parent.0.saturating_sub(1) / u64::from(alloc.geo.inodes_per_group)) as u32
+                },
+            );
+            let (ino, mut inode) = {
+                let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+                ffs_inode::create_inode(
+                    cx,
+                    &block_dev,
+                    geo,
+                    groups,
+                    ffs_inode::file_type::S_IFLNK | 0o777,
+                    uid,
+                    gid,
+                    parent_group,
+                    csum_seed,
+                    tstamp_secs,
+                    tstamp_nanos,
+                )?
+            };
+
+            if fast_storage {
+                inode.flags &= !EXT4_EXTENTS_FL;
+                if inode.extent_bytes.len() < ffs_types::EXT4_FAST_SYMLINK_MAX {
+                    inode
+                        .extent_bytes
+                        .resize(ffs_types::EXT4_FAST_SYMLINK_MAX, 0);
+                }
+                inode.extent_bytes.fill(0);
+                inode.extent_bytes[..target_bytes.len()].copy_from_slice(target_bytes);
+                inode.size = u64::try_from(target_bytes.len()).map_err(|_| {
+                    FfsError::Format("symlink target length does not fit u64".to_owned())
+                })?;
+                inode.blocks = 0;
+
+                let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+                ffs_inode::write_inode(cx, &block_dev, geo, groups, ino, &inode, csum_seed)?;
+            }
+
+            self.ext4_add_dir_entry(
+                cx,
+                &block_dev,
+                &mut alloc,
+                parent,
+                &parent_inode,
+                name,
+                ino,
+                Ext4FileType::Symlink,
+                csum_seed,
+                tstamp_secs,
+                tstamp_nanos,
+            )?;
+
+            (ino, inode)
+        };
+
+        if !fast_storage {
+            let _written = self.ext4_write(cx, ino, 0, target_bytes)?;
+            symlink_inode = self.read_inode(cx, ino)?;
+        }
+
+        debug!(
+            target: "ffs::write",
+            op = "symlink",
+            parent = parent.0,
+            ino = ino.0,
+            name = %String::from_utf8_lossy(name),
+            target = %target.to_string_lossy(),
+            storage = if fast_storage { "fast" } else { "slow" },
+            "symlink created"
+        );
+
+        Ok(inode_to_attr(sb, ino, &symlink_inode))
+    }
+
+    /// Preallocate or punch file space.
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
+    fn ext4_fallocate(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        offset: u64,
+        length: u64,
+        mode: i32,
+    ) -> ffs_error::Result<()> {
+        const KEEP_SIZE: i32 = 0x01;
+        const PUNCH_HOLE: i32 = 0x02;
+        const EINVAL_ERRNO: i32 = 22;
+        const MAX_EXTENT_COUNT: u32 = (u16::MAX >> 1) as u32;
+
+        let alloc_mutex = self.require_alloc_state()?;
+        let block_dev = self.block_device_adapter();
+        let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
+
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let csum_seed = sb.csum_seed();
+        let block_size = u64::from(sb.block_size);
+        let sectors_per_block = u64::from(sb.block_size / 512);
+
+        if length == 0 {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| FfsError::Format("fallocate range overflow".to_owned()))?;
+
+        let keep_size = (mode & KEEP_SIZE) != 0;
+        let punch_hole = (mode & PUNCH_HOLE) != 0;
+        let unsupported_bits = mode & !(KEEP_SIZE | PUNCH_HOLE);
+        if unsupported_bits != 0 {
+            return Err(FfsError::UnsupportedFeature(format!(
+                "ext4 fallocate unsupported mode bits: 0x{unsupported_bits:08x}"
+            )));
+        }
+        if punch_hole && !keep_size {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                EINVAL_ERRNO,
+            )));
+        }
+
+        let mut inode = self.read_inode(cx, ino)?;
+        if inode.is_dir() {
+            return Err(FfsError::IsDirectory);
+        }
+
+        let mut root_bytes = Self::extent_root(&inode);
+        let mut alloc = alloc_mutex.lock();
+
+        if punch_hole {
+            if (offset % block_size) != 0 || (length % block_size) != 0 {
+                return Err(FfsError::UnsupportedFeature(
+                    "ext4 punch_hole currently requires block-aligned offset/length".to_owned(),
+                ));
+            }
+
+            let logical_start =
+                u32::try_from(offset / block_size).map_err(|_| FfsError::NoSpace)?;
+            let logical_count =
+                u32::try_from(length / block_size).map_err(|_| FfsError::NoSpace)?;
+            if logical_count > 0 {
+                let freed_blocks = {
+                    let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+                    ffs_extent::punch_hole(
+                        cx,
+                        &block_dev,
+                        &mut root_bytes,
+                        geo,
+                        groups,
+                        logical_start,
+                        logical_count,
+                    )?
+                };
+                inode.blocks = inode
+                    .blocks
+                    .saturating_sub(freed_blocks.saturating_mul(sectors_per_block));
+                Self::set_extent_root(&mut inode, &root_bytes);
+            }
+        } else {
+            let logical_start =
+                u32::try_from(offset / block_size).map_err(|_| FfsError::NoSpace)?;
+            let logical_end =
+                u32::try_from(end.div_ceil(block_size)).map_err(|_| FfsError::NoSpace)?;
+            let logical_count = logical_end.saturating_sub(logical_start);
+            let mappings = ffs_extent::map_logical_to_physical(
+                cx,
+                &block_dev,
+                &root_bytes,
+                logical_start,
+                logical_count,
+            )?;
+            let zero_block = vec![
+                0_u8;
+                usize::try_from(block_size).map_err(|_| {
+                    FfsError::Format("block_size does not fit usize".to_owned())
+                })?
+            ];
+
+            let mut goal_block = None;
+            let mut newly_allocated_blocks = 0_u64;
+            for mapping in mappings {
+                if mapping.physical_start != 0 {
+                    goal_block = Some(BlockNumber(
+                        mapping.physical_start + u64::from(mapping.count),
+                    ));
+                    continue;
+                }
+
+                let mut remaining = mapping.count;
+                let mut logical = mapping.logical_start;
+                while remaining > 0 {
+                    let chunk = remaining.min(MAX_EXTENT_COUNT);
+                    let hint = AllocHint {
+                        goal_group: None,
+                        goal_block,
+                    };
+                    let alloc_mapping = {
+                        let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+                        ffs_extent::allocate_extent(
+                            cx,
+                            &block_dev,
+                            &mut root_bytes,
+                            geo,
+                            groups,
+                            logical,
+                            chunk,
+                            &hint,
+                        )?
+                    };
+
+                    for rel in 0..alloc_mapping.count {
+                        block_dev.write_block(
+                            cx,
+                            BlockNumber(alloc_mapping.physical_start + u64::from(rel)),
+                            &zero_block,
+                        )?;
+                    }
+                    newly_allocated_blocks += u64::from(alloc_mapping.count);
+                    goal_block = Some(BlockNumber(
+                        alloc_mapping.physical_start + u64::from(alloc_mapping.count),
+                    ));
+                    logical = logical.saturating_add(chunk);
+                    remaining -= chunk;
+                }
+            }
+
+            if newly_allocated_blocks > 0 {
+                inode.blocks = inode
+                    .blocks
+                    .saturating_add(newly_allocated_blocks.saturating_mul(sectors_per_block));
+                Self::set_extent_root(&mut inode, &root_bytes);
+            }
+
+            if !keep_size && end > inode.size {
+                inode.size = end;
+            }
+        }
+
+        ffs_inode::touch_mtime_ctime(&mut inode, tstamp_secs, tstamp_nanos);
+        ffs_inode::write_inode(
+            cx,
+            &block_dev,
+            &alloc.geo,
+            &alloc.groups,
+            ino,
+            &inode,
+            csum_seed,
+        )?;
+
+        debug!(
+            target: "ffs::write",
+            op = "fallocate",
+            ino = ino.0,
+            offset,
+            length,
+            mode,
+            keep_size,
+            punch_hole,
+            size = inode.size,
+            blocks = inode.blocks,
+            "fallocate completed"
+        );
+
+        Ok(())
+    }
+
     /// Write data to an ext4 file.
     #[allow(
         clippy::too_many_lines,
@@ -4632,11 +5107,7 @@ impl OpenFs {
             .ok_or_else(|| FfsError::NotFound(String::from_utf8_lossy(name).into_owned()))?;
         let child_ino = InodeNumber(u64::from(entry.inode));
         let child_inode = self.read_inode(cx, child_ino)?;
-        let ft = if child_inode.is_dir() {
-            ffs_ondisk::Ext4FileType::Dir
-        } else {
-            ffs_ondisk::Ext4FileType::RegFile
-        };
+        let ft = inode_dir_entry_file_type(&child_inode);
 
         let mut alloc = alloc_mutex.lock();
 
@@ -5002,6 +5473,40 @@ impl FsOps for OpenFs {
         }
     }
 
+    fn statfs(&self, _cx: &Cx, _ino: InodeNumber) -> ffs_error::Result<FsStat> {
+        match &self.flavor {
+            FsFlavor::Ext4(sb) => {
+                let blocks_free = sb.free_blocks_count;
+                let blocks_available = blocks_free.saturating_sub(sb.reserved_blocks_count);
+                Ok(FsStat {
+                    blocks: sb.blocks_count,
+                    blocks_free,
+                    blocks_available,
+                    files: u64::from(sb.inodes_count),
+                    files_free: u64::from(sb.free_inodes_count),
+                    block_size: sb.block_size,
+                    name_max: 255,
+                    fragment_size: sb.block_size,
+                })
+            }
+            FsFlavor::Btrfs(sb) => {
+                let unit = sb.sectorsize.max(1);
+                let unit_u64 = u64::from(unit);
+                let free_bytes = sb.total_bytes.saturating_sub(sb.bytes_used);
+                Ok(FsStat {
+                    blocks: sb.total_bytes / unit_u64,
+                    blocks_free: free_bytes / unit_u64,
+                    blocks_available: free_bytes / unit_u64,
+                    files: 0,
+                    files_free: 0,
+                    block_size: unit,
+                    name_max: 255,
+                    fragment_size: unit,
+                })
+            }
+        }
+    }
+
     fn listxattr(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<Vec<String>> {
         match &self.flavor {
             FsFlavor::Ext4(_) => {
@@ -5122,6 +5627,50 @@ impl FsOps for OpenFs {
     fn write(&self, cx: &Cx, ino: InodeNumber, offset: u64, data: &[u8]) -> ffs_error::Result<u32> {
         match &self.flavor {
             FsFlavor::Ext4(_) => self.ext4_write(cx, ino, offset, data),
+            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+        }
+    }
+
+    fn link(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        new_parent: InodeNumber,
+        new_name: &OsStr,
+    ) -> ffs_error::Result<InodeAttr> {
+        match &self.flavor {
+            FsFlavor::Ext4(_) => self.ext4_link(cx, ino, new_parent, new_name.as_encoded_bytes()),
+            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+        }
+    }
+
+    fn symlink(
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        name: &OsStr,
+        target: &Path,
+        uid: u32,
+        gid: u32,
+    ) -> ffs_error::Result<InodeAttr> {
+        match &self.flavor {
+            FsFlavor::Ext4(_) => {
+                self.ext4_symlink(cx, parent, name.as_encoded_bytes(), target, uid, gid)
+            }
+            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+        }
+    }
+
+    fn fallocate(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        offset: u64,
+        length: u64,
+        mode: i32,
+    ) -> ffs_error::Result<()> {
+        match &self.flavor {
+            FsFlavor::Ext4(_) => self.ext4_fallocate(cx, ino, offset, length, mode),
             FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
         }
     }
@@ -7717,6 +8266,53 @@ mod tests {
     }
 
     #[test]
+    fn open_fs_fsops_statfs_ext4_uses_superblock_counts() {
+        let image = build_ext4_image_with_dir();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let sb = fs.ext4_superblock().expect("ext4 superblock");
+
+        let ops: &dyn FsOps = &fs;
+        let stats = ops.statfs(&cx, InodeNumber(2)).unwrap();
+        assert_eq!(stats.block_size, sb.block_size);
+        assert_eq!(stats.fragment_size, sb.block_size);
+        assert_eq!(stats.blocks, sb.blocks_count);
+        assert_eq!(stats.blocks_free, sb.free_blocks_count);
+        assert_eq!(
+            stats.blocks_available,
+            sb.free_blocks_count
+                .saturating_sub(sb.reserved_blocks_count)
+        );
+        assert_eq!(stats.files, u64::from(sb.inodes_count));
+        assert_eq!(stats.files_free, u64::from(sb.free_inodes_count));
+        assert_eq!(stats.name_max, 255);
+    }
+
+    #[test]
+    fn open_fs_fsops_statfs_btrfs_uses_capacity_fields() {
+        let image = build_btrfs_fsops_image();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let sb = fs.btrfs_superblock().expect("btrfs superblock");
+        let unit = sb.sectorsize.max(1);
+        let unit_u64 = u64::from(unit);
+        let free_bytes = sb.total_bytes.saturating_sub(sb.bytes_used);
+
+        let ops: &dyn FsOps = &fs;
+        let stats = ops.statfs(&cx, InodeNumber(1)).unwrap();
+        assert_eq!(stats.block_size, unit);
+        assert_eq!(stats.fragment_size, unit);
+        assert_eq!(stats.blocks, sb.total_bytes / unit_u64);
+        assert_eq!(stats.blocks_free, free_bytes / unit_u64);
+        assert_eq!(stats.blocks_available, free_bytes / unit_u64);
+        assert_eq!(stats.files, 0);
+        assert_eq!(stats.files_free, 0);
+        assert_eq!(stats.name_max, 255);
+    }
+
+    #[test]
     fn open_fs_btrfs_fsops_getattr_lookup_readdir_read() {
         let image = build_btrfs_fsops_image();
         let dev = TestDevice::from_vec(image);
@@ -9801,6 +10397,159 @@ mod tests {
     }
 
     #[test]
+    fn write_link_creates_hardlink_and_increments_nlink() {
+        let Some(fs) = open_writable_ext4() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        let src = fs
+            .create(&cx, root, OsStr::new("link_src.txt"), 0o644, 0, 0)
+            .expect("create source");
+        fs.write(&cx, src.ino, 0, b"linked-bytes")
+            .expect("write source");
+
+        let link_attr = fs
+            .link(&cx, src.ino, root, OsStr::new("link_dst.txt"))
+            .expect("link");
+        assert_eq!(link_attr.ino, src.ino);
+
+        let src_attr = fs.getattr(&cx, src.ino).expect("getattr source");
+        assert_eq!(src_attr.nlink, 2);
+
+        let dst_attr = fs
+            .lookup(&cx, root, OsStr::new("link_dst.txt"))
+            .expect("lookup destination");
+        assert_eq!(dst_attr.ino, src.ino);
+
+        let readback = fs.read(&cx, dst_attr.ino, 0, 64).expect("read via link");
+        assert_eq!(&readback, b"linked-bytes");
+    }
+
+    #[test]
+    fn write_link_directory_rejected_with_eperm() {
+        let Some(fs) = open_writable_ext4() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let dir_attr = fs
+            .mkdir(&cx, root, OsStr::new("link_dir"), 0o755, 0, 0)
+            .expect("mkdir");
+
+        let err = fs
+            .link(&cx, dir_attr.ino, root, OsStr::new("dir_hardlink"))
+            .unwrap_err();
+        assert_eq!(err.to_errno(), libc::EPERM);
+    }
+
+    #[test]
+    fn write_symlink_fast_target_roundtrip() {
+        let Some(fs) = open_writable_ext4() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        let attr = fs
+            .symlink(
+                &cx,
+                root,
+                OsStr::new("fast_link"),
+                Path::new("hello.txt"),
+                1000,
+                1000,
+            )
+            .expect("symlink fast");
+        assert_eq!(attr.kind, FileType::Symlink);
+
+        let looked_up = fs
+            .lookup(&cx, root, OsStr::new("fast_link"))
+            .expect("lookup fast_link");
+        assert_eq!(looked_up.kind, FileType::Symlink);
+
+        let target = fs.readlink(&cx, attr.ino).expect("readlink");
+        assert_eq!(&target, b"hello.txt");
+
+        let inode = fs.read_inode(&cx, attr.ino).expect("inode");
+        assert!(inode.is_fast_symlink());
+    }
+
+    #[test]
+    fn write_symlink_slow_target_roundtrip() {
+        let Some(fs) = open_writable_ext4() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let long_target = "/var/lib/frankenfs/some/really/long/path/that/exceeds/sixty/bytes/for/slow/symlink-target.txt";
+
+        let attr = fs
+            .symlink(
+                &cx,
+                root,
+                OsStr::new("slow_link"),
+                Path::new(long_target),
+                1000,
+                1000,
+            )
+            .expect("symlink slow");
+        assert_eq!(attr.kind, FileType::Symlink);
+
+        let target = fs.readlink(&cx, attr.ino).expect("readlink");
+        assert_eq!(target, long_target.as_bytes());
+
+        let inode = fs.read_inode(&cx, attr.ino).expect("inode");
+        assert!(!inode.is_fast_symlink());
+    }
+
+    #[test]
+    fn write_fallocate_preallocate_keep_size_and_punch_hole() {
+        let Some(fs) = open_writable_ext4() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        let attr = fs
+            .create(&cx, root, OsStr::new("falloc.bin"), 0o644, 0, 0)
+            .expect("create");
+
+        fs.fallocate(&cx, attr.ino, 0, 8192, 0).expect("fallocate");
+        let after_alloc = fs.getattr(&cx, attr.ino).expect("getattr");
+        assert_eq!(after_alloc.size, 8192);
+        assert!(after_alloc.blocks >= 16);
+
+        let zero_data = fs.read(&cx, attr.ino, 0, 8192).expect("read prealloc");
+        assert_eq!(zero_data.len(), 8192);
+        assert!(zero_data.iter().all(|&b| b == 0));
+
+        fs.fallocate(&cx, attr.ino, 12288, 4096, libc::FALLOC_FL_KEEP_SIZE)
+            .expect("fallocate keep_size");
+        let after_keep = fs.getattr(&cx, attr.ino).expect("getattr keep_size");
+        assert_eq!(after_keep.size, 8192);
+
+        let payload = vec![0xAB_u8; 8192];
+        fs.write(&cx, attr.ino, 0, &payload).expect("write payload");
+
+        fs.fallocate(
+            &cx,
+            attr.ino,
+            4096,
+            4096,
+            libc::FALLOC_FL_KEEP_SIZE | libc::FALLOC_FL_PUNCH_HOLE,
+        )
+        .expect("punch hole");
+
+        let after_punch = fs.getattr(&cx, attr.ino).expect("getattr after punch");
+        assert_eq!(after_punch.size, 8192);
+        let readback = fs.read(&cx, attr.ino, 0, 8192).expect("read after punch");
+        assert!(readback[..4096].iter().all(|&b| b == 0xAB));
+        assert!(readback[4096..8192].iter().all(|&b| b == 0));
+    }
+
+    #[test]
     fn write_setattr_truncate() {
         let Some(fs) = open_writable_ext4() else {
             return;
@@ -10733,6 +11482,7 @@ mod tests {
     #[test]
     fn request_op_is_write() {
         assert!(!RequestOp::Getattr.is_write());
+        assert!(!RequestOp::Statfs.is_write());
         assert!(!RequestOp::Read.is_write());
         assert!(!RequestOp::Lookup.is_write());
         assert!(!RequestOp::Readdir.is_write());
@@ -10748,6 +11498,9 @@ mod tests {
         assert!(RequestOp::Unlink.is_write());
         assert!(RequestOp::Rmdir.is_write());
         assert!(RequestOp::Rename.is_write());
+        assert!(RequestOp::Link.is_write());
+        assert!(RequestOp::Symlink.is_write());
+        assert!(RequestOp::Fallocate.is_write());
         assert!(RequestOp::Setattr.is_write());
         assert!(RequestOp::Write.is_write());
         assert!(RequestOp::Fsync.is_write());
