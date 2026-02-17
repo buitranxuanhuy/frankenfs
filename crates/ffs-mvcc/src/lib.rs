@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod compression;
+pub mod demo;
 pub mod persist;
 pub mod sharded;
 pub mod wal;
@@ -11,13 +12,20 @@ use compression::{CompressionStats, VersionData};
 use crossbeam_epoch as epoch;
 use ffs_block::{BlockBuf, BlockDevice, FlushPinToken, MvccFlushLifecycle};
 use ffs_error::{FfsError, Result as FfsResult};
+use ffs_repair::evidence::{
+    EvidenceRecord, SerializationConflictDetail, TransactionCommitDetail, TxnAbortReason,
+    TxnAbortedDetail,
+};
 use ffs_types::{BlockNumber, CommitSeq, Snapshot, TxnId};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, error, info, trace, warn};
 
@@ -267,6 +275,24 @@ pub struct BlockVersionStats {
     pub critical_chain_length: Option<usize>,
 }
 
+/// Budget-driven controls for MVCC version GC batches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GcBackpressureConfig {
+    /// Poll quota threshold below which GC skips the current batch.
+    pub min_poll_quota: u32,
+    /// Sleep duration used when a GC batch is throttled.
+    pub throttle_sleep: Duration,
+}
+
+impl Default for GcBackpressureConfig {
+    fn default() -> Self {
+        Self {
+            min_poll_quota: 256,
+            throttle_sleep: Duration::from_millis(10),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct EbrVersionReclaimer {
     collector: Arc<epoch::Collector>,
@@ -313,11 +339,82 @@ impl EbrVersionReclaimer {
         }
     }
 
+    fn collect_with_budget(&self, cx: &Cx, min_poll_quota: u32) -> bool {
+        let passes = usize::try_from(self.stats().pending_versions().clamp(1, 8)).unwrap_or(8);
+        let mut collected_any = false;
+        for _ in 0..passes {
+            let budget = cx.budget();
+            if budget.is_exhausted() || budget.poll_quota <= min_poll_quota {
+                break;
+            }
+            if cx.checkpoint().is_err() {
+                break;
+            }
+
+            let handle = self.collector.register();
+            handle.pin().flush();
+            collected_any = true;
+            if self.stats().pending_versions() == 0 {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        collected_any
+    }
+
     fn stats(&self) -> EbrVersionStats {
         EbrVersionStats {
             retired_versions: self.retired_versions.load(Ordering::Relaxed),
             reclaimed_versions: self.reclaimed_versions.load(Ordering::Relaxed),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MvccEvidenceSink {
+    file: Arc<Mutex<File>>,
+}
+
+impl MvccEvidenceSink {
+    fn open(path: &Path) -> FfsResult<Self> {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(Self {
+            file: Arc::new(Mutex::new(file)),
+        })
+    }
+
+    fn append(&self, record: &EvidenceRecord, txn_id: u64) {
+        let start = Instant::now();
+        let append_result = {
+            let mut file = self.file.lock();
+            serde_json::to_writer(&mut *file, record)
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+                .and_then(|()| file.write_all(b"\n"))
+                .and_then(|()| file.flush())
+        };
+        if let Err(error) = append_result {
+            warn!(
+                target: "ffs::mvcc::evidence",
+                event = "evidence_append_failed",
+                txn_id,
+                error = %error
+            );
+            return;
+        }
+
+        trace!(
+            target: "ffs::mvcc::evidence",
+            event = "evidence_entry_written",
+            entry_type = ?record.event_type,
+            txn_id
+        );
+        let flush_duration_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+        debug!(
+            target: "ffs::mvcc::evidence",
+            event = "evidence_ledger_flush",
+            entries_buffered = 1_u64,
+            flush_duration_us
+        );
     }
 }
 
@@ -346,6 +443,10 @@ pub struct MvccStore {
     compression_policy: CompressionPolicy,
     /// Epoch-based reclaimer for retired logical block versions.
     ebr_reclaimer: EbrVersionReclaimer,
+    /// Optional append-only evidence sink for transaction decisions.
+    evidence_sink: Option<MvccEvidenceSink>,
+    /// Whether the most recent GC batch was throttled by budget pressure.
+    gc_throttled: bool,
 }
 
 impl Default for MvccStore {
@@ -366,6 +467,8 @@ impl MvccStore {
             ssi_log: Vec::new(),
             compression_policy: CompressionPolicy::default(),
             ebr_reclaimer: EbrVersionReclaimer::default(),
+            evidence_sink: None,
+            gc_throttled: false,
         }
     }
 
@@ -376,6 +479,24 @@ impl MvccStore {
             compression_policy: policy,
             ..Self::new()
         }
+    }
+
+    /// Enable append-only evidence recording to a JSONL ledger path.
+    ///
+    /// Evidence events are best-effort: MVCC commit/abort semantics are never
+    /// blocked by ledger I/O errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the ledger file cannot be opened for append.
+    pub fn enable_evidence_ledger(&mut self, path: impl AsRef<Path>) -> FfsResult<()> {
+        self.evidence_sink = Some(MvccEvidenceSink::open(path.as_ref())?);
+        Ok(())
+    }
+
+    /// Disable evidence recording.
+    pub fn disable_evidence_ledger(&mut self) {
+        self.evidence_sink = None;
     }
 
     /// Returns the current compression policy.
@@ -419,6 +540,59 @@ impl MvccStore {
     /// Best-effort collection pass for deferred version reclamation.
     pub fn ebr_collect(&self) {
         self.ebr_reclaimer.collect();
+    }
+
+    /// Run one budget-aware MVCC GC batch.
+    ///
+    /// Returns `Some(watermark)` when pruning/collection ran, or `None` when
+    /// the batch was skipped due to tight budget.
+    pub fn run_gc_batch(&mut self, cx: &Cx, config: GcBackpressureConfig) -> Option<CommitSeq> {
+        let budget = cx.budget();
+        let budget_remaining = budget.poll_quota;
+        let budget_throttled = budget.is_exhausted() || budget_remaining <= config.min_poll_quota;
+        if budget_throttled {
+            debug!(
+                target: "ffs::mvcc::gc",
+                daemon_name = "mvcc_gc",
+                budget_remaining,
+                yield_duration_ms = config.throttle_sleep.as_millis(),
+                "daemon_throttled"
+            );
+            self.gc_throttled = true;
+            if !config.throttle_sleep.is_zero() {
+                std::thread::sleep(config.throttle_sleep);
+            }
+            return None;
+        }
+
+        if self.gc_throttled {
+            debug!(
+                target: "ffs::mvcc::gc",
+                daemon_name = "mvcc_gc",
+                new_budget = budget_remaining,
+                "daemon_resumed"
+            );
+            self.gc_throttled = false;
+        }
+
+        let watermark = self.prune_safe();
+        let collected = self
+            .ebr_reclaimer
+            .collect_with_budget(cx, config.min_poll_quota);
+        if !collected && self.ebr_reclaimer.stats().pending_versions() > 0 {
+            debug!(
+                target: "ffs::mvcc::gc",
+                daemon_name = "mvcc_gc",
+                budget_remaining = cx.budget().poll_quota,
+                yield_duration_ms = config.throttle_sleep.as_millis(),
+                "daemon_throttled"
+            );
+            self.gc_throttled = true;
+            if !config.throttle_sleep.is_zero() {
+                std::thread::sleep(config.throttle_sleep);
+            }
+        }
+        Some(watermark)
     }
 
     /// Chain-length monitoring snapshot for logical block versions.
@@ -475,9 +649,39 @@ impl MvccStore {
         txn
     }
 
+    /// Explicitly abort a transaction and emit an evidence entry.
+    ///
+    /// Aborting is a metadata operation: no versions are installed and staged
+    /// writes are dropped when `txn` goes out of scope.
+    pub fn abort(&mut self, txn: Transaction, reason: TxnAbortReason, detail: Option<String>) {
+        let txn_id = txn.id().0;
+        let read_set_size = txn.read_set().len();
+        let write_set_size = txn.pending_writes();
+        drop(txn);
+        self.emit_txn_aborted(TxnAbortedDetail {
+            txn_id,
+            reason,
+            detail,
+            read_set_size,
+            write_set_size,
+        });
+    }
+
     pub fn commit(&mut self, txn: Transaction) -> Result<CommitSeq, CommitError> {
-        self.commit_fcw_internal(txn)
-            .map(|(commit_seq, _)| commit_seq)
+        let started = Instant::now();
+        let txn_id = txn.id().0;
+        let read_set_size = txn.read_set().len();
+        let write_set_size = txn.pending_writes();
+        match self.commit_fcw_internal(txn) {
+            Ok((commit_seq, _)) => {
+                self.emit_transaction_commit(txn_id, commit_seq, write_set_size, started);
+                Ok(commit_seq)
+            }
+            Err(error) => {
+                self.record_commit_abort(txn_id, read_set_size, write_set_size, &error);
+                Err(error)
+            }
+        }
     }
 
     pub fn commit_with_cow_allocator(
@@ -486,13 +690,25 @@ impl MvccStore {
         allocator: &dyn CowAllocator,
         cx: &Cx,
     ) -> Result<CommitSeq, CommitError> {
-        let (commit_seq, deferred) = self.commit_fcw_internal(txn)?;
-        for block in deferred {
-            trace!(block = block.0, commit_seq = commit_seq.0, "cow_defer_free");
-            allocator.defer_free(block, commit_seq);
+        let started = Instant::now();
+        let txn_id = txn.id().0;
+        let read_set_size = txn.read_set().len();
+        let write_set_size = txn.pending_writes();
+        match self.commit_fcw_internal(txn) {
+            Ok((commit_seq, deferred)) => {
+                for block in deferred {
+                    trace!(block = block.0, commit_seq = commit_seq.0, "cow_defer_free");
+                    allocator.defer_free(block, commit_seq);
+                }
+                let _ = self.gc_cow_blocks(allocator, cx);
+                self.emit_transaction_commit(txn_id, commit_seq, write_set_size, started);
+                Ok(commit_seq)
+            }
+            Err(error) => {
+                self.record_commit_abort(txn_id, read_set_size, write_set_size, &error);
+                Err(error)
+            }
         }
-        let _ = self.gc_cow_blocks(allocator, cx);
-        Ok(commit_seq)
     }
 
     /// Commit with Serializable Snapshot Isolation (SSI) enforcement.
@@ -510,8 +726,20 @@ impl MvccStore {
     /// of SSI (as used by PostgreSQL).  Read-only transactions never trigger
     /// SSI aborts.
     pub fn commit_ssi(&mut self, txn: Transaction) -> Result<CommitSeq, CommitError> {
-        self.commit_ssi_internal(txn)
-            .map(|(commit_seq, _)| commit_seq)
+        let started = Instant::now();
+        let txn_id = txn.id().0;
+        let read_set_size = txn.read_set().len();
+        let write_set_size = txn.pending_writes();
+        match self.commit_ssi_internal(txn) {
+            Ok((commit_seq, _)) => {
+                self.emit_transaction_commit(txn_id, commit_seq, write_set_size, started);
+                Ok(commit_seq)
+            }
+            Err(error) => {
+                self.record_commit_abort(txn_id, read_set_size, write_set_size, &error);
+                Err(error)
+            }
+        }
     }
 
     pub fn commit_ssi_with_cow_allocator(
@@ -520,13 +748,113 @@ impl MvccStore {
         allocator: &dyn CowAllocator,
         cx: &Cx,
     ) -> Result<CommitSeq, CommitError> {
-        let (commit_seq, deferred) = self.commit_ssi_internal(txn)?;
-        for block in deferred {
-            trace!(block = block.0, commit_seq = commit_seq.0, "cow_defer_free");
-            allocator.defer_free(block, commit_seq);
+        let started = Instant::now();
+        let txn_id = txn.id().0;
+        let read_set_size = txn.read_set().len();
+        let write_set_size = txn.pending_writes();
+        match self.commit_ssi_internal(txn) {
+            Ok((commit_seq, deferred)) => {
+                for block in deferred {
+                    trace!(block = block.0, commit_seq = commit_seq.0, "cow_defer_free");
+                    allocator.defer_free(block, commit_seq);
+                }
+                let _ = self.gc_cow_blocks(allocator, cx);
+                self.emit_transaction_commit(txn_id, commit_seq, write_set_size, started);
+                Ok(commit_seq)
+            }
+            Err(error) => {
+                self.record_commit_abort(txn_id, read_set_size, write_set_size, &error);
+                Err(error)
+            }
         }
-        let _ = self.gc_cow_blocks(allocator, cx);
-        Ok(commit_seq)
+    }
+
+    fn record_commit_abort(
+        &self,
+        txn_id: u64,
+        read_set_size: usize,
+        write_set_size: usize,
+        error: &CommitError,
+    ) {
+        match error {
+            CommitError::Conflict { .. } => self.emit_txn_aborted(TxnAbortedDetail {
+                txn_id,
+                reason: TxnAbortReason::FcwConflict,
+                detail: Some(error.to_string()),
+                read_set_size,
+                write_set_size,
+            }),
+            CommitError::SsiConflict { concurrent_txn, .. } => {
+                self.emit_txn_aborted(TxnAbortedDetail {
+                    txn_id,
+                    reason: TxnAbortReason::SsiCycle,
+                    detail: Some(error.to_string()),
+                    read_set_size,
+                    write_set_size,
+                });
+                self.emit_serialization_conflict(
+                    txn_id,
+                    Some(concurrent_txn.0),
+                    "rw_antidependency_cycle",
+                );
+            }
+            CommitError::ChainBackpressure { .. } => self.emit_txn_aborted(TxnAbortedDetail {
+                txn_id,
+                reason: TxnAbortReason::Timeout,
+                detail: Some(error.to_string()),
+                read_set_size,
+                write_set_size,
+            }),
+        }
+    }
+
+    fn emit_transaction_commit(
+        &self,
+        txn_id: u64,
+        commit_seq: CommitSeq,
+        write_set_size: usize,
+        started: Instant,
+    ) {
+        let Some(sink) = &self.evidence_sink else {
+            return;
+        };
+        let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        sink.append(
+            &EvidenceRecord::transaction_commit(TransactionCommitDetail {
+                txn_id,
+                commit_seq: commit_seq.0,
+                write_set_size,
+                duration_us,
+            }),
+            txn_id,
+        );
+    }
+
+    fn emit_txn_aborted(&self, detail: TxnAbortedDetail) {
+        let Some(sink) = &self.evidence_sink else {
+            return;
+        };
+        let txn_id = detail.txn_id;
+        sink.append(&EvidenceRecord::txn_aborted(detail), txn_id);
+    }
+
+    fn emit_serialization_conflict(
+        &self,
+        txn_id: u64,
+        conflicting_txn: Option<u64>,
+        conflict_type: &str,
+    ) {
+        let Some(sink) = &self.evidence_sink else {
+            return;
+        };
+        sink.append(
+            &EvidenceRecord::serialization_conflict(SerializationConflictDetail {
+                txn_id,
+                conflicting_txn,
+                conflict_type: conflict_type.to_owned(),
+            }),
+            txn_id,
+        );
     }
 
     fn commit_fcw_internal(
@@ -1656,7 +1984,7 @@ impl Drop for StoreBackedFlushPin {
 
 impl MvccFlushLifecycle for StoreBackedMvccFlushLifecycle {
     fn pin_for_flush(&self, block: BlockNumber, commit_seq: CommitSeq) -> FfsResult<FlushPinToken> {
-        if commit_seq == CommitSeq::ZERO {
+        if commit_seq == CommitSeq(0) {
             return Ok(FlushPinToken::noop());
         }
 
@@ -3598,6 +3926,86 @@ mod tests {
         let after = store.ebr_stats();
         assert_eq!(before, after);
         assert_eq!(after.pending_versions(), 0);
+    }
+
+    #[test]
+    fn gc_batch_skips_when_budget_below_threshold() {
+        let mut store = MvccStore::new();
+        let block = BlockNumber(777);
+        for v in 1_u8..=16 {
+            let mut txn = store.begin();
+            txn.stage_write(block, vec![v; 32]);
+            store.commit(txn).expect("commit");
+        }
+
+        let _ = store.prune_safe();
+        let pending_before = store.ebr_stats().pending_versions();
+        assert!(pending_before > 0, "expected pending retired versions");
+
+        let low_budget_cx =
+            Cx::for_testing_with_budget(asupersync::Budget::new().with_poll_quota(8));
+        let result = store.run_gc_batch(
+            &low_budget_cx,
+            GcBackpressureConfig {
+                min_poll_quota: 16,
+                throttle_sleep: Duration::ZERO,
+            },
+        );
+
+        assert!(result.is_none(), "expected GC batch to be skipped");
+        assert_eq!(
+            store.ebr_stats().pending_versions(),
+            pending_before,
+            "pending retired versions should be unchanged when throttled"
+        );
+    }
+
+    #[test]
+    fn gc_batch_throttling_reduces_reclamation_throughput() {
+        let build_store = || {
+            let mut store = MvccStore::new();
+            let block = BlockNumber(778);
+            for v in 1_u8..=32 {
+                let mut txn = store.begin();
+                txn.stage_write(block, vec![v; 32]);
+                store.commit(txn).expect("commit");
+            }
+            let _ = store.prune_safe();
+            assert!(store.ebr_stats().pending_versions() > 0);
+            store
+        };
+
+        let mut throttled_store = build_store();
+        let throttled_cx =
+            Cx::for_testing_with_budget(asupersync::Budget::new().with_poll_quota(8));
+        for _ in 0..4 {
+            let _ = throttled_store.run_gc_batch(
+                &throttled_cx,
+                GcBackpressureConfig {
+                    min_poll_quota: 16,
+                    throttle_sleep: Duration::ZERO,
+                },
+            );
+        }
+        let throttled_reclaimed = throttled_store.ebr_stats().reclaimed_versions;
+
+        let mut unthrottled_store = build_store();
+        let unthrottled_cx = Cx::for_testing();
+        for _ in 0..4 {
+            let _ = unthrottled_store.run_gc_batch(
+                &unthrottled_cx,
+                GcBackpressureConfig {
+                    min_poll_quota: 16,
+                    throttle_sleep: Duration::ZERO,
+                },
+            );
+        }
+        let unthrottled_reclaimed = unthrottled_store.ebr_stats().reclaimed_versions;
+
+        assert!(
+            unthrottled_reclaimed > throttled_reclaimed,
+            "expected more reclamation throughput without budget pressure"
+        );
     }
 
     #[test]

@@ -12,16 +12,17 @@ crc32c = { workspace = true }
 crossbeam-epoch = { workspace = true }
 ffs-block = { workspace = true }
 ffs-error = { workspace = true }
+ffs-repair = { workspace = true }
 ffs-types = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
-serde_json = { workspace = true }
 
 [[bench]]
 name = "wal_throughput"
