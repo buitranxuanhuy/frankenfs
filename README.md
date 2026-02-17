@@ -54,6 +54,9 @@ cargo run -p ffs-cli -- inspect /path/to/btrfs.img --json
 cargo run -p ffs-harness -- check-fixtures
 cargo run -p ffs-harness -- parity
 
+# One-command self-healing adoption wedge (no FUSE, temp raw image)
+cargo run --example self_heal_demo
+
 # Full CI gate
 cargo fmt --check
 cargo check --all-targets
