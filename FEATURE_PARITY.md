@@ -34,7 +34,7 @@
 | ext4 bitmap free space reading | `fs/ext4/balloc.c` | ✅ | `OpenFs::free_space_summary`, bitmap-derived free block/inode counts |
 | ext4 journal replay parity | `fs/ext4/ext4_jbd2.c` | 🟡 | Replay + write-side implemented in `ffs-journal` (`replay_jbd2`, `Jbd2Writer` with descriptor/data/revoke/commit blocks, self-replayability verified). `OpenFs::commit_transaction_journaled` integration boundary in `ffs-core`. Checkpoint/space management pending. |
 | ext4 allocator parity | `fs/ext4/mballoc.c` | 🟡 | Phase A: correctness-first contiguous alloc with reserved-block exclusion, on-disk GDT persistence, double-free detection. `alloc_blocks_persist` / `free_blocks_persist` in `ffs-alloc`. Buddy-style search and preallocation pending. |
-| ext4 orphan recovery parity | `fs/ext4/orphan.c` | 🟡 | Read-only orphan-list detection/traversal implemented (`OpenFs::read_ext4_orphan_list` + CLI inspect diagnostics); mutating orphan cleanup still pending |
+| ext4 orphan recovery parity | `fs/ext4/orphan.c` | ✅ | Mount-time orphan cleanup implemented in `ffs-core` (`OpenFs::maybe_recover_ext4_orphans`): tolerant chain traversal (cycle/out-of-range guardrails), delete-or-truncate recovery actions, and superblock orphan-state clearing (`s_last_orphan`, `EXT4_ORPHAN_FS`). Read-only orphan diagnostics remain available via `OpenFs::read_ext4_orphan_list` + CLI inspect output. |
 | btrfs superblock decode | `fs/btrfs/disk-io.c` | ✅ | Implemented in `ffs-ondisk` |
 | btrfs btree header decode | `fs/btrfs/ctree.c` | ✅ | Implemented in `ffs-ondisk` |
 | btrfs leaf item metadata decode | `fs/btrfs/ctree.c` | ✅ | Implemented in `ffs-ondisk` |

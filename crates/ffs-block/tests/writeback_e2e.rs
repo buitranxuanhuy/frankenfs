@@ -173,6 +173,7 @@ fn scenario_1_basic_flush_correctness() {
             batch_size: 256,
             high_watermark: 0.99,
             critical_watermark: 1.0,
+            ..FlushDaemonConfig::default()
         })
         .expect("start flush daemon");
 
@@ -348,6 +349,7 @@ fn scenario_5_backpressure_under_load() {
             batch_size: 4,
             high_watermark: 0.5,
             critical_watermark: 0.75,
+            ..FlushDaemonConfig::default()
         })
         .expect("start flush daemon");
 

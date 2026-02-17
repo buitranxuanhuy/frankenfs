@@ -1,0 +1,24 @@
+[default]
+# Warn/fail thresholds for p99 latency regression percentage.
+warn_percent = 10
+fail_percent = 20
+
+[operation_thresholds.metadata_parity_cli]
+warn_percent = 10
+fail_percent = 20
+
+[operation_thresholds.metadata_parity_harness]
+warn_percent = 10
+fail_percent = 20
+
+[operation_thresholds.fixture_validation]
+warn_percent = 10
+fail_percent = 20
+
+[operation_thresholds.read_metadata_inspect_ext4_reference]
+warn_percent = 10
+fail_percent = 20
+
+[operation_thresholds.read_metadata_scrub_ext4_reference]
+warn_percent = 10
+fail_percent = 20

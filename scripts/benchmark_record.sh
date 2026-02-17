@@ -12,12 +12,18 @@ DATE_TAG="$(date -u +%Y%m%d)"
 REF_IMAGE="conformance/golden/ext4_8mb_reference.ext4"
 P99_WARN_THRESHOLD=10
 P99_FAIL_THRESHOLD=20
+P99_FAIL_THRESHOLD_OVERRIDE=""
 PERF_BASELINE_PATH="artifacts/baselines/perf_baseline.json"
+THRESHOLDS_PATH="benchmarks/thresholds.toml"
+BENCHMARK_BASELINE_LATEST_PATH="benchmarks/baselines/latest.json"
+BENCHMARK_BASELINE_HISTORY_PATH=""
+declare -A OP_WARN_THRESHOLDS=()
+declare -A OP_FAIL_THRESHOLDS=()
 
 usage() {
     cat <<'USAGE'
 Usage:
-  scripts/benchmark_record.sh [--date YYYYMMDD] [--warmup N] [--runs N] [--compare] [--skip-verify-golden] [--p99-fail-threshold N] [--out-json PATH]
+  scripts/benchmark_record.sh [--date YYYYMMDD] [--warmup N] [--runs N] [--compare] [--skip-verify-golden] [--thresholds PATH] [--p99-fail-threshold N] [--out-json PATH]
 
 Options:
   --date YYYYMMDD          Override date-tag for output paths (default: today)
@@ -25,6 +31,7 @@ Options:
   --runs N                 Hyperfine measured runs (default: 10)
   --compare                Compare current p99 against latest prior baseline (warn >10%, fail >20%)
   --skip-verify-golden     Skip scripts/verify_golden.sh preflight
+  --thresholds PATH        Read warn/fail thresholds from TOML (default: benchmarks/thresholds.toml)
   --p99-fail-threshold N   Fail compare if p99 regression exceeds N percent (default: 20)
   --out-json PATH          Structured baseline JSON output path (default: artifacts/baselines/perf_baseline.json)
   -h, --help               Show this help
@@ -58,7 +65,12 @@ while [ $# -gt 0 ]; do
             ;;
         --p99-fail-threshold)
             [ $# -ge 2 ] || { echo "missing value for --p99-fail-threshold" >&2; exit 2; }
-            P99_FAIL_THRESHOLD="$2"
+            P99_FAIL_THRESHOLD_OVERRIDE="$2"
+            shift 2
+            ;;
+        --thresholds)
+            [ $# -ge 2 ] || { echo "missing value for --thresholds" >&2; exit 2; }
+            THRESHOLDS_PATH="$2"
             shift 2
             ;;
         --out-json)
@@ -78,15 +90,88 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+load_thresholds() {
+    if [ ! -f "$THRESHOLDS_PATH" ]; then
+        return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "warning: python3 unavailable; skipping thresholds file ${THRESHOLDS_PATH}" >&2
+        return 0
+    fi
+
+    local threshold_json
+    if ! threshold_json="$(
+        python3 - "$THRESHOLDS_PATH" <<'PY'
+import json
+import sys
+import tomllib
+
+path = sys.argv[1]
+with open(path, "rb") as fh:
+    data = tomllib.load(fh)
+
+defaults = data.get("default", {})
+warn = defaults.get("warn_percent", 10)
+fail = defaults.get("fail_percent", 20)
+ops = data.get("operation_thresholds", {})
+
+out = {
+    "default": {"warn_percent": warn, "fail_percent": fail},
+    "operations": {},
+}
+for name, cfg in ops.items():
+    if isinstance(cfg, dict):
+        out["operations"][name] = {
+            "warn_percent": cfg.get("warn_percent"),
+            "fail_percent": cfg.get("fail_percent"),
+        }
+print(json.dumps(out))
+PY
+    )"; then
+        echo "warning: failed to parse thresholds file ${THRESHOLDS_PATH}; using defaults" >&2
+        return 0
+    fi
+
+    P99_WARN_THRESHOLD="$(jq -r '.default.warn_percent // 10' <<<"$threshold_json")"
+    P99_FAIL_THRESHOLD="$(jq -r '.default.fail_percent // 20' <<<"$threshold_json")"
+
+    while IFS=$'\t' read -r operation warn fail; do
+        [ -n "$operation" ] || continue
+        if [ "$warn" != "null" ] && [ -n "$warn" ]; then
+            OP_WARN_THRESHOLDS["$operation"]="$warn"
+        fi
+        if [ "$fail" != "null" ] && [ -n "$fail" ]; then
+            OP_FAIL_THRESHOLDS["$operation"]="$fail"
+        fi
+    done < <(
+        jq -r '
+            .operations
+            | to_entries[]
+            | [.key, (.value.warn_percent // "null"), (.value.fail_percent // "null")]
+            | @tsv
+        ' <<<"$threshold_json"
+    )
+}
+
+load_thresholds
+if [ -n "$P99_FAIL_THRESHOLD_OVERRIDE" ]; then
+    P99_FAIL_THRESHOLD="$P99_FAIL_THRESHOLD_OVERRIDE"
+fi
+
 OUT_DIR="baselines/hyperfine/${DATE_TAG}"
 REPORT_PATH="baselines/baseline-${DATE_TAG}.md"
+BENCHMARK_BASELINE_HISTORY_PATH="benchmarks/baselines/history/${DATE_TAG}.json"
 if [[ "$PERF_BASELINE_PATH" == *.json ]]; then
     PERF_BASELINE_DATED_PATH="${PERF_BASELINE_PATH%.json}-${DATE_TAG}.json"
 else
     PERF_BASELINE_DATED_PATH="${PERF_BASELINE_PATH}-${DATE_TAG}.json"
 fi
 
-mkdir -p "$OUT_DIR" "$(dirname "$PERF_BASELINE_PATH")"
+mkdir -p \
+    "$OUT_DIR" \
+    "$(dirname "$PERF_BASELINE_PATH")" \
+    "$(dirname "$BENCHMARK_BASELINE_LATEST_PATH")" \
+    "$(dirname "$BENCHMARK_BASELINE_HISTORY_PATH")"
 
 if [ -n "${CARGO_TARGET_DIR:-}" ]; then
     TARGET_DIR="${CARGO_TARGET_DIR}"
@@ -422,6 +507,7 @@ write_perf_baseline_json() {
         --arg date_tag "$DATE_TAG" \
         --arg commit "$git_sha" \
         --arg branch "$git_branch" \
+        --arg thresholds_file "$THRESHOLDS_PATH" \
         --arg cpu_model "$cpu_model" \
         --arg kernel "$kernel_ver" \
         --arg rustc "$rustc_ver" \
@@ -429,6 +515,7 @@ write_perf_baseline_json() {
         --arg hyperfine "$hyperfine_ver" \
         --argjson warmup_runs "$WARMUP" \
         --argjson measured_runs "$RUNS" \
+        --argjson p99_warn_threshold_percent "$P99_WARN_THRESHOLD" \
         --argjson p99_fail_threshold_percent "$P99_FAIL_THRESHOLD" \
         --argjson measurements "$measurements_json" \
         --argjson measured_count "$(jq 'map(select(.status == "measured")) | length' <<<"$measurements_json")" \
@@ -447,6 +534,8 @@ write_perf_baseline_json() {
             },
             warmup_runs: $warmup_runs,
             measured_runs: $measured_runs,
+            thresholds_file: $thresholds_file,
+            p99_warn_threshold_percent: $p99_warn_threshold_percent,
             p99_fail_threshold_percent: $p99_fail_threshold_percent,
             measurement_coverage: {
                 measured_count: $measured_count,
@@ -456,6 +545,8 @@ write_perf_baseline_json() {
         }' > "$PERF_BASELINE_PATH"
 
     cp "$PERF_BASELINE_PATH" "$PERF_BASELINE_DATED_PATH"
+    cp "$PERF_BASELINE_PATH" "$BENCHMARK_BASELINE_LATEST_PATH"
+    cp "$PERF_BASELINE_PATH" "$BENCHMARK_BASELINE_HISTORY_PATH"
     rm -f "$tmp_measurements"
 }
 
@@ -487,6 +578,9 @@ date_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "- hyperfine: \`${hyperfine_ver}\`"
     echo "- Warmup runs: \`${WARMUP}\`"
     echo "- Measured runs: \`${RUNS}\`"
+    echo "- Thresholds file: \`${THRESHOLDS_PATH}\`"
+    echo "- Warn threshold (default): \`${P99_WARN_THRESHOLD}%\`"
+    echo "- Fail threshold (default): \`${P99_FAIL_THRESHOLD}%\`"
     echo ""
     echo "## Preflight Conformance Gate"
     echo ""
@@ -544,26 +638,29 @@ if [ "$COMPARE" -eq 1 ]; then
     if [ -n "$previous_tag" ]; then
         previous_dir="baselines/hyperfine/${previous_tag}"
         COMPARE_SUMMARY+="## Regression Check (vs ${previous_tag})"$'\n\n'
-        COMPARE_SUMMARY+="Thresholds: warn if p99 regresses >${P99_WARN_THRESHOLD}%; fail if >${P99_FAIL_THRESHOLD}%."$'\n\n'
-        COMPARE_SUMMARY+="| Command | Baseline p99 (ms) | Current p99 (ms) | Delta % | Status |"$'\n'
-        COMPARE_SUMMARY+="|---|---:|---:|---:|---|"$'\n'
+        COMPARE_SUMMARY+="Threshold defaults: warn if p99 regresses >${P99_WARN_THRESHOLD}%; fail if >${P99_FAIL_THRESHOLD}%."$'\n\n'
+        COMPARE_SUMMARY+="| Command | Baseline p99 (ms) | Current p99 (ms) | Delta % | Warn % | Fail % | Status |"$'\n'
+        COMPARE_SUMMARY+="|---|---:|---:|---:|---:|---:|---|"$'\n'
 
         for i in "${!BENCH_LABELS[@]}"; do
             cur_json="${OUT_DIR}/${BENCH_FILES[$i]}"
             prev_json="${previous_dir}/${BENCH_FILES[$i]}"
+            op="${BENCH_OPERATIONS[$i]}"
+            warn_threshold="${OP_WARN_THRESHOLDS[$op]:-$P99_WARN_THRESHOLD}"
+            fail_threshold="${OP_FAIL_THRESHOLDS[$op]:-$P99_FAIL_THRESHOLD}"
             if [ ! -f "$prev_json" ]; then
-                COMPARE_SUMMARY+="| ${BENCH_LABELS[$i]} | n/a | n/a | n/a | SKIP (no prior file) |"$'\n'
+                COMPARE_SUMMARY+="| ${BENCH_LABELS[$i]} | n/a | n/a | n/a | ${warn_threshold} | ${fail_threshold} | SKIP (no prior file) |"$'\n'
                 continue
             fi
 
             cur_p99_s="$(json_p99 "$cur_json" 2>/dev/null || true)"
             prev_p99_s="$(json_p99 "$prev_json" 2>/dev/null || true)"
             if [ -z "$cur_p99_s" ] || [ -z "$prev_p99_s" ] || ! valid_number "$cur_p99_s" || ! valid_number "$prev_p99_s"; then
-                COMPARE_SUMMARY+="| ${BENCH_LABELS[$i]} | n/a | n/a | n/a | SKIP (invalid hyperfine JSON) |"$'\n'
+                COMPARE_SUMMARY+="| ${BENCH_LABELS[$i]} | n/a | n/a | n/a | ${warn_threshold} | ${fail_threshold} | SKIP (invalid hyperfine JSON) |"$'\n'
                 continue
             fi
             if awk -v base="$prev_p99_s" 'BEGIN { exit !(base <= 0.0) }'; then
-                COMPARE_SUMMARY+="| ${BENCH_LABELS[$i]} | n/a | n/a | n/a | SKIP (baseline p99 <= 0) |"$'\n'
+                COMPARE_SUMMARY+="| ${BENCH_LABELS[$i]} | n/a | n/a | n/a | ${warn_threshold} | ${fail_threshold} | SKIP (baseline p99 <= 0) |"$'\n'
                 continue
             fi
 
@@ -572,13 +669,13 @@ if [ "$COMPARE" -eq 1 ]; then
             delta_pct="$(pct_change "$prev_p99_s" "$cur_p99_s")"
 
             status="OK"
-            if awk -v d="$delta_pct" -v threshold="$P99_FAIL_THRESHOLD" 'BEGIN { exit !(d > threshold) }'; then
+            if awk -v d="$delta_pct" -v threshold="$fail_threshold" 'BEGIN { exit !(d > threshold) }'; then
                 status="FAIL"
                 COMPARE_STATUS=1
-            elif awk -v d="$delta_pct" -v threshold="$P99_WARN_THRESHOLD" 'BEGIN { exit !(d > threshold) }'; then
+            elif awk -v d="$delta_pct" -v threshold="$warn_threshold" 'BEGIN { exit !(d > threshold) }'; then
                 status="WARN"
             fi
-            COMPARE_SUMMARY+="| ${BENCH_LABELS[$i]} | ${prev_p99_ms} | ${cur_p99_ms} | ${delta_pct}% | ${status} |"$'\n'
+            COMPARE_SUMMARY+="| ${BENCH_LABELS[$i]} | ${prev_p99_ms} | ${cur_p99_ms} | ${delta_pct}% | ${warn_threshold} | ${fail_threshold} | ${status} |"$'\n'
         done
     else
         COMPARE_SUMMARY+="## Regression Check"$'\n\n'
@@ -594,6 +691,8 @@ fi
 echo "Wrote baseline report: ${REPORT_PATH}"
 echo "Wrote structured baseline JSON: ${PERF_BASELINE_PATH}"
 echo "Wrote dated structured baseline JSON: ${PERF_BASELINE_DATED_PATH}"
+echo "Wrote baseline latest JSON: ${BENCHMARK_BASELINE_LATEST_PATH}"
+echo "Wrote baseline history JSON: ${BENCHMARK_BASELINE_HISTORY_PATH}"
 echo "Wrote hyperfine exports:"
 for i in "${!BENCH_LABELS[@]}"; do
     echo "  - ${OUT_DIR}/${BENCH_FILES[$i]}"

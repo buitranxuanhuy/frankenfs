@@ -44,3 +44,5 @@ jobs:
             baselines/baseline-*.md
             baselines/hyperfine/**/*.json
             artifacts/baselines/perf_baseline*.json
+            benchmarks/baselines/latest.json
+            benchmarks/baselines/history/*.json

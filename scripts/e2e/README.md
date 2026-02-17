@@ -14,11 +14,14 @@ End-to-end smoke tests for FrankenFS that exercise user-facing workflows.
 # Run btrfs read-write smoke + persistence checks
 ./scripts/e2e/ffs_btrfs_rw_smoke.sh
 
+# Run btrfs read-only FUSE smoke
+./scripts/e2e/ffs_btrfs_ro_smoke.sh
+
 # Run write-back durability scenarios
 ./scripts/e2e/ffs_writeback_e2e.sh
 
-# Run deterministic 5% corruption auto-repair E2E
-./scripts/e2e/ffs_repair_5pct_e2e.sh
+# Run deterministic corruption-injection + recovery smoke
+./scripts/e2e/ffs_repair_recovery_smoke.sh
 
 # Plan/run curated xfstests generic+ext4 subsets
 ./scripts/e2e/ffs_xfstests_e2e.sh
@@ -65,12 +68,22 @@ The btrfs read-write smoke suite exercises:
 5. Persistence checks: clean unmount, read-only remount, and post-remount data/metadata validation
 6. CI artifacts: structured per-test timing logs and a `junit.xml` report under the suite artifact directory
 
-The 5% repair E2E suite exercises:
+The btrfs read-only smoke suite exercises:
 
-1. Deterministic 5% random block corruption across repair groups
+1. Runtime btrfs fixture generation via `scripts/fixtures/make_btrfs_reference_image.sh`
+2. `ffs inspect --json` geometry capture (sectorsize/nodesize logged in test header)
+3. Read-only `ffs mount` behavior through `/dev/fuse`
+4. Basic black-box operations: `ls`, `stat`, bounded `find`, and `cat` of a known fixture file when present
+5. Reliable unmount with actionable mount-log diagnostics on failure
+
+The repair recovery smoke suite exercises:
+
+1. Deterministic bounded random block corruption across repair groups (currently 5% in the test harness)
 2. Background scrub daemon auto-detection and auto-recovery
 3. Full before/after block digest equivalence checks
-4. Structured evidence ledger capture and artifact export
+4. Structured evidence ledger capture and artifact export under `artifacts/e2e/<timestamp>_ffs_repair_recovery_smoke/repair/`
+
+If rch offload runs the test but does not materialize custom artifact files locally, the script exits with `SKIPPED` unless `FFS_REPAIR_LOCAL_ARTIFACT_FALLBACK=1` is set.
 
 The xfstests E2E suite exercises:
 
@@ -102,6 +115,7 @@ artifacts/e2e/20260212_161500_ffs_smoke/
 | `BASELINE_FILE_COUNT` | `500` | Number of fsync-backed baseline files written before SIGKILL phase |
 | `CRASH_WRITER_RUNTIME_SECS` | `2` | Duration to run background in-flight writer before sending SIGKILL |
 | `CRASH_WRITER_SLEEP_SECS` | `0.01` | Per-write pacing interval for crash in-flight writer |
+| `FFS_REPAIR_LOCAL_ARTIFACT_FALLBACK` | `0` | For `ffs_repair_recovery_smoke.sh`: if `1`, re-run repair test locally when rch offload does not materialize artifact files |
 | `XFSTESTS_MODE` | `auto` | `auto`, `plan`, or `run` for `ffs_xfstests_e2e.sh` |
 | `XFSTESTS_DIR` | *(unset)* | Path to xfstests checkout containing `check` |
 | `XFSTESTS_DRY_RUN` | `1` | In run mode, pass `-n` to `check` (selection validation without executing tests) |
@@ -124,6 +138,7 @@ artifacts/e2e/20260212_161500_ffs_smoke/
 Mount tests are automatically skipped if:
 - `/dev/fuse` doesn't exist
 - `/dev/fuse` isn't readable/writable
+- `mkfs.btrfs` / `btrfs` tools are unavailable for btrfs fixture generation
 - `fuse3` rejects implicit `allow_other` because `user_allow_other` is not enabled in `/etc/fuse.conf`
 - `fusermount` returns `Permission denied` / `Operation not permitted` for the current runtime environment
 - `SKIP_MOUNT=1` is set

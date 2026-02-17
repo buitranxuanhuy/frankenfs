@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod e2e;
+pub mod perf_regression;
 
 use anyhow::{Context, Result, bail};
 use ffs_ondisk::{
