@@ -175,7 +175,7 @@ artifacts/e2e/20260212_161500_ffs_smoke/
 - Rust toolchain (nightly)
 - `python3` (used by concurrency/perf probes in `ffs_fuse_production.sh`)
 - `mkfs.ext4` and `debugfs` (e2fsprogs)
-- `b3sum` (required by `ffs_ext4_ro_roundtrip.sh` for BLAKE3 digest verification)
+- `b3sum` **or** Python package `blake3` (required by `ffs_ext4_ro_roundtrip.sh` for BLAKE3 digest verification)
 - `mkfs.btrfs` and `btrfs` (btrfs-progs)
 - `/dev/fuse` accessible (for mount tests)
 - `fusermount` or `fusermount3` (for unmounting)

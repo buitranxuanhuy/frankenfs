@@ -29,17 +29,33 @@ CURRENT_MOUNT_PID=""
 CURRENT_MOUNT_LOG=""
 CURRENT_MOUNT_POINT=""
 MAX_DURATION_SECS="${EXT4_ROUNDTRIP_MAX_SECS:-30}"
+BLAKE3_BACKEND=""
 
 require_tools() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        e2e_skip "python3 not found (required for manifest + metadata checks)"
+    fi
     if ! command -v debugfs >/dev/null 2>&1; then
         e2e_skip "debugfs not found (required for reference extraction)"
     fi
     if ! command -v mountpoint >/dev/null 2>&1; then
         e2e_skip "mountpoint utility not found"
     fi
-    if ! command -v b3sum >/dev/null 2>&1; then
-        e2e_skip "b3sum not found (required for BLAKE3 manifest checks)"
+    if command -v b3sum >/dev/null 2>&1; then
+        BLAKE3_BACKEND="b3sum"
+        return
     fi
+    if python3 - <<'PY' >/dev/null 2>&1
+import importlib.util
+import sys
+sys.exit(0 if importlib.util.find_spec("blake3") else 1)
+PY
+    then
+        BLAKE3_BACKEND="python-blake3"
+        return
+    fi
+
+    e2e_skip "BLAKE3 backend missing (install b3sum or python package blake3)"
 }
 
 run_cargo() {
@@ -89,8 +105,9 @@ build_blake3_manifest() {
     local root="$1"
     local output_path="$2"
     local label="$3"
+    local backend="$4"
 
-    e2e_assert python3 - "$root" "$output_path" "$label" <<'PY'
+    e2e_assert python3 - "$root" "$output_path" "$label" "$backend" <<'PY'
 import json
 import os
 import pathlib
@@ -100,6 +117,13 @@ import sys
 root = pathlib.Path(sys.argv[1])
 output_path = pathlib.Path(sys.argv[2])
 label = sys.argv[3]
+backend = sys.argv[4]
+
+if backend == "python-blake3":
+    try:
+        import blake3
+    except ImportError as exc:
+        raise SystemExit(f"{label}: python backend requested but blake3 module missing: {exc}") from exc
 
 if not root.exists():
     raise SystemExit(f"{label}: root path does not exist: {root}")
@@ -122,7 +146,12 @@ for path in sorted(root.rglob("*"), key=lambda p: p.as_posix()):
         )
         continue
     if path.is_file():
-        digest = subprocess.check_output(["b3sum", str(path)], text=True).split()[0]
+        if backend == "b3sum":
+            digest = subprocess.check_output(["b3sum", str(path)], text=True).split()[0]
+        elif backend == "python-blake3":
+            digest = blake3.blake3(path.read_bytes()).hexdigest()
+        else:
+            raise SystemExit(f"{label}: unsupported BLAKE3 backend: {backend}")
         entries.append(
             {
                 "path": rel,
@@ -134,9 +163,14 @@ for path in sorted(root.rglob("*"), key=lambda p: p.as_posix()):
         continue
     entries.append({"path": rel, "kind": "other"})
 
-payload = {"root": str(root), "entry_count": len(entries), "entries": entries}
+payload = {
+    "root": str(root),
+    "entry_count": len(entries),
+    "blake3_backend": backend,
+    "entries": entries,
+}
 output_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-print(f"{label}: wrote {len(entries)} entries -> {output_path}")
+print(f"{label}: wrote {len(entries)} entries -> {output_path} (backend={backend})")
 PY
 }
 
@@ -350,6 +384,7 @@ verify_journal_replay_reporting() {
 
 e2e_step "Phase 1: Preconditions and build"
 require_tools
+e2e_log "BLAKE3 backend: $BLAKE3_BACKEND"
 run_cargo build -p ffs-cli --release
 e2e_assert_file "$FFS_CLI_BIN"
 
@@ -365,7 +400,7 @@ INSPECT_JSON="$E2E_LOG_DIR/inspect_ext4.json"
 
 e2e_step "Phase 3: Build debugfs reference extraction + manifest"
 build_reference_tree "$WORK_IMAGE" "$REFERENCE_ROOT"
-build_blake3_manifest "$REFERENCE_ROOT" "$REFERENCE_MANIFEST" "reference"
+build_blake3_manifest "$REFERENCE_ROOT" "$REFERENCE_MANIFEST" "reference" "$BLAKE3_BACKEND"
 e2e_assert_file "$REFERENCE_MANIFEST"
 
 e2e_step "Phase 4: Inspect metadata (superblock/group/inode signals)"
@@ -376,7 +411,7 @@ assert_inspect_metadata "$INSPECT_JSON"
 e2e_step "Phase 5: Read-only mount + full tree/BLAKE3 verification"
 MOUNT_POINT="$E2E_TEMP_DIR/mnt_ext4_roundtrip"
 start_mount_ro "$WORK_IMAGE" "$MOUNT_POINT" 20
-build_blake3_manifest "$MOUNT_POINT" "$MOUNT_MANIFEST" "mounted"
+build_blake3_manifest "$MOUNT_POINT" "$MOUNT_MANIFEST" "mounted" "$BLAKE3_BACKEND"
 assert_manifests_equal "$REFERENCE_MANIFEST" "$MOUNT_MANIFEST"
 verify_journal_replay_reporting "$CURRENT_MOUNT_LOG"
 stop_mount "$MOUNT_POINT"

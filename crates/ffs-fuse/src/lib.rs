@@ -2794,4 +2794,381 @@ mod tests {
         let snap = handle.wait();
         assert_eq!(snap.requests_ok, 1);
     }
+
+    // ── FuseErrorContext errno mapping for all 21 variants (bd-2s4.6) ──
+
+    #[test]
+    fn fuse_error_context_log_and_errno_covers_all_variants() {
+        let cases: Vec<(FfsError, libc::c_int)> = vec![
+            (FfsError::Io(std::io::Error::other("test")), libc::EIO),
+            (
+                FfsError::Corruption {
+                    block: 1,
+                    detail: "bad crc".into(),
+                },
+                libc::EIO,
+            ),
+            (FfsError::Format("bad magic".into()), libc::EINVAL),
+            (FfsError::Parse("truncated".into()), libc::EINVAL),
+            (
+                FfsError::UnsupportedFeature("ENCRYPT".into()),
+                libc::EOPNOTSUPP,
+            ),
+            (
+                FfsError::IncompatibleFeature("missing FILETYPE".into()),
+                libc::EOPNOTSUPP,
+            ),
+            (
+                FfsError::UnsupportedBlockSize("8192".into()),
+                libc::EOPNOTSUPP,
+            ),
+            (
+                FfsError::InvalidGeometry("blocks_per_group=0".into()),
+                libc::EINVAL,
+            ),
+            (FfsError::MvccConflict { tx: 1, block: 2 }, libc::EAGAIN),
+            (FfsError::Cancelled, libc::EINTR),
+            (FfsError::NoSpace, libc::ENOSPC),
+            (FfsError::NotFound("gone".into()), libc::ENOENT),
+            (FfsError::PermissionDenied, libc::EACCES),
+            (FfsError::ReadOnly, libc::EROFS),
+            (FfsError::NotDirectory, libc::ENOTDIR),
+            (FfsError::IsDirectory, libc::EISDIR),
+            (FfsError::NotEmpty, libc::ENOTEMPTY),
+            (FfsError::NameTooLong, libc::ENAMETOOLONG),
+            (FfsError::Exists, libc::EEXIST),
+            (FfsError::RepairFailed("checksum".into()), libc::EIO),
+        ];
+
+        // 20 variants listed; verify count matches expectation.
+        assert_eq!(cases.len(), 20, "expected all 20 constructible FfsError variants");
+
+        for (error, expected) in &cases {
+            let ctx = FuseErrorContext {
+                error,
+                operation: "test_op",
+                ino: 99,
+                offset: Some(0),
+            };
+            assert_eq!(
+                ctx.log_and_errno(),
+                *expected,
+                "wrong errno for {error:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn fuse_error_context_io_preserves_raw_os_error() {
+        let raw = std::io::Error::from_raw_os_error(libc::EPERM);
+        let err = FfsError::Io(raw);
+        let ctx = FuseErrorContext {
+            error: &err,
+            operation: "open",
+            ino: 5,
+            offset: None,
+        };
+        assert_eq!(ctx.log_and_errno(), libc::EPERM);
+    }
+
+    #[test]
+    fn fuse_error_context_enoent_does_not_panic() {
+        // ENOENT is logged at trace, not warn — ensure it doesn't panic.
+        let err = FfsError::NotFound("test".into());
+        let ctx = FuseErrorContext {
+            error: &err,
+            operation: "lookup",
+            ino: 2,
+            offset: None,
+        };
+        assert_eq!(ctx.log_and_errno(), libc::ENOENT);
+    }
+
+    // ── Read-only flag propagation ───────────────────────────────────────
+
+    #[test]
+    fn fuse_inner_read_only_reflects_mount_options() {
+        let opts_ro = MountOptions {
+            read_only: true,
+            ..Default::default()
+        };
+        let fuse_ro = FrankenFuse::with_options(Box::new(StubFs), &opts_ro);
+        assert!(fuse_ro.inner.read_only);
+
+        let opts_rw = MountOptions {
+            read_only: false,
+            ..Default::default()
+        };
+        let fuse_rw = FrankenFuse::with_options(Box::new(StubFs), &opts_rw);
+        assert!(!fuse_rw.inner.read_only);
+    }
+
+    #[test]
+    fn build_mount_options_omits_ro_when_read_write() {
+        let opts = MountOptions {
+            read_only: false,
+            allow_other: false,
+            auto_unmount: true,
+            worker_threads: 0,
+        };
+        let mount_opts = build_mount_options(&opts);
+        // Should NOT contain RO
+        let has_ro = mount_opts
+            .iter()
+            .any(|o| matches!(o, MountOption::RO));
+        assert!(!has_ro, "RO should not be present when read_only=false");
+    }
+
+    #[test]
+    fn build_mount_options_includes_allow_other_when_set() {
+        let opts = MountOptions {
+            read_only: true,
+            allow_other: true,
+            auto_unmount: false,
+            worker_threads: 0,
+        };
+        let mount_opts = build_mount_options(&opts);
+        let has_allow = mount_opts
+            .iter()
+            .any(|o| matches!(o, MountOption::AllowOther));
+        assert!(has_allow, "AllowOther should be present");
+    }
+
+    // ── should_shed backpressure tests ───────────────────────────────────
+
+    #[test]
+    fn should_shed_returns_false_without_backpressure_gate() {
+        let fuse = FrankenFuse::new(Box::new(StubFs));
+        // No backpressure gate → never shed.
+        assert!(!fuse.should_shed(RequestOp::Read));
+        assert!(!fuse.should_shed(RequestOp::Write));
+        assert!(!fuse.should_shed(RequestOp::Create));
+        assert!(!fuse.should_shed(RequestOp::Mkdir));
+    }
+
+    #[test]
+    fn should_shed_with_emergency_gate_sheds_writes() {
+        use asupersync::SystemPressure;
+        use ffs_core::DegradationFsm;
+
+        // Emergency level: headroom 0.02 → all writes shed.
+        let pressure = Arc::new(SystemPressure::with_headroom(0.02));
+        let fsm = Arc::new(DegradationFsm::new(Arc::clone(&pressure), 1));
+        fsm.tick();
+        let gate = BackpressureGate::new(fsm);
+
+        let opts = MountOptions::default();
+        let fuse = FrankenFuse::with_backpressure(Box::new(StubFs), &opts, gate);
+
+        // Reads proceed.
+        assert!(!fuse.should_shed(RequestOp::Read));
+        assert!(!fuse.should_shed(RequestOp::Lookup));
+        assert!(!fuse.should_shed(RequestOp::Getattr));
+        assert!(!fuse.should_shed(RequestOp::Readdir));
+
+        // Writes are shed.
+        assert!(fuse.should_shed(RequestOp::Write));
+        assert!(fuse.should_shed(RequestOp::Create));
+        assert!(fuse.should_shed(RequestOp::Mkdir));
+        assert!(fuse.should_shed(RequestOp::Unlink));
+        assert!(fuse.should_shed(RequestOp::Rmdir));
+        assert!(fuse.should_shed(RequestOp::Rename));
+        assert!(fuse.should_shed(RequestOp::Link));
+        assert!(fuse.should_shed(RequestOp::Symlink));
+        assert!(fuse.should_shed(RequestOp::Fallocate));
+        assert!(fuse.should_shed(RequestOp::Setattr));
+        assert!(fuse.should_shed(RequestOp::Setxattr));
+        assert!(fuse.should_shed(RequestOp::Removexattr));
+    }
+
+    #[test]
+    fn should_shed_with_normal_gate_proceeds_all() {
+        use asupersync::SystemPressure;
+        use ffs_core::DegradationFsm;
+
+        // Normal level: headroom 0.9 → all ops proceed.
+        let pressure = Arc::new(SystemPressure::with_headroom(0.9));
+        let fsm = Arc::new(DegradationFsm::new(Arc::clone(&pressure), 1));
+        fsm.tick();
+        let gate = BackpressureGate::new(fsm);
+
+        let opts = MountOptions::default();
+        let fuse = FrankenFuse::with_backpressure(Box::new(StubFs), &opts, gate);
+
+        assert!(!fuse.should_shed(RequestOp::Read));
+        assert!(!fuse.should_shed(RequestOp::Write));
+        assert!(!fuse.should_shed(RequestOp::Create));
+        assert!(!fuse.should_shed(RequestOp::Mkdir));
+    }
+
+    // ── AccessPredictor backward sequence detection ──────────────────────
+
+    #[test]
+    fn access_predictor_backward_sequence_does_not_batch() {
+        let predictor = AccessPredictor::default();
+        let ino = InodeNumber(20);
+        let size = 4096_u32;
+
+        // Read backward: 3*4096, 2*4096, 1*4096, 0
+        predictor.record_read(ino, u64::from(size) * 3, size);
+        predictor.record_read(ino, u64::from(size) * 2, size);
+        predictor.record_read(ino, u64::from(size), size);
+
+        // After backward sequence, fetch_size should NOT batch (returns requested).
+        assert_eq!(predictor.fetch_size(ino, 0, size), size);
+    }
+
+    #[test]
+    fn access_predictor_random_access_does_not_batch() {
+        let predictor = AccessPredictor::default();
+        let ino = InodeNumber(21);
+        let size = 4096_u32;
+
+        // Random offsets.
+        predictor.record_read(ino, 0, size);
+        predictor.record_read(ino, u64::from(size) * 10, size);
+        predictor.record_read(ino, u64::from(size) * 3, size);
+        predictor.record_read(ino, u64::from(size) * 7, size);
+
+        // Not sequential → no batching.
+        assert_eq!(predictor.fetch_size(ino, u64::from(size) * 8, size), size);
+    }
+
+    #[test]
+    fn access_predictor_different_inodes_are_independent() {
+        let predictor = AccessPredictor::default();
+        let size = 4096_u32;
+
+        // Build forward sequence on inode 30.
+        for i in 0..5_u64 {
+            predictor.record_read(InodeNumber(30), i * u64::from(size), size);
+        }
+
+        // Inode 31 has no history — should not batch.
+        assert_eq!(
+            predictor.fetch_size(InodeNumber(31), 0, size),
+            size,
+        );
+    }
+
+    // ── Concurrent AccessPredictor stress ────────────────────────────────
+
+    #[test]
+    fn access_predictor_concurrent_stress() {
+        let predictor = Arc::new(AccessPredictor::default());
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+
+        std::thread::scope(|s| {
+            for thread_id in 0_u64..8 {
+                let predictor = Arc::clone(&predictor);
+                let barrier = Arc::clone(&barrier);
+                s.spawn(move || {
+                    let ino = InodeNumber(100 + thread_id);
+                    barrier.wait();
+                    for i in 0_u64..500 {
+                        let offset = i * 4096;
+                        let _ = predictor.fetch_size(ino, offset, 4096);
+                        predictor.record_read(ino, offset, 4096);
+                    }
+                });
+            }
+        });
+
+        // No panic or deadlock = success. Verify state is queryable.
+        for thread_id in 0_u64..8 {
+            let _ = predictor.fetch_size(InodeNumber(100 + thread_id), 0, 4096);
+        }
+    }
+
+    // ── Metrics record_err tracking ──────────────────────────────────────
+
+    #[test]
+    fn atomic_metrics_tracks_errors_separately() {
+        let metrics = AtomicMetrics::new();
+        metrics.record_ok();
+        metrics.record_ok();
+        metrics.record_err();
+        metrics.record_bytes_read(1024);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.requests_total, 3);
+        assert_eq!(snap.requests_ok, 2);
+        assert_eq!(snap.requests_err, 1);
+        assert_eq!(snap.bytes_read, 1024);
+    }
+
+    // ── MountOptions thread count resolution ─────────────────────────────
+
+    #[test]
+    fn resolved_thread_count_auto_is_bounded() {
+        let opts = MountOptions {
+            worker_threads: 0,
+            ..Default::default()
+        };
+        let count = opts.resolved_thread_count();
+        assert!(count >= 1);
+        assert!(count <= 8);
+    }
+
+    #[test]
+    fn resolved_thread_count_explicit_value_passes_through() {
+        let opts = MountOptions {
+            worker_threads: 4,
+            ..Default::default()
+        };
+        assert_eq!(opts.resolved_thread_count(), 4);
+    }
+
+    #[test]
+    fn resolved_thread_count_clamps_to_at_least_one() {
+        // worker_threads=0 means auto, so test with 1.
+        let opts = MountOptions {
+            worker_threads: 1,
+            ..Default::default()
+        };
+        assert_eq!(opts.resolved_thread_count(), 1);
+    }
+
+    // ── FrankenFuse thread_count accessor ────────────────────────────────
+
+    #[test]
+    fn franken_fuse_thread_count_matches_options() {
+        let opts = MountOptions {
+            worker_threads: 3,
+            ..Default::default()
+        };
+        let fuse = FrankenFuse::with_options(Box::new(StubFs), &opts);
+        assert_eq!(fuse.thread_count(), 3);
+    }
+
+    // ── ReadaheadManager edge cases ──────────────────────────────────────
+
+    #[test]
+    fn readahead_manager_miss_returns_none() {
+        let manager = ReadaheadManager::new(8);
+        // No data inserted → take returns None.
+        assert_eq!(manager.take(InodeNumber(1), 0, 4), None);
+    }
+
+    #[test]
+    fn readahead_manager_wrong_offset_returns_none() {
+        let manager = ReadaheadManager::new(8);
+        let ino = InodeNumber(2);
+        manager.insert(ino, 100, vec![1, 2, 3]);
+        // Wrong offset → miss.
+        assert_eq!(manager.take(ino, 200, 3), None);
+        // Correct offset → hit.
+        assert_eq!(manager.take(ino, 100, 3), Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn readahead_manager_exact_size_take() {
+        let manager = ReadaheadManager::new(8);
+        let ino = InodeNumber(3);
+        manager.insert(ino, 0, vec![10, 20, 30, 40]);
+        // Take exactly the stored amount.
+        assert_eq!(manager.take(ino, 0, 4), Some(vec![10, 20, 30, 40]));
+        // Second take should return None (consumed).
+        assert_eq!(manager.take(ino, 0, 4), None);
+    }
 }
