@@ -1412,6 +1412,89 @@ pub fn verify_extent_block_checksum(
     Ok(())
 }
 
+/// Verify that an inode bitmap's free-bit count matches the group descriptor.
+///
+/// `inodes_per_group` is `s_inodes_per_group` from the superblock.
+/// `expected_free_inodes` is `bg_free_inodes_count` from the group descriptor.
+pub fn verify_inode_bitmap_free_count(
+    raw_bitmap: &[u8],
+    inodes_per_group: u32,
+    expected_free_inodes: u32,
+) -> Result<(), ParseError> {
+    verify_bitmap_free_count(
+        raw_bitmap,
+        inodes_per_group,
+        expected_free_inodes,
+        "bg_inode_bitmap",
+    )
+}
+
+/// Verify that a block bitmap's free-bit count matches the group descriptor.
+///
+/// `blocks_per_group` is `s_blocks_per_group` from the superblock.
+/// `expected_free_blocks` is `bg_free_blocks_count` from the group descriptor.
+pub fn verify_block_bitmap_free_count(
+    raw_bitmap: &[u8],
+    blocks_per_group: u32,
+    expected_free_blocks: u32,
+) -> Result<(), ParseError> {
+    verify_bitmap_free_count(
+        raw_bitmap,
+        blocks_per_group,
+        expected_free_blocks,
+        "bg_block_bitmap",
+    )
+}
+
+fn verify_bitmap_free_count(
+    raw_bitmap: &[u8],
+    total_bits: u32,
+    expected_free_count: u32,
+    field: &'static str,
+) -> Result<(), ParseError> {
+    let bytes_needed_u32 = total_bits.div_ceil(8);
+    let bytes_needed =
+        usize::try_from(bytes_needed_u32).map_err(|_| ParseError::IntegerConversion {
+            field: "bitmap_len",
+        })?;
+    if raw_bitmap.len() < bytes_needed {
+        return Err(ParseError::InsufficientData {
+            needed: bytes_needed,
+            offset: 0,
+            actual: raw_bitmap.len(),
+        });
+    }
+
+    let full_bytes_u32 = total_bits / 8;
+    let full_bytes =
+        usize::try_from(full_bytes_u32).map_err(|_| ParseError::IntegerConversion {
+            field: "bitmap_len",
+        })?;
+    let rem_bits = total_bits % 8;
+
+    let used_bits_full: u32 = raw_bitmap[..full_bytes]
+        .iter()
+        .map(|byte| byte.count_ones())
+        .sum();
+    let used_bits_rem = if rem_bits == 0 {
+        0
+    } else {
+        let mask = (1_u8 << rem_bits) - 1;
+        (raw_bitmap[full_bytes] & mask).count_ones()
+    };
+    let used_bits = used_bits_full.saturating_add(used_bits_rem);
+    let free_bits = total_bits.saturating_sub(used_bits);
+
+    if free_bits != expected_free_count {
+        return Err(ParseError::InvalidField {
+            field,
+            reason: "bitmap free count mismatch",
+        });
+    }
+
+    Ok(())
+}
+
 // EXT4_HUGE_FILE_FL imported from ffs_types
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3614,6 +3697,7 @@ fn tea_transform(a: &mut u32, b: &mut u32, c: &mut u32, d: &mut u32, buf: &[u32]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn parse_ext4_superblock_region_smoke() {
@@ -4906,6 +4990,193 @@ mod tests {
         // Corrupt one byte and verify it fails
         raw[0x10] ^= 0x01;
         assert!(verify_inode_checksum(&raw, csum_seed, ino, inode_size).is_err());
+    }
+
+    fn set_bitmap_bit(bitmap: &mut [u8], bit: u32) {
+        let byte_idx = usize::try_from(bit / 8).expect("bit index fits usize");
+        let bit_in_byte = u8::try_from(bit % 8).expect("bit-in-byte fits u8");
+        bitmap[byte_idx] |= 1_u8 << bit_in_byte;
+    }
+
+    #[test]
+    fn inode_bitmap_corruption_detected_by_free_count_mismatch() {
+        let inodes_per_group = 32_u32;
+        let mut inode_bitmap = vec![0_u8; 4];
+
+        // Mark 3 inodes used -> free should be 29.
+        set_bitmap_bit(&mut inode_bitmap, 0);
+        set_bitmap_bit(&mut inode_bitmap, 2);
+        set_bitmap_bit(&mut inode_bitmap, 7);
+        verify_inode_bitmap_free_count(&inode_bitmap, inodes_per_group, 29)
+            .expect("free count should match");
+
+        // Corrupt bitmap by flipping one more bit to "used".
+        set_bitmap_bit(&mut inode_bitmap, 8);
+        let err = verify_inode_bitmap_free_count(&inode_bitmap, inodes_per_group, 29)
+            .expect_err("bitmap mismatch should be detected");
+        assert!(matches!(
+            err,
+            ParseError::InvalidField {
+                field: "bg_inode_bitmap",
+                reason: "bitmap free count mismatch"
+            }
+        ));
+    }
+
+    #[test]
+    fn block_bitmap_corruption_detected_by_free_count_mismatch() {
+        let blocks_per_group = 64_u32;
+        let mut block_bitmap = vec![0_u8; 8];
+
+        // Mark 10 blocks used -> free should be 54.
+        for idx in [0_u32, 1, 2, 3, 8, 9, 10, 15, 31, 47] {
+            set_bitmap_bit(&mut block_bitmap, idx);
+        }
+        verify_block_bitmap_free_count(&block_bitmap, blocks_per_group, 54)
+            .expect("free count should match");
+
+        // Corrupt bitmap by clearing one used bit; free count no longer matches.
+        let byte_idx = usize::try_from(31_u32 / 8).expect("fits");
+        let bit_in_byte = u8::try_from(31_u32 % 8).expect("fits");
+        block_bitmap[byte_idx] &= !(1_u8 << bit_in_byte);
+
+        let err = verify_block_bitmap_free_count(&block_bitmap, blocks_per_group, 54)
+            .expect_err("bitmap mismatch should be detected");
+        assert!(matches!(
+            err,
+            ParseError::InvalidField {
+                field: "bg_block_bitmap",
+                reason: "bitmap free count mismatch"
+            }
+        ));
+    }
+
+    #[test]
+    fn extent_internal_corruption_keeps_earlier_extents_accessible() {
+        let block_size = 4096_usize;
+        let image_blocks = 80_usize;
+        let image_blocks_u32 = u32::try_from(image_blocks).expect("image blocks fit u32");
+        let block_size_u32 = u32::try_from(block_size).expect("block size fits u32");
+        let mut image = vec![0_u8; block_size * image_blocks];
+
+        // Superblock
+        let sb_off = EXT4_SUPERBLOCK_OFFSET;
+        let mut sb = [0_u8; EXT4_SUPERBLOCK_SIZE];
+        sb[0x38..0x3A].copy_from_slice(&EXT4_SUPER_MAGIC.to_le_bytes());
+        sb[0x18..0x1C].copy_from_slice(&2_u32.to_le_bytes()); // 4K blocks
+        sb[0x1C..0x20].copy_from_slice(&2_u32.to_le_bytes()); // 4K clusters
+        sb[0x00..0x04].copy_from_slice(&8192_u32.to_le_bytes()); // inodes_count
+        sb[0x04..0x08].copy_from_slice(&image_blocks_u32.to_le_bytes()); // blocks_count
+        sb[0x14..0x18].copy_from_slice(&0_u32.to_le_bytes()); // first_data_block=0
+        sb[0x20..0x24].copy_from_slice(&image_blocks_u32.to_le_bytes()); // blocks_per_group
+        sb[0x24..0x28].copy_from_slice(&image_blocks_u32.to_le_bytes()); // clusters_per_group
+        sb[0x28..0x2C].copy_from_slice(&8192_u32.to_le_bytes()); // inodes_per_group
+        sb[0x58..0x5A].copy_from_slice(&256_u16.to_le_bytes()); // inode_size
+        sb[0x54..0x58].copy_from_slice(&11_u32.to_le_bytes()); // first_ino
+        image[sb_off..sb_off + EXT4_SUPERBLOCK_SIZE].copy_from_slice(&sb);
+
+        // Group descriptor table at block 1, inode table starts at block 2.
+        let gdt_off = block_size;
+        let mut gd = [0_u8; 32];
+        gd[0x08..0x0C].copy_from_slice(&2_u32.to_le_bytes()); // inode_table
+        image[gdt_off..gdt_off + 32].copy_from_slice(&gd);
+
+        // Inode 11 with a depth-1 extent tree and two child leaves.
+        let inode_table_off = 2 * block_size;
+        let inode_off = inode_table_off + (11 - 1) * 256;
+        image[inode_off..inode_off + 2].copy_from_slice(&0o100_644_u16.to_le_bytes()); // mode
+        image[inode_off + 0x04..inode_off + 0x08]
+            .copy_from_slice(&(16_u32 * block_size_u32).to_le_bytes()); // size_lo
+        image[inode_off + 0x1A..inode_off + 0x1C].copy_from_slice(&1_u16.to_le_bytes()); // links
+        image[inode_off + 0x20..inode_off + 0x24].copy_from_slice(&0x0008_0000_u32.to_le_bytes()); // extents flag
+        image[inode_off + 0x64..inode_off + 0x68].copy_from_slice(&1_u32.to_le_bytes()); // generation
+
+        let i_block = inode_off + 0x28;
+        image[i_block..i_block + 2].copy_from_slice(&EXT4_EXTENT_MAGIC.to_le_bytes()); // magic
+        image[i_block + 2..i_block + 4].copy_from_slice(&2_u16.to_le_bytes()); // entries
+        image[i_block + 4..i_block + 6].copy_from_slice(&4_u16.to_le_bytes()); // max
+        image[i_block + 6..i_block + 8].copy_from_slice(&1_u16.to_le_bytes()); // depth
+        image[i_block + 8..i_block + 12].copy_from_slice(&1_u32.to_le_bytes()); // generation
+
+        // Index 0 -> leaf block 20 for logical blocks 0..7
+        let idx0 = i_block + 12;
+        image[idx0..idx0 + 4].copy_from_slice(&0_u32.to_le_bytes()); // logical start
+        image[idx0 + 4..idx0 + 8].copy_from_slice(&20_u32.to_le_bytes()); // leaf_lo
+        image[idx0 + 8..idx0 + 10].copy_from_slice(&0_u16.to_le_bytes()); // leaf_hi
+
+        // Index 1 -> leaf block 21 for logical blocks 8..
+        let idx1 = i_block + 24;
+        image[idx1..idx1 + 4].copy_from_slice(&8_u32.to_le_bytes()); // logical start
+        image[idx1 + 4..idx1 + 8].copy_from_slice(&21_u32.to_le_bytes()); // leaf_lo
+        image[idx1 + 8..idx1 + 10].copy_from_slice(&0_u16.to_le_bytes()); // leaf_hi
+
+        // Valid child leaf at block 20 -> one extent (logical 0..7 -> physical 40..47).
+        let leaf0 = 20 * block_size;
+        image[leaf0..leaf0 + 2].copy_from_slice(&EXT4_EXTENT_MAGIC.to_le_bytes()); // magic
+        image[leaf0 + 2..leaf0 + 4].copy_from_slice(&1_u16.to_le_bytes()); // entries
+        image[leaf0 + 4..leaf0 + 6].copy_from_slice(&4_u16.to_le_bytes()); // max
+        image[leaf0 + 6..leaf0 + 8].copy_from_slice(&0_u16.to_le_bytes()); // depth
+        image[leaf0 + 8..leaf0 + 12].copy_from_slice(&1_u32.to_le_bytes()); // generation
+        let leaf0_e = leaf0 + 12;
+        image[leaf0_e..leaf0_e + 4].copy_from_slice(&0_u32.to_le_bytes()); // logical
+        image[leaf0_e + 4..leaf0_e + 6].copy_from_slice(&8_u16.to_le_bytes()); // len
+        image[leaf0_e + 8..leaf0_e + 12].copy_from_slice(&40_u32.to_le_bytes()); // physical
+
+        // Corrupted child leaf at block 21 (bad magic).
+        let leaf1 = 21 * block_size;
+        image[leaf1..leaf1 + 2].copy_from_slice(&0xFFFF_u16.to_le_bytes()); // bad magic
+        image[leaf1 + 2..leaf1 + 4].copy_from_slice(&1_u16.to_le_bytes());
+        image[leaf1 + 4..leaf1 + 6].copy_from_slice(&4_u16.to_le_bytes());
+        image[leaf1 + 6..leaf1 + 8].copy_from_slice(&0_u16.to_le_bytes());
+
+        let reader = Ext4ImageReader::new(&image).expect("open image");
+        let inode = reader
+            .read_inode(&image, ffs_types::InodeNumber(11))
+            .expect("read inode 11");
+
+        // Extents before the corrupted child remain resolvable.
+        let first = reader
+            .resolve_extent(&image, &inode, 0)
+            .expect("resolve first logical block");
+        assert_eq!(first, Some(40));
+
+        // Extents routed through the corrupted child fail cleanly.
+        let err = reader
+            .resolve_extent(&image, &inode, 8)
+            .expect_err("second logical range should fail due to child corruption");
+        assert!(matches!(err, ParseError::InvalidMagic { .. }));
+    }
+
+    #[test]
+    fn inode_corruption_makes_only_target_file_inaccessible() {
+        let mut image = build_test_image();
+        let reader = Ext4ImageReader::new(&image).expect("open image");
+
+        // Corrupt inode 11's extent header magic (hello.txt).
+        let inode11_off = (2 * 4096) + ((11 - 1) * 256);
+        let i_block = inode11_off + 0x28;
+        image[i_block..i_block + 2].copy_from_slice(&0_u16.to_le_bytes());
+
+        // The corrupted file now fails cleanly on read.
+        let (_, hello_inode) = reader
+            .resolve_path(&image, "/hello.txt")
+            .expect("resolve corrupted inode path");
+        let mut hello_buf = vec![0_u8; 32];
+        let err = reader
+            .read_inode_data(&image, &hello_inode, 0, &mut hello_buf)
+            .expect_err("corrupted inode should fail");
+        assert!(matches!(err, ParseError::InvalidMagic { .. }));
+
+        // Neighbor files remain readable.
+        let (_, deep_inode) = reader
+            .resolve_path(&image, "/subdir/deep.txt")
+            .expect("resolve unaffected file");
+        let mut deep_buf = vec![0_u8; 16];
+        let n = reader
+            .read_inode_data(&image, &deep_inode, 0, &mut deep_buf)
+            .expect("unaffected file read succeeds");
+        assert_eq!(n, 16);
+        assert!(deep_buf.iter().all(|&b| b == b'A'));
     }
 
     // ── Extent mapping / file reading / path resolution tests ───────────
@@ -6422,5 +6693,212 @@ mod tests {
         let inode = make_device_inode(S_IFDIR | 0o755, 0, 0);
         assert!(inode.is_dir());
         assert_eq!(inode.device_number(), 0);
+    }
+
+    fn make_proptest_valid_ext4_superblock(
+        log_block_size: u32,
+        blocks_per_group: u32,
+        inodes_per_group: u32,
+        desc_size: u16,
+        incompat: u32,
+        volume_name: &[u8],
+    ) -> [u8; EXT4_SUPERBLOCK_SIZE] {
+        let mut sb = make_valid_sb();
+        let first_data_block = u32::from(log_block_size == 0);
+        let groups = 4_u32;
+        let blocks_count = blocks_per_group
+            .saturating_mul(groups)
+            .saturating_add(first_data_block);
+        let inodes_count = inodes_per_group.saturating_mul(groups);
+        let mut name = [0_u8; 16];
+        let copy_len = volume_name.len().min(name.len());
+        name[..copy_len].copy_from_slice(&volume_name[..copy_len]);
+
+        sb[0x18..0x1C].copy_from_slice(&log_block_size.to_le_bytes());
+        sb[0x1C..0x20].copy_from_slice(&log_block_size.to_le_bytes());
+        sb[0x14..0x18].copy_from_slice(&first_data_block.to_le_bytes());
+        sb[0x04..0x08].copy_from_slice(&blocks_count.to_le_bytes());
+        sb[0x20..0x24].copy_from_slice(&blocks_per_group.to_le_bytes());
+        sb[0x24..0x28].copy_from_slice(&blocks_per_group.to_le_bytes());
+        sb[0x28..0x2C].copy_from_slice(&inodes_per_group.to_le_bytes());
+        sb[0x00..0x04].copy_from_slice(&inodes_count.to_le_bytes());
+        sb[0x58..0x5A].copy_from_slice(&256_u16.to_le_bytes());
+        sb[0x54..0x58].copy_from_slice(&11_u32.to_le_bytes());
+        sb[0xFE..0x100].copy_from_slice(&desc_size.to_le_bytes());
+        sb[0x60..0x64].copy_from_slice(&incompat.to_le_bytes());
+        sb[0x5C..0x60].copy_from_slice(&0_u32.to_le_bytes());
+        sb[0x64..0x68].copy_from_slice(&0_u32.to_le_bytes());
+        sb[0x78..0x88].copy_from_slice(&name);
+        sb
+    }
+
+    // Reproduce any failing case with:
+    // PROPTEST_CASES=1 PROPTEST_SEED=<seed> cargo test -p ffs-ondisk <test_name> -- --nocapture
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn ext4_proptest_parse_superblock_region_no_panic(
+            bytes in proptest::collection::vec(any::<u8>(), 0..=(EXT4_SUPERBLOCK_SIZE * 2)),
+        ) {
+            let _ = Ext4Superblock::parse_superblock_region(&bytes);
+        }
+
+        #[test]
+        fn ext4_proptest_parse_from_image_no_panic(
+            image in proptest::collection::vec(
+                any::<u8>(),
+                0..=(EXT4_SUPERBLOCK_OFFSET + EXT4_SUPERBLOCK_SIZE + 256),
+            ),
+        ) {
+            let _ = Ext4Superblock::parse_from_image(&image);
+        }
+
+        #[test]
+        fn ext4_proptest_parse_extent_tree_no_panic(
+            block in proptest::collection::vec(any::<u8>(), 0..=4096),
+        ) {
+            let _ = parse_extent_tree(&block);
+        }
+
+        #[test]
+        fn ext4_proptest_parse_inode_extent_tree_no_panic(
+            inode_bytes in proptest::collection::vec(any::<u8>(), 128..=128),
+        ) {
+            let inode_buf: [u8; 128] = inode_bytes
+                .as_slice()
+                .try_into()
+                .expect("fixed-size inode bytes");
+            if let Ok(inode) = Ext4Inode::parse_from_bytes(&inode_buf) {
+                let _ = parse_inode_extent_tree(&inode);
+            }
+        }
+
+        #[test]
+        fn ext4_proptest_parse_dir_block_no_panic(
+            block in proptest::collection::vec(any::<u8>(), 0..=4096),
+            block_size in prop_oneof![Just(1024_u32), Just(2048_u32), Just(4096_u32)],
+        ) {
+            let _ = parse_dir_block(&block, block_size);
+        }
+
+        #[test]
+        fn ext4_proptest_iter_dir_block_no_panic(
+            block in proptest::collection::vec(any::<u8>(), 0..=4096),
+            block_size in prop_oneof![Just(1024_u32), Just(2048_u32), Just(4096_u32)],
+        ) {
+            for _entry in iter_dir_block(&block, block_size) {}
+        }
+
+        #[test]
+        fn ext4_proptest_structured_block_size_supported(log_block_size in 0_u32..=2) {
+            let incompat = Ext4IncompatFeatures::FILETYPE.0 | Ext4IncompatFeatures::EXTENTS.0;
+            let sb = make_proptest_valid_ext4_superblock(
+                log_block_size,
+                8192,
+                4096,
+                64,
+                incompat,
+                b"prop-ext4",
+            );
+            let parsed = Ext4Superblock::parse_superblock_region(&sb).expect("parse structured superblock");
+            prop_assert!(matches!(parsed.block_size, 1024 | 2048 | 4096));
+        }
+
+        #[test]
+        fn ext4_proptest_structured_group_counts_positive(
+            blocks_per_group in 1_u32..=8192,
+            inodes_per_group in 1_u32..=8192,
+            log_block_size in 0_u32..=2,
+        ) {
+            let incompat = Ext4IncompatFeatures::FILETYPE.0 | Ext4IncompatFeatures::EXTENTS.0;
+            let sb = make_proptest_valid_ext4_superblock(
+                log_block_size,
+                blocks_per_group,
+                inodes_per_group,
+                64,
+                incompat,
+                b"groups",
+            );
+            let parsed = Ext4Superblock::parse_superblock_region(&sb).expect("parse structured superblock");
+            prop_assert!(parsed.blocks_per_group > 0);
+            prop_assert!(parsed.inodes_per_group > 0);
+            prop_assert!(parsed.validate_geometry().is_ok());
+        }
+
+        #[test]
+        fn ext4_proptest_group_desc_size_floor_for_64bit(desc_size in 0_u16..=255) {
+            let incompat = Ext4IncompatFeatures::FILETYPE.0
+                | Ext4IncompatFeatures::EXTENTS.0
+                | Ext4IncompatFeatures::BIT64.0;
+            let sb = make_proptest_valid_ext4_superblock(
+                2,
+                8192,
+                4096,
+                desc_size,
+                incompat,
+                b"desc64",
+            );
+            let parsed = Ext4Superblock::parse_superblock_region(&sb).expect("parse structured superblock");
+            prop_assert!(parsed.is_64bit());
+            prop_assert!(parsed.group_desc_size() >= 64);
+        }
+
+        #[test]
+        fn ext4_proptest_group_desc_size_fixed_for_non_64bit(desc_size in 0_u16..=255) {
+            let incompat = Ext4IncompatFeatures::FILETYPE.0 | Ext4IncompatFeatures::EXTENTS.0;
+            let sb = make_proptest_valid_ext4_superblock(
+                2,
+                8192,
+                4096,
+                desc_size,
+                incompat,
+                b"desc32",
+            );
+            let parsed = Ext4Superblock::parse_superblock_region(&sb).expect("parse structured superblock");
+            prop_assert!(!parsed.is_64bit());
+            prop_assert_eq!(parsed.group_desc_size(), 32);
+        }
+
+        #[test]
+        fn ext4_proptest_parse_from_image_reads_superblock_at_offset(
+            mut image in proptest::collection::vec(
+                any::<u8>(),
+                (EXT4_SUPERBLOCK_OFFSET + EXT4_SUPERBLOCK_SIZE)..=(EXT4_SUPERBLOCK_OFFSET + EXT4_SUPERBLOCK_SIZE + 256),
+            ),
+            log_block_size in 0_u32..=2,
+        ) {
+            let incompat = Ext4IncompatFeatures::FILETYPE.0 | Ext4IncompatFeatures::EXTENTS.0;
+            let sb = make_proptest_valid_ext4_superblock(
+                log_block_size,
+                8192,
+                4096,
+                64,
+                incompat,
+                b"offset",
+            );
+            image[EXT4_SUPERBLOCK_OFFSET..EXT4_SUPERBLOCK_OFFSET + EXT4_SUPERBLOCK_SIZE]
+                .copy_from_slice(&sb);
+            let parsed = Ext4Superblock::parse_from_image(&image).expect("parse from image");
+            prop_assert!(matches!(parsed.block_size, 1024 | 2048 | 4096));
+        }
+
+        #[test]
+        fn ext4_proptest_volume_name_trimmed(
+            raw_name in proptest::collection::vec(any::<u8>(), 0..=16),
+        ) {
+            let incompat = Ext4IncompatFeatures::FILETYPE.0 | Ext4IncompatFeatures::EXTENTS.0;
+            let sb = make_proptest_valid_ext4_superblock(
+                2,
+                8192,
+                4096,
+                64,
+                incompat,
+                &raw_name,
+            );
+            let parsed = Ext4Superblock::parse_superblock_region(&sb).expect("parse structured superblock");
+            prop_assert!(parsed.volume_name.chars().count() <= 16);
+            prop_assert!(!parsed.volume_name.contains('\0'));
+        }
     }
 }

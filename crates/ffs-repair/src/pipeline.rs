@@ -15,11 +15,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use asupersync::{Cx, SystemPressure};
-use ffs_block::BlockDevice;
+use ffs_block::{BlockDevice, RepairFlushLifecycle};
 use ffs_error::{FfsError, Result};
 use ffs_types::{BlockNumber, GroupNumber};
 use serde::{Deserialize, Serialize};
@@ -112,6 +112,147 @@ impl GroupRefreshState {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct GroupBlockRange {
+    group: GroupNumber,
+    start: u64,
+    end: u64,
+}
+
+/// Flush-driven queue of block groups that require symbol refresh.
+///
+/// This adapter bridges write-back flush notifications from `ffs-block` into
+/// the repair pipeline without coupling `ffs-block` to repair internals.
+#[derive(Debug, Clone)]
+pub struct QueuedRepairRefresh {
+    group_ranges: Arc<Vec<GroupBlockRange>>,
+    queued_groups: Arc<Mutex<BTreeSet<GroupNumber>>>,
+}
+
+impl QueuedRepairRefresh {
+    /// Build a queue adapter from repair group configurations.
+    #[must_use]
+    pub fn from_group_configs(groups: &[GroupConfig]) -> Self {
+        let ranges = groups
+            .iter()
+            .map(|cfg| GroupBlockRange {
+                group: cfg.layout.group,
+                start: cfg.source_first_block.0,
+                end: cfg.source_first_block.0 + u64::from(cfg.source_block_count),
+            })
+            .collect();
+        Self {
+            group_ranges: Arc::new(ranges),
+            queued_groups: Arc::new(Mutex::new(BTreeSet::new())),
+        }
+    }
+
+    fn groups_for_blocks(&self, blocks: &[BlockNumber]) -> BTreeSet<GroupNumber> {
+        let mut groups = BTreeSet::new();
+        for block in blocks {
+            if let Some(range) = self
+                .group_ranges
+                .iter()
+                .find(|range| block.0 >= range.start && block.0 < range.end)
+            {
+                groups.insert(range.group);
+            }
+        }
+        groups
+    }
+
+    /// Drain queued dirty groups in deterministic order.
+    pub fn drain_queued_groups(&self) -> Result<Vec<GroupNumber>> {
+        let mut guard = self
+            .queued_groups
+            .lock()
+            .map_err(|_| FfsError::RepairFailed("queued refresh mutex poisoned".to_owned()))?;
+        let groups = guard.iter().copied().collect();
+        guard.clear();
+        drop(guard);
+        Ok(groups)
+    }
+
+    /// Apply queued refresh notifications to a mutable repair pipeline.
+    ///
+    /// Returns the number of groups refreshed immediately (groups that remain
+    /// dirty were queued but deferred by policy).
+    pub fn apply_queued_refreshes<W: Write>(
+        &self,
+        cx: &Cx,
+        pipeline: &mut ScrubWithRecovery<'_, W>,
+    ) -> Result<usize> {
+        let groups = self.drain_queued_groups()?;
+        if groups.is_empty() {
+            return Ok(0);
+        }
+
+        let mut refreshed_now = 0_usize;
+        for group in groups {
+            let started = Instant::now();
+            pipeline.mark_group_dirty(group)?;
+            pipeline.on_group_flush(cx, group)?;
+
+            if pipeline.is_group_dirty(group) {
+                debug!(
+                    target: "ffs::repair::refresh",
+                    group_id = group.0,
+                    "symbol_refresh_deferred"
+                );
+            } else {
+                let symbols = pipeline
+                    .find_group_config(group)
+                    .map_or(0, |cfg| pipeline.selected_refresh_symbol_count(&cfg));
+                info!(
+                    target: "ffs::repair::refresh",
+                    group_id = group.0,
+                    duration_ms = started.elapsed().as_millis(),
+                    symbol_count = symbols,
+                    "symbol_refresh_complete"
+                );
+                refreshed_now += 1;
+            }
+        }
+        Ok(refreshed_now)
+    }
+}
+
+impl RepairFlushLifecycle for QueuedRepairRefresh {
+    fn on_flush_committed(&self, _cx: &Cx, blocks: &[BlockNumber]) -> Result<()> {
+        let groups = self.groups_for_blocks(blocks);
+        if groups.is_empty() {
+            return Ok(());
+        }
+
+        let group_ids: Vec<u32> = groups.iter().map(|group| group.0).collect();
+        debug!(
+            target: "ffs::repair::refresh",
+            group_ids = ?group_ids,
+            block_count = blocks.len(),
+            "flush_triggers_refresh"
+        );
+
+        {
+            let mut queued = self
+                .queued_groups
+                .lock()
+                .map_err(|_| FfsError::RepairFailed("queued refresh mutex poisoned".to_owned()))?;
+            for group in &groups {
+                queued.insert(*group);
+            }
+        }
+        for group in groups {
+            debug!(
+                target: "ffs::repair::refresh",
+                group_id = group.0,
+                priority = "normal",
+                "symbol_refresh_queued"
+            );
+        }
+        Ok(())
+    }
+}
+
 // ── Recovery report ───────────────────────────────────────────────────────
 
 /// Outcome for a single block.
@@ -178,6 +319,10 @@ pub struct ScrubDaemonConfig {
     pub interval: Duration,
     /// Cancellation polling granularity while sleeping.
     pub cancel_check_interval: Duration,
+    /// Poll quota threshold below which the daemon yields for budget pressure.
+    pub budget_poll_quota_threshold: u32,
+    /// Yield duration when budget pressure is active.
+    pub budget_sleep: Duration,
     /// Headroom threshold below which the daemon yields for backpressure.
     pub backpressure_headroom_threshold: f32,
     /// Yield duration when backpressure is active.
@@ -189,6 +334,8 @@ impl Default for ScrubDaemonConfig {
         Self {
             interval: Duration::from_secs(5),
             cancel_check_interval: Duration::from_millis(100),
+            budget_poll_quota_threshold: 256,
+            budget_sleep: Duration::from_millis(10),
             backpressure_headroom_threshold: 0.3,
             backpressure_sleep: Duration::from_millis(25),
         }
@@ -246,6 +393,7 @@ pub struct ScrubDaemon<'a, W: Write> {
     round_groups_scanned: usize,
     round_corrupt: usize,
     round_recovered: usize,
+    throttled: bool,
 }
 
 // ── Pipeline ──────────────────────────────────────────────────────────────
@@ -348,13 +496,45 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
         self
     }
 
+    /// Mark a group as dirty without immediately forcing refresh.
+    ///
+    /// This is used by write-path integrations that batch refresh work until
+    /// an explicit flush/scrub boundary.
+    pub fn mark_group_dirty(&mut self, group: GroupNumber) -> Result<()> {
+        self.mark_group_dirty_with_cause(group, "manual")
+    }
+
+    /// Return whether a group is currently marked dirty.
+    #[must_use]
+    pub fn is_group_dirty(&self, group: GroupNumber) -> bool {
+        self.refresh_states
+            .get(&group.0)
+            .is_some_and(|state| state.dirty)
+    }
+
+    /// Return all dirty groups in deterministic order.
+    #[must_use]
+    pub fn dirty_groups(&self) -> Vec<GroupNumber> {
+        self.refresh_states
+            .iter()
+            .filter_map(|(group, state)| state.dirty.then_some(GroupNumber(*group)))
+            .collect()
+    }
+
     /// Notify the refresh policy that a write dirtied `group`.
     ///
     /// Eager/adaptive-eager policies will immediately refresh symbols.
     pub fn on_group_write(&mut self, cx: &Cx, group: GroupNumber) -> Result<()> {
-        self.mark_group_dirty(group)?;
+        self.mark_group_dirty_with_cause(group, "write")?;
         self.maybe_refresh_dirty_group(cx, group, true)?;
         Ok(())
+    }
+
+    /// Notify the refresh policy that dirty data for `group` reached a flush boundary.
+    ///
+    /// This is intended for fsync/flush wiring from write-back layers.
+    pub fn on_group_flush(&mut self, cx: &Cx, group: GroupNumber) -> Result<()> {
+        self.maybe_refresh_dirty_group(cx, group, true)
     }
 
     /// Run the full scrub-and-recover pipeline.
@@ -377,7 +557,7 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             "scrub complete"
         );
         self.update_adaptive_policy(&report)?;
-        self.refresh_dirty_groups(cx)?;
+        self.refresh_dirty_groups_now(cx)?;
 
         if report.is_clean() {
             info!("scrub_and_recover: no corruption found");
@@ -506,7 +686,11 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             .find(|cfg| cfg.layout.group == group)
     }
 
-    fn mark_group_dirty(&mut self, group: GroupNumber) -> Result<()> {
+    fn mark_group_dirty_with_cause(
+        &mut self,
+        group: GroupNumber,
+        cause: &'static str,
+    ) -> Result<()> {
         let state = self
             .refresh_states
             .get_mut(&group.0)
@@ -515,9 +699,10 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             state.dirty = true;
             state.dirty_since = Some(Instant::now());
         }
-        debug!(
+        trace!(
             target: "ffs::repair::refresh",
             group = group.0,
+            cause,
             policy = ?state.policy,
             dirty = state.dirty,
             "refresh_group_marked_dirty"
@@ -525,12 +710,9 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
         Ok(())
     }
 
-    fn refresh_dirty_groups(&mut self, cx: &Cx) -> Result<()> {
-        let dirty_groups: Vec<GroupNumber> = self
-            .refresh_states
-            .iter()
-            .filter_map(|(group, state)| state.dirty.then_some(GroupNumber(*group)))
-            .collect();
+    /// Refresh all currently dirty groups using scrub-trigger semantics.
+    pub fn refresh_dirty_groups_now(&mut self, cx: &Cx) -> Result<()> {
+        let dirty_groups = self.dirty_groups();
         for group in dirty_groups {
             self.maybe_refresh_dirty_group(cx, group, false)?;
         }
@@ -1175,6 +1357,7 @@ impl<'a, W: Write> ScrubDaemon<'a, W> {
             round_groups_scanned: 0,
             round_corrupt: 0,
             round_recovered: 0,
+            throttled: false,
         }
     }
 
@@ -1229,6 +1412,7 @@ impl<'a, W: Write> ScrubDaemon<'a, W> {
 
         let group_cfg = self.pipeline.groups[self.next_group_index];
         let group = group_cfg.layout.group;
+        self.maybe_backpressure_yield(cx, group)?;
         trace!(
             target: "ffs::repair::daemon",
             group_id = group.0,
@@ -1296,8 +1480,6 @@ impl<'a, W: Write> ScrubDaemon<'a, W> {
             );
         }
 
-        self.maybe_backpressure_yield(cx, group)?;
-
         Ok(ScrubDaemonStep {
             group: group.0,
             blocks_scanned: report.blocks_scanned,
@@ -1323,6 +1505,7 @@ impl<'a, W: Write> ScrubDaemon<'a, W> {
             target: "ffs::repair::daemon",
             total_groups = self.pipeline.groups.len(),
             interval_secs = self.config.interval.as_secs_f64(),
+            budget_poll_quota_threshold = self.config.budget_poll_quota_threshold,
             backpressure_threshold = self.config.backpressure_headroom_threshold,
             "scrub_daemon_start"
         );
@@ -1383,26 +1566,56 @@ impl<'a, W: Write> ScrubDaemon<'a, W> {
     }
 
     fn maybe_backpressure_yield(&mut self, cx: &Cx, group: GroupNumber) -> Result<()> {
-        let Some(pressure) = self.pressure.as_ref() else {
-            return Ok(());
-        };
-
-        let headroom = pressure.headroom();
-        if headroom >= self.config.backpressure_headroom_threshold {
-            return Ok(());
+        let budget = cx.budget();
+        let budget_remaining = budget.poll_quota;
+        if budget.is_exhausted() || budget_remaining <= self.config.budget_poll_quota_threshold {
+            let yield_duration = self.config.budget_sleep;
+            self.metrics.backpressure_yields = self.metrics.backpressure_yields.saturating_add(1);
+            debug!(
+                target: "ffs::repair::daemon",
+                daemon_name = "scrub_daemon",
+                current_group = group.0,
+                budget_remaining,
+                yield_duration_ms = yield_duration.as_millis(),
+                pressure_level = "budget",
+                "daemon_throttled"
+            );
+            self.throttled = true;
+            return self.sleep_with_checkpoint(cx, yield_duration);
         }
 
-        let yield_duration = self.config.backpressure_sleep;
-        self.metrics.backpressure_yields = self.metrics.backpressure_yields.saturating_add(1);
-        debug!(
-            target: "ffs::repair::daemon",
-            current_group = group.0,
-            pressure_source = pressure.level_label(),
-            headroom,
-            yield_duration_ms = yield_duration.as_millis(),
-            "backpressure_yield"
-        );
-        self.sleep_with_checkpoint(cx, yield_duration)
+        if let Some(pressure) = self.pressure.as_ref() {
+            let headroom = pressure.headroom();
+            if headroom < self.config.backpressure_headroom_threshold {
+                let yield_duration = self.config.backpressure_sleep;
+                self.metrics.backpressure_yields =
+                    self.metrics.backpressure_yields.saturating_add(1);
+                debug!(
+                    target: "ffs::repair::daemon",
+                    daemon_name = "scrub_daemon",
+                    current_group = group.0,
+                    pressure_source = pressure.level_label(),
+                    headroom,
+                    budget_remaining,
+                    yield_duration_ms = yield_duration.as_millis(),
+                    pressure_level = "system",
+                    "daemon_throttled"
+                );
+                self.throttled = true;
+                return self.sleep_with_checkpoint(cx, yield_duration);
+            }
+        }
+
+        if self.throttled {
+            debug!(
+                target: "ffs::repair::daemon",
+                daemon_name = "scrub_daemon",
+                new_budget = budget_remaining,
+                "daemon_resumed"
+            );
+            self.throttled = false;
+        }
+        Ok(())
     }
 
     fn sleep_with_checkpoint(&self, cx: &Cx, duration: Duration) -> Result<()> {
@@ -1429,9 +1642,11 @@ mod tests {
     use crate::autopilot::DurabilityAutopilot;
     use crate::codec::encode_group;
     use crate::evidence::{EvidenceEventType, EvidenceRecord};
-    use crate::scrub::{BlockVerdict, CorruptionKind, Severity};
+    use crate::scrub::{BlockVerdict, CorruptionKind, Ext4SuperblockValidator, Severity};
     use crate::symbol::RepairGroupDescExt;
-    use ffs_block::BlockBuf;
+    use ffs_block::{ArcCache, ArcWritePolicy, BlockBuf, RepairFlushLifecycle};
+    use ffs_ondisk::{Ext4IncompatFeatures, Ext4RoCompatFeatures};
+    use ffs_types::{EXT4_SUPER_MAGIC, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE};
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
@@ -1536,6 +1751,29 @@ mod tests {
                 u8::try_from(value).expect("value < 251")
             })
             .collect()
+    }
+
+    fn make_valid_ext4_superblock_region() -> [u8; EXT4_SUPERBLOCK_SIZE] {
+        let mut sb = [0_u8; EXT4_SUPERBLOCK_SIZE];
+        sb[0x38..0x3A].copy_from_slice(&EXT4_SUPER_MAGIC.to_le_bytes()); // magic
+        sb[0x18..0x1C].copy_from_slice(&2_u32.to_le_bytes()); // 4KiB blocks
+        sb[0x1C..0x20].copy_from_slice(&2_u32.to_le_bytes()); // 4KiB clusters
+        sb[0x00..0x04].copy_from_slice(&8192_u32.to_le_bytes()); // inodes_count
+        sb[0x04..0x08].copy_from_slice(&32768_u32.to_le_bytes()); // blocks_count_lo
+        sb[0x14..0x18].copy_from_slice(&0_u32.to_le_bytes()); // first_data_block
+        sb[0x20..0x24].copy_from_slice(&32768_u32.to_le_bytes()); // blocks_per_group
+        sb[0x24..0x28].copy_from_slice(&32768_u32.to_le_bytes()); // clusters_per_group
+        sb[0x28..0x2C].copy_from_slice(&8192_u32.to_le_bytes()); // inodes_per_group
+        sb[0x58..0x5A].copy_from_slice(&256_u16.to_le_bytes()); // inode_size
+        let incompat =
+            (Ext4IncompatFeatures::FILETYPE.0 | Ext4IncompatFeatures::EXTENTS.0).to_le_bytes();
+        sb[0x60..0x64].copy_from_slice(&incompat);
+        sb[0x64..0x68].copy_from_slice(&Ext4RoCompatFeatures::METADATA_CSUM.0.to_le_bytes());
+        sb[0x175] = 1; // checksum_type=crc32c
+
+        let checksum = crc32c::crc32c_append(!0_u32, &sb[..0x3FC]);
+        sb[0x3FC..0x400].copy_from_slice(&checksum.to_le_bytes());
+        sb
     }
 
     fn write_source_blocks(
@@ -2078,6 +2316,95 @@ mod tests {
     }
 
     #[test]
+    fn ext4_superblock_corruption_recovered_and_logged() {
+        let cx = Cx::for_testing();
+        let block_size = 4096;
+        let device = MemBlockDevice::new(block_size, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 8).expect("layout");
+        let source_first = BlockNumber(0);
+        let source_count = 8;
+
+        let mut originals = write_source_blocks(&cx, &device, source_first, source_count);
+        let mut block0 = originals[0].clone();
+        let superblock = make_valid_ext4_superblock_region();
+        block0[EXT4_SUPERBLOCK_OFFSET..EXT4_SUPERBLOCK_OFFSET + EXT4_SUPERBLOCK_SIZE]
+            .copy_from_slice(&superblock);
+        device
+            .write_block(&cx, source_first, &block0)
+            .expect("write ext4 superblock block");
+        originals[0] = block0.clone();
+
+        bootstrap_storage(&cx, &device, layout, source_first, source_count, 8);
+
+        let mut corrupted = block0;
+        corrupted[EXT4_SUPERBLOCK_OFFSET + 0x50] ^= 0x01; // invalidate checksum
+        device
+            .write_block(&cx, source_first, &corrupted)
+            .expect("inject superblock corruption");
+
+        let validator = Ext4SuperblockValidator::new(block_size);
+        let group_cfg = GroupConfig {
+            layout,
+            source_first_block: source_first,
+            source_block_count: source_count,
+        };
+        let mut ledger_buf = Vec::new();
+        let mut pipeline = ScrubWithRecovery::new(
+            &device,
+            &validator,
+            test_uuid(),
+            vec![group_cfg],
+            &mut ledger_buf,
+            8,
+        );
+
+        let report = pipeline.scrub_and_recover(&cx).expect("pipeline");
+        assert!(report.is_fully_recovered(), "{report:?}");
+        assert_eq!(report.total_corrupt, 1);
+        assert_eq!(report.total_recovered, 1);
+        assert_eq!(report.total_unrecoverable, 0);
+        assert_eq!(
+            report.block_outcomes.get(&0),
+            Some(&BlockOutcome::Recovered)
+        );
+
+        let repaired_block = device
+            .read_block(&cx, source_first)
+            .expect("read repaired block");
+        let repaired_region = &repaired_block.as_slice()
+            [EXT4_SUPERBLOCK_OFFSET..EXT4_SUPERBLOCK_OFFSET + EXT4_SUPERBLOCK_SIZE];
+        assert_eq!(repaired_region, superblock.as_slice());
+        assert_eq!(
+            repaired_block.as_slice(),
+            originals[0].as_slice(),
+            "source block should be byte-identical after repair"
+        );
+
+        let records = crate::evidence::parse_evidence_ledger(pipeline.into_ledger());
+        assert_ledger_self_consistency(&records);
+        assert_eq!(
+            count_event(&records, EvidenceEventType::CorruptionDetected),
+            1
+        );
+        assert_eq!(count_event(&records, EvidenceEventType::RepairAttempted), 1);
+        assert_eq!(count_event(&records, EvidenceEventType::RepairSucceeded), 1);
+        assert_eq!(count_event(&records, EvidenceEventType::RepairFailed), 0);
+
+        let corruption = records
+            .iter()
+            .find(|record| record.event_type == EvidenceEventType::CorruptionDetected)
+            .and_then(|record| record.corruption.as_ref())
+            .expect("corruption detail");
+        assert_eq!(corruption.blocks_affected, 1);
+        assert!(
+            corruption.detail.contains('0'),
+            "expected corruption detail to mention block 0, got: {}",
+            corruption.detail
+        );
+    }
+
+    #[test]
     fn multiple_corrupt_blocks_same_group_recovered() {
         let cx = Cx::for_testing();
         let block_size = 256;
@@ -2488,6 +2815,220 @@ mod tests {
 
         let generation_after = read_generation(&cx, &device, layout);
         assert_eq!(generation_after, generation_before + 1);
+    }
+
+    #[test]
+    fn dirty_group_tracking_api_reports_state() {
+        let cx = Cx::for_testing();
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+        let source_first = BlockNumber(0);
+        let source_count = 8;
+
+        write_source_blocks(&cx, &device, source_first, source_count);
+        bootstrap_storage(&cx, &device, layout, source_first, source_count, 4);
+
+        let validator = CorruptBlockValidator::new(vec![]);
+        let group_cfg = GroupConfig {
+            layout,
+            source_first_block: source_first,
+            source_block_count: source_count,
+        };
+        let mut ledger_buf = Vec::new();
+        let mut pipeline = ScrubWithRecovery::new(
+            &device,
+            &validator,
+            test_uuid(),
+            vec![group_cfg],
+            &mut ledger_buf,
+            4,
+        );
+
+        assert!(pipeline.dirty_groups().is_empty());
+        assert!(!pipeline.is_group_dirty(GroupNumber(0)));
+        pipeline
+            .mark_group_dirty(GroupNumber(0))
+            .expect("mark dirty");
+        assert_eq!(pipeline.dirty_groups(), vec![GroupNumber(0)]);
+        assert!(pipeline.is_group_dirty(GroupNumber(0)));
+
+        pipeline
+            .refresh_dirty_groups_now(&cx)
+            .expect("refresh dirty groups");
+        assert!(pipeline.dirty_groups().is_empty());
+        assert!(!pipeline.is_group_dirty(GroupNumber(0)));
+    }
+
+    #[test]
+    fn group_flush_refreshes_eager_policy() {
+        let cx = Cx::for_testing();
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+        let source_first = BlockNumber(0);
+        let source_count = 8;
+
+        write_source_blocks(&cx, &device, source_first, source_count);
+        bootstrap_storage(&cx, &device, layout, source_first, source_count, 4);
+        let generation_before = read_generation(&cx, &device, layout);
+
+        let validator = CorruptBlockValidator::new(vec![]);
+        let group_cfg = GroupConfig {
+            layout,
+            source_first_block: source_first,
+            source_block_count: source_count,
+        };
+        let mut ledger_buf = Vec::new();
+        let mut pipeline = ScrubWithRecovery::new(
+            &device,
+            &validator,
+            test_uuid(),
+            vec![group_cfg],
+            &mut ledger_buf,
+            4,
+        )
+        .with_group_refresh_policy(GroupNumber(0), RefreshPolicy::Eager);
+
+        pipeline
+            .mark_group_dirty(GroupNumber(0))
+            .expect("mark dirty");
+        pipeline
+            .on_group_flush(&cx, GroupNumber(0))
+            .expect("flush refresh");
+
+        assert_eq!(read_generation(&cx, &device, layout), generation_before + 1);
+        assert!(!pipeline.is_group_dirty(GroupNumber(0)));
+    }
+
+    #[test]
+    fn group_flush_keeps_fresh_lazy_group_dirty() {
+        let cx = Cx::for_testing();
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+        let source_first = BlockNumber(0);
+        let source_count = 8;
+
+        write_source_blocks(&cx, &device, source_first, source_count);
+        bootstrap_storage(&cx, &device, layout, source_first, source_count, 4);
+        let generation_before = read_generation(&cx, &device, layout);
+
+        let validator = CorruptBlockValidator::new(vec![]);
+        let group_cfg = GroupConfig {
+            layout,
+            source_first_block: source_first,
+            source_block_count: source_count,
+        };
+        let mut ledger_buf = Vec::new();
+        let mut pipeline = ScrubWithRecovery::new(
+            &device,
+            &validator,
+            test_uuid(),
+            vec![group_cfg],
+            &mut ledger_buf,
+            4,
+        )
+        .with_group_refresh_policy(
+            GroupNumber(0),
+            RefreshPolicy::Lazy {
+                max_staleness: Duration::from_secs(30),
+            },
+        );
+
+        pipeline
+            .mark_group_dirty(GroupNumber(0))
+            .expect("mark dirty");
+        pipeline
+            .on_group_flush(&cx, GroupNumber(0))
+            .expect("flush check");
+
+        assert_eq!(read_generation(&cx, &device, layout), generation_before);
+        assert!(pipeline.is_group_dirty(GroupNumber(0)));
+    }
+
+    #[test]
+    fn queued_refresh_lifecycle_receives_group_notifications() {
+        let cx = Cx::for_testing();
+        let groups = vec![
+            GroupConfig {
+                layout: RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4)
+                    .expect("layout0"),
+                source_first_block: BlockNumber(0),
+                source_block_count: 16,
+            },
+            GroupConfig {
+                layout: RepairGroupLayout::new(GroupNumber(1), BlockNumber(64), 64, 0, 4)
+                    .expect("layout1"),
+                source_first_block: BlockNumber(64),
+                source_block_count: 16,
+            },
+        ];
+
+        let queue = QueuedRepairRefresh::from_group_configs(&groups);
+        queue
+            .on_flush_committed(&cx, &[BlockNumber(3), BlockNumber(70), BlockNumber(71)])
+            .expect("queue groups");
+        let queued = queue.drain_queued_groups().expect("drain queue");
+        assert_eq!(queued, vec![GroupNumber(0), GroupNumber(1)]);
+    }
+
+    #[test]
+    fn writeback_flush_queue_triggers_symbol_refresh() {
+        let cx = Cx::for_testing();
+        let block_size = 256_u32;
+        let source_count = 8_u32;
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+        let group_cfg = GroupConfig {
+            layout,
+            source_first_block: BlockNumber(0),
+            source_block_count: source_count,
+        };
+        let queue = QueuedRepairRefresh::from_group_configs(&[group_cfg]);
+        let repair_lifecycle: Arc<dyn RepairFlushLifecycle> = Arc::new(queue.clone());
+
+        let cache = ArcCache::new_with_policy_and_repair_lifecycle(
+            MemBlockDevice::new(block_size, 128),
+            32,
+            ArcWritePolicy::WriteBack,
+            repair_lifecycle,
+        )
+        .expect("cache");
+
+        write_source_blocks(&cx, cache.inner(), BlockNumber(0), source_count);
+        bootstrap_storage(&cx, cache.inner(), layout, BlockNumber(0), source_count, 4);
+        let generation_before = read_generation(&cx, cache.inner(), layout);
+
+        let mut mutated = deterministic_block(99, block_size);
+        mutated[0] ^= 0x5A;
+        cache
+            .write_block(&cx, BlockNumber(2), &mutated)
+            .expect("stage write");
+        cache.flush_dirty(&cx).expect("flush dirty");
+
+        let validator = CorruptBlockValidator::new(vec![]);
+        let mut ledger_buf = Vec::new();
+        let mut pipeline = ScrubWithRecovery::new(
+            cache.inner(),
+            &validator,
+            test_uuid(),
+            vec![group_cfg],
+            &mut ledger_buf,
+            4,
+        );
+
+        let refreshed = queue
+            .apply_queued_refreshes(&cx, &mut pipeline)
+            .expect("apply refresh queue");
+        assert_eq!(refreshed, 1);
+        assert_eq!(
+            read_generation(&cx, cache.inner(), layout),
+            generation_before + 1
+        );
     }
 
     #[test]
@@ -2961,9 +3502,53 @@ mod tests {
                 cancel_check_interval: Duration::from_millis(1),
                 backpressure_headroom_threshold: 0.5,
                 backpressure_sleep: Duration::from_millis(1),
+                ..ScrubDaemonConfig::default()
             },
         )
         .with_pressure(pressure);
+
+        let _step = daemon.run_once(&cx).expect("run once");
+        assert_eq!(daemon.metrics().backpressure_yields, 1);
+    }
+
+    #[test]
+    fn scrub_daemon_yields_when_budget_is_low() {
+        let cx = Cx::for_testing_with_budget(asupersync::Budget::new().with_poll_quota(8));
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+        let source_first = BlockNumber(0);
+        let source_count = 8;
+
+        write_source_blocks(&cx, &device, source_first, source_count);
+        bootstrap_storage(&cx, &device, layout, source_first, source_count, 4);
+
+        let validator = CorruptBlockValidator::new(vec![]);
+        let group_cfg = GroupConfig {
+            layout,
+            source_first_block: source_first,
+            source_block_count: source_count,
+        };
+        let mut ledger_buf = Vec::new();
+        let pipeline = ScrubWithRecovery::new(
+            &device,
+            &validator,
+            test_uuid(),
+            vec![group_cfg],
+            &mut ledger_buf,
+            4,
+        );
+        let mut daemon = ScrubDaemon::new(
+            pipeline,
+            ScrubDaemonConfig {
+                interval: Duration::ZERO,
+                cancel_check_interval: Duration::from_millis(1),
+                budget_poll_quota_threshold: 16,
+                budget_sleep: Duration::from_millis(1),
+                ..ScrubDaemonConfig::default()
+            },
+        );
 
         let _step = daemon.run_once(&cx).expect("run once");
         assert_eq!(daemon.metrics().backpressure_yields, 1);

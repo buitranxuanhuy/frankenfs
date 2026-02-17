@@ -699,6 +699,7 @@ pub fn verify_tree_block_checksum(block: &[u8], csum_type: u16) -> Result<(), Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn parse_superblock_smoke() {
@@ -1190,5 +1191,139 @@ mod tests {
             ),
             "expected tree block checksum mismatch, got: {err:?}"
         );
+    }
+
+    fn make_proptest_valid_btrfs_superblock(
+        sectorsize: u32,
+        nodesize: u32,
+        sys_chunk_array: &[u8],
+    ) -> [u8; BTRFS_SUPER_INFO_SIZE] {
+        let mut sb = [0_u8; BTRFS_SUPER_INFO_SIZE];
+        let sys_chunk_len_u32 =
+            u32::try_from(sys_chunk_array.len()).expect("sys_chunk_array length fits in u32");
+
+        sb[0x40..0x48].copy_from_slice(&BTRFS_MAGIC.to_le_bytes());
+        sb[0x30..0x38].copy_from_slice(&(BTRFS_SUPER_INFO_OFFSET as u64).to_le_bytes());
+        sb[0x48..0x50].copy_from_slice(&1_u64.to_le_bytes());
+        sb[0x50..0x58].copy_from_slice(&0x1000_u64.to_le_bytes());
+        sb[0x58..0x60].copy_from_slice(&0x2000_u64.to_le_bytes());
+        sb[0x60..0x68].copy_from_slice(&0_u64.to_le_bytes());
+        sb[0x70..0x78].copy_from_slice(&1_000_000_u64.to_le_bytes());
+        sb[0x78..0x80].copy_from_slice(&123_456_u64.to_le_bytes());
+        sb[0x80..0x88].copy_from_slice(&6_u64.to_le_bytes());
+        sb[0x88..0x90].copy_from_slice(&1_u64.to_le_bytes());
+        sb[0x90..0x94].copy_from_slice(&sectorsize.to_le_bytes());
+        sb[0x94..0x98].copy_from_slice(&nodesize.to_le_bytes());
+        sb[0x9C..0xA0].copy_from_slice(&sectorsize.to_le_bytes());
+        sb[0xA0..0xA4].copy_from_slice(&sys_chunk_len_u32.to_le_bytes());
+
+        let array_end = BTRFS_SYS_CHUNK_ARRAY_OFFSET + sys_chunk_array.len();
+        sb[BTRFS_SYS_CHUNK_ARRAY_OFFSET..array_end].copy_from_slice(sys_chunk_array);
+        sb
+    }
+
+    fn make_proptest_header_block(block_size: usize, nritems: u32, level: u8) -> Vec<u8> {
+        let mut block = vec![0_u8; block_size.max(BTRFS_HEADER_SIZE)];
+        block[0x30..0x38].copy_from_slice(&0x1000_u64.to_le_bytes());
+        block[0x60..0x64].copy_from_slice(&nritems.to_le_bytes());
+        block[0x64] = level;
+        block
+    }
+
+    // Reproduce any failing case with:
+    // PROPTEST_CASES=1 PROPTEST_SEED=<seed> cargo test -p ffs-ondisk <test_name> -- --nocapture
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn btrfs_proptest_parse_superblock_region_no_panic(
+            region in proptest::collection::vec(any::<u8>(), 0..=(BTRFS_SUPER_INFO_SIZE * 2)),
+        ) {
+            let _ = BtrfsSuperblock::parse_superblock_region(&region);
+        }
+
+        #[test]
+        fn btrfs_proptest_parse_from_image_no_panic(
+            image in proptest::collection::vec(
+                any::<u8>(),
+                0..=(BTRFS_SUPER_INFO_OFFSET + BTRFS_SUPER_INFO_SIZE + 256),
+            ),
+        ) {
+            let _ = BtrfsSuperblock::parse_from_image(&image);
+        }
+
+        #[test]
+        fn btrfs_proptest_parse_sys_chunk_array_no_panic(
+            data in proptest::collection::vec(any::<u8>(), 0..=BTRFS_SYS_CHUNK_ARRAY_MAX),
+        ) {
+            let _ = parse_sys_chunk_array(&data);
+        }
+
+        #[test]
+        fn btrfs_proptest_parse_leaf_items_no_panic(
+            block in proptest::collection::vec(any::<u8>(), 0..=4096),
+        ) {
+            let _ = parse_leaf_items(&block);
+        }
+
+        #[test]
+        fn btrfs_proptest_parse_internal_items_no_panic(
+            block in proptest::collection::vec(any::<u8>(), 0..=4096),
+        ) {
+            let _ = parse_internal_items(&block);
+        }
+
+        #[test]
+        fn btrfs_proptest_header_parse_validate_no_panic(
+            block in proptest::collection::vec(any::<u8>(), 0..=4096),
+        ) {
+            if let Ok(header) = BtrfsHeader::parse_from_block(&block) {
+                let _ = header.validate(block.len(), None);
+            }
+        }
+
+        #[test]
+        fn btrfs_proptest_structured_superblock_size_invariants(
+            sector_shift in 12_u32..=18,
+            node_shift in 12_u32..=18,
+        ) {
+            let sectorsize = 1_u32 << sector_shift;
+            let nodesize = 1_u32 << node_shift;
+            let sb = make_proptest_valid_btrfs_superblock(sectorsize, nodesize, &[]);
+            let parsed = BtrfsSuperblock::parse_superblock_region(&sb).expect("parse structured btrfs superblock");
+            prop_assert!(parsed.sectorsize.is_power_of_two());
+            prop_assert!(parsed.nodesize.is_power_of_two());
+            prop_assert!(parsed.sectorsize <= 256 * 1024);
+            prop_assert!(parsed.nodesize <= 256 * 1024);
+        }
+
+        #[test]
+        fn btrfs_proptest_structured_sys_chunk_array_round_trip(
+            sys_chunk_array in proptest::collection::vec(any::<u8>(), 0..=128),
+        ) {
+            let sb = make_proptest_valid_btrfs_superblock(4096, 16384, &sys_chunk_array);
+            let parsed = BtrfsSuperblock::parse_superblock_region(&sb).expect("parse structured btrfs superblock");
+            prop_assert_eq!(usize::try_from(parsed.sys_chunk_array_size).ok(), Some(sys_chunk_array.len()));
+            prop_assert_eq!(parsed.sys_chunk_array, sys_chunk_array);
+        }
+
+        #[test]
+        fn btrfs_proptest_header_validate_leaf_capacity(nritems in 0_u32..=159) {
+            let block_size = 4096_usize;
+            let block = make_proptest_header_block(block_size, nritems, 0);
+            let header = BtrfsHeader::parse_from_block(&block).expect("parse header");
+            prop_assert!(header.validate(block_size, Some(0x1000)).is_ok());
+        }
+
+        #[test]
+        fn btrfs_proptest_header_validate_internal_capacity(
+            nritems in 0_u32..=121,
+            level in 1_u8..=BTRFS_MAX_LEVEL,
+        ) {
+            let block_size = 4096_usize;
+            let block = make_proptest_header_block(block_size, nritems, level);
+            let header = BtrfsHeader::parse_from_block(&block).expect("parse header");
+            prop_assert!(header.validate(block_size, Some(0x1000)).is_ok());
+        }
     }
 }

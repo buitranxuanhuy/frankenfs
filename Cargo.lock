@@ -686,6 +686,7 @@ dependencies = [
  "crossbeam-epoch",
  "ffs-block",
  "ffs-error",
+ "ffs-repair",
  "ffs-types",
  "parking_lot",
  "serde",
@@ -702,6 +703,7 @@ dependencies = [
  "crc32c",
  "ffs-error",
  "ffs-types",
+ "proptest",
  "serde",
 ]
 

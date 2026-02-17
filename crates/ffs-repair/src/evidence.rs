@@ -57,8 +57,12 @@ pub enum EvidenceEventType {
     SymbolRefresh,
     /// WAL recovery completed (replay after crash or restart).
     WalRecovery,
+    /// MVCC transaction committed successfully.
+    TransactionCommit,
     /// MVCC transaction was aborted.
     TxnAborted,
+    /// Serializable Snapshot Isolation conflict detected.
+    SerializationConflict,
     /// MVCC version garbage collection reclaimed old versions.
     VersionGc,
     /// Active snapshot watermark advanced.
@@ -185,6 +189,19 @@ pub struct WalRecoveryDetail {
     pub checkpoint_commit_seq: Option<u64>,
 }
 
+/// Detail payload for MVCC transaction commit events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransactionCommitDetail {
+    /// Committed transaction identifier.
+    pub txn_id: u64,
+    /// Assigned commit sequence.
+    pub commit_seq: u64,
+    /// Number of logical blocks in the write set.
+    pub write_set_size: usize,
+    /// End-to-end commit duration in microseconds.
+    pub duration_us: u64,
+}
+
 /// Abort reason classification for MVCC transaction aborts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -209,6 +226,24 @@ pub struct TxnAbortedDetail {
     /// Optional diagnostic message.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Number of blocks in the read set at abort time.
+    #[serde(default)]
+    pub read_set_size: usize,
+    /// Number of blocks in the write set at abort time.
+    #[serde(default)]
+    pub write_set_size: usize,
+}
+
+/// Detail payload for SSI serialization conflicts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SerializationConflictDetail {
+    /// Transaction rejected by SSI.
+    pub txn_id: u64,
+    /// Conflicting transaction identifier, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conflicting_txn: Option<u64>,
+    /// Conflict classification (for example, "rw_antidependency_cycle").
+    pub conflict_type: String,
 }
 
 /// Detail payload for MVCC version-GC events.
@@ -334,9 +369,15 @@ pub struct EvidenceRecord {
     /// WAL recovery detail (present when `event_type` is `WalRecovery`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wal_recovery: Option<WalRecoveryDetail>,
+    /// Transaction-commit detail (present when `event_type` is `TransactionCommit`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transaction_commit: Option<TransactionCommitDetail>,
     /// Transaction-aborted detail (present when `event_type` is `TxnAborted`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub txn_aborted: Option<TxnAbortedDetail>,
+    /// Serialization-conflict detail (present when `event_type` is `SerializationConflict`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serialization_conflict: Option<SerializationConflictDetail>,
     /// Version-GC detail (present when `event_type` is `VersionGc`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version_gc: Option<VersionGcDetail>,
@@ -373,7 +414,9 @@ impl EvidenceRecord {
             policy: None,
             symbol_refresh: None,
             wal_recovery: None,
+            transaction_commit: None,
             txn_aborted: None,
+            serialization_conflict: None,
             version_gc: None,
             snapshot_advanced: None,
             flush_batch: None,
@@ -448,11 +491,27 @@ impl EvidenceRecord {
         r
     }
 
+    /// Create a transaction-commit evidence record.
+    #[must_use]
+    pub fn transaction_commit(detail: TransactionCommitDetail) -> Self {
+        let mut r = Self::base(EvidenceEventType::TransactionCommit, 0);
+        r.transaction_commit = Some(detail);
+        r
+    }
+
     /// Create a transaction-aborted evidence record.
     #[must_use]
     pub fn txn_aborted(detail: TxnAbortedDetail) -> Self {
         let mut r = Self::base(EvidenceEventType::TxnAborted, 0);
         r.txn_aborted = Some(detail);
+        r
+    }
+
+    /// Create a serialization-conflict evidence record.
+    #[must_use]
+    pub fn serialization_conflict(detail: SerializationConflictDetail) -> Self {
+        let mut r = Self::base(EvidenceEventType::SerializationConflict, 0);
+        r.serialization_conflict = Some(detail);
         r
     }
 
@@ -701,6 +760,25 @@ mod tests {
             txn_id: 77,
             reason: TxnAbortReason::SsiCycle,
             detail: Some("rw-antidependency cycle".to_owned()),
+            read_set_size: 3,
+            write_set_size: 2,
+        }
+    }
+
+    fn sample_transaction_commit_detail() -> TransactionCommitDetail {
+        TransactionCommitDetail {
+            txn_id: 77,
+            commit_seq: 19,
+            write_set_size: 5,
+            duration_us: 420,
+        }
+    }
+
+    fn sample_serialization_conflict_detail() -> SerializationConflictDetail {
+        SerializationConflictDetail {
+            txn_id: 77,
+            conflicting_txn: Some(76),
+            conflict_type: "rw_antidependency_cycle".to_owned(),
         }
     }
 
@@ -886,6 +964,32 @@ mod tests {
         let parsed = EvidenceRecord::from_json(&json).expect("deserialize");
         assert_eq!(parsed.event_type, EvidenceEventType::TxnAborted);
         assert_eq!(parsed.txn_aborted, Some(sample_txn_aborted_detail()));
+    }
+
+    #[test]
+    fn transaction_commit_round_trip() {
+        let record = EvidenceRecord::transaction_commit(sample_transaction_commit_detail())
+            .with_timestamp(7_500_000);
+        let json = record.to_json().expect("serialize");
+        let parsed = EvidenceRecord::from_json(&json).expect("deserialize");
+        assert_eq!(parsed.event_type, EvidenceEventType::TransactionCommit);
+        assert_eq!(
+            parsed.transaction_commit,
+            Some(sample_transaction_commit_detail())
+        );
+    }
+
+    #[test]
+    fn serialization_conflict_round_trip() {
+        let record = EvidenceRecord::serialization_conflict(sample_serialization_conflict_detail())
+            .with_timestamp(7_750_000);
+        let json = record.to_json().expect("serialize");
+        let parsed = EvidenceRecord::from_json(&json).expect("deserialize");
+        assert_eq!(parsed.event_type, EvidenceEventType::SerializationConflict);
+        assert_eq!(
+            parsed.serialization_conflict,
+            Some(sample_serialization_conflict_detail())
+        );
     }
 
     #[test]
@@ -1118,7 +1222,9 @@ mod tests {
         assert!(!json.contains("\"symbol_refresh\""));
         assert!(!json.contains("\"block_range\""));
         assert!(!json.contains("\"wal_recovery\""));
+        assert!(!json.contains("\"transaction_commit\""));
         assert!(!json.contains("\"txn_aborted\""));
+        assert!(!json.contains("\"serialization_conflict\""));
         assert!(!json.contains("\"version_gc\""));
         assert!(!json.contains("\"snapshot_advanced\""));
         assert!(!json.contains("\"flush_batch\""));

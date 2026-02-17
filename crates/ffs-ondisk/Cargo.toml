@@ -12,5 +12,8 @@ ffs-error = { workspace = true }
 crc32c = { workspace = true }
 serde = { workspace = true }
 
+[dev-dependencies]
+proptest = { workspace = true }
+
 [lints]
 workspace = true

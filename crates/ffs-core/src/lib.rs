@@ -566,6 +566,21 @@ impl Ext4OrphanList {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Ext4OrphanRecoveryStats {
+    scanned: u32,
+    deleted: u32,
+    truncated: u32,
+    skipped: u32,
+}
+
+impl Ext4OrphanRecoveryStats {
+    #[must_use]
+    fn processed(self) -> u32 {
+        self.deleted.saturating_add(self.truncated)
+    }
+}
+
 pub fn detect_filesystem(image: &[u8]) -> Result<FsFlavor, DetectionError> {
     if let Ok(ext4) = Ext4Superblock::parse_from_image(image) {
         return Ok(FsFlavor::Ext4(ext4));
@@ -1085,6 +1100,28 @@ impl OpenFs {
             fs.ext4_journal_replay =
                 fs.maybe_replay_ext4_journal(cx, options.ext4_journal_replay_mode)?;
             fs.crash_recovery = fs.detect_and_recover_crash();
+            if options.ext4_journal_replay_mode != Ext4JournalReplayMode::Skip {
+                match fs.maybe_recover_ext4_orphans(cx) {
+                    Ok(stats) => {
+                        if stats.scanned > 0 {
+                            info!(
+                                scanned = stats.scanned,
+                                processed = stats.processed(),
+                                deleted = stats.deleted,
+                                truncated = stats.truncated,
+                                skipped = stats.skipped,
+                                "ext4 orphan recovery completed"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            "ext4 orphan recovery failed; filesystem remains read-only"
+                        );
+                    }
+                }
+            }
         }
 
         Ok(fs)
@@ -1207,6 +1244,199 @@ impl OpenFs {
             journal_blocks_replayed,
             mvcc_reset,
         })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn maybe_recover_ext4_orphans(&mut self, cx: &Cx) -> Result<Ext4OrphanRecoveryStats, FfsError> {
+        let (head, fs_state, inodes_count, csum_seed) = match self.ext4_superblock() {
+            Some(sb) => (sb.last_orphan, sb.state, sb.inodes_count, sb.csum_seed()),
+            None => return Ok(Ext4OrphanRecoveryStats::default()),
+        };
+        let has_orphan_flag = (fs_state & EXT4_ORPHAN_FS) != 0;
+
+        if !has_orphan_flag && head == 0 {
+            return Ok(Ext4OrphanRecoveryStats::default());
+        }
+
+        debug!(
+            orphan_head = head,
+            orphan_state_flag = has_orphan_flag,
+            "ext4 orphan recovery start"
+        );
+
+        let mut alloc = self.load_ext4_alloc_state(cx)?;
+        let block_dev = self.block_device_adapter();
+        let orphans = self.collect_ext4_orphan_list_lenient(cx, head, inodes_count)?;
+        let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
+        let mut stats = Ext4OrphanRecoveryStats::default();
+
+        for ino in orphans {
+            stats.scanned = stats.scanned.saturating_add(1);
+
+            let mut inode = match self.read_inode(cx, ino) {
+                Ok(inode) => inode,
+                Err(err) => {
+                    stats.skipped = stats.skipped.saturating_add(1);
+                    warn!(
+                        orphan_inode = ino.0,
+                        error = %err,
+                        "ext4 orphan recovery skipped unreadable inode"
+                    );
+                    continue;
+                }
+            };
+
+            if inode.links_count == 0 {
+                ffs_inode::delete_inode(
+                    cx,
+                    &block_dev,
+                    &alloc.geo,
+                    &mut alloc.groups,
+                    ino,
+                    &mut inode,
+                    csum_seed,
+                    tstamp_secs,
+                )?;
+                stats.deleted = stats.deleted.saturating_add(1);
+                info!(
+                    orphan_inode = ino.0,
+                    action = "deleted",
+                    "ext4 orphan recovered"
+                );
+                continue;
+            }
+
+            if inode.flags & ffs_types::EXT4_EXTENTS_FL != 0 && inode.extent_bytes.len() >= 60 {
+                let mut root_bytes = Self::extent_root(&inode);
+                let logical_end_u64 = inode.size.div_ceil(u64::from(alloc.geo.block_size));
+                let logical_end = u32::try_from(logical_end_u64).map_err(|_| {
+                    FfsError::InvalidGeometry(format!(
+                        "inode {} logical end {} does not fit u32",
+                        ino.0, logical_end_u64
+                    ))
+                })?;
+                let freed = ffs_extent::truncate_extents(
+                    cx,
+                    &block_dev,
+                    &mut root_bytes,
+                    &alloc.geo,
+                    &mut alloc.groups,
+                    logical_end,
+                )?;
+                Self::set_extent_root(&mut inode, &root_bytes);
+                inode.blocks = inode
+                    .blocks
+                    .saturating_sub(freed.saturating_mul(u64::from(alloc.geo.block_size / 512)));
+            }
+
+            inode.dtime = 0;
+            ffs_inode::touch_ctime(&mut inode, tstamp_secs, tstamp_nanos);
+            ffs_inode::write_inode(
+                cx,
+                &block_dev,
+                &alloc.geo,
+                &alloc.groups,
+                ino,
+                &inode,
+                csum_seed,
+            )?;
+            stats.truncated = stats.truncated.saturating_add(1);
+            info!(
+                orphan_inode = ino.0,
+                action = "truncated",
+                "ext4 orphan recovered"
+            );
+        }
+
+        self.clear_ext4_orphan_state(cx)?;
+        info!(
+            orphan_head = head,
+            scanned = stats.scanned,
+            processed = stats.processed(),
+            deleted = stats.deleted,
+            truncated = stats.truncated,
+            skipped = stats.skipped,
+            "ext4 orphan list cleared"
+        );
+
+        Ok(stats)
+    }
+
+    fn collect_ext4_orphan_list_lenient(
+        &self,
+        cx: &Cx,
+        head: u32,
+        inodes_count: u32,
+    ) -> Result<Vec<InodeNumber>, FfsError> {
+        let mut next = head;
+        let mut seen = BTreeSet::new();
+        let mut inodes = Vec::new();
+        let max_inodes = usize::try_from(inodes_count)
+            .map_err(|_| FfsError::InvalidGeometry("inodes_count does not fit usize".to_owned()))?;
+
+        while next != 0 {
+            if next > inodes_count {
+                warn!(
+                    orphan_inode = next,
+                    inodes_count,
+                    "ext4 orphan recovery detected out-of-range inode; stopping traversal"
+                );
+                break;
+            }
+            if !seen.insert(next) {
+                warn!(
+                    orphan_inode = next,
+                    "ext4 orphan recovery detected cycle; stopping traversal"
+                );
+                break;
+            }
+            if inodes.len() >= max_inodes {
+                warn!(
+                    max_inodes,
+                    "ext4 orphan recovery reached inode traversal bound; stopping traversal"
+                );
+                break;
+            }
+
+            let ino = InodeNumber(u64::from(next));
+            inodes.push(ino);
+
+            match self.read_inode(cx, ino) {
+                Ok(inode) => {
+                    next = inode.dtime;
+                }
+                Err(err) => {
+                    warn!(
+                        orphan_inode = ino.0,
+                        error = %err,
+                        "ext4 orphan recovery failed to read inode link; stopping traversal"
+                    );
+                    break;
+                }
+            }
+        }
+
+        Ok(inodes)
+    }
+
+    fn clear_ext4_orphan_state(&mut self, cx: &Cx) -> Result<(), FfsError> {
+        let mut sb_region = read_ext4_superblock_region(cx, self.dev.as_ref())?;
+        let old_state = u16::from_le_bytes([sb_region[0x3A], sb_region[0x3B]]);
+        let new_state = old_state & !EXT4_ORPHAN_FS;
+        sb_region[0x3A..0x3C].copy_from_slice(&new_state.to_le_bytes());
+        sb_region[0xE8..0xEC].copy_from_slice(&0_u32.to_le_bytes());
+
+        let sb_offset = u64::try_from(ffs_types::EXT4_SUPERBLOCK_OFFSET)
+            .map_err(|_| FfsError::Format("ext4 superblock offset does not fit u64".to_owned()))?;
+        self.dev
+            .write_all_at(cx, ByteOffset(sb_offset), &sb_region)?;
+
+        if let FsFlavor::Ext4(sb) = &mut self.flavor {
+            sb.state = new_state;
+            sb.last_orphan = 0;
+        }
+
+        Ok(())
     }
 
     fn maybe_replay_ext4_journal(
@@ -1515,6 +1745,12 @@ impl OpenFs {
     /// Reads all group descriptors from disk to populate the in-memory
     /// group statistics cache. Must be called before any write operations.
     pub fn enable_writes(&mut self, cx: &Cx) -> Result<(), FfsError> {
+        let alloc_state = self.load_ext4_alloc_state(cx)?;
+        self.ext4_alloc_state = Some(Mutex::new(alloc_state));
+        Ok(())
+    }
+
+    fn load_ext4_alloc_state(&self, cx: &Cx) -> Result<Ext4AllocState, FfsError> {
         let sb = match &self.flavor {
             FsFlavor::Ext4(sb) => sb,
             FsFlavor::Btrfs(_) => {
@@ -1552,13 +1788,11 @@ impl OpenFs {
             "ext4 write state initialized"
         );
 
-        self.ext4_alloc_state = Some(Mutex::new(Ext4AllocState {
+        Ok(Ext4AllocState {
             geo,
             groups,
             persist_ctx,
-        }));
-
-        Ok(())
+        })
     }
 
     /// Commit an MVCC transaction with JBD2 journaling.
@@ -6297,7 +6531,11 @@ mod tests {
         let image = build_ext4_image_with_orphan_chain(&[11, 12, 13]);
         let dev = TestDevice::from_vec(image);
         let cx = Cx::for_testing();
-        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let opts = OpenOptions {
+            skip_validation: true,
+            ..OpenOptions::default()
+        };
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &opts).unwrap();
 
         let orphans = fs.read_ext4_orphan_list(&cx).unwrap();
         assert_eq!(orphans.head, 11);
@@ -6314,7 +6552,11 @@ mod tests {
         set_test_inode_dtime(&mut image, 12, 11);
         let dev = TestDevice::from_vec(image);
         let cx = Cx::for_testing();
-        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let opts = OpenOptions {
+            skip_validation: true,
+            ..OpenOptions::default()
+        };
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &opts).unwrap();
 
         let err = fs.read_ext4_orphan_list(&cx).unwrap_err();
         assert!(matches!(err, FfsError::Corruption { .. }));
@@ -6327,10 +6569,85 @@ mod tests {
         image[sb_off + 0xE8..sb_off + 0xEC].copy_from_slice(&129_u32.to_le_bytes());
         let dev = TestDevice::from_vec(image);
         let cx = Cx::for_testing();
-        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let opts = OpenOptions {
+            skip_validation: true,
+            ..OpenOptions::default()
+        };
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &opts).unwrap();
 
         let err = fs.read_ext4_orphan_list(&cx).unwrap_err();
         assert!(matches!(err, FfsError::InvalidGeometry(_)));
+    }
+
+    #[test]
+    fn open_fs_recovers_deleted_ext4_orphan_inode() {
+        let mut image = build_ext4_image_with_orphan_chain(&[11, 12]);
+        set_test_ext4_state(&mut image, EXT4_VALID_FS | EXT4_ORPHAN_FS);
+        set_test_inode_links_count(&mut image, 11, 0);
+
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let recovery = fs.crash_recovery().expect("ext4 crash recovery outcome");
+        assert!(recovery.had_orphans);
+
+        let inode11 = fs.read_inode(&cx, InodeNumber(11)).unwrap();
+        assert_eq!(inode11.links_count, 0);
+        assert_eq!(inode11.size, 0);
+        assert_ne!(inode11.dtime, 12);
+
+        let orphan_list = fs.read_ext4_orphan_list(&cx).unwrap();
+        assert!(orphan_list.inodes.is_empty());
+
+        let sb = fs.ext4_superblock().expect("ext4 superblock");
+        assert_eq!(sb.last_orphan, 0);
+        assert_eq!(sb.state & EXT4_ORPHAN_FS, 0);
+    }
+
+    #[test]
+    fn open_fs_recovers_truncated_ext4_orphan_inode() {
+        let mut image = build_ext4_image_with_orphan_chain(&[11, 12]);
+        set_test_ext4_state(&mut image, EXT4_VALID_FS | EXT4_ORPHAN_FS);
+        set_test_inode_links_count(&mut image, 11, 1);
+        set_test_inode_links_count(&mut image, 12, 0);
+
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let inode11 = fs.read_inode(&cx, InodeNumber(11)).unwrap();
+        assert_eq!(inode11.links_count, 1);
+        assert_eq!(inode11.dtime, 0);
+
+        let orphan_list = fs.read_ext4_orphan_list(&cx).unwrap();
+        assert!(orphan_list.inodes.is_empty());
+
+        let sb = fs.ext4_superblock().expect("ext4 superblock");
+        assert_eq!(sb.last_orphan, 0);
+        assert_eq!(sb.state & EXT4_ORPHAN_FS, 0);
+    }
+
+    #[test]
+    fn open_fs_recovers_orphan_list_with_invalid_head() {
+        let mut image = build_ext4_image_with_extents();
+        let sb_off = EXT4_SUPERBLOCK_OFFSET;
+        image[sb_off + 0xE8..sb_off + 0xEC].copy_from_slice(&129_u32.to_le_bytes());
+        set_test_ext4_state(&mut image, EXT4_VALID_FS | EXT4_ORPHAN_FS);
+
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+
+        let recovery = fs.crash_recovery().expect("ext4 crash recovery outcome");
+        assert!(recovery.had_orphans);
+
+        let orphan_list = fs.read_ext4_orphan_list(&cx).unwrap();
+        assert!(orphan_list.inodes.is_empty());
+
+        let sb = fs.ext4_superblock().expect("ext4 superblock");
+        assert_eq!(sb.last_orphan, 0);
+        assert_eq!(sb.state & EXT4_ORPHAN_FS, 0);
     }
 
     #[test]
@@ -6615,11 +6932,25 @@ mod tests {
         image
     }
 
-    fn set_test_inode_dtime(image: &mut [u8], ino: u32, next: u32) {
+    fn test_inode_offset(ino: u32) -> usize {
         assert!(ino > 0, "inode numbers are 1-based");
         let inode_index = usize::try_from(ino.saturating_sub(1)).expect("inode index should fit");
-        let inode_off = 4 * 4096 + inode_index * 256;
+        4 * 4096 + inode_index * 256
+    }
+
+    fn set_test_inode_dtime(image: &mut [u8], ino: u32, next: u32) {
+        let inode_off = test_inode_offset(ino);
         image[inode_off + 0x14..inode_off + 0x18].copy_from_slice(&next.to_le_bytes());
+    }
+
+    fn set_test_inode_links_count(image: &mut [u8], ino: u32, links_count: u16) {
+        let inode_off = test_inode_offset(ino);
+        image[inode_off + 0x1A..inode_off + 0x1C].copy_from_slice(&links_count.to_le_bytes());
+    }
+
+    fn set_test_ext4_state(image: &mut [u8], state: u16) {
+        let sb_off = EXT4_SUPERBLOCK_OFFSET;
+        image[sb_off + 0x3A..sb_off + 0x3C].copy_from_slice(&state.to_le_bytes());
     }
 
     fn build_ext4_image_with_orphan_chain(chain: &[u32]) -> Vec<u8> {

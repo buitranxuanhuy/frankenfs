@@ -25,7 +25,10 @@
 use asupersync::Cx;
 use ffs_block::{BlockBuf, BlockDevice};
 use ffs_error::{FfsError, Result};
-use ffs_ondisk::{BtrfsSuperblock, Ext4Superblock, verify_btrfs_superblock_checksum};
+use ffs_ondisk::{
+    BtrfsHeader, BtrfsSuperblock, Ext4Superblock, verify_btrfs_superblock_checksum,
+    verify_btrfs_tree_block_checksum,
+};
 use ffs_types::{
     BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE, BlockNumber, EXT4_SUPERBLOCK_OFFSET,
     EXT4_SUPERBLOCK_SIZE, ParseError,
@@ -417,6 +420,79 @@ impl BlockValidator for BtrfsSuperblockValidator {
     }
 }
 
+/// Validator for btrfs tree block metadata integrity.
+///
+/// Applies to blocks that look like btrfs tree blocks for the current
+/// filesystem (`fsid` match). For candidate blocks, validates header geometry
+/// and tree-block checksum.
+#[derive(Debug, Clone, Copy)]
+pub struct BtrfsTreeBlockValidator {
+    block_size: u32,
+    fsid: [u8; 16],
+    csum_type: u16,
+}
+
+impl BtrfsTreeBlockValidator {
+    #[must_use]
+    pub fn new(block_size: u32, fsid: [u8; 16], csum_type: u16) -> Self {
+        Self {
+            block_size,
+            fsid,
+            csum_type,
+        }
+    }
+
+    fn superblock_block(self) -> u64 {
+        if self.block_size == 0 {
+            return 0;
+        }
+        (BTRFS_SUPER_INFO_OFFSET as u64) / u64::from(self.block_size)
+    }
+}
+
+impl BlockValidator for BtrfsTreeBlockValidator {
+    fn validate(&self, block: BlockNumber, data: &BlockBuf) -> BlockVerdict {
+        if block.0 == self.superblock_block() {
+            return BlockVerdict::Skip;
+        }
+
+        let slice = data.as_slice();
+        let Ok(header) = BtrfsHeader::parse_from_block(slice) else {
+            return BlockVerdict::Skip;
+        };
+
+        // Treat only blocks that appear to belong to this filesystem as btrfs metadata candidates.
+        if header.fsid != self.fsid {
+            return BlockVerdict::Skip;
+        }
+
+        let Some(expected_bytenr) = block.0.checked_mul(u64::from(self.block_size)) else {
+            return BlockVerdict::Corrupt(vec![(
+                CorruptionKind::StructuralInvariant,
+                Severity::Critical,
+                format!(
+                    "btrfs tree header invalid: expected bytenr overflow for block {block} and block_size {}",
+                    self.block_size
+                ),
+            )]);
+        };
+
+        let mut issues = Vec::new();
+        if let Err(err) = header.validate(slice.len(), Some(expected_bytenr)) {
+            issues.push(parse_error_issue("btrfs tree header invalid", &err));
+        }
+        if let Err(err) = verify_btrfs_tree_block_checksum(slice, self.csum_type) {
+            issues.push(parse_error_issue("btrfs tree block checksum invalid", &err));
+        }
+
+        if issues.is_empty() {
+            BlockVerdict::Clean
+        } else {
+            BlockVerdict::Corrupt(issues)
+        }
+    }
+}
+
 fn parse_error_issue(prefix: &str, err: &ParseError) -> (CorruptionKind, Severity, String) {
     let (kind, severity) = match err {
         ParseError::InvalidMagic { .. } => (CorruptionKind::BadMagic, Severity::Critical),
@@ -658,6 +734,20 @@ mod tests {
         let csum = crc32c::crc32c(&sb[0x20..BTRFS_SUPER_INFO_SIZE]);
         sb[0..4].copy_from_slice(&csum.to_le_bytes());
         sb
+    }
+
+    fn make_valid_btrfs_tree_block(block_size: usize, fsid: [u8; 16], bytenr: u64) -> Vec<u8> {
+        let mut block = vec![0_u8; block_size];
+        block[0x20..0x30].copy_from_slice(&fsid); // fsid
+        block[0x30..0x38].copy_from_slice(&bytenr.to_le_bytes()); // bytenr
+        block[0x50..0x58].copy_from_slice(&1_u64.to_le_bytes()); // generation
+        block[0x58..0x60].copy_from_slice(&5_u64.to_le_bytes()); // owner (tree id)
+        block[0x60..0x64].copy_from_slice(&0_u32.to_le_bytes()); // nritems
+        block[0x64] = 0; // leaf level
+
+        let csum = crc32c::crc32c(&block[0x20..]);
+        block[0..4].copy_from_slice(&csum.to_le_bytes());
+        block
     }
 
     // ── Tests ───────────────────────────────────────────────────────────
@@ -905,6 +995,79 @@ mod tests {
         let finding = &report.findings[0];
         assert_eq!(finding.block, BlockNumber(4));
         assert_eq!(finding.kind, CorruptionKind::ChecksumMismatch);
+    }
+
+    #[test]
+    fn btrfs_tree_block_validator_accepts_valid_tree_block() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(16384, 8);
+
+        let fsid = [0x11_u8; 16];
+        let mut sb = make_valid_btrfs_superblock_region();
+        sb[0x20..0x30].copy_from_slice(&fsid);
+        let sb_csum = crc32c::crc32c(&sb[0x20..BTRFS_SUPER_INFO_SIZE]);
+        sb[0..4].copy_from_slice(&sb_csum.to_le_bytes());
+
+        let mut block4 = vec![0_u8; 16384];
+        block4[..BTRFS_SUPER_INFO_SIZE].copy_from_slice(&sb);
+        dev.write(BlockNumber(4), block4);
+
+        let block5_bytenr = 5_u64 * 16384_u64;
+        let tree_block = make_valid_btrfs_tree_block(16384, fsid, block5_bytenr);
+        dev.write(BlockNumber(5), tree_block);
+
+        let report = Scrubber::new(
+            &dev,
+            &CompositeValidator::new(vec![
+                Box::new(BtrfsSuperblockValidator::new(16384)),
+                Box::new(BtrfsTreeBlockValidator::new(16384, fsid, 0)),
+            ]),
+        )
+        .scrub_all(&cx)
+        .expect("scrub should succeed");
+        assert!(
+            report.is_clean(),
+            "unexpected findings: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn btrfs_tree_block_validator_detects_checksum_corruption() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(16384, 8);
+        let fsid = [0x22_u8; 16];
+
+        let block5_bytenr = 5_u64 * 16384_u64;
+        let mut tree_block = make_valid_btrfs_tree_block(16384, fsid, block5_bytenr);
+        tree_block[0x80] ^= 0x01;
+        dev.write(BlockNumber(5), tree_block);
+
+        let report = Scrubber::new(&dev, &BtrfsTreeBlockValidator::new(16384, fsid, 0))
+            .scrub_all(&cx)
+            .expect("scrub should succeed");
+
+        assert_eq!(report.blocks_corrupt, 1);
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].block, BlockNumber(5));
+        assert_eq!(report.findings[0].kind, CorruptionKind::ChecksumMismatch);
+    }
+
+    #[test]
+    fn btrfs_tree_block_validator_skips_foreign_fsid_blocks() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(16384, 8);
+
+        let block5_bytenr = 5_u64 * 16384_u64;
+        let mut tree_block = make_valid_btrfs_tree_block(16384, [0x33_u8; 16], block5_bytenr);
+        tree_block[0x80] ^= 0x01; // invalidate checksum, but fsid won't match validator
+        dev.write(BlockNumber(5), tree_block);
+
+        let report = Scrubber::new(&dev, &BtrfsTreeBlockValidator::new(16384, [0x44_u8; 16], 0))
+            .scrub_all(&cx)
+            .expect("scrub should succeed");
+
+        assert!(report.is_clean());
     }
 
     #[test]

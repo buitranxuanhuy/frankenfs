@@ -252,6 +252,23 @@ impl MvccFlushLifecycle for NoopMvccFlushLifecycle {
     }
 }
 
+/// Repair refresh coordination hook for write-back flush lifecycle.
+///
+/// Implementations receive the set of blocks durably flushed in one batch and
+/// can queue downstream symbol refresh work.
+pub trait RepairFlushLifecycle: Send + Sync + std::fmt::Debug {
+    fn on_flush_committed(&self, cx: &Cx, blocks: &[BlockNumber]) -> Result<()>;
+}
+
+#[derive(Debug, Default)]
+struct NoopRepairFlushLifecycle;
+
+impl RepairFlushLifecycle for NoopRepairFlushLifecycle {
+    fn on_flush_committed(&self, _cx: &Cx, _blocks: &[BlockNumber]) -> Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct ByteBlockDevice<D: ByteDevice> {
     inner: D,
@@ -1465,6 +1482,7 @@ pub struct ArcCache<D: BlockDevice> {
     state: Mutex<ArcState>,
     write_policy: ArcWritePolicy,
     mvcc_flush_lifecycle: Arc<dyn MvccFlushLifecycle>,
+    repair_flush_lifecycle: Arc<dyn RepairFlushLifecycle>,
 }
 
 /// Write policy for [`ArcCache`].
@@ -1488,6 +1506,12 @@ pub struct FlushDaemonConfig {
     pub interval: Duration,
     /// Maximum number of dirty blocks to flush per non-aggressive cycle.
     pub batch_size: usize,
+    /// Poll quota threshold below which flush batches are reduced.
+    pub budget_poll_quota_threshold: u32,
+    /// Reduced batch size used when budget pressure is active.
+    pub reduced_batch_size: usize,
+    /// Yield duration when budget pressure is active.
+    pub budget_yield_sleep: Duration,
     /// Dirty ratio threshold that triggers aggressive full flush.
     pub high_watermark: f64,
     /// Dirty ratio threshold that blocks writes until flushed below high watermark.
@@ -1499,6 +1523,9 @@ impl Default for FlushDaemonConfig {
         Self {
             interval: Duration::from_secs(5),
             batch_size: 256,
+            budget_poll_quota_threshold: 256,
+            reduced_batch_size: 64,
+            budget_yield_sleep: Duration::from_millis(10),
             high_watermark: DIRTY_HIGH_WATERMARK,
             critical_watermark: DIRTY_CRITICAL_WATERMARK,
         }
@@ -1515,6 +1542,11 @@ impl FlushDaemonConfig {
         if self.batch_size == 0 {
             return Err(FfsError::Format(
                 "flush daemon batch_size must be > 0".to_owned(),
+            ));
+        }
+        if self.reduced_batch_size == 0 {
+            return Err(FfsError::Format(
+                "flush daemon reduced_batch_size must be > 0".to_owned(),
             ));
         }
         if !(0.0..=1.0).contains(&self.high_watermark)
@@ -1565,11 +1597,12 @@ impl<D: BlockDevice> ArcCache<D> {
         capacity_blocks: usize,
         write_policy: ArcWritePolicy,
     ) -> Result<Self> {
-        Self::new_with_policy_and_mvcc_lifecycle(
+        Self::new_with_policy_and_lifecycles(
             inner,
             capacity_blocks,
             write_policy,
             Arc::new(NoopMvccFlushLifecycle),
+            Arc::new(NoopRepairFlushLifecycle),
         )
     }
 
@@ -1578,6 +1611,37 @@ impl<D: BlockDevice> ArcCache<D> {
         capacity_blocks: usize,
         write_policy: ArcWritePolicy,
         mvcc_flush_lifecycle: Arc<dyn MvccFlushLifecycle>,
+    ) -> Result<Self> {
+        Self::new_with_policy_and_lifecycles(
+            inner,
+            capacity_blocks,
+            write_policy,
+            mvcc_flush_lifecycle,
+            Arc::new(NoopRepairFlushLifecycle),
+        )
+    }
+
+    pub fn new_with_policy_and_repair_lifecycle(
+        inner: D,
+        capacity_blocks: usize,
+        write_policy: ArcWritePolicy,
+        repair_flush_lifecycle: Arc<dyn RepairFlushLifecycle>,
+    ) -> Result<Self> {
+        Self::new_with_policy_and_lifecycles(
+            inner,
+            capacity_blocks,
+            write_policy,
+            Arc::new(NoopMvccFlushLifecycle),
+            repair_flush_lifecycle,
+        )
+    }
+
+    pub fn new_with_policy_and_lifecycles(
+        inner: D,
+        capacity_blocks: usize,
+        write_policy: ArcWritePolicy,
+        mvcc_flush_lifecycle: Arc<dyn MvccFlushLifecycle>,
+        repair_flush_lifecycle: Arc<dyn RepairFlushLifecycle>,
     ) -> Result<Self> {
         if capacity_blocks == 0 {
             return Err(FfsError::Format(
@@ -1589,6 +1653,7 @@ impl<D: BlockDevice> ArcCache<D> {
             state: Mutex::new(ArcState::new(capacity_blocks)),
             write_policy,
             mvcc_flush_lifecycle,
+            repair_flush_lifecycle,
         };
         #[cfg(feature = "s3fifo")]
         info!(
@@ -1913,6 +1978,7 @@ impl<D: BlockDevice> ArcCache<D> {
                 // Daemon uses a long-lived context for periodic background work.
                 let cx = Cx::for_testing();
                 let mut cycle_seq = 0_u64;
+                let mut daemon_throttled = false;
 
                 loop {
                     if stop_flag.load(Ordering::Acquire) {
@@ -1921,7 +1987,7 @@ impl<D: BlockDevice> ArcCache<D> {
 
                     thread::sleep(config.interval);
                     cycle_seq = cycle_seq.saturating_add(1);
-                    cache.run_flush_daemon_cycle(&cx, &config, cycle_seq);
+                    cache.run_flush_daemon_cycle(&cx, &config, cycle_seq, &mut daemon_throttled);
                 }
 
                 if let Err(err) = cache.flush_dirty(&cx) {
@@ -1940,7 +2006,13 @@ impl<D: BlockDevice> ArcCache<D> {
         })
     }
 
-    fn run_flush_daemon_cycle(&self, cx: &Cx, config: &FlushDaemonConfig, cycle_seq: u64) {
+    fn run_flush_daemon_cycle(
+        &self,
+        cx: &Cx,
+        config: &FlushDaemonConfig,
+        cycle_seq: u64,
+        daemon_throttled: &mut bool,
+    ) {
         let metrics = self.metrics();
         let dirty_ratio = metrics.dirty_ratio();
         let (in_flight_blocks, committed_blocks) = self.dirty_state_counts();
@@ -1962,6 +2034,7 @@ impl<D: BlockDevice> ArcCache<D> {
         );
 
         if committed_blocks == 0 {
+            Self::maybe_log_daemon_resumed(daemon_throttled, cx.budget().poll_quota);
             trace!(
                 event = "flush_daemon_sleep",
                 cycle_seq,
@@ -1970,7 +2043,91 @@ impl<D: BlockDevice> ArcCache<D> {
             return;
         }
 
-        let flush_res = if committed_dirty_ratio > config.high_watermark {
+        let batch_size = Self::effective_flush_batch_size(cx, config, daemon_throttled);
+        let flush_res = self.flush_cycle_batch(
+            cx,
+            config,
+            cycle_seq,
+            committed_dirty_ratio,
+            committed_blocks,
+            batch_size,
+        );
+
+        if let Err(err) = flush_res {
+            error!(
+                event = "flush_batch_failed",
+                cycle_seq,
+                error = %err,
+                attempted_blocks = metrics.dirty_blocks,
+                attempted_bytes = metrics.dirty_bytes
+            );
+        }
+
+        trace!(
+            event = "flush_daemon_sleep",
+            cycle_seq,
+            interval_ms = config.interval.as_millis()
+        );
+    }
+
+    fn maybe_log_daemon_resumed(daemon_throttled: &mut bool, new_budget: u32) {
+        if *daemon_throttled {
+            debug!(
+                event = "daemon_resumed",
+                daemon_name = "flush_daemon",
+                new_budget
+            );
+            *daemon_throttled = false;
+        }
+    }
+
+    fn effective_flush_batch_size(
+        cx: &Cx,
+        config: &FlushDaemonConfig,
+        daemon_throttled: &mut bool,
+    ) -> usize {
+        let budget = cx.budget();
+        let budget_pressure =
+            budget.is_exhausted() || budget.poll_quota <= config.budget_poll_quota_threshold;
+        if budget_pressure {
+            let reduced = config.reduced_batch_size.min(config.batch_size).max(1);
+            if reduced < config.batch_size {
+                debug!(
+                    event = "batch_size_reduced",
+                    daemon_name = "flush_daemon",
+                    original_size = config.batch_size,
+                    reduced_size = reduced,
+                    pressure_level = "budget"
+                );
+            }
+            debug!(
+                event = "daemon_throttled",
+                daemon_name = "flush_daemon",
+                budget_remaining = budget.poll_quota,
+                yield_duration_ms = config.budget_yield_sleep.as_millis(),
+                pressure_level = "budget"
+            );
+            *daemon_throttled = true;
+            if !config.budget_yield_sleep.is_zero() {
+                thread::sleep(config.budget_yield_sleep);
+            }
+            reduced
+        } else {
+            Self::maybe_log_daemon_resumed(daemon_throttled, budget.poll_quota);
+            config.batch_size
+        }
+    }
+
+    fn flush_cycle_batch(
+        &self,
+        cx: &Cx,
+        config: &FlushDaemonConfig,
+        cycle_seq: u64,
+        committed_dirty_ratio: f64,
+        committed_blocks: usize,
+        batch_size: usize,
+    ) -> Result<usize> {
+        if committed_dirty_ratio > config.high_watermark {
             if committed_dirty_ratio > config.critical_watermark {
                 warn!(
                     event = "flush_backpressure_critical",
@@ -2004,24 +2161,8 @@ impl<D: BlockDevice> ArcCache<D> {
             }
             self.flush_dirty(cx).map(|()| committed_blocks)
         } else {
-            self.flush_dirty_batch(cx, config.batch_size)
-        };
-
-        if let Err(err) = flush_res {
-            error!(
-                event = "flush_batch_failed",
-                cycle_seq,
-                error = %err,
-                attempted_blocks = metrics.dirty_blocks,
-                attempted_bytes = metrics.dirty_bytes
-            );
+            self.flush_dirty_batch(cx, batch_size)
         }
-
-        trace!(
-            event = "flush_daemon_sleep",
-            cycle_seq,
-            interval_ms = config.interval.as_millis()
-        );
     }
 
     fn flush_blocks(&self, cx: &Cx, flushes: &[FlushCandidate]) -> Result<()> {
@@ -2057,6 +2198,37 @@ impl<D: BlockDevice> ArcCache<D> {
         Ok(())
     }
 
+    fn notify_repair_flush(&self, cx: &Cx, flushes: &[FlushCandidate]) -> Result<()> {
+        if flushes.is_empty() {
+            return Ok(());
+        }
+
+        let blocks: Vec<BlockNumber> = flushes.iter().map(|candidate| candidate.block).collect();
+        let block_preview: Vec<u64> = blocks.iter().take(16).map(|block| block.0).collect();
+        debug!(
+            target: "ffs::repair::refresh",
+            event = "flush_triggers_refresh",
+            block_count = blocks.len(),
+            block_ids = ?block_preview,
+            truncated = blocks.len() > block_preview.len()
+        );
+        self.repair_flush_lifecycle.on_flush_committed(cx, &blocks)
+    }
+
+    fn restore_pending_flush_candidates(&self, flushes: Vec<FlushCandidate>) {
+        let mut guard = self.state.lock();
+        for candidate in &flushes {
+            guard.mark_dirty(
+                candidate.block,
+                candidate.data.len(),
+                candidate.txn_id,
+                Some(candidate.commit_seq),
+                DirtyState::Committed,
+            );
+        }
+        guard.pending_flush.extend(flushes);
+    }
+
     fn flush_pending_evictions(&self, cx: &Cx, pending_flush: Vec<FlushCandidate>) -> Result<()> {
         if pending_flush.is_empty() {
             return Ok(());
@@ -2070,19 +2242,14 @@ impl<D: BlockDevice> ArcCache<D> {
 
         if let Err(err) = self.flush_blocks(cx, &pending_flush) {
             // Restore the pending queue on failure so callers can retry.
-            let mut guard = self.state.lock();
-            for candidate in &pending_flush {
-                guard.mark_dirty(
-                    candidate.block,
-                    candidate.data.len(),
-                    candidate.txn_id,
-                    Some(candidate.commit_seq),
-                    DirtyState::Committed,
-                );
-            }
-            guard.pending_flush.extend(pending_flush);
-            drop(guard);
+            self.restore_pending_flush_candidates(pending_flush);
             error!(event = "pending_flush_batch_failed", error = %err);
+            return Err(err);
+        }
+
+        if let Err(err) = self.notify_repair_flush(cx, &pending_flush) {
+            self.restore_pending_flush_candidates(pending_flush);
+            error!(event = "pending_flush_batch_repair_notify_failed", error = %err);
             return Err(err);
         }
 
@@ -2329,20 +2496,22 @@ impl<D: BlockDevice> ArcCache<D> {
         let started = Instant::now();
         if let Err(err) = self.flush_blocks(cx, &flushes) {
             let attempted_blocks = flushes.len();
-            let mut guard = self.state.lock();
-            for candidate in &flushes {
-                guard.mark_dirty(
-                    candidate.block,
-                    candidate.data.len(),
-                    candidate.txn_id,
-                    Some(candidate.commit_seq),
-                    DirtyState::Committed,
-                );
-            }
-            guard.pending_flush.extend(flushes);
-            drop(guard);
+            self.restore_pending_flush_candidates(flushes);
             error!(
                 event = "flush_batch_failed",
+                error = %err,
+                attempted_blocks,
+                duration_ms = started.elapsed().as_millis(),
+                attempted_bytes = flush_bytes
+            );
+            return Err(err);
+        }
+
+        if let Err(err) = self.notify_repair_flush(cx, &flushes) {
+            let attempted_blocks = flushes.len();
+            self.restore_pending_flush_candidates(flushes);
+            error!(
+                event = "flush_batch_repair_notify_failed",
                 error = %err,
                 attempted_blocks,
                 duration_ms = started.elapsed().as_millis(),
@@ -2415,20 +2584,19 @@ impl<D: BlockDevice> ArcCache<D> {
         let started = Instant::now();
         if let Err(err) = self.flush_blocks(cx, &flushes) {
             // Restore flush state on failure so retry logic can recover.
-            let mut guard = self.state.lock();
-            for candidate in &flushes {
-                guard.mark_dirty(
-                    candidate.block,
-                    candidate.data.len(),
-                    candidate.txn_id,
-                    Some(candidate.commit_seq),
-                    DirtyState::Committed,
-                );
-            }
-            guard.pending_flush.extend(flushes);
-            drop(guard);
+            self.restore_pending_flush_candidates(flushes);
             error!(
                 event = "flush_dirty_failed",
+                error = %err,
+                duration_ms = started.elapsed().as_millis()
+            );
+            return Err(err);
+        }
+
+        if let Err(err) = self.notify_repair_flush(cx, &flushes) {
+            self.restore_pending_flush_candidates(flushes);
+            error!(
+                event = "flush_dirty_repair_notify_failed",
                 error = %err,
                 duration_ms = started.elapsed().as_millis()
             );
@@ -2635,6 +2803,28 @@ mod tests {
 
         fn mark_persisted(&self, _block: BlockNumber, _commit_seq: CommitSeq) -> Result<()> {
             self.persisted.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingRepairFlushLifecycle {
+        calls: Mutex<Vec<Vec<BlockNumber>>>,
+    }
+
+    impl RecordingRepairFlushLifecycle {
+        fn call_count(&self) -> usize {
+            self.calls.lock().len()
+        }
+
+        fn flushed_blocks(&self) -> Vec<Vec<BlockNumber>> {
+            self.calls.lock().clone()
+        }
+    }
+
+    impl RepairFlushLifecycle for RecordingRepairFlushLifecycle {
+        fn on_flush_committed(&self, _cx: &Cx, blocks: &[BlockNumber]) -> Result<()> {
+            self.calls.lock().push(blocks.to_vec());
             Ok(())
         }
     }
@@ -3063,6 +3253,7 @@ mod tests {
                 batch_size: 1,
                 high_watermark: 0.99,
                 critical_watermark: 1.0,
+                ..FlushDaemonConfig::default()
             })
             .expect("start daemon");
 
@@ -3109,6 +3300,82 @@ mod tests {
         daemon.shutdown();
         assert_eq!(cache.dirty_count(), 0);
         assert_eq!(cache.inner().write_count(), 6);
+    }
+
+    #[test]
+    fn flush_daemon_reduces_batch_size_under_budget_pressure() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 16);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let counted = CountingBlockDevice::new(dev);
+        let cache =
+            ArcCache::new_with_policy(counted, 8, ArcWritePolicy::WriteBack).expect("cache");
+
+        for i in 0..4_u64 {
+            cache
+                .write_block(&cx, BlockNumber(i), &[0xA5; 4096])
+                .expect("write");
+        }
+        assert_eq!(cache.dirty_count(), 4);
+
+        let low_budget_cx =
+            Cx::for_testing_with_budget(asupersync::Budget::new().with_poll_quota(8));
+        let config = FlushDaemonConfig {
+            interval: Duration::from_millis(1),
+            batch_size: 4,
+            reduced_batch_size: 1,
+            budget_poll_quota_threshold: 16,
+            budget_yield_sleep: Duration::ZERO,
+            high_watermark: 0.99,
+            critical_watermark: 1.0,
+        };
+        let mut daemon_throttled = false;
+        cache.run_flush_daemon_cycle(&low_budget_cx, &config, 1, &mut daemon_throttled);
+
+        assert!(daemon_throttled);
+        assert_eq!(cache.inner().write_count(), 1);
+        assert_eq!(cache.dirty_count(), 3);
+    }
+
+    #[test]
+    fn foreground_reads_remain_responsive_under_budget_pressure() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 32);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let counted = CountingBlockDevice::new(dev);
+        let cache =
+            ArcCache::new_with_policy(counted, 16, ArcWritePolicy::WriteBack).expect("cache");
+
+        for i in 0..8_u64 {
+            cache
+                .write_block(&cx, BlockNumber(i), &[0x5A; 4096])
+                .expect("write");
+        }
+        assert_eq!(cache.dirty_count(), 8);
+
+        let low_budget_cx =
+            Cx::for_testing_with_budget(asupersync::Budget::new().with_poll_quota(8));
+        let config = FlushDaemonConfig {
+            interval: Duration::from_millis(1),
+            batch_size: 8,
+            reduced_batch_size: 1,
+            budget_poll_quota_threshold: 16,
+            budget_yield_sleep: Duration::from_millis(1),
+            ..FlushDaemonConfig::default()
+        };
+        let mut daemon_throttled = false;
+        cache.run_flush_daemon_cycle(&low_budget_cx, &config, 1, &mut daemon_throttled);
+        assert!(daemon_throttled);
+
+        let start = Instant::now();
+        let _ = cache
+            .read_block(&cx, BlockNumber(0))
+            .expect("foreground read");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed <= Duration::from_millis(20),
+            "foreground read exceeded latency bound under pressure: {elapsed:?}"
+        );
     }
 
     #[test]
@@ -3207,6 +3474,37 @@ mod tests {
         assert_eq!(cache.inner().write_count(), 1);
         assert_eq!(lifecycle.pin_count(), 1);
         assert_eq!(lifecycle.persisted_count(), 1);
+    }
+
+    #[test]
+    fn flush_batch_notifies_repair_lifecycle_with_flushed_blocks() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 8);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let counted = CountingBlockDevice::new(dev);
+        let repair_lifecycle = StdArc::new(RecordingRepairFlushLifecycle::default());
+        let cache = ArcCache::new_with_policy_and_repair_lifecycle(
+            counted,
+            8,
+            ArcWritePolicy::WriteBack,
+            repair_lifecycle.clone(),
+        )
+        .expect("cache");
+
+        cache
+            .write_block(&cx, BlockNumber(1), &[0xAA; 4096])
+            .expect("write block 1");
+        cache
+            .write_block(&cx, BlockNumber(2), &[0xBB; 4096])
+            .expect("write block 2");
+
+        let flushed = cache.flush_dirty_batch(&cx, 8).expect("flush dirty batch");
+        assert_eq!(flushed, 2);
+        assert_eq!(repair_lifecycle.call_count(), 1);
+        assert_eq!(
+            repair_lifecycle.flushed_blocks(),
+            vec![vec![BlockNumber(1), BlockNumber(2)]]
+        );
     }
 
     #[test]

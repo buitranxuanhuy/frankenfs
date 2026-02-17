@@ -11,8 +11,8 @@ use ffs_fuse::MountOptions;
 use ffs_harness::ParityReport;
 use ffs_repair::evidence::{self, EvidenceEventType, EvidenceRecord};
 use ffs_repair::scrub::{
-    BlockValidator, BtrfsSuperblockValidator, CompositeValidator, Ext4SuperblockValidator,
-    ScrubReport, Scrubber, Severity, ZeroCheckValidator,
+    BlockValidator, BtrfsSuperblockValidator, BtrfsTreeBlockValidator, CompositeValidator,
+    Ext4SuperblockValidator, ScrubReport, Scrubber, Severity, ZeroCheckValidator,
 };
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -630,9 +630,14 @@ fn scrub_validator(flavor: &FsFlavor, block_size: u32) -> Box<dyn BlockValidator
             Box::new(ZeroCheckValidator),
             Box::new(Ext4SuperblockValidator::new(block_size)),
         ])),
-        FsFlavor::Btrfs(_) => Box::new(CompositeValidator::new(vec![
+        FsFlavor::Btrfs(sb) => Box::new(CompositeValidator::new(vec![
             Box::new(ZeroCheckValidator),
             Box::new(BtrfsSuperblockValidator::new(block_size)),
+            Box::new(BtrfsTreeBlockValidator::new(
+                block_size,
+                sb.fsid,
+                sb.csum_type,
+            )),
         ])),
     }
 }
@@ -856,7 +861,9 @@ fn print_evidence_record_event_payload(record: &EvidenceRecord) {
         EvidenceEventType::PolicyDecision => print_policy_payload(record),
         EvidenceEventType::SymbolRefresh => print_symbol_refresh_payload(record),
         EvidenceEventType::WalRecovery => print_wal_recovery_payload(record),
+        EvidenceEventType::TransactionCommit => print_transaction_commit_payload(record),
         EvidenceEventType::TxnAborted => print_txn_aborted_payload(record),
+        EvidenceEventType::SerializationConflict => print_serialization_conflict_payload(record),
         EvidenceEventType::VersionGc => print_version_gc_payload(record),
         EvidenceEventType::SnapshotAdvanced => print_snapshot_advanced_payload(record),
         EvidenceEventType::FlushBatch => print_flush_batch_payload(record),
@@ -935,15 +942,36 @@ fn print_wal_recovery_payload(record: &EvidenceRecord) {
     }
 }
 
+fn print_transaction_commit_payload(record: &EvidenceRecord) {
+    if let Some(t) = record.transaction_commit.as_ref() {
+        print!(
+            " txn_id={} commit_seq={} write_set_size={} duration_us={}",
+            t.txn_id, t.commit_seq, t.write_set_size, t.duration_us
+        );
+    }
+}
+
 fn print_txn_aborted_payload(record: &EvidenceRecord) {
     if let Some(t) = record.txn_aborted.as_ref() {
         let reason = serde_json::to_value(t.reason)
             .ok()
             .and_then(|v| v.as_str().map(str::to_owned))
             .unwrap_or_else(|| format!("{:?}", t.reason));
-        print!(" txn_id={} reason={reason}", t.txn_id);
+        print!(
+            " txn_id={} reason={reason} read_set_size={} write_set_size={}",
+            t.txn_id, t.read_set_size, t.write_set_size
+        );
         if let Some(detail) = t.detail.as_ref() {
             print!(" detail=\"{detail}\"");
+        }
+    }
+}
+
+fn print_serialization_conflict_payload(record: &EvidenceRecord) {
+    if let Some(c) = record.serialization_conflict.as_ref() {
+        print!(" txn_id={} conflict_type={}", c.txn_id, c.conflict_type);
+        if let Some(conflicting_txn) = c.conflicting_txn {
+            print!(" conflicting_txn={conflicting_txn}");
         }
     }
 }
