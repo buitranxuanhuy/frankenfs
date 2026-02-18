@@ -767,4 +767,315 @@ mod tests {
         // Should preserve the nanosecond value (masked).
         assert_eq!(nsec, 0x3B9A_C9FF & 0x3FFF_FFFC);
     }
+
+    #[test]
+    fn locate_inode_out_of_range() {
+        let geo = make_geometry();
+        let groups = make_groups(&geo);
+
+        // Inode 0 is invalid (ext4 inodes are 1-based).
+        // Inode way beyond total → group index out of range.
+        let result = locate_inode(InodeNumber(100_000), &geo, &groups);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn locate_inode_block_offset_within_table() {
+        let geo = make_geometry();
+        let groups = make_groups(&geo);
+
+        // 4096-byte block / 256-byte inode = 16 inodes per block.
+        // Inode 17 → group 0, index 16 → byte 16*256 = 4096 → second block.
+        let loc = locate_inode(InodeNumber(17), &geo, &groups).unwrap();
+        assert_eq!(loc.block, BlockNumber(4)); // inode_table_block(3) + 1
+        assert_eq!(loc.byte_offset, 0);
+
+        // Inode 18 → index 17 → byte 17*256 = 4352 → block 4, offset 256.
+        let loc = locate_inode(InodeNumber(18), &geo, &groups).unwrap();
+        assert_eq!(loc.block, BlockNumber(4));
+        assert_eq!(loc.byte_offset, 256);
+    }
+
+    #[test]
+    fn serialize_large_uid_gid() {
+        // UID/GID > 65535 should be split across low and high fields.
+        let inode = Ext4Inode {
+            mode: 0o100_644,
+            uid: 0x0012_3456, // high=0x0012, low=0x3456
+            gid: 0x00AB_CDEF, // high=0x00AB, low=0xCDEF
+            size: 0,
+            links_count: 1,
+            blocks: 0,
+            flags: 0,
+            generation: 0,
+            file_acl: 0,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            dtime: 0,
+            atime_extra: 0,
+            ctime_extra: 0,
+            mtime_extra: 0,
+            crtime: 0,
+            crtime_extra: 0,
+            extra_isize: 32,
+            checksum: 0,
+            projid: 0,
+            extent_bytes: vec![0u8; 60],
+            xattr_ibody: Vec::new(),
+        };
+
+        let raw = serialize_inode(&inode, 256);
+        let parsed = Ext4Inode::parse_from_bytes(&raw).unwrap();
+        assert_eq!(parsed.uid, 0x0012_3456);
+        assert_eq!(parsed.gid, 0x00AB_CDEF);
+    }
+
+    #[test]
+    fn serialize_large_file_size() {
+        // Size > 4GB should be split across low and high fields.
+        let inode = Ext4Inode {
+            mode: 0o100_644,
+            uid: 0,
+            gid: 0,
+            size: 0x1_0000_1234, // > 4GB
+            links_count: 1,
+            blocks: 0,
+            flags: 0,
+            generation: 0,
+            file_acl: 0,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            dtime: 0,
+            atime_extra: 0,
+            ctime_extra: 0,
+            mtime_extra: 0,
+            crtime: 0,
+            crtime_extra: 0,
+            extra_isize: 32,
+            checksum: 0,
+            projid: 0,
+            extent_bytes: vec![0u8; 60],
+            xattr_ibody: Vec::new(),
+        };
+
+        let raw = serialize_inode(&inode, 256);
+        let parsed = Ext4Inode::parse_from_bytes(&raw).unwrap();
+        assert_eq!(parsed.size, 0x1_0000_1234);
+    }
+
+    #[test]
+    fn serialize_xattr_ibody_preserved() {
+        let xattr_data = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        let inode = Ext4Inode {
+            mode: 0o100_644,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            links_count: 1,
+            blocks: 0,
+            flags: 0,
+            generation: 0,
+            file_acl: 0,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            dtime: 0,
+            atime_extra: 0,
+            ctime_extra: 0,
+            mtime_extra: 0,
+            crtime: 0,
+            crtime_extra: 0,
+            extra_isize: 32,
+            checksum: 0,
+            projid: 0,
+            extent_bytes: vec![0u8; 60],
+            xattr_ibody: xattr_data.clone(),
+        };
+
+        let raw = serialize_inode(&inode, 256);
+        // Inline xattrs start at offset 128 + extra_isize = 160.
+        assert_eq!(&raw[160..164], &xattr_data);
+    }
+
+    #[test]
+    fn checksum_skipped_for_small_inode() {
+        // Inode < 128 bytes should not panic.
+        let mut raw = vec![0u8; 64];
+        compute_and_set_checksum(&mut raw, 0, 1);
+        // Should just return without modifying (no checksum field to set).
+        assert_eq!(raw, vec![0u8; 64]);
+    }
+
+    #[test]
+    fn create_multiple_inodes_sequential() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+
+        let mut inos = Vec::new();
+        for _ in 0..5 {
+            let (ino, _) = create_inode(
+                &cx,
+                &dev,
+                &geo,
+                &mut groups,
+                0o100_644,
+                0,
+                0,
+                GroupNumber(0),
+                0,
+                1_700_000_000,
+                0,
+            )
+            .unwrap();
+            inos.push(ino);
+        }
+
+        // All inodes should be unique.
+        for i in 0..inos.len() {
+            for j in (i + 1)..inos.len() {
+                assert_ne!(inos[i], inos[j], "duplicate inode numbers");
+            }
+        }
+
+        // All should be readable.
+        for &ino in &inos {
+            let inode = read_inode(&cx, &dev, &geo, &groups, ino).unwrap();
+            assert_eq!(inode.mode, 0o100_644);
+        }
+    }
+
+    #[test]
+    fn read_inode_out_of_range_returns_error() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let groups = make_groups(&geo);
+
+        let result = read_inode(&cx, &dev, &geo, &groups, InodeNumber(100_000));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn write_inode_updates_on_disk() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+
+        let (ino, mut inode) = create_inode(
+            &cx,
+            &dev,
+            &geo,
+            &mut groups,
+            0o100_644,
+            0,
+            0,
+            GroupNumber(0),
+            0,
+            1_700_000_000,
+            0,
+        )
+        .unwrap();
+
+        // Modify and write back.
+        inode.size = 8192;
+        inode.uid = 500;
+        touch_mtime_ctime(&mut inode, 1_700_000_100, 0);
+        write_inode(&cx, &dev, &geo, &groups, ino, &inode, 0).unwrap();
+
+        // Read back and verify.
+        let read_back = read_inode(&cx, &dev, &geo, &groups, ino).unwrap();
+        assert_eq!(read_back.size, 8192);
+        assert_eq!(read_back.uid, 500);
+        assert_eq!(read_back.mtime, 1_700_000_100);
+        assert_eq!(read_back.ctime, 1_700_000_100);
+    }
+
+    #[test]
+    fn delete_directory_zeroes_fields() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+
+        let (ino, mut inode) = create_inode(
+            &cx,
+            &dev,
+            &geo,
+            &mut groups,
+            file_type::S_IFDIR | 0o755,
+            0,
+            0,
+            GroupNumber(0),
+            0,
+            1_700_000_000,
+            0,
+        )
+        .unwrap();
+
+        // Directory creation should increment used_dirs in some group.
+        let total_dirs: u32 = groups.iter().map(|g| g.used_dirs).sum();
+        assert_eq!(total_dirs, 1, "one directory should be tracked");
+
+        delete_inode(
+            &cx,
+            &dev,
+            &geo,
+            &mut groups,
+            ino,
+            &mut inode,
+            0,
+            1_700_000_001,
+        )
+        .unwrap();
+
+        assert_eq!(inode.links_count, 0);
+        assert_eq!(inode.size, 0);
+        assert_eq!(inode.dtime, 1_700_000_001);
+    }
+
+    #[test]
+    fn encode_extra_timestamp_zero_nsec() {
+        let extra = encode_extra_timestamp(0, 0);
+        assert_eq!(extra, 0);
+    }
+
+    #[test]
+    fn serialize_blocks_high_bits() {
+        // Test 48-bit blocks field split.
+        let inode = Ext4Inode {
+            mode: 0o100_644,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            links_count: 1,
+            blocks: 0x1_2345_6789, // needs high bits
+            flags: 0,
+            generation: 0,
+            file_acl: 0x2_0000_0000, // needs file_acl high bits
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            dtime: 0,
+            atime_extra: 0,
+            ctime_extra: 0,
+            mtime_extra: 0,
+            crtime: 0,
+            crtime_extra: 0,
+            extra_isize: 32,
+            checksum: 0,
+            projid: 0,
+            extent_bytes: vec![0u8; 60],
+            xattr_ibody: Vec::new(),
+        };
+
+        let raw = serialize_inode(&inode, 256);
+        let parsed = Ext4Inode::parse_from_bytes(&raw).unwrap();
+        assert_eq!(parsed.blocks, 0x1_2345_6789);
+        assert_eq!(parsed.file_acl, 0x2_0000_0000);
+    }
 }
