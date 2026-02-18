@@ -1178,7 +1178,6 @@ impl ArcState {
         #[cfg(feature = "s3fifo")]
         {
             self.s3_on_miss_or_ghost_hit(key);
-            return;
         }
         #[cfg(not(feature = "s3fifo"))]
         {
@@ -2985,26 +2984,29 @@ impl<D: BlockDevice> FaultInjector<D> {
 
     /// Check if any rule matches and should fire, returning an error if so.
     fn check_fault(&self, target: FaultTarget) -> Option<FfsError> {
-        let mut rules = self.rules.lock();
-        let mut matched = false;
-
-        for rule in rules.iter_mut() {
-            if rule.target == target {
-                match rule.mode {
-                    FaultMode::OneShot => {
-                        if !rule.fired {
-                            rule.fired = true;
-                            matched = true;
+        let matched = {
+            let mut rules = self.rules.lock();
+            let mut found = false;
+            for rule in rules.iter_mut() {
+                if rule.target == target {
+                    match rule.mode {
+                        FaultMode::OneShot => {
+                            if !rule.fired {
+                                rule.fired = true;
+                                found = true;
+                                break;
+                            }
+                        }
+                        FaultMode::Persistent => {
+                            found = true;
                             break;
                         }
                     }
-                    FaultMode::Persistent => {
-                        matched = true;
-                        break;
-                    }
                 }
             }
-        }
+            drop(rules);
+            found
+        };
 
         if matched {
             let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
@@ -3050,6 +3052,215 @@ impl<D: BlockDevice> BlockDevice for FaultInjector<D> {
 
     fn sync(&self, cx: &Cx) -> Result<()> {
         self.inner.sync(cx)
+    }
+}
+
+// ── I/O throttle injection framework (bd-32yn.4) ──────────────────────────
+
+/// Configuration for I/O throttle injection.
+///
+/// Wraps a `BlockDevice` and adds configurable latency to read/write
+/// operations for testing behavior under degraded I/O performance.
+#[derive(Debug, Clone)]
+pub struct ThrottleConfig {
+    /// Fixed latency added to every read.
+    pub read_latency: Duration,
+    /// Fixed latency added to every write.
+    pub write_latency: Duration,
+    /// If > 0, simulates bandwidth limiting: delay = data_len / bps.
+    /// Value is in bytes per second.
+    pub bandwidth_bps: u64,
+    /// Probability (0.0–1.0) that an individual operation stalls for
+    /// `stall_duration` instead of the normal latency.
+    pub stall_probability: f64,
+    /// Duration of a random stall when triggered.
+    pub stall_duration: Duration,
+    /// If true, I/O operations that exceed the Cx deadline return
+    /// `FfsError::Cancelled` instead of sleeping the full duration.
+    pub respect_deadline: bool,
+}
+
+impl Default for ThrottleConfig {
+    fn default() -> Self {
+        Self {
+            read_latency: Duration::ZERO,
+            write_latency: Duration::ZERO,
+            bandwidth_bps: 0,
+            stall_probability: 0.0,
+            stall_duration: Duration::ZERO,
+            respect_deadline: true,
+        }
+    }
+}
+
+/// Record of a throttle event that was applied.
+#[derive(Debug, Clone)]
+pub struct ThrottleRecord {
+    /// Whether this was a read or write.
+    pub is_read: bool,
+    /// Block number targeted.
+    pub block: BlockNumber,
+    /// Actual delay applied.
+    pub delay: Duration,
+    /// Whether a stall was triggered.
+    pub stalled: bool,
+    /// Monotonic sequence number.
+    pub sequence: u64,
+}
+
+/// A `BlockDevice` wrapper that injects configurable I/O latency.
+///
+/// Designed to test filesystem behavior under degraded I/O:
+/// - Uniform latency (every op delayed)
+/// - Random stalls (probabilistic, deterministic via seed)
+/// - Bandwidth throttling (per-byte delay)
+/// - Cx deadline integration (respects cancellation)
+///
+/// The configuration can be updated at runtime via `update_config`.
+pub struct ThrottleInjector<D: BlockDevice> {
+    inner: D,
+    config: Mutex<ThrottleConfig>,
+    log: Mutex<Vec<ThrottleRecord>>,
+    sequence: std::sync::atomic::AtomicU64,
+    seed: u64,
+    rng_state: std::sync::atomic::AtomicU64,
+}
+
+impl<D: BlockDevice> ThrottleInjector<D> {
+    /// Wrap a device with the given throttle configuration.
+    #[must_use]
+    pub fn new(inner: D, config: ThrottleConfig, seed: u64) -> Self {
+        Self {
+            inner,
+            config: Mutex::new(config),
+            log: Mutex::new(Vec::new()),
+            sequence: std::sync::atomic::AtomicU64::new(0),
+            seed,
+            rng_state: std::sync::atomic::AtomicU64::new(seed),
+        }
+    }
+
+    /// Update the throttle configuration at runtime.
+    ///
+    /// This enables progressive degradation scenarios where latency
+    /// increases over time.
+    pub fn update_config(&self, config: ThrottleConfig) {
+        *self.config.lock() = config;
+    }
+
+    /// Return the throttle log (all recorded delays).
+    pub fn throttle_log(&self) -> Vec<ThrottleRecord> {
+        self.log.lock().clone()
+    }
+
+    /// The seed used for deterministic stall scheduling.
+    #[must_use]
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// Clear the log and reset sequence counter.
+    pub fn reset(&self) {
+        self.log.lock().clear();
+        self.sequence.store(0, Ordering::Relaxed);
+        self.rng_state.store(self.seed, Ordering::Relaxed);
+    }
+
+    /// Deterministic pseudo-random: returns value in [0.0, 1.0).
+    fn next_random(&self) -> f64 {
+        // Simple xorshift64 for deterministic, seed-based randomness.
+        let mut s = self.rng_state.load(Ordering::Relaxed);
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        self.rng_state.store(s, Ordering::Relaxed);
+        // Map to [0.0, 1.0)
+        (s >> 11) as f64 / ((1_u64 << 53) as f64)
+    }
+
+    /// Compute and apply the delay for an operation.
+    fn apply_delay(&self, cx: &Cx, is_read: bool, block: BlockNumber, data_len: u32) {
+        let config = self.config.lock().clone();
+
+        let base_latency = if is_read {
+            config.read_latency
+        } else {
+            config.write_latency
+        };
+
+        // Bandwidth throttle: delay = data_len / bps
+        let bw_delay = if config.bandwidth_bps > 0 {
+            Duration::from_secs_f64(f64::from(data_len) / config.bandwidth_bps as f64)
+        } else {
+            Duration::ZERO
+        };
+
+        // Random stall check
+        let stalled =
+            config.stall_probability > 0.0 && self.next_random() < config.stall_probability;
+        let stall_delay = if stalled {
+            config.stall_duration
+        } else {
+            Duration::ZERO
+        };
+
+        let total_delay = base_latency + bw_delay + stall_delay;
+
+        if total_delay > Duration::ZERO {
+            if config.respect_deadline {
+                // Check Cx cancellation before sleeping.
+                if cx.checkpoint().is_err() {
+                    return;
+                }
+            }
+            std::thread::sleep(total_delay);
+        }
+
+        let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
+        self.log.lock().push(ThrottleRecord {
+            is_read,
+            block,
+            delay: total_delay,
+            stalled,
+            sequence: seq,
+        });
+    }
+}
+
+impl<D: BlockDevice> BlockDevice for ThrottleInjector<D> {
+    fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
+        self.apply_delay(cx, true, block, self.inner.block_size());
+        self.inner.read_block(cx, block)
+    }
+
+    fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
+        let len = u32::try_from(data.len()).unwrap_or(u32::MAX);
+        self.apply_delay(cx, false, block, len);
+        self.inner.write_block(cx, block, data)
+    }
+
+    fn block_size(&self) -> u32 {
+        self.inner.block_size()
+    }
+
+    fn block_count(&self) -> u64 {
+        self.inner.block_count()
+    }
+
+    fn sync(&self, cx: &Cx) -> Result<()> {
+        self.inner.sync(cx)
+    }
+}
+
+impl<D: BlockDevice> std::fmt::Debug for ThrottleInjector<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThrottleInjector")
+            .field("config", &*self.config.lock())
+            .field("seed", &self.seed)
+            .field("events", &self.sequence.load(Ordering::Relaxed))
+            .field("log_len", &self.log.lock().len())
+            .field("rng_state", &self.rng_state.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
     }
 }
 
@@ -3621,7 +3832,10 @@ mod tests {
         let hot_before: usize = (0..5_u64)
             .filter(|k| state.resident.contains_key(&BlockNumber(*k)))
             .count();
-        assert!(hot_before >= 2, "at least 2 hot keys should be resident before scan");
+        assert!(
+            hot_before >= 2,
+            "at least 2 hot keys should be resident before scan"
+        );
 
         // Now scan through 30 unique one-touch keys.
         for key in 100..130_u64 {
@@ -3743,6 +3957,130 @@ mod tests {
             "scan keys should not fill the entire cache"
         );
         assert!(state.resident_len() <= state.capacity);
+    }
+
+    #[cfg(feature = "s3fifo")]
+    #[test]
+    fn s3fifo_arc_cache_read_path_preserves_written_bytes() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 2_048);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let cache = ArcCache::new(dev, 500).expect("cache");
+        let block_len = usize::try_from(cache.block_size()).expect("block size fits usize");
+
+        for block in 0_u64..1_000_u64 {
+            let byte = u8::try_from((block.wrapping_mul(31)) % 251).expect("value <= 250");
+            cache
+                .write_block(&cx, BlockNumber(block), &vec![byte; block_len])
+                .expect("write");
+        }
+
+        for block in 0_u64..1_000_u64 {
+            let expected = u8::try_from((block.wrapping_mul(31)) % 251).expect("value <= 250");
+            let buf = cache.read_block(&cx, BlockNumber(block)).expect("read");
+            assert!(buf.as_slice().iter().all(|byte| *byte == expected));
+        }
+
+        for block in (0_u64..1_000_u64).step_by(3) {
+            let updated = u8::try_from((block.wrapping_mul(17).wrapping_add(13)) % 251)
+                .expect("value <= 250");
+            cache
+                .write_block(&cx, BlockNumber(block), &vec![updated; block_len])
+                .expect("rewrite");
+            let buf = cache.read_block(&cx, BlockNumber(block)).expect("re-read");
+            assert!(buf.as_slice().iter().all(|byte| *byte == updated));
+        }
+
+        let metrics = cache.metrics();
+        assert!(metrics.resident <= metrics.capacity);
+    }
+
+    #[cfg(feature = "s3fifo")]
+    #[test]
+    fn s3fifo_arc_cache_scan_resistance_on_read_path() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 4_096);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let cache = ArcCache::new(dev, 256).expect("cache");
+
+        let hot_set: Vec<BlockNumber> = (0_u64..64_u64).map(BlockNumber).collect();
+        for _ in 0..10 {
+            for block in &hot_set {
+                let _ = cache.read_block(&cx, *block).expect("warm hot");
+            }
+        }
+
+        for block in 512_u64..2_560_u64 {
+            let _ = cache
+                .read_block(&cx, BlockNumber(block))
+                .expect("scan cold");
+        }
+
+        let hits_before_probe = cache.metrics().hits;
+        for block in &hot_set {
+            let _ = cache.read_block(&cx, *block).expect("probe hot");
+        }
+        let hits_after_probe = cache.metrics().hits;
+        let recovered_hot_hits = hits_after_probe.saturating_sub(hits_before_probe);
+        assert!(
+            recovered_hot_hits >= 32,
+            "expected at least half of hot set to survive scan, got {recovered_hot_hits}/64 hits"
+        );
+
+        let metrics = cache.metrics();
+        assert!(metrics.resident <= metrics.capacity);
+    }
+
+    #[cfg(feature = "s3fifo")]
+    #[test]
+    fn s3fifo_arc_cache_ghost_reaccess_promotes_to_main_queue() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 128);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let cache = ArcCache::new(dev, 12).expect("cache");
+
+        for block in 0_u64..9_u64 {
+            let _ = cache.read_block(&cx, BlockNumber(block)).expect("read");
+        }
+        let ghost_key = {
+            let guard = cache.state.lock();
+            guard.b1.front().copied().expect("ghost entry")
+        };
+
+        let _ = cache.read_block(&cx, ghost_key).expect("ghost re-read");
+        let guard = cache.state.lock();
+        assert!(
+            guard.t2.contains(&ghost_key),
+            "ghost-hit key should be promoted into main queue"
+        );
+        assert_eq!(guard.loc.get(&ghost_key), Some(&ArcList::T2));
+        drop(guard);
+    }
+
+    #[cfg(feature = "s3fifo")]
+    #[test]
+    fn s3fifo_arc_cache_capacity_invariant_under_random_access() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 2_048);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let cache = ArcCache::new(dev, 128).expect("cache");
+        let mut rng_state = 0xA5A5_5A5A_9E37_79B9_u64;
+
+        for _ in 0..100_000_u64 {
+            rng_state = rng_state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let block = BlockNumber(rng_state % 2_048);
+            let _ = cache.read_block(&cx, block).expect("random read");
+        }
+
+        let metrics = cache.metrics();
+        assert!(
+            metrics.resident <= metrics.capacity,
+            "resident set {} exceeded capacity {}",
+            metrics.resident,
+            metrics.capacity
+        );
     }
 
     #[test]
@@ -4844,8 +5182,9 @@ mod tests {
 
     impl BlockDevice for MemBlockDevice {
         fn read_block(&self, _cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
-            let blocks = self.blocks.lock();
-            let data = blocks
+            let data = self
+                .blocks
+                .lock()
                 .get(&block.0)
                 .cloned()
                 .unwrap_or_else(|| vec![0_u8; self.block_size as usize]);
@@ -5120,5 +5459,312 @@ mod tests {
         // Post-recovery data is correct.
         let buf1 = fi.read_block(&cx, BlockNumber(1)).unwrap();
         assert_eq!(&buf1.as_slice()[..4], &[0xBB, 0xBB, 0xBB, 0xBB]);
+    }
+
+    // ── ThrottleInjector tests (bd-32yn.4) ────────────────────────────
+
+    #[test]
+    fn throttle_passthrough_no_delay() {
+        let dev = MemBlockDevice::new(4096, 8);
+        let config = ThrottleConfig::default();
+        let ti = ThrottleInjector::new(dev, config, 42);
+        let cx = Cx::for_testing();
+
+        let data = vec![0xCC_u8; 4096];
+        ti.write_block(&cx, BlockNumber(0), &data).unwrap();
+        let buf = ti.read_block(&cx, BlockNumber(0)).unwrap();
+        assert_eq!(&buf.as_slice()[..4], &[0xCC, 0xCC, 0xCC, 0xCC]);
+
+        let log = ti.throttle_log();
+        assert_eq!(log.len(), 2); // write + read
+        assert!(!log[0].stalled);
+        assert!(!log[1].stalled);
+    }
+
+    #[test]
+    fn throttle_uniform_read_latency() {
+        let dev = MemBlockDevice::new(4096, 8);
+        let config = ThrottleConfig {
+            read_latency: Duration::from_millis(10),
+            ..Default::default()
+        };
+        let ti = ThrottleInjector::new(dev, config, 1);
+        let cx = Cx::for_testing();
+
+        let start = Instant::now();
+        let _ = ti.read_block(&cx, BlockNumber(0)).unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(9),
+            "read should take >= 9ms, took {elapsed:?}"
+        );
+
+        let log = ti.throttle_log();
+        assert_eq!(log.len(), 1);
+        assert!(log[0].is_read);
+        assert_eq!(log[0].delay, Duration::from_millis(10));
+    }
+
+    #[test]
+    fn throttle_uniform_write_latency() {
+        let dev = MemBlockDevice::new(4096, 8);
+        let config = ThrottleConfig {
+            write_latency: Duration::from_millis(10),
+            ..Default::default()
+        };
+        let ti = ThrottleInjector::new(dev, config, 2);
+        let cx = Cx::for_testing();
+
+        let data = vec![0_u8; 4096];
+        let start = Instant::now();
+        ti.write_block(&cx, BlockNumber(0), &data).unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(9),
+            "write should take >= 9ms, took {elapsed:?}"
+        );
+
+        let log = ti.throttle_log();
+        assert_eq!(log.len(), 1);
+        assert!(!log[0].is_read);
+    }
+
+    #[test]
+    fn throttle_bandwidth_limiting() {
+        let dev = MemBlockDevice::new(4096, 8);
+        // 4096 bytes at 409600 bytes/sec = 10ms delay
+        let config = ThrottleConfig {
+            bandwidth_bps: 409_600,
+            ..Default::default()
+        };
+        let ti = ThrottleInjector::new(dev, config, 3);
+        let cx = Cx::for_testing();
+
+        let start = Instant::now();
+        let _ = ti.read_block(&cx, BlockNumber(0)).unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(9),
+            "bandwidth-limited read should take >= 9ms, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn throttle_stall_deterministic() {
+        let dev = MemBlockDevice::new(4096, 8);
+        let config = ThrottleConfig {
+            stall_probability: 1.0, // always stall
+            stall_duration: Duration::from_millis(15),
+            ..Default::default()
+        };
+        let ti = ThrottleInjector::new(dev, config, 4);
+        let cx = Cx::for_testing();
+
+        let start = Instant::now();
+        let _ = ti.read_block(&cx, BlockNumber(0)).unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(14),
+            "stalled read should take >= 14ms, took {elapsed:?}"
+        );
+
+        let log = ti.throttle_log();
+        assert!(log[0].stalled);
+    }
+
+    #[test]
+    fn throttle_no_stall_at_zero_probability() {
+        let dev = MemBlockDevice::new(4096, 8);
+        let config = ThrottleConfig {
+            stall_probability: 0.0,
+            stall_duration: Duration::from_secs(10),
+            ..Default::default()
+        };
+        let ti = ThrottleInjector::new(dev, config, 5);
+        let cx = Cx::for_testing();
+
+        let start = Instant::now();
+        let _ = ti.read_block(&cx, BlockNumber(0)).unwrap();
+        let elapsed = start.elapsed();
+
+        // No stall, no latency → near-instant
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "should be fast, took {elapsed:?}"
+        );
+
+        let log = ti.throttle_log();
+        assert!(!log[0].stalled);
+    }
+
+    #[test]
+    fn throttle_progressive_degradation() {
+        let dev = MemBlockDevice::new(4096, 8);
+        let config = ThrottleConfig {
+            read_latency: Duration::from_millis(5),
+            ..Default::default()
+        };
+        let ti = ThrottleInjector::new(dev, config, 6);
+        let cx = Cx::for_testing();
+
+        // First read: 5ms latency.
+        let start = Instant::now();
+        let _ = ti.read_block(&cx, BlockNumber(0)).unwrap();
+        let t1 = start.elapsed();
+
+        // Progressive: increase latency to 15ms.
+        ti.update_config(ThrottleConfig {
+            read_latency: Duration::from_millis(15),
+            ..Default::default()
+        });
+
+        let start = Instant::now();
+        let _ = ti.read_block(&cx, BlockNumber(0)).unwrap();
+        let t2 = start.elapsed();
+
+        assert!(
+            t2 > t1,
+            "second read should be slower after config update: t1={t1:?}, t2={t2:?}"
+        );
+    }
+
+    #[test]
+    fn throttle_reset_clears_log() {
+        let dev = MemBlockDevice::new(4096, 8);
+        let config = ThrottleConfig::default();
+        let ti = ThrottleInjector::new(dev, config, 7);
+        let cx = Cx::for_testing();
+
+        let _ = ti.read_block(&cx, BlockNumber(0)).unwrap();
+        assert_eq!(ti.throttle_log().len(), 1);
+
+        ti.reset();
+        assert!(ti.throttle_log().is_empty());
+    }
+
+    #[test]
+    fn throttle_log_sequence_monotonic() {
+        let dev = MemBlockDevice::new(4096, 8);
+        let config = ThrottleConfig::default();
+        let ti = ThrottleInjector::new(dev, config, 8);
+        let cx = Cx::for_testing();
+
+        for i in 0..5 {
+            let _ = ti.read_block(&cx, BlockNumber(i)).unwrap();
+        }
+
+        let log = ti.throttle_log();
+        assert_eq!(log.len(), 5);
+        for (i, record) in log.iter().enumerate() {
+            assert_eq!(record.sequence, u64::try_from(i).unwrap());
+        }
+    }
+
+    #[test]
+    fn throttle_combined_with_fault_injector() {
+        // Stack: FaultInjector<ThrottleInjector<MemBlockDevice>>
+        let dev = MemBlockDevice::new(4096, 8);
+        let config = ThrottleConfig {
+            read_latency: Duration::from_millis(5),
+            ..Default::default()
+        };
+        let throttled = ThrottleInjector::new(dev, config, 9);
+        let faulted = FaultInjector::new(throttled, 10);
+        let cx = Cx::for_testing();
+
+        // Normal read with throttle: should work.
+        let data = vec![0xDD_u8; 4096];
+        faulted
+            .inner
+            .inner
+            .write_block(&cx, BlockNumber(0), &data)
+            .ok();
+        let buf = faulted.read_block(&cx, BlockNumber(0)).unwrap();
+        assert_eq!(buf.as_slice()[0], 0xDD);
+
+        // Inject fault: read should fail.
+        faulted.fail_on_read(BlockNumber(1), FaultMode::OneShot);
+        assert!(faulted.read_block(&cx, BlockNumber(1)).is_err());
+    }
+
+    #[test]
+    fn throttle_concurrent_no_deadlock() {
+        let dev = MemBlockDevice::new(4096, 16);
+        let config = ThrottleConfig {
+            read_latency: Duration::from_millis(1),
+            write_latency: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let ti = StdArc::new(ThrottleInjector::new(dev, config, 11));
+        let barrier = StdArc::new(std::sync::Barrier::new(4));
+
+        std::thread::scope(|s| {
+            for thread_id in 0_u64..4 {
+                let ti = StdArc::clone(&ti);
+                let barrier = StdArc::clone(&barrier);
+                s.spawn(move || {
+                    let cx = Cx::for_testing();
+                    barrier.wait();
+                    for i in 0..10 {
+                        let block = BlockNumber(thread_id * 4 + i);
+                        let data = vec![u8::try_from(i).unwrap_or(0); 4096];
+                        ti.write_block(&cx, block, &data).unwrap();
+                        let _ = ti.read_block(&cx, block).unwrap();
+                    }
+                });
+            }
+        });
+
+        // 4 threads * 10 iterations * 2 ops (write + read) = 80 events
+        assert_eq!(ti.throttle_log().len(), 80);
+    }
+
+    #[test]
+    fn throttle_debug_format() {
+        let dev = MemBlockDevice::new(4096, 4);
+        let config = ThrottleConfig {
+            read_latency: Duration::from_millis(10),
+            ..Default::default()
+        };
+        let ti = ThrottleInjector::new(dev, config, 99);
+        let dbg = format!("{ti:?}");
+        assert!(dbg.contains("ThrottleInjector"), "missing struct: {dbg}");
+        assert!(dbg.contains("seed"), "missing seed: {dbg}");
+    }
+
+    #[test]
+    fn throttle_same_seed_same_stall_pattern() {
+        // Two injectors with the same seed should produce identical stall patterns.
+        let config = ThrottleConfig {
+            stall_probability: 0.5,
+            stall_duration: Duration::from_millis(1),
+            ..Default::default()
+        };
+
+        let dev1 = MemBlockDevice::new(4096, 8);
+        let ti1 = ThrottleInjector::new(dev1, config.clone(), 123);
+        let dev2 = MemBlockDevice::new(4096, 8);
+        let ti2 = ThrottleInjector::new(dev2, config, 123);
+        let cx = Cx::for_testing();
+
+        for i in 0..20 {
+            let _ = ti1.read_block(&cx, BlockNumber(i % 8)).unwrap();
+            let _ = ti2.read_block(&cx, BlockNumber(i % 8)).unwrap();
+        }
+
+        let log1 = ti1.throttle_log();
+        let log2 = ti2.throttle_log();
+        assert_eq!(log1.len(), log2.len());
+        for (r1, r2) in log1.iter().zip(log2.iter()) {
+            assert_eq!(
+                r1.stalled, r2.stalled,
+                "stall mismatch at seq {}",
+                r1.sequence
+            );
+        }
     }
 }

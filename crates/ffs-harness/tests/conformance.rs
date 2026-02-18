@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use ffs_harness::{
-    ParityReport, validate_btrfs_chunk_fixture, validate_btrfs_fixture,
+    GoldenReference, ParityReport, validate_btrfs_chunk_fixture, validate_btrfs_fixture,
     validate_btrfs_leaf_fixture, validate_dir_block_fixture, validate_ext4_fixture,
     validate_group_desc_fixture, validate_inode_fixture,
 };
@@ -325,4 +325,212 @@ fn golden_checksum_manifest_is_complete() {
             "golden {json_file} exists but is not listed in checksums.sha256"
         );
     }
+}
+
+/// Full conformance gate pass (bd-2jk.14).
+///
+/// This is the single CI gate test that exercises every conformance
+/// surface in one deterministic pass: all fixture parsers, checksum
+/// manifests, golden references, fuzz corpus, and parity report.
+/// Must complete in < 60 seconds.
+#[test]
+fn full_conformance_gate_pass() {
+    let start = std::time::Instant::now();
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+
+    // ── 1. All 12 fixture JSONs parse successfully ──────────────────
+    let ext4_sparse = validate_ext4_fixture(&fixture_path("ext4_superblock_sparse.json"))
+        .expect("ext4_superblock_sparse.json");
+    let ext4_mkfs = validate_ext4_fixture(&fixture_path("ext4_superblock_mkfs_4096.json"))
+        .expect("ext4_superblock_mkfs_4096.json");
+    let btrfs_sb = validate_btrfs_fixture(&fixture_path("btrfs_superblock_sparse.json"))
+        .expect("btrfs_superblock_sparse.json");
+    let gd32 = validate_group_desc_fixture(&fixture_path("ext4_group_desc_32byte.json"), 32)
+        .expect("ext4_group_desc_32byte.json");
+    let gd64 = validate_group_desc_fixture(&fixture_path("ext4_group_desc_64byte.json"), 64)
+        .expect("ext4_group_desc_64byte.json");
+    let inode_file = validate_inode_fixture(&fixture_path("ext4_inode_regular_file.json"))
+        .expect("ext4_inode_regular_file.json");
+    let inode_dir = validate_inode_fixture(&fixture_path("ext4_inode_directory.json"))
+        .expect("ext4_inode_directory.json");
+    let dir_entries = validate_dir_block_fixture(&fixture_path("ext4_dir_block.json"), 4096)
+        .expect("ext4_dir_block.json");
+    let (chunk_sb, chunks) =
+        validate_btrfs_chunk_fixture(&fixture_path("btrfs_superblock_with_chunks.json"))
+            .expect("btrfs_superblock_with_chunks.json");
+    let (leaf_hdr, leaf_items) = validate_btrfs_leaf_fixture(&fixture_path("btrfs_leaf_node.json"))
+        .expect("btrfs_leaf_node.json");
+    let (fstree_hdr, fstree_items) =
+        validate_btrfs_leaf_fixture(&fixture_path("btrfs_fstree_leaf.json"))
+            .expect("btrfs_fstree_leaf.json");
+    let (roottree_hdr, roottree_items) =
+        validate_btrfs_leaf_fixture(&fixture_path("btrfs_roottree_leaf.json"))
+            .expect("btrfs_roottree_leaf.json");
+
+    // Spot-check parsed values to verify parser correctness
+    assert_eq!(ext4_sparse.block_size, 4096);
+    assert_eq!(ext4_mkfs.block_size, 4096);
+    assert_eq!(btrfs_sb.sectorsize, 4096);
+    assert_eq!(gd32.block_bitmap, 5);
+    assert!(gd64.block_bitmap > u64::from(u32::MAX));
+    assert_eq!(inode_file.mode & 0o17_0000, 0o10_0000);
+    assert_eq!(inode_dir.mode & 0o17_0000, 0o4_0000);
+    assert!(dir_entries.len() >= 3);
+    assert!(!chunks.is_empty());
+    assert_eq!(leaf_hdr.level, 0);
+    assert!(leaf_items.len() >= 3);
+    assert_eq!(fstree_hdr.owner, 5);
+    assert!(fstree_items.len() >= 5);
+    assert_eq!(roottree_hdr.owner, 1);
+    assert!(roottree_items.len() >= 3);
+
+    // Chunk mapping sanity
+    assert!(
+        ffs_ondisk::map_logical_to_physical(&chunks, chunk_sb.root)
+            .expect("map ok")
+            .is_some()
+    );
+
+    // ── 2. Fixture checksum manifest is bidirectionally complete ─────
+    let fix_checksums =
+        std::fs::read_to_string(workspace.join("conformance/fixtures/checksums.sha256"))
+            .expect("read fixture checksums");
+    let fix_listed: Vec<&str> = fix_checksums
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| l.split_once("  ").map(|(_, f)| f))
+        .collect();
+    assert_eq!(
+        fix_listed.len(),
+        12,
+        "fixture manifest should list 12 files"
+    );
+
+    let fixtures_dir = workspace.join("conformance/fixtures");
+    let mut fix_actual: Vec<String> = std::fs::read_dir(&fixtures_dir)
+        .expect("read fixtures dir")
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    fix_actual.sort();
+
+    assert_eq!(
+        fix_actual.len(),
+        fix_listed.len(),
+        "fixture dir vs manifest count mismatch"
+    );
+    for name in &fix_actual {
+        assert!(
+            fix_listed.contains(&name.as_str()),
+            "fixture {name} not in manifest"
+        );
+    }
+    for name in &fix_listed {
+        let data = std::fs::read(fixtures_dir.join(name))
+            .unwrap_or_else(|e| panic!("fixture {name} unreadable: {e}"));
+        assert!(!data.is_empty(), "fixture {name} is empty");
+    }
+
+    // ── 3. Golden checksum manifest is bidirectionally complete ──────
+    let gold_checksums =
+        std::fs::read_to_string(workspace.join("conformance/golden/checksums.sha256"))
+            .expect("read golden checksums");
+    let gold_listed: Vec<&str> = gold_checksums
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| l.split_once("  ").map(|(_, f)| f))
+        .collect();
+    assert_eq!(gold_listed.len(), 5, "golden manifest should list 5 files");
+
+    let golden_dir = workspace.join("conformance/golden");
+    let mut gold_actual: Vec<String> = std::fs::read_dir(&golden_dir)
+        .expect("read golden dir")
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    gold_actual.sort();
+
+    assert_eq!(
+        gold_actual.len(),
+        gold_listed.len(),
+        "golden dir vs manifest count mismatch"
+    );
+    for name in &gold_actual {
+        assert!(
+            gold_listed.contains(&name.as_str()),
+            "golden {name} not in manifest"
+        );
+    }
+
+    // ── 4. All golden JSON files deserialize successfully ───────────
+    let golden_names = [
+        "ext4_64mb_sparse_super.json",
+        "ext4_htree_dirindex.json",
+        "ext4_64mb_reference.json",
+        "ext4_dir_index_reference.json",
+        "ext4_8mb_reference.json",
+    ];
+    for name in &golden_names {
+        let text = std::fs::read_to_string(golden_dir.join(name))
+            .unwrap_or_else(|e| panic!("golden {name} unreadable: {e}"));
+        let golden: GoldenReference =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("golden {name} invalid: {e}"));
+        assert!(golden.version >= 1, "golden {name} version should be >= 1");
+        assert!(
+            !golden.source.is_empty(),
+            "golden {name} source should be non-empty"
+        );
+    }
+
+    // ── 5. Fuzz corpus is populated ─────────────────────────────────
+    let corpus_dir = workspace.join("tests/fuzz_corpus");
+    let corpus_count = std::fs::read_dir(&corpus_dir)
+        .expect("read fuzz_corpus dir")
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "bin"))
+        .count();
+    assert!(
+        corpus_count >= 50,
+        "expected >= 50 fuzz corpus samples, found {corpus_count}"
+    );
+
+    // ── 6. ParityReport at 100% and consistent ─────────────────────
+    let report = ParityReport::current();
+    assert_eq!(report.overall_implemented, report.overall_total);
+    assert!(
+        (report.overall_coverage_percent - 100.0).abs() < f64::EPSILON,
+        "overall coverage should be 100%, got {}%",
+        report.overall_coverage_percent
+    );
+    for domain in &report.domains {
+        assert_eq!(
+            domain.implemented, domain.total,
+            "domain '{}' not at 100%: {}/{}",
+            domain.domain, domain.implemented, domain.total
+        );
+    }
+
+    // Internal consistency
+    let impl_sum: u32 = report.domains.iter().map(|d| d.implemented).sum();
+    let total_sum: u32 = report.domains.iter().map(|d| d.total).sum();
+    assert_eq!(impl_sum, report.overall_implemented);
+    assert_eq!(total_sum, report.overall_total);
+
+    // ── 7. Deterministic: second run yields identical report ────────
+    let report2 = ParityReport::current();
+    assert_eq!(report.overall_implemented, report2.overall_implemented);
+    assert_eq!(report.overall_total, report2.overall_total);
+    assert_eq!(report.domains.len(), report2.domains.len());
+
+    // ── 8. Time bound ───────────────────────────────────────────────
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed.as_secs() < 60,
+        "conformance gate should complete in < 60s, took {elapsed:?}"
+    );
 }

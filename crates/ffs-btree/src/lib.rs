@@ -13,6 +13,8 @@
 //!           extents (at 4K blocks: (4096-12-4)/12 = 340).
 //! Depth 2: up to 4 × 340 = 1360 child blocks, each with 340 leaf extents.
 
+pub mod bw_tree;
+
 use asupersync::Cx;
 use ffs_block::BlockDevice;
 use ffs_error::{FfsError, Result};

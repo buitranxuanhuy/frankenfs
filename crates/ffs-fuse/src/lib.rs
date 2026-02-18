@@ -2841,7 +2841,11 @@ mod tests {
         ];
 
         // 20 variants listed; verify count matches expectation.
-        assert_eq!(cases.len(), 20, "expected all 20 constructible FfsError variants");
+        assert_eq!(
+            cases.len(),
+            20,
+            "expected all 20 constructible FfsError variants"
+        );
 
         for (error, expected) in &cases {
             let ctx = FuseErrorContext {
@@ -2850,11 +2854,7 @@ mod tests {
                 ino: 99,
                 offset: Some(0),
             };
-            assert_eq!(
-                ctx.log_and_errno(),
-                *expected,
-                "wrong errno for {error:?}",
-            );
+            assert_eq!(ctx.log_and_errno(), *expected, "wrong errno for {error:?}",);
         }
     }
 
@@ -2887,20 +2887,23 @@ mod tests {
     // ── Read-only flag propagation ───────────────────────────────────────
 
     #[test]
-    fn fuse_inner_read_only_reflects_mount_options() {
-        let opts_ro = MountOptions {
+    fn fuse_inner_read_only_true_when_mount_option_set() {
+        let opts = MountOptions {
             read_only: true,
             ..Default::default()
         };
-        let fuse_ro = FrankenFuse::with_options(Box::new(StubFs), &opts_ro);
-        assert!(fuse_ro.inner.read_only);
+        let fuse = FrankenFuse::with_options(Box::new(StubFs), &opts);
+        assert!(fuse.inner.read_only);
+    }
 
-        let opts_rw = MountOptions {
+    #[test]
+    fn fuse_inner_read_only_false_when_writable() {
+        let opts = MountOptions {
             read_only: false,
             ..Default::default()
         };
-        let fuse_rw = FrankenFuse::with_options(Box::new(StubFs), &opts_rw);
-        assert!(!fuse_rw.inner.read_only);
+        let fuse = FrankenFuse::with_options(Box::new(StubFs), &opts);
+        assert!(!fuse.inner.read_only);
     }
 
     #[test]
@@ -2913,9 +2916,7 @@ mod tests {
         };
         let mount_opts = build_mount_options(&opts);
         // Should NOT contain RO
-        let has_ro = mount_opts
-            .iter()
-            .any(|o| matches!(o, MountOption::RO));
+        let has_ro = mount_opts.iter().any(|o| matches!(o, MountOption::RO));
         assert!(!has_ro, "RO should not be present when read_only=false");
     }
 
@@ -3045,10 +3046,7 @@ mod tests {
         }
 
         // Inode 31 has no history — should not batch.
-        assert_eq!(
-            predictor.fetch_size(InodeNumber(31), 0, size),
-            size,
-        );
+        assert_eq!(predictor.fetch_size(InodeNumber(31), 0, size), size);
     }
 
     // ── Concurrent AccessPredictor stress ────────────────────────────────

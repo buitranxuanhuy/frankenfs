@@ -511,6 +511,8 @@ name = "ffs-btree"
 version = "0.1.0"
 dependencies = [
  "asupersync",
+ "criterion",
+ "crossbeam-epoch",
  "ffs-block",
  "ffs-error",
  "ffs-ondisk",

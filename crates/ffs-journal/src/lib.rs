@@ -1,9 +1,12 @@
 #![forbid(unsafe_code)]
-//! JBD2-compatible journal replay and native COW journal.
+//! JBD2-compatible journal replay, native COW journal, and per-core WAL buffers.
 //!
-//! This crate provides two complementary journaling mechanisms:
+//! This crate provides three complementary journaling mechanisms:
 //! 1. A JBD2 replay engine for compatibility-mode ext4 recovery.
 //! 2. A native append-only COW journal for FrankenFS MVCC commits.
+//! 3. Per-core WAL buffers for lock-free concurrent MVCC writes.
+
+pub mod wal_buffer;
 
 use asupersync::Cx;
 use ffs_block::BlockDevice;
@@ -1786,13 +1789,21 @@ mod tests {
 
         // Verify target block is initially zeros.
         let before = dev.read_block(&cx, BlockNumber(7)).expect("read before");
-        assert_eq!(before.as_slice(), &[0_u8; 512], "target should be zero before replay");
+        assert_eq!(
+            before.as_slice(),
+            &[0_u8; 512],
+            "target should be zero before replay"
+        );
 
         let out = replay_jbd2(&cx, &dev, region).expect("replay");
 
         // Verify target block now contains the journal payload.
         let after = dev.read_block(&cx, BlockNumber(7)).expect("read after");
-        assert_eq!(after.as_slice(), &[0xDE; 512], "target should have journal payload");
+        assert_eq!(
+            after.as_slice(),
+            &[0xDE; 512],
+            "target should have journal payload"
+        );
         assert_eq!(out.committed_sequences, vec![42]);
         assert_eq!(out.stats.replayed_blocks, 1);
     }
@@ -1817,7 +1828,11 @@ mod tests {
 
         // Target block should remain untouched.
         let target = dev.read_block(&cx, BlockNumber(4)).expect("read");
-        assert_eq!(target.as_slice(), &[0_u8; 512], "aborted txn should not modify target");
+        assert_eq!(
+            target.as_slice(),
+            &[0_u8; 512],
+            "aborted txn should not modify target"
+        );
         assert!(out.committed_sequences.is_empty());
         assert_eq!(out.stats.incomplete_transactions, 1);
         assert_eq!(out.stats.replayed_blocks, 0);
@@ -1850,13 +1865,25 @@ mod tests {
 
         // First transaction's blocks should be replayed.
         let b3 = dev.read_block(&cx, BlockNumber(3)).expect("read block 3");
-        assert_eq!(b3.as_slice(), &[0xAA; 512], "complete txn block 3 should be written");
+        assert_eq!(
+            b3.as_slice(),
+            &[0xAA; 512],
+            "complete txn block 3 should be written"
+        );
         let b4 = dev.read_block(&cx, BlockNumber(4)).expect("read block 4");
-        assert_eq!(b4.as_slice(), &[0xBB; 512], "complete txn block 4 should be written");
+        assert_eq!(
+            b4.as_slice(),
+            &[0xBB; 512],
+            "complete txn block 4 should be written"
+        );
 
         // Second transaction's block should NOT be replayed.
         let b5 = dev.read_block(&cx, BlockNumber(5)).expect("read block 5");
-        assert_eq!(b5.as_slice(), &[0_u8; 512], "torn txn block 5 should be untouched");
+        assert_eq!(
+            b5.as_slice(),
+            &[0_u8; 512],
+            "torn txn block 5 should be untouched"
+        );
 
         assert_eq!(out.committed_sequences, vec![10]);
         assert_eq!(out.stats.replayed_blocks, 2);

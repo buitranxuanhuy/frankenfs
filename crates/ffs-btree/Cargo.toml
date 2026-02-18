@@ -13,9 +13,15 @@ ffs-block = { workspace = true }
 ffs-ondisk = { workspace = true }
 asupersync = { workspace = true }
 tracing = { workspace = true }
+crossbeam-epoch = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 proptest = { workspace = true }
+
+[[bench]]
+name = "bwtree_vs_locked"
+harness = false
 
 [lints]
 workspace = true
