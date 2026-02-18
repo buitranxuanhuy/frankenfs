@@ -4,6 +4,11 @@
 //! Provides the `BlockDevice` trait, cached block reads/writes with
 //! `&Cx` capability context for cooperative cancellation, dirty page
 //! tracking, and background flush coordination.
+//!
+//! See [`io_engine`] for the pluggable I/O engine abstraction
+//! (pread/pwrite, future io_uring/SPDK backends).
+
+pub mod io_engine;
 
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
@@ -5076,7 +5081,7 @@ mod tests {
                     }
                 })
                 .expect("create reader task");
-            runtime.scheduler.lock().unwrap().schedule(task_id, 0);
+            runtime.scheduler.lock().schedule(task_id, 0);
         }
 
         for writer in 0..WRITERS {
@@ -5097,7 +5102,7 @@ mod tests {
                     }
                 })
                 .expect("create writer task");
-            runtime.scheduler.lock().unwrap().schedule(task_id, 0);
+            runtime.scheduler.lock().schedule(task_id, 0);
         }
 
         runtime.run_until_quiescent();

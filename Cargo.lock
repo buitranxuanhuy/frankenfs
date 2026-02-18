@@ -504,6 +504,7 @@ dependencies = [
  "ffs-error",
  "ffs-types",
  "parking_lot",
+ "tempfile",
  "tracing",
 ]
 
