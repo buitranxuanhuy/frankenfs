@@ -62,3 +62,15 @@ fail_percent = 20
 [operation_thresholds.block_cache_s3fifo_database_like]
 warn_percent = 10
 fail_percent = 20
+
+[operation_thresholds.block_cache_lookup_latency]
+warn_percent = 10
+fail_percent = 20
+
+[operation_thresholds.block_cache_writeback_single_4k]
+warn_percent = 10
+fail_percent = 20
+
+[operation_thresholds.block_cache_writeback_batch_100x4k]
+warn_percent = 10
+fail_percent = 20

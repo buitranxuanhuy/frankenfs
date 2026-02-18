@@ -201,6 +201,14 @@ pub fn decode_group(
             "malformed repair equation for group {}: esi={esi}, columns={columns}, coefficients={coefficients}",
             group.0
         )),
+        DecodeError::ColumnIndexOutOfRange { esi, column, max_valid } => FfsError::RepairFailed(format!(
+            "column index out of range for group {}: esi={esi}, column={column}, max_valid={max_valid}",
+            group.0
+        )),
+        DecodeError::CorruptDecodedOutput { esi, byte_index, expected, actual } => FfsError::RepairFailed(format!(
+            "corrupt decoded output for group {}: esi={esi}, byte_index={byte_index}, expected={expected:#x}, actual={actual:#x}",
+            group.0
+        )),
     })?;
 
     // Extract recovered blocks for the corrupt indices.

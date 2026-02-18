@@ -1,0 +1,81 @@
+{
+  "generated_at": "2026-02-18T01:18:00Z",
+  "commit": "a923dd9",
+  "branch": "main",
+  "p99_warn_threshold_percent": 10.0,
+  "p99_fail_threshold_percent": 20.0,
+  "measurements": [
+    {
+      "operation": "block_cache_arc_sequential_scan",
+      "metric": "hit_rate",
+      "p50_us": 0.0,
+      "p95_us": 0.0,
+      "p99_us": 0.0,
+      "throughput_ops_sec": 16384.0,
+      "status": "measured"
+    },
+    {
+      "operation": "block_cache_arc_zipf_distribution",
+      "metric": "hit_rate",
+      "p50_us": 0.0,
+      "p95_us": 0.0,
+      "p99_us": 0.0,
+      "throughput_ops_sec": 24000.0,
+      "status": "measured"
+    },
+    {
+      "operation": "block_cache_arc_mixed_seq70_hot30",
+      "metric": "hit_rate",
+      "p50_us": 0.0,
+      "p95_us": 0.0,
+      "p99_us": 0.0,
+      "throughput_ops_sec": 24000.0,
+      "status": "measured"
+    },
+    {
+      "operation": "block_cache_arc_compile_like",
+      "metric": "hit_rate",
+      "p50_us": 0.0,
+      "p95_us": 0.0,
+      "p99_us": 0.0,
+      "throughput_ops_sec": 14848.0,
+      "status": "measured"
+    },
+    {
+      "operation": "block_cache_arc_database_like",
+      "metric": "hit_rate",
+      "p50_us": 0.0,
+      "p95_us": 0.0,
+      "p99_us": 0.0,
+      "throughput_ops_sec": 38880.0,
+      "status": "measured"
+    },
+    {
+      "operation": "block_cache_lookup_latency",
+      "metric": "latency",
+      "p50_us": 4.1,
+      "p95_us": 7.0,
+      "p99_us": 10.4,
+      "throughput_ops_sec": 0.0,
+      "status": "measured"
+    },
+    {
+      "operation": "block_cache_writeback_single_4k",
+      "metric": "latency",
+      "p50_us": 0.0,
+      "p95_us": 0.0,
+      "p99_us": 0.0,
+      "throughput_ops_sec": 0.0,
+      "status": "pending"
+    },
+    {
+      "operation": "block_cache_writeback_batch_100x4k",
+      "metric": "latency",
+      "p50_us": 0.0,
+      "p95_us": 0.0,
+      "p99_us": 0.0,
+      "throughput_ops_sec": 0.0,
+      "status": "pending"
+    }
+  ]
+}
