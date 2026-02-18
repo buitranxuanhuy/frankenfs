@@ -11,6 +11,7 @@ pub mod decision;
 pub mod demo;
 pub mod evidence;
 pub mod pipeline;
+pub mod por;
 pub mod recovery;
 pub mod scrub;
 pub mod storage;
