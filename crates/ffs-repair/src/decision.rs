@@ -75,10 +75,13 @@ impl RepairAction {
 /// Lower values are better. The units are abstract "cost units" that
 /// weigh data-loss risk against operational overhead.
 #[must_use]
+#[allow(clippy::enum_glob_use, clippy::match_same_arms)]
 pub fn loss(state: RepairState, action: RepairAction) -> f64 {
     use RepairAction::*;
     use RepairState::*;
 
+    // Loss matrix: each cell is an intentional design choice.
+    // Coincidental value equality across rows is expected.
     match (state, action) {
         // Clean state: repairs are unnecessary overhead.
         (Clean, RepairLocal) => 5.0,
