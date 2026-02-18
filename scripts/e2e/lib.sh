@@ -365,6 +365,11 @@ e2e_unmount() {
         umount "$mnt_point" 2>/dev/null || true
     fi
 
+    # Fallback for orphaned/stuck FUSE mounts where fusermount fails.
+    if mountpoint -q "$mnt_point" 2>/dev/null; then
+        umount "$mnt_point" 2>/dev/null || umount -l "$mnt_point" 2>/dev/null || true
+    fi
+
     # Give it a moment
     sleep 0.5
 

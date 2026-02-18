@@ -252,7 +252,7 @@ pub(crate) struct CommittedTxnRecord {
     pub(crate) read_set: BTreeMap<BlockNumber, CommitSeq>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EbrVersionStats {
     pub retired_versions: u64,
     pub reclaimed_versions: u64,
@@ -266,7 +266,7 @@ impl EbrVersionStats {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockVersionStats {
     pub tracked_blocks: usize,
     pub max_chain_length: usize,
@@ -1475,6 +1475,7 @@ impl MvccStore {
 
     pub fn prune_versions_older_than(&mut self, watermark: CommitSeq) {
         let mut retired_versions = Vec::new();
+        let active_snapshot_count = self.active_snapshot_count();
         for (block, versions) in &mut self.versions {
             if versions.len() <= 1 {
                 continue;
@@ -1501,6 +1502,19 @@ impl MvccStore {
                     versions_freed = u64::try_from(keep_from).unwrap_or(u64::MAX),
                     oldest_retained_commit_seq
                 );
+            } else if versions.len() > 1 {
+                let next_commit_seq = versions[1].commit_seq;
+                if next_commit_seq > watermark {
+                    debug!(
+                        target: "ffs::mvcc::gc",
+                        event = "gc_skip_pinned_version",
+                        block_id = block.0,
+                        blocked_commit_seq = next_commit_seq.0,
+                        epoch_id = watermark.0,
+                        pinned_by = "active_snapshot_watermark",
+                        active_snapshot_count
+                    );
+                }
             }
         }
         if !retired_versions.is_empty() {

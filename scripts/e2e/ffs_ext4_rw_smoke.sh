@@ -15,8 +15,10 @@ source "$REPO_ROOT/scripts/e2e/lib.sh"
 
 export RUST_LOG="${RUST_LOG:-trace}"
 export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
+export FFS_USE_RCH="${FFS_USE_RCH:-1}"
 # Avoid implicit AllowOther injection from fuse3 auto-unmount in rootless test environments.
 export FFS_AUTO_UNMOUNT="${FFS_AUTO_UNMOUNT:-0}"
+FFS_SKIP_BUILD="${FFS_SKIP_BUILD:-0}"
 FFS_CLI_BIN="${FFS_CLI_BIN:-$REPO_ROOT/target/release/ffs-cli}"
 
 e2e_init "ffs_ext4_rw_smoke"
@@ -205,6 +207,13 @@ stop_mount() {
         wait "$CURRENT_MOUNT_PID" 2>/dev/null || true
     fi
 
+    # Unmount once more after daemon shutdown in case the first attempt ran
+    # before the mount process exited.
+    if mountpoint -q "$mount_point" 2>/dev/null; then
+        e2e_log "Retrying unmount after mount process exit: $mount_point"
+        e2e_unmount "$mount_point"
+    fi
+
     CURRENT_MOUNT_PID=""
     CURRENT_MOUNT_POINT=""
 }
@@ -234,8 +243,42 @@ wait_for_pid_exit() {
     wait "$pid" 2>/dev/null || true
 }
 
+fsync_file_and_parent() {
+    local file_path="$1"
+    e2e_assert python3 - "$file_path" <<'PY'
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+fd = os.open(path, os.O_RDONLY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+
+dir_fd = os.open(str(path.parent), os.O_RDONLY)
+try:
+    os.fsync(dir_fd)
+finally:
+    os.close(dir_fd)
+PY
+}
+
+run_cargo() {
+    if [[ "$FFS_USE_RCH" == "1" ]] && command -v rch >/dev/null 2>&1; then
+        e2e_assert rch exec -- cargo "$@"
+    else
+        e2e_assert cargo "$@"
+    fi
+}
+
 e2e_step "Phase 1: Build ffs-cli"
-e2e_assert cargo build -p ffs-cli --release
+if [[ "$FFS_SKIP_BUILD" == "1" ]]; then
+    e2e_log "Skipping build (FFS_SKIP_BUILD=1); expecting existing binary at $FFS_CLI_BIN"
+else
+    run_cargo build -p ffs-cli --release
+fi
 e2e_assert_file "$FFS_CLI_BIN"
 
 e2e_step "Phase 2: Create base/work ext4 images"
@@ -260,6 +303,7 @@ e2e_assert grep -Fxq "goodbye" "$MOUNT_RW/newfile.txt"
 
 e2e_assert bash -lc "printf 'persisted-after-clean-unmount\n' > '$MOUNT_RW/persist.txt'"
 e2e_assert grep -Fxq "persisted-after-clean-unmount" "$MOUNT_RW/persist.txt"
+fsync_file_and_parent "$MOUNT_RW/persist.txt"
 
 e2e_step "Phase 3.2: mkdir/rmdir"
 e2e_assert mkdir "$MOUNT_RW/newdir"
@@ -287,6 +331,7 @@ fi
 MTIME_BEFORE="$(stat -c '%Y' "$MOUNT_RW/persist.txt")"
 sleep 1
 e2e_assert bash -lc "printf 'mtime-check\n' >> '$MOUNT_RW/persist.txt'"
+fsync_file_and_parent "$MOUNT_RW/persist.txt"
 MTIME_AFTER="$(stat -c '%Y' "$MOUNT_RW/persist.txt")"
 if (( MTIME_AFTER < MTIME_BEFORE )); then
     e2e_fail "mtime monotonicity check failed: before=$MTIME_BEFORE after=$MTIME_AFTER"
@@ -524,12 +569,17 @@ for rel in existing_inflight:
         continue
     idx = int(planned_event["idx"])
     mode = str(planned_event["mode"])
+    was_fsynced = rel in fsynced
     expected = payload_for(idx, mode)
     actual = (mount / rel).read_bytes()
     if actual == expected:
         continue
-    # For non-fsync writes, allow clean prefix truncation after SIGKILL.
-    if mode != "fsync" and expected.startswith(actual):
+    # For writes that did not complete fsync, allow clean prefix truncation
+    # after SIGKILL regardless of planned mode.
+    if not was_fsynced and expected.startswith(actual):
+        continue
+    # fsync-marked files are checked strictly in the fsynced loop below.
+    if was_fsynced:
         continue
     errors.append(
         f"inflight file contains unexpected bytes: {rel} (len={len(actual)} expected={len(expected)})"

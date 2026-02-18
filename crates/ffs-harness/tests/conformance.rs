@@ -5,6 +5,7 @@ use ffs_harness::{
     validate_btrfs_leaf_fixture, validate_dir_block_fixture, validate_ext4_fixture,
     validate_group_desc_fixture, validate_inode_fixture,
 };
+use serde_json::Value;
 use std::path::Path;
 
 fn fixture_path(name: &str) -> std::path::PathBuf {
@@ -444,7 +445,7 @@ fn full_conformance_gate_pass() {
         .filter(|l| !l.is_empty())
         .filter_map(|l| l.split_once("  ").map(|(_, f)| f))
         .collect();
-    assert_eq!(gold_listed.len(), 5, "golden manifest should list 5 files");
+    assert_eq!(gold_listed.len(), 8, "golden manifest should list 8 files");
 
     let golden_dir = workspace.join("conformance/golden");
     let mut gold_actual: Vec<String> = std::fs::read_dir(&golden_dir)
@@ -468,14 +469,14 @@ fn full_conformance_gate_pass() {
     }
 
     // ── 4. All golden JSON files deserialize successfully ───────────
-    let golden_names = [
+    let ext4_golden_names = [
         "ext4_64mb_sparse_super.json",
         "ext4_htree_dirindex.json",
         "ext4_64mb_reference.json",
         "ext4_dir_index_reference.json",
         "ext4_8mb_reference.json",
     ];
-    for name in &golden_names {
+    for name in &ext4_golden_names {
         let text = std::fs::read_to_string(golden_dir.join(name))
             .unwrap_or_else(|e| panic!("golden {name} unreadable: {e}"));
         let golden: GoldenReference =
@@ -484,6 +485,32 @@ fn full_conformance_gate_pass() {
         assert!(
             !golden.source.is_empty(),
             "golden {name} source should be non-empty"
+        );
+    }
+
+    let btrfs_golden_names = ["btrfs_small.json", "btrfs_medium.json", "btrfs_large.json"];
+    for name in &btrfs_golden_names {
+        let text = std::fs::read_to_string(golden_dir.join(name))
+            .unwrap_or_else(|e| panic!("golden {name} unreadable: {e}"));
+        let golden: Value =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("golden {name} invalid: {e}"));
+        assert_eq!(
+            golden.get("filesystem").and_then(Value::as_str),
+            Some("btrfs"),
+            "golden {name} filesystem should be btrfs"
+        );
+        for numeric in ["sectorsize", "nodesize", "generation"] {
+            assert!(
+                golden.get(numeric).and_then(Value::as_u64).is_some(),
+                "golden {name} missing numeric field {numeric}"
+            );
+        }
+        assert!(
+            golden
+                .get("label")
+                .and_then(Value::as_str)
+                .is_some_and(|label| !label.is_empty()),
+            "golden {name} label should be non-empty"
         );
     }
 

@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::autopilot::{DurabilityAutopilot, OverheadDecision};
-use crate::codec::{EncodedGroup, encode_group};
+use crate::codec::{encode_group, EncodedGroup};
 use crate::evidence::{
     CorruptionDetail, EvidenceLedger, EvidenceRecord, PolicyDecisionDetail, RepairDetail,
     SymbolRefreshDetail,
@@ -384,6 +384,7 @@ pub struct ScrubDaemonStep {
 /// Round-robin background scheduler over [`ScrubWithRecovery`] group configs.
 pub struct ScrubDaemon<'a, W: Write> {
     pipeline: ScrubWithRecovery<'a, W>,
+    queued_refresh: Option<QueuedRepairRefresh>,
     config: ScrubDaemonConfig,
     metrics: ScrubDaemonMetrics,
     next_group_index: usize,
@@ -747,6 +748,7 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             policy = ?policy,
             dirty = state.dirty,
             dirty_since_ms = dirty_age.as_millis(),
+            dirty_age_ms = dirty_age.as_millis(),
             last_refresh_ms = Instant::now()
                 .saturating_duration_since(state.last_refresh)
                 .as_millis(),
@@ -823,7 +825,16 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             if refresh_symbol_count == 0 {
                 return Ok(());
             }
-            self.refresh_symbols(cx, &group_cfg, refresh_symbol_count, mode)?;
+            if let Err(error) = self.refresh_symbols(cx, &group_cfg, refresh_symbol_count, mode) {
+                error!(
+                    target: "ffs::repair::refresh",
+                    group = group.0,
+                    refresh_mode = mode.as_str(),
+                    error = %error,
+                    "refresh_symbols_failed"
+                );
+                return Err(error);
+            }
             if let Some(state) = self.refresh_states.get_mut(&group.0) {
                 state.dirty = false;
                 state.dirty_since = None;
@@ -1008,12 +1019,19 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
 
         match self.refresh_symbols(cx, group_cfg, refresh_symbol_count, RefreshMode::Recovery) {
             Ok(()) => {
-                info!(group = group_num.0, "repair symbols refreshed");
+                info!(
+                    target: "ffs::repair::refresh",
+                    group = group_num.0,
+                    refresh_mode = RefreshMode::Recovery.as_str(),
+                    "repair symbols refreshed"
+                );
                 true
             }
             Err(e) => {
                 error!(
+                    target: "ffs::repair::refresh",
                     group = group_num.0,
+                    refresh_mode = RefreshMode::Recovery.as_str(),
                     error = %e,
                     "failed to refresh repair symbols"
                 );
@@ -1348,6 +1366,7 @@ impl<'a, W: Write> ScrubDaemon<'a, W> {
     pub fn new(pipeline: ScrubWithRecovery<'a, W>, config: ScrubDaemonConfig) -> Self {
         Self {
             pipeline,
+            queued_refresh: None,
             config,
             metrics: ScrubDaemonMetrics::default(),
             next_group_index: 0,
@@ -1359,6 +1378,13 @@ impl<'a, W: Write> ScrubDaemon<'a, W> {
             round_recovered: 0,
             throttled: false,
         }
+    }
+
+    /// Attach queued flush lifecycle integration for daemon-driven refreshes.
+    #[must_use]
+    pub fn with_queued_refresh(mut self, queued_refresh: QueuedRepairRefresh) -> Self {
+        self.queued_refresh = Some(queued_refresh);
+        self
     }
 
     /// Attach shared system pressure for backpressure-aware yielding.
@@ -1386,7 +1412,7 @@ impl<'a, W: Write> ScrubDaemon<'a, W> {
         self.pipeline
     }
 
-    /// Execute one daemon tick (scan one group, recover if needed).
+    /// Execute one daemon tick (apply queued refreshes, then scan one group).
     pub fn run_once(&mut self, cx: &Cx) -> Result<ScrubDaemonStep> {
         if self.pipeline.groups.is_empty() {
             return Err(FfsError::RepairFailed(
@@ -1409,6 +1435,17 @@ impl<'a, W: Write> ScrubDaemon<'a, W> {
         }
 
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+
+        if let Some(queue) = &self.queued_refresh {
+            let refreshed = queue.apply_queued_refreshes(cx, &mut self.pipeline)?;
+            if refreshed > 0 {
+                debug!(
+                    target: "ffs::repair::daemon",
+                    refreshed_groups = refreshed,
+                    "scrub_daemon_applied_queued_refreshes"
+                );
+            }
+        }
 
         let group_cfg = self.pipeline.groups[self.next_group_index];
         let group = group_cfg.layout.group;
@@ -1646,7 +1683,7 @@ mod tests {
     use crate::symbol::RepairGroupDescExt;
     use ffs_block::{ArcCache, ArcWritePolicy, BlockBuf, RepairFlushLifecycle};
     use ffs_ondisk::{Ext4IncompatFeatures, Ext4RoCompatFeatures};
-    use ffs_types::{EXT4_SUPER_MAGIC, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE};
+    use ffs_types::{EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, EXT4_SUPER_MAGIC};
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
@@ -2650,21 +2687,15 @@ mod tests {
             records[0].event_type,
             crate::evidence::EvidenceEventType::CorruptionDetected
         );
-        assert!(
-            records
-                .iter()
-                .any(|r| { r.event_type == crate::evidence::EvidenceEventType::RepairAttempted })
-        );
-        assert!(
-            records
-                .iter()
-                .any(|r| { r.event_type == crate::evidence::EvidenceEventType::RepairSucceeded })
-        );
-        assert!(
-            records
-                .iter()
-                .any(|r| { r.event_type == crate::evidence::EvidenceEventType::SymbolRefresh })
-        );
+        assert!(records
+            .iter()
+            .any(|r| { r.event_type == crate::evidence::EvidenceEventType::RepairAttempted }));
+        assert!(records
+            .iter()
+            .any(|r| { r.event_type == crate::evidence::EvidenceEventType::RepairSucceeded }));
+        assert!(records
+            .iter()
+            .any(|r| { r.event_type == crate::evidence::EvidenceEventType::SymbolRefresh }));
     }
 
     #[test]
@@ -3363,6 +3394,72 @@ mod tests {
     }
 
     #[test]
+    fn scrub_daemon_run_once_applies_queued_refreshes() {
+        let cx = Cx::for_testing();
+        let block_size = 256_u32;
+        let source_count = 8_u32;
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+        let group_cfg = GroupConfig {
+            layout,
+            source_first_block: BlockNumber(0),
+            source_block_count: source_count,
+        };
+        let queue = QueuedRepairRefresh::from_group_configs(&[group_cfg]);
+        let repair_lifecycle: Arc<dyn RepairFlushLifecycle> = Arc::new(queue.clone());
+
+        let cache = ArcCache::new_with_policy_and_repair_lifecycle(
+            MemBlockDevice::new(block_size, 128),
+            32,
+            ArcWritePolicy::WriteBack,
+            repair_lifecycle,
+        )
+        .expect("cache");
+
+        write_source_blocks(&cx, cache.inner(), BlockNumber(0), source_count);
+        bootstrap_storage(&cx, cache.inner(), layout, BlockNumber(0), source_count, 4);
+        let generation_before = read_generation(&cx, cache.inner(), layout);
+
+        let mut mutated = deterministic_block(77, block_size);
+        mutated[0] ^= 0x33;
+        cache
+            .write_block(&cx, BlockNumber(2), &mutated)
+            .expect("stage write");
+        cache.flush_dirty(&cx).expect("flush dirty");
+
+        let validator = CorruptBlockValidator::new(vec![]);
+        let mut ledger_buf = Vec::new();
+        let pipeline = ScrubWithRecovery::new(
+            cache.inner(),
+            &validator,
+            test_uuid(),
+            vec![group_cfg],
+            &mut ledger_buf,
+            4,
+        );
+        let mut daemon = ScrubDaemon::new(
+            pipeline,
+            ScrubDaemonConfig {
+                interval: Duration::ZERO,
+                cancel_check_interval: Duration::from_millis(1),
+                ..ScrubDaemonConfig::default()
+            },
+        )
+        .with_queued_refresh(queue.clone());
+
+        let _step = daemon.run_once(&cx).expect("run once");
+
+        assert_eq!(
+            read_generation(&cx, cache.inner(), layout),
+            generation_before + 1
+        );
+        assert!(queue
+            .drain_queued_groups()
+            .expect("drain queue after daemon run")
+            .is_empty());
+    }
+
+    #[test]
     fn scrub_daemon_detects_corruption_and_triggers_recovery() {
         let cx = Cx::for_testing();
         let block_size = 256;
@@ -3417,16 +3514,12 @@ mod tests {
         let (pipeline, _metrics) = daemon.into_parts();
         let ledger = pipeline.into_ledger();
         let records = crate::evidence::parse_evidence_ledger(ledger);
-        assert!(
-            records.iter().any(|r| {
-                r.event_type == crate::evidence::EvidenceEventType::ScrubCycleComplete
-            })
-        );
-        assert!(
-            records
-                .iter()
-                .any(|r| r.event_type == crate::evidence::EvidenceEventType::RepairSucceeded)
-        );
+        assert!(records
+            .iter()
+            .any(|r| { r.event_type == crate::evidence::EvidenceEventType::ScrubCycleComplete }));
+        assert!(records
+            .iter()
+            .any(|r| r.event_type == crate::evidence::EvidenceEventType::RepairSucceeded));
     }
 
     #[test]

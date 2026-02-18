@@ -150,6 +150,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show MVCC and EBR version statistics for a filesystem image.
+    MvccStats {
+        /// Path to the filesystem image.
+        image: PathBuf,
+        /// Output in JSON format.
+        #[arg(long)]
+        json: bool,
+    },
     /// Mount a filesystem image via FUSE.
     Mount {
         /// Path to the filesystem image.
@@ -197,6 +205,7 @@ impl Command {
     const fn name(&self) -> &'static str {
         match self {
             Self::Inspect { .. } => "inspect",
+            Self::MvccStats { .. } => "mvcc-stats",
             Self::Mount { .. } => "mount",
             Self::Scrub { .. } => "scrub",
             Self::Parity { .. } => "parity",
@@ -243,6 +252,29 @@ struct Ext4OrphanDiagnosticsOutput {
     sample_inodes: Vec<u64>,
 }
 
+#[derive(Debug, Serialize)]
+struct MvccStatsOutput {
+    block_versions: BlockVersionStatsOutput,
+    ebr_versions: EbrVersionStatsOutput,
+}
+
+#[derive(Debug, Serialize)]
+struct BlockVersionStatsOutput {
+    tracked_blocks: usize,
+    max_chain_length: usize,
+    chains_over_cap: usize,
+    chains_over_critical: usize,
+    chain_cap: Option<usize>,
+    critical_chain_length: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct EbrVersionStatsOutput {
+    retired_versions: u64,
+    reclaimed_versions: u64,
+    pending_versions: u64,
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -274,6 +306,7 @@ fn run() -> Result<()> {
 
     let result = match cli.command {
         Command::Inspect { image, json } => inspect(&image, json),
+        Command::MvccStats { image, json } => mvcc_stats_cmd(&image, json),
         Command::Mount {
             image,
             mountpoint,
@@ -420,6 +453,98 @@ fn inspect(path: &PathBuf, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn mvcc_stats_cmd(path: &PathBuf, json: bool) -> Result<()> {
+    let command_span = info_span!(
+        target: "ffs::cli::mvcc_stats",
+        "mvcc_stats",
+        image = %path.display(),
+        output_json = json
+    );
+    let _command_guard = command_span.enter();
+    let started = Instant::now();
+    info!(target: "ffs::cli::mvcc_stats", "mvcc_stats_start");
+
+    let cx = cli_cx();
+    let open_opts = OpenOptions {
+        ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
+        ..OpenOptions::default()
+    };
+    let open_fs = OpenFs::open_with_options(&cx, path, &open_opts)
+        .with_context(|| format!("failed to open image: {}", path.display()))?;
+
+    let mvcc_guard = open_fs.mvcc_store().read();
+    let block_stats = mvcc_guard.block_version_stats();
+    let ebr_stats = mvcc_guard.ebr_stats();
+
+    let output = MvccStatsOutput {
+        block_versions: BlockVersionStatsOutput {
+            tracked_blocks: block_stats.tracked_blocks,
+            max_chain_length: block_stats.max_chain_length,
+            chains_over_cap: block_stats.chains_over_cap,
+            chains_over_critical: block_stats.chains_over_critical,
+            chain_cap: block_stats.chain_cap,
+            critical_chain_length: block_stats.critical_chain_length,
+        },
+        ebr_versions: EbrVersionStatsOutput {
+            retired_versions: ebr_stats.retired_versions,
+            reclaimed_versions: ebr_stats.reclaimed_versions,
+            pending_versions: ebr_stats.pending_versions(),
+        },
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output).context("serialize mvcc stats output")?
+        );
+    } else {
+        println!("FrankenFS MVCC/EBR Stats");
+        println!("block_versions:");
+        println!("  tracked_blocks: {}", output.block_versions.tracked_blocks);
+        println!(
+            "  max_chain_length: {}",
+            output.block_versions.max_chain_length
+        );
+        println!(
+            "  chains_over_cap: {}",
+            output.block_versions.chains_over_cap
+        );
+        println!(
+            "  chains_over_critical: {}",
+            output.block_versions.chains_over_critical
+        );
+        println!("  chain_cap: {:?}", output.block_versions.chain_cap);
+        println!(
+            "  critical_chain_length: {:?}",
+            output.block_versions.critical_chain_length
+        );
+        println!("ebr_versions:");
+        println!(
+            "  retired_versions: {}",
+            output.ebr_versions.retired_versions
+        );
+        println!(
+            "  reclaimed_versions: {}",
+            output.ebr_versions.reclaimed_versions
+        );
+        println!(
+            "  pending_versions: {}",
+            output.ebr_versions.pending_versions
+        );
+    }
+
+    info!(
+        target: "ffs::cli::mvcc_stats",
+        tracked_blocks = output.block_versions.tracked_blocks,
+        max_chain_length = output.block_versions.max_chain_length,
+        pending_versions = output.ebr_versions.pending_versions,
+        duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        "mvcc_stats_complete"
+    );
+
+    Ok(())
+}
+
 fn inspect_ext4_output(
     cx: &Cx,
     path: &PathBuf,
@@ -468,6 +593,14 @@ fn inspect_ext4_output(
     })
 }
 
+const fn ext4_mount_replay_mode(read_write: bool) -> Ext4JournalReplayMode {
+    if read_write {
+        Ext4JournalReplayMode::Apply
+    } else {
+        Ext4JournalReplayMode::SimulateOverlay
+    }
+}
+
 fn mount_cmd(
     image_path: &PathBuf,
     mountpoint: &PathBuf,
@@ -490,7 +623,7 @@ fn mount_cmd(
 
     let cx = cli_cx();
     let open_opts = OpenOptions {
-        ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
+        ext4_journal_replay_mode: ext4_mount_replay_mode(rw),
         ..OpenOptions::default()
     };
     let mut open_fs = OpenFs::open_with_options(&cx, image_path, &open_opts)
@@ -1091,7 +1224,7 @@ fn parity(json: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::LogFormat;
+    use super::{Ext4JournalReplayMode, LogFormat, ext4_mount_replay_mode};
     use serde_json::Value;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
@@ -1216,5 +1349,14 @@ mod tests {
         assert_eq!(json["span"]["name"], "mount");
         assert_eq!(json["span"]["image"], "/tmp/ext4.img");
         assert_eq!(json["span"]["mode"], "ro");
+    }
+
+    #[test]
+    fn ext4_mount_replay_mode_is_persistent_for_rw() {
+        assert_eq!(ext4_mount_replay_mode(true), Ext4JournalReplayMode::Apply);
+        assert_eq!(
+            ext4_mount_replay_mode(false),
+            Ext4JournalReplayMode::SimulateOverlay
+        );
     }
 }

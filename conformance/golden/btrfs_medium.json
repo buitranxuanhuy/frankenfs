@@ -1,0 +1,7 @@
+{
+  "filesystem": "btrfs",
+  "sectorsize": 4096,
+  "nodesize": 16384,
+  "generation": 8,
+  "label": "btrfs_medium"
+}
