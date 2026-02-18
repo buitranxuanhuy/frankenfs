@@ -47,6 +47,7 @@ doc_markdown = { level = "allow", priority = 1 }
 [workspace.dependencies]
 # External dependencies
 anyhow = "1.0.97"
+arc-swap = "1.7.1"
 bitflags = "2.9.0"
 blake3 = "1.6.0"
 clap = { version = "4.5.0", features = ["derive"] }

@@ -3,6 +3,7 @@
 pub mod compression;
 pub mod demo;
 pub mod persist;
+pub mod rcu;
 pub mod sharded;
 pub mod wal;
 
@@ -1681,6 +1682,9 @@ pub struct SnapshotRegistry {
     // Counters for metrics (monotonic).
     acquired_total: std::sync::atomic::AtomicU64,
     released_total: std::sync::atomic::AtomicU64,
+    /// Lock-free watermark for GC — updated on register/release,
+    /// readable without acquiring any lock.
+    atomic_watermark: rcu::AtomicWatermark,
 }
 
 impl Default for SnapshotRegistry {
@@ -1699,6 +1703,7 @@ impl SnapshotRegistry {
             stall_threshold_secs: 60,
             acquired_total: std::sync::atomic::AtomicU64::new(0),
             released_total: std::sync::atomic::AtomicU64::new(0),
+            atomic_watermark: rcu::AtomicWatermark::new(),
         }
     }
 
@@ -1733,6 +1738,11 @@ impl SnapshotRegistry {
         // Track oldest registration time.
         if active.len() == 1 || self.oldest_registered_at.read().is_none() {
             *self.oldest_registered_at.write() = Some(Instant::now());
+        }
+
+        // Update atomic watermark (lock-free GC reads).
+        if let Some(&min_seq) = active.keys().next() {
+            self.atomic_watermark.store(min_seq.0);
         }
         drop(active);
 
@@ -1782,6 +1792,13 @@ impl SnapshotRegistry {
                 "snapshot_release"
             );
         }
+
+        // Update atomic watermark (lock-free GC reads).
+        if let Some(&min_seq) = active.keys().next() {
+            self.atomic_watermark.store(min_seq.0);
+        } else {
+            self.atomic_watermark.clear();
+        }
         drop(active);
         if clear_oldest {
             *self.oldest_registered_at.write() = None;
@@ -1796,9 +1813,29 @@ impl SnapshotRegistry {
     }
 
     /// The oldest active snapshot (safe GC watermark), or `None` if empty.
+    ///
+    /// This acquires a brief read lock on the active set for an authoritative
+    /// answer. For lock-free (possibly slightly stale) reads, use
+    /// [`watermark_lockfree`](Self::watermark_lockfree).
     #[must_use]
     pub fn watermark(&self) -> Option<CommitSeq> {
         self.active.read().keys().next().copied()
+    }
+
+    /// Lock-free watermark query via RCU-style atomic.
+    ///
+    /// Returns the oldest active snapshot commit sequence, or `None` if no
+    /// snapshots are registered. This reads an atomic integer — no lock
+    /// acquisition, no atomic increment on the reader path.
+    ///
+    /// The value may be very slightly stale if a concurrent register/release
+    /// is in progress, but it is always conservative: the returned watermark
+    /// is never *newer* than the true minimum, so GC decisions based on it
+    /// are always safe (may keep versions slightly longer, never too short).
+    #[inline]
+    #[must_use]
+    pub fn watermark_lockfree(&self) -> Option<CommitSeq> {
+        self.atomic_watermark.load().map(CommitSeq)
     }
 
     /// Total number of active snapshot references (counting duplicates).
