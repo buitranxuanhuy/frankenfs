@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 //! Block and inode allocation.
 //!
+//! See [`succinct::SuccinctBitmap`] for O(1) rank / O(log n) select over bitmaps.
+//!
 //! mballoc-style multi-block allocator (buddy system, best-fit,
 //! per-inode and per-locality-group preallocation) and Orlov
 //! inode allocator for directory spreading.
@@ -13,6 +15,8 @@
 //! 2. **GroupStats** — cached per-group free counts.
 //! 3. **BlockAllocator** — goal-directed block allocation across groups.
 //! 4. **InodeAllocator** — Orlov-style inode placement.
+
+pub mod succinct;
 
 use asupersync::Cx;
 use ffs_block::BlockDevice;

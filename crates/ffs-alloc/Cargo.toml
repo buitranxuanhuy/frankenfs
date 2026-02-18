@@ -13,5 +13,12 @@ ffs-block = { workspace = true }
 ffs-ondisk = { workspace = true }
 asupersync = { workspace = true }
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "bitmap_ops"
+harness = false
+
 [lints]
 workspace = true
