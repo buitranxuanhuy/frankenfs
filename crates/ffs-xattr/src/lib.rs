@@ -661,4 +661,156 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, FfsError::Format(_)));
     }
+
+    // ── Additional edge-case tests ───────────────────────────────────
+
+    #[test]
+    fn parse_xattr_name_rejects_unknown_namespace() {
+        let err = parse_xattr_name("unknown.key").unwrap_err();
+        assert!(matches!(err, FfsError::Format(_)));
+    }
+
+    #[test]
+    fn parse_xattr_name_rejects_empty_after_prefix() {
+        assert!(parse_xattr_name("user.").is_err());
+        assert!(parse_xattr_name("trusted.").is_err());
+        assert!(parse_xattr_name("security.").is_err());
+        assert!(parse_xattr_name("system.").is_err());
+    }
+
+    #[test]
+    fn get_xattr_returns_none_for_missing() {
+        let inode = make_inode(128);
+        let result = get_xattr(&inode, None, "user.nonexistent").unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn remove_nonexistent_xattr_returns_false() {
+        let mut inode = make_inode(128);
+        let access = XattrWriteAccess {
+            is_owner: true,
+            has_cap_fowner: false,
+            has_cap_sys_admin: false,
+        };
+        let removed = remove_xattr(&mut inode, None, "user.nope", access).unwrap();
+        assert!(!removed);
+    }
+
+    #[test]
+    fn list_xattrs_empty_returns_empty() {
+        let inode = make_inode(128);
+        let names = list_xattrs(&inode, None).unwrap();
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn set_multiple_inline_xattrs() {
+        let mut inode = make_inode(128);
+        let access = XattrWriteAccess {
+            is_owner: true,
+            has_cap_fowner: false,
+            has_cap_sys_admin: false,
+        };
+
+        set_xattr(&mut inode, None, "user.a", b"v1", access).unwrap();
+        set_xattr(&mut inode, None, "user.b", b"v2", access).unwrap();
+
+        assert_eq!(
+            get_xattr(&inode, None, "user.a").unwrap(),
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(
+            get_xattr(&inode, None, "user.b").unwrap(),
+            Some(b"v2".to_vec())
+        );
+
+        let mut names = list_xattrs(&inode, None).unwrap();
+        names.sort();
+        assert_eq!(names, vec!["user.a", "user.b"]);
+    }
+
+    #[test]
+    fn set_xattr_updates_existing_value() {
+        let mut inode = make_inode(128);
+        let access = XattrWriteAccess {
+            is_owner: true,
+            has_cap_fowner: false,
+            has_cap_sys_admin: false,
+        };
+
+        set_xattr(&mut inode, None, "user.key", b"old", access).unwrap();
+        set_xattr(&mut inode, None, "user.key", b"new", access).unwrap();
+
+        assert_eq!(
+            get_xattr(&inode, None, "user.key").unwrap(),
+            Some(b"new".to_vec())
+        );
+
+        // Should still be just one entry.
+        let names = list_xattrs(&inode, None).unwrap();
+        assert_eq!(names.len(), 1);
+    }
+
+    #[test]
+    fn cap_fowner_allows_user_xattr_write() {
+        let mut inode = make_inode(128);
+        let stored = set_xattr(
+            &mut inode,
+            None,
+            "user.test",
+            b"v",
+            XattrWriteAccess {
+                is_owner: false,
+                has_cap_fowner: true,
+                has_cap_sys_admin: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(stored, XattrStorage::Inline);
+    }
+
+    #[test]
+    fn security_namespace_requires_sys_admin() {
+        let mut inode = make_inode(128);
+        let err = set_xattr(
+            &mut inode,
+            None,
+            "security.selinux",
+            b"context",
+            XattrWriteAccess {
+                is_owner: true,
+                has_cap_fowner: true,
+                has_cap_sys_admin: false,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, FfsError::PermissionDenied));
+    }
+
+    #[test]
+    fn no_inline_space_no_external_returns_error() {
+        let mut inode = make_inode(0); // zero ibody space
+        let err = set_xattr(
+            &mut inode,
+            None,
+            "user.key",
+            b"value",
+            XattrWriteAccess {
+                is_owner: true,
+                has_cap_fowner: false,
+                has_cap_sys_admin: false,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, FfsError::NoSpace));
+    }
+
+    #[test]
+    fn xattr_write_access_default_denies_all() {
+        let access = XattrWriteAccess::default();
+        assert!(!access.is_owner);
+        assert!(!access.has_cap_fowner);
+        assert!(!access.has_cap_sys_admin);
+    }
 }
