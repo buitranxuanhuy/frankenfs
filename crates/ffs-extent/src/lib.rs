@@ -988,4 +988,199 @@ mod tests {
         );
         assert!(result.is_err());
     }
+
+    #[test]
+    fn allocate_over_max_count_fails() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let mut root = empty_root();
+
+        // Max valid extent count is 32767 (15 bits minus unwritten flag).
+        let result = allocate_extent(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            32768,
+            &AllocHint::default(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn map_hole_between_two_extents() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let mut root = empty_root();
+
+        // Allocate blocks 0-4 and 10-14 (gap at 5-9).
+        let m1 = allocate_extent(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            5,
+            &AllocHint::default(),
+        )
+        .unwrap();
+        let m2 = allocate_extent(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            10,
+            5,
+            &AllocHint::default(),
+        )
+        .unwrap();
+
+        let mappings = map_logical_to_physical(&cx, &dev, &root, 0, 15).unwrap();
+        // Should be: [0-4] mapped, [5-9] hole, [10-14] mapped.
+        assert_eq!(mappings.len(), 3);
+        assert_eq!(mappings[0].physical_start, m1.physical_start);
+        assert_eq!(mappings[0].count, 5);
+        assert_eq!(mappings[1].logical_start, 5);
+        assert_eq!(mappings[1].count, 5); // hole
+        assert_eq!(mappings[2].physical_start, m2.physical_start);
+        assert_eq!(mappings[2].count, 5);
+    }
+
+    #[test]
+    fn truncate_empty_tree_is_noop() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let mut root = empty_root();
+
+        let freed = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 0).unwrap();
+        assert_eq!(freed, 0);
+    }
+
+    #[test]
+    fn map_partial_extent_overlap() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let mut root = empty_root();
+
+        // Allocate blocks 0-9.
+        let m = allocate_extent(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            10,
+            &AllocHint::default(),
+        )
+        .unwrap();
+
+        // Query just blocks 3-7 (within the extent).
+        let mappings = map_logical_to_physical(&cx, &dev, &root, 3, 5).unwrap();
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].logical_start, 3);
+        assert_eq!(mappings[0].count, 5);
+        assert_eq!(mappings[0].physical_start, m.physical_start + 3);
+    }
+
+    #[test]
+    fn split_for_mark_written_full_overlap() {
+        // Extent [0, 10) fully within mark range [0, 10) → single written extent.
+        let ext = Ext4Extent {
+            logical_block: 0,
+            raw_len: 0x0A | UNWRITTEN_FLAG,
+            physical_start: 100,
+        };
+        let out = split_for_mark_written(&ext, 0, 10, 10, 10);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].is_unwritten());
+        assert_eq!(out[0].actual_len(), 10);
+    }
+
+    #[test]
+    fn split_for_mark_written_left_unwritten() {
+        // Extent [0, 10), mark [5, 10) → [0,5) unwritten + [5,10) written.
+        let ext = Ext4Extent {
+            logical_block: 0,
+            raw_len: 0x0A | UNWRITTEN_FLAG,
+            physical_start: 100,
+        };
+        let out = split_for_mark_written(&ext, 5, 10, 10, 5);
+        assert_eq!(out.len(), 2);
+        assert!(out[0].is_unwritten());
+        assert_eq!(out[0].actual_len(), 5);
+        assert_eq!(out[0].physical_start, 100);
+        assert!(!out[1].is_unwritten());
+        assert_eq!(out[1].actual_len(), 5);
+        assert_eq!(out[1].physical_start, 105);
+    }
+
+    #[test]
+    fn split_for_mark_written_right_unwritten() {
+        // Extent [0, 10), mark [0, 5) → [0,5) written + [5,10) unwritten.
+        let ext = Ext4Extent {
+            logical_block: 0,
+            raw_len: 0x0A | UNWRITTEN_FLAG,
+            physical_start: 100,
+        };
+        let out = split_for_mark_written(&ext, 0, 5, 10, 5);
+        assert_eq!(out.len(), 2);
+        assert!(!out[0].is_unwritten());
+        assert_eq!(out[0].actual_len(), 5);
+        assert_eq!(out[0].physical_start, 100);
+        assert!(out[1].is_unwritten());
+        assert_eq!(out[1].actual_len(), 5);
+        assert_eq!(out[1].physical_start, 105);
+    }
+
+    #[test]
+    fn split_for_mark_written_three_way() {
+        // Extent [0, 10), mark [3, 7) → [0,3) unwritten + [3,7) written + [7,10) unwritten.
+        let ext = Ext4Extent {
+            logical_block: 0,
+            raw_len: 0x0A | UNWRITTEN_FLAG,
+            physical_start: 100,
+        };
+        let out = split_for_mark_written(&ext, 3, 7, 10, 4);
+        assert_eq!(out.len(), 3);
+        assert!(out[0].is_unwritten());
+        assert_eq!(out[0].logical_block, 0);
+        assert_eq!(out[0].actual_len(), 3);
+        assert!(!out[1].is_unwritten());
+        assert_eq!(out[1].logical_block, 3);
+        assert_eq!(out[1].actual_len(), 4);
+        assert!(out[2].is_unwritten());
+        assert_eq!(out[2].logical_block, 7);
+        assert_eq!(out[2].actual_len(), 3);
+    }
+
+    #[test]
+    fn extent_mapping_equality() {
+        let a = ExtentMapping {
+            logical_start: 0,
+            physical_start: 100,
+            count: 5,
+            unwritten: false,
+        };
+        let b = a;
+        assert_eq!(a, b);
+
+        let c = ExtentMapping {
+            unwritten: true,
+            ..a
+        };
+        assert_ne!(a, c);
+    }
 }
