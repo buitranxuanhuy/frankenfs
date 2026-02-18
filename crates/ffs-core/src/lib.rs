@@ -1,30 +1,30 @@
 #![forbid(unsafe_code)]
 
 use asupersync::{Cx, RaptorQConfig, SystemPressure};
-use ffs_alloc::{AllocHint, FsGeometry, GroupStats, PersistCtx, bitmap_count_free};
+use ffs_alloc::{bitmap_count_free, AllocHint, FsGeometry, GroupStats, PersistCtx};
 use ffs_block::{
-    BlockBuf, BlockDevice, ByteDevice, FileByteDevice, read_btrfs_superblock_region,
-    read_ext4_superblock_region,
+    read_btrfs_superblock_region, read_ext4_superblock_region, BlockBuf, BlockDevice, ByteDevice,
+    FileByteDevice,
 };
 use ffs_btrfs::{
-    BTRFS_FILE_EXTENT_PREALLOC, BTRFS_FILE_EXTENT_REG, BTRFS_FS_TREE_OBJECTID, BTRFS_FT_BLKDEV,
-    BTRFS_FT_CHRDEV, BTRFS_FT_DIR, BTRFS_FT_FIFO, BTRFS_FT_SOCK, BTRFS_FT_SYMLINK,
-    BTRFS_ITEM_DIR_INDEX, BTRFS_ITEM_DIR_ITEM, BTRFS_ITEM_EXTENT_DATA, BTRFS_ITEM_INODE_ITEM,
-    BTRFS_ITEM_ROOT_ITEM, BtrfsExtentData, BtrfsInodeItem, BtrfsLeafEntry, map_logical_to_physical,
-    parse_dir_items, parse_extent_data, parse_inode_item, parse_root_item, walk_tree,
+    map_logical_to_physical, parse_dir_items, parse_extent_data, parse_inode_item, parse_root_item,
+    walk_tree, BtrfsExtentData, BtrfsInodeItem, BtrfsLeafEntry, BTRFS_FILE_EXTENT_PREALLOC,
+    BTRFS_FILE_EXTENT_REG, BTRFS_FS_TREE_OBJECTID, BTRFS_FT_BLKDEV, BTRFS_FT_CHRDEV, BTRFS_FT_DIR,
+    BTRFS_FT_FIFO, BTRFS_FT_SOCK, BTRFS_FT_SYMLINK, BTRFS_ITEM_DIR_INDEX, BTRFS_ITEM_DIR_ITEM,
+    BTRFS_ITEM_EXTENT_DATA, BTRFS_ITEM_INODE_ITEM, BTRFS_ITEM_ROOT_ITEM,
 };
 use ffs_error::FfsError;
-use ffs_journal::{Jbd2WriteStats, Jbd2Writer, JournalRegion, ReplayOutcome, replay_jbd2};
+use ffs_journal::{replay_jbd2, Jbd2WriteStats, Jbd2Writer, JournalRegion, ReplayOutcome};
 use ffs_mvcc::{CommitError, MvccStore, Transaction};
 use ffs_ondisk::{
-    BtrfsChunkEntry, BtrfsSuperblock, EXT4_ERROR_FS, EXT4_ORPHAN_FS, EXT4_VALID_FS, Ext4DirEntry,
-    Ext4Extent, Ext4FileType, Ext4GroupDesc, Ext4ImageReader, Ext4Inode, Ext4Superblock, Ext4Xattr,
-    ExtentTree, lookup_in_dir_block, parse_dir_block, parse_extent_tree, parse_inode_extent_tree,
-    parse_sys_chunk_array,
+    lookup_in_dir_block, parse_dir_block, parse_extent_tree, parse_inode_extent_tree,
+    parse_sys_chunk_array, BtrfsChunkEntry, BtrfsSuperblock, Ext4DirEntry, Ext4Extent,
+    Ext4FileType, Ext4GroupDesc, Ext4ImageReader, Ext4Inode, Ext4Superblock, Ext4Xattr, ExtentTree,
+    EXT4_ERROR_FS, EXT4_ORPHAN_FS, EXT4_VALID_FS,
 };
 use ffs_types::{
-    BlockNumber, ByteOffset, CommitSeq, EXT4_EXTENTS_FL, GroupNumber, InodeNumber, ParseError,
-    Snapshot, TxnId,
+    BlockNumber, ByteOffset, CommitSeq, GroupNumber, InodeNumber, ParseError, Snapshot, TxnId,
+    EXT4_EXTENTS_FL,
 };
 use ffs_xattr::{XattrStorage, XattrWriteAccess};
 use parking_lot::{Mutex, RwLock};
@@ -2071,12 +2071,20 @@ impl OpenFs {
     /// ext4 uses inode `2` as root on disk, so we canonicalize at the FsOps
     /// boundary.
     const fn ext4_canonical_inode(ino: InodeNumber) -> InodeNumber {
-        if ino.0 == 1 { InodeNumber(2) } else { ino }
+        if ino.0 == 1 {
+            InodeNumber(2)
+        } else {
+            ino
+        }
     }
 
     /// Translate ext4 on-disk inode numbers back to VFS inode numbers.
     const fn ext4_presented_inode(ino: InodeNumber) -> InodeNumber {
-        if ino.0 == 2 { InodeNumber(1) } else { ino }
+        if ino.0 == 2 {
+            InodeNumber(1)
+        } else {
+            ino
+        }
     }
 
     fn ext4_present_attr(mut attr: InodeAttr) -> InodeAttr {
@@ -3575,7 +3583,7 @@ pub trait FsOps: Send + Sync {
     /// file identified by `ino`. Returns fewer bytes at EOF. Returns
     /// `FfsError::IsDirectory` if `ino` is a directory.
     fn read(&self, cx: &Cx, ino: InodeNumber, offset: u64, size: u32)
-    -> ffs_error::Result<Vec<u8>>;
+        -> ffs_error::Result<Vec<u8>>;
 
     /// Read the target of a symbolic link.
     ///
@@ -6153,7 +6161,11 @@ fn erfc_approx(x: f64) -> f64 {
             + t * (-0.284_496_736
                 + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
     let result = poly * (-x * x).exp();
-    if x >= 0.0 { result } else { 2.0 - result }
+    if x >= 0.0 {
+        result
+    } else {
+        2.0 - result
+    }
 }
 
 /// ln(Beta(a, b)) = ln(Γ(a)) + ln(Γ(b)) - ln(Γ(a+b))
@@ -6775,8 +6787,8 @@ impl FrankenFsEngine {
 mod tests {
     use super::*;
     use ffs_types::{
-        BTRFS_MAGIC, BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE, ByteOffset, EXT4_SUPER_MAGIC,
-        EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE,
+        ByteOffset, BTRFS_MAGIC, BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE,
+        EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, EXT4_SUPER_MAGIC,
     };
     use std::sync::Mutex;
 
@@ -9256,7 +9268,8 @@ mod tests {
         let extent_off = btrfs_test_extent_payload_off();
         image[extent_off + 8..extent_off + 16].copy_from_slice(&length.to_le_bytes()); // ram_bytes
         image[extent_off + 29..extent_off + 37].copy_from_slice(&length.to_le_bytes()); // disk_num_bytes
-        image[extent_off + 45..extent_off + 53].copy_from_slice(&length.to_le_bytes()); // num_bytes
+        image[extent_off + 45..extent_off + 53].copy_from_slice(&length.to_le_bytes());
+        // num_bytes
     }
 
     fn write_btrfs_test_extent_payload(image: &mut [u8], payload: &[u8]) {
@@ -11054,15 +11067,13 @@ mod tests {
             Some(b"application/octet-stream".to_vec())
         );
 
-        assert!(
-            fs.removexattr(&cx, ino, "user.mime")
-                .expect("removexattr first call")
-        );
+        assert!(fs
+            .removexattr(&cx, ino, "user.mime")
+            .expect("removexattr first call"));
         assert_eq!(fs.getxattr(&cx, ino, "user.mime").expect("getxattr"), None);
-        assert!(
-            !fs.removexattr(&cx, ino, "user.mime")
-                .expect("removexattr second call")
-        );
+        assert!(!fs
+            .removexattr(&cx, ino, "user.mime")
+            .expect("removexattr second call"));
     }
 
     #[test]

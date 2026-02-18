@@ -17,11 +17,11 @@
 //! available blocks + repair symbols ──► InactivationDecoder ──► recovered blocks + proof
 //! ```
 
-use asupersync::Cx;
 use asupersync::raptorq::decoder::{
     DecodeError, DecodeResult, InactivationDecoder, ReceivedSymbol,
 };
 use asupersync::raptorq::systematic::{EmittedSymbol, SystematicEncoder};
+use asupersync::Cx;
 use ffs_block::BlockDevice;
 use ffs_error::{FfsError, Result};
 use ffs_types::{BlockNumber, GroupNumber};
@@ -185,10 +185,7 @@ pub fn decode_group(
             "insufficient symbols for group {}: have {received}, need {required}",
             group.0
         )),
-        other => FfsError::RepairFailed(format!(
-            "decode failed for group {}: {other:?}",
-            group.0
-        )),
+        other => FfsError::RepairFailed(format!("decode failed for group {}: {other:?}", group.0)),
     })?;
 
     // Extract recovered blocks for the corrupt indices.
