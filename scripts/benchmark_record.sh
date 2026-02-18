@@ -19,6 +19,32 @@ BENCHMARK_BASELINE_LATEST_PATH="benchmarks/baselines/latest.json"
 BENCHMARK_BASELINE_HISTORY_PATH=""
 declare -A OP_WARN_THRESHOLDS=()
 declare -A OP_FAIL_THRESHOLDS=()
+CACHE_WORKLOAD_METRICS_JSON='[]'
+
+cargo_exec() {
+    rch exec -- cargo "$@"
+}
+
+extract_cache_report_from_log() {
+    local log_file="$1"
+    local report_tsv="$2"
+    awk -F'\t' '
+        $1 == "policy" && $2 == "workload" {
+            print;
+            saw_header = 1;
+            next;
+        }
+        saw_header && ($1 == "arc" || $1 == "s3fifo") {
+            print;
+            row_count += 1;
+        }
+        END {
+            if (!saw_header || row_count == 0) {
+                exit 1;
+            }
+        }
+    ' "$log_file" > "$report_tsv"
+}
 
 usage() {
     cat <<'USAGE'
@@ -190,15 +216,17 @@ echo "Output directory: ${OUT_DIR}"
 echo ""
 
 echo "Building release binaries once..."
-cargo build -p ffs-cli --release --quiet
-cargo build -p ffs-harness --release --quiet
+cargo_exec build -p ffs-cli --release --quiet
+cargo_exec build -p ffs-harness --release --quiet
 echo ""
 
 CLI_BIN="${TARGET_DIR}/release/ffs-cli"
 HARNESS_BIN="${TARGET_DIR}/release/ffs-harness"
-
-[ -x "$CLI_BIN" ] || { echo "missing executable: ${CLI_BIN}" >&2; exit 1; }
-[ -x "$HARNESS_BIN" ] || { echo "missing executable: ${HARNESS_BIN}" >&2; exit 1; }
+USE_LOCAL_RELEASE_BINS=1
+if [ ! -x "$CLI_BIN" ] || [ ! -x "$HARNESS_BIN" ]; then
+    USE_LOCAL_RELEASE_BINS=0
+    echo "warning: missing local release binaries under ${TARGET_DIR}; falling back to rch cargo run commands" >&2
+fi
 
 declare -a BENCH_LABELS=()
 declare -a BENCH_COMMANDS=()
@@ -206,6 +234,8 @@ declare -a BENCH_FILES=()
 declare -a BENCH_OPERATIONS=()
 declare -a BENCH_PAYLOAD_MB=()
 declare -a SKIPPED_LABELS=()
+declare -a CACHE_WORKLOAD_REPORT_PATHS=()
+declare -a CACHE_WORKLOAD_REPORT_POLICIES=()
 
 add_bench() {
     BENCH_LABELS+=("$1")
@@ -215,46 +245,145 @@ add_bench() {
     BENCH_PAYLOAD_MB+=("${5:-0}")
 }
 
-add_bench "ffs-cli parity --json" \
-    "${CLI_BIN} parity --json" \
-    "ffs_cli_parity.json" \
-    "metadata_parity_cli" \
-    "0"
+if [ "$USE_LOCAL_RELEASE_BINS" -eq 1 ]; then
+    add_bench "ffs-cli parity --json" \
+        "${CLI_BIN} parity --json" \
+        "ffs_cli_parity.json" \
+        "metadata_parity_cli" \
+        "0"
 
-add_bench "ffs-harness parity" \
-    "${HARNESS_BIN} parity" \
-    "ffs_harness_parity.json" \
-    "metadata_parity_harness" \
-    "0"
+    add_bench "ffs-harness parity" \
+        "${HARNESS_BIN} parity" \
+        "ffs_harness_parity.json" \
+        "metadata_parity_harness" \
+        "0"
 
-add_bench "ffs-harness check-fixtures" \
-    "${HARNESS_BIN} check-fixtures" \
-    "ffs_harness_check_fixtures.json" \
-    "fixture_validation" \
-    "0"
+    add_bench "ffs-harness check-fixtures" \
+        "${HARNESS_BIN} check-fixtures" \
+        "ffs_harness_check_fixtures.json" \
+        "fixture_validation" \
+        "0"
+else
+    add_bench "ffs-cli parity --json" \
+        "rch exec -- cargo run -p ffs-cli --release --quiet -- parity --json" \
+        "ffs_cli_parity.json" \
+        "metadata_parity_cli" \
+        "0"
+
+    add_bench "ffs-harness parity" \
+        "rch exec -- cargo run -p ffs-harness --release --quiet -- parity" \
+        "ffs_harness_parity.json" \
+        "metadata_parity_harness" \
+        "0"
+
+    add_bench "ffs-harness check-fixtures" \
+        "rch exec -- cargo run -p ffs-harness --release --quiet -- check-fixtures" \
+        "ffs_harness_check_fixtures.json" \
+        "fixture_validation" \
+        "0"
+fi
 
 if [ -f "$REF_IMAGE" ]; then
     probe_stderr="${OUT_DIR}/ffs_cli_inspect_probe.stderr"
-    if "$CLI_BIN" inspect "$REF_IMAGE" --json >/dev/null 2>"$probe_stderr"; then
-        add_bench "ffs-cli inspect ext4_8mb_reference.ext4 --json" \
-            "${CLI_BIN} inspect ${REF_IMAGE} --json" \
-            "ffs_cli_inspect_ext4_8mb_reference.json" \
-            "read_metadata_inspect_ext4_reference" \
-            "8"
-        add_bench "ffs-cli scrub ext4_8mb_reference.ext4 --json" \
-            "${CLI_BIN} scrub ${REF_IMAGE} --json" \
-            "ffs_cli_scrub_ext4_8mb_reference.json" \
-            "read_metadata_scrub_ext4_reference" \
-            "8"
+    if [ "$USE_LOCAL_RELEASE_BINS" -eq 1 ]; then
+        if "$CLI_BIN" inspect "$REF_IMAGE" --json >/dev/null 2>"$probe_stderr"; then
+            add_bench "ffs-cli inspect ext4_8mb_reference.ext4 --json" \
+                "${CLI_BIN} inspect ${REF_IMAGE} --json" \
+                "ffs_cli_inspect_ext4_8mb_reference.json" \
+                "read_metadata_inspect_ext4_reference" \
+                "8"
+            add_bench "ffs-cli scrub ext4_8mb_reference.ext4 --json" \
+                "${CLI_BIN} scrub ${REF_IMAGE} --json" \
+                "ffs_cli_scrub_ext4_8mb_reference.json" \
+                "read_metadata_scrub_ext4_reference" \
+                "8"
+        else
+            probe_reason="$(tr '\n' ' ' < "$probe_stderr" | sed 's/[[:space:]]\+/ /g' | sed 's/^ //; s/ $//')"
+            SKIPPED_LABELS+=("ffs-cli inspect ext4_8mb_reference.ext4 --json (unsupported by current parser: ${probe_reason})")
+            SKIPPED_LABELS+=("ffs-cli scrub ext4_8mb_reference.ext4 --json (skipped because inspect probe failed)")
+        fi
     else
-        probe_reason="$(tr '\n' ' ' < "$probe_stderr" | sed 's/[[:space:]]\+/ /g' | sed 's/^ //; s/ $//')"
-        SKIPPED_LABELS+=("ffs-cli inspect ext4_8mb_reference.ext4 --json (unsupported by current parser: ${probe_reason})")
-        SKIPPED_LABELS+=("ffs-cli scrub ext4_8mb_reference.ext4 --json (skipped because inspect probe failed)")
+        if rch exec -- cargo run -p ffs-cli --release --quiet -- inspect "$REF_IMAGE" --json >/dev/null 2>"$probe_stderr"; then
+            add_bench "ffs-cli inspect ext4_8mb_reference.ext4 --json" \
+                "rch exec -- cargo run -p ffs-cli --release --quiet -- inspect ${REF_IMAGE} --json" \
+                "ffs_cli_inspect_ext4_8mb_reference.json" \
+                "read_metadata_inspect_ext4_reference" \
+                "8"
+            add_bench "ffs-cli scrub ext4_8mb_reference.ext4 --json" \
+                "rch exec -- cargo run -p ffs-cli --release --quiet -- scrub ${REF_IMAGE} --json" \
+                "ffs_cli_scrub_ext4_8mb_reference.json" \
+                "read_metadata_scrub_ext4_reference" \
+                "8"
+        else
+            probe_reason="$(tr '\n' ' ' < "$probe_stderr" | sed 's/[[:space:]]\+/ /g' | sed 's/^ //; s/ $//')"
+            SKIPPED_LABELS+=("ffs-cli inspect ext4_8mb_reference.ext4 --json (unsupported by current parser: ${probe_reason})")
+            SKIPPED_LABELS+=("ffs-cli scrub ext4_8mb_reference.ext4 --json (skipped because inspect probe failed)")
+        fi
     fi
 else
     SKIPPED_LABELS+=("ffs-cli inspect ext4_8mb_reference.ext4 --json (missing ${REF_IMAGE})")
     SKIPPED_LABELS+=("ffs-cli scrub ext4_8mb_reference.ext4 --json (missing ${REF_IMAGE})")
 fi
+
+add_bench "ffs-block arc sequential scan (criterion)" \
+    "rch exec -- cargo bench -p ffs-block --bench arc_cache -- block_cache_arc_sequential_scan" \
+    "ffs_block_arc_sequential_scan.json" \
+    "block_cache_arc_sequential_scan" \
+    "0"
+
+add_bench "ffs-block arc zipf distribution (criterion)" \
+    "rch exec -- cargo bench -p ffs-block --bench arc_cache -- block_cache_arc_zipf_distribution" \
+    "ffs_block_arc_zipf_distribution.json" \
+    "block_cache_arc_zipf_distribution" \
+    "0"
+
+add_bench "ffs-block arc mixed seq70 hot30 (criterion)" \
+    "rch exec -- cargo bench -p ffs-block --bench arc_cache -- block_cache_arc_mixed_seq70_hot30" \
+    "ffs_block_arc_mixed_seq70_hot30.json" \
+    "block_cache_arc_mixed_seq70_hot30" \
+    "0"
+
+add_bench "ffs-block arc compile-like (criterion)" \
+    "rch exec -- cargo bench -p ffs-block --bench arc_cache -- block_cache_arc_compile_like" \
+    "ffs_block_arc_compile_like.json" \
+    "block_cache_arc_compile_like" \
+    "0"
+
+add_bench "ffs-block arc database-like (criterion)" \
+    "rch exec -- cargo bench -p ffs-block --bench arc_cache -- block_cache_arc_database_like" \
+    "ffs_block_arc_database_like.json" \
+    "block_cache_arc_database_like" \
+    "0"
+
+add_bench "ffs-block s3fifo sequential scan (criterion)" \
+    "rch exec -- cargo bench -p ffs-block --features s3fifo --bench arc_cache -- block_cache_s3fifo_sequential_scan" \
+    "ffs_block_s3fifo_sequential_scan.json" \
+    "block_cache_s3fifo_sequential_scan" \
+    "0"
+
+add_bench "ffs-block s3fifo zipf distribution (criterion)" \
+    "rch exec -- cargo bench -p ffs-block --features s3fifo --bench arc_cache -- block_cache_s3fifo_zipf_distribution" \
+    "ffs_block_s3fifo_zipf_distribution.json" \
+    "block_cache_s3fifo_zipf_distribution" \
+    "0"
+
+add_bench "ffs-block s3fifo mixed seq70 hot30 (criterion)" \
+    "rch exec -- cargo bench -p ffs-block --features s3fifo --bench arc_cache -- block_cache_s3fifo_mixed_seq70_hot30" \
+    "ffs_block_s3fifo_mixed_seq70_hot30.json" \
+    "block_cache_s3fifo_mixed_seq70_hot30" \
+    "0"
+
+add_bench "ffs-block s3fifo compile-like (criterion)" \
+    "rch exec -- cargo bench -p ffs-block --features s3fifo --bench arc_cache -- block_cache_s3fifo_compile_like" \
+    "ffs_block_s3fifo_compile_like.json" \
+    "block_cache_s3fifo_compile_like" \
+    "0"
+
+add_bench "ffs-block s3fifo database-like (criterion)" \
+    "rch exec -- cargo bench -p ffs-block --features s3fifo --bench arc_cache -- block_cache_s3fifo_database_like" \
+    "ffs_block_s3fifo_database_like.json" \
+    "block_cache_s3fifo_database_like" \
+    "0"
 
 json_mean() {
     jq -r '.results[0].mean' "$1"
@@ -338,6 +467,79 @@ pct_change() {
         }
     }'
 }
+
+run_cache_workload_report() {
+    local policy="$1"
+    local report_tsv="$2"
+    local log_file="${report_tsv%.tsv}.txt"
+    local -a command
+
+    if [ "$policy" = "s3fifo" ]; then
+        command=(
+            rch exec -- env "FFS_BLOCK_CACHE_WORKLOAD_REPORT=-" cargo bench -p ffs-block --features s3fifo --bench arc_cache -- block_cache_s3fifo_sequential_scan
+        )
+    else
+        command=(
+            rch exec -- env "FFS_BLOCK_CACHE_WORKLOAD_REPORT=-" cargo bench -p ffs-block --bench arc_cache -- block_cache_arc_sequential_scan
+        )
+    fi
+
+    echo ""
+    echo "--- ffs-block cache metrics (${policy}) ---"
+    if "${command[@]}" >"$log_file" 2>&1; then
+        if [ -s "$report_tsv" ] || extract_cache_report_from_log "$log_file" "$report_tsv"; then
+            CACHE_WORKLOAD_REPORT_PATHS+=("$report_tsv")
+            CACHE_WORKLOAD_REPORT_POLICIES+=("$policy")
+        else
+            SKIPPED_LABELS+=("ffs-block cache metrics (${policy}) missing report TSV; see ${log_file}")
+        fi
+    else
+        SKIPPED_LABELS+=("ffs-block cache metrics (${policy}) failed; see ${log_file}")
+    fi
+}
+
+collect_cache_workload_metrics_json() {
+    local tmp_json
+    tmp_json="$(mktemp)"
+    for report_tsv in "${CACHE_WORKLOAD_REPORT_PATHS[@]}"; do
+        if [ ! -f "$report_tsv" ]; then
+            continue
+        fi
+        jq -Rsn --arg source_tsv "$report_tsv" '
+            [inputs
+            | select(length > 0)
+            | split("\t")
+            | select(.[0] != "policy")
+            | {
+                policy: .[0],
+                workload: .[1],
+                accesses: (.[2] | tonumber),
+                hits: (.[3] | tonumber),
+                misses: (.[4] | tonumber),
+                hit_rate: (.[5] | tonumber),
+                resident: (.[6] | tonumber),
+                capacity: (.[7] | tonumber),
+                b1_len: (.[8] | tonumber),
+                b2_len: (.[9] | tonumber),
+                memory_overhead_per_cached_block: (.[10] | tonumber),
+                seed: (.[11] | tonumber),
+                source_tsv: $source_tsv
+              }
+            ]
+        ' < "$report_tsv" >> "$tmp_json"
+    done
+
+    if [ -s "$tmp_json" ]; then
+        jq -s 'add // []' "$tmp_json"
+    else
+        echo '[]'
+    fi
+    rm -f "$tmp_json"
+}
+
+run_cache_workload_report "arc" "${OUT_DIR}/ffs_block_cache_workloads_arc.tsv"
+run_cache_workload_report "s3fifo" "${OUT_DIR}/ffs_block_cache_workloads_s3fifo.tsv"
+CACHE_WORKLOAD_METRICS_JSON="$(collect_cache_workload_metrics_json)"
 
 echo "Running hyperfine benchmarks..."
 for i in "${!BENCH_LABELS[@]}"; do
@@ -518,8 +720,10 @@ write_perf_baseline_json() {
         --argjson p99_warn_threshold_percent "$P99_WARN_THRESHOLD" \
         --argjson p99_fail_threshold_percent "$P99_FAIL_THRESHOLD" \
         --argjson measurements "$measurements_json" \
+        --argjson cache_workload_metrics "$CACHE_WORKLOAD_METRICS_JSON" \
         --argjson measured_count "$(jq 'map(select(.status == "measured")) | length' <<<"$measurements_json")" \
         --argjson pending_count "$(jq 'map(select(.status == "pending")) | length' <<<"$measurements_json")" \
+        --argjson cache_workload_metric_count "$(jq 'length' <<<"$CACHE_WORKLOAD_METRICS_JSON")" \
         '{
             generated_at: $generated_at,
             date_tag: $date_tag,
@@ -539,9 +743,11 @@ write_perf_baseline_json() {
             p99_fail_threshold_percent: $p99_fail_threshold_percent,
             measurement_coverage: {
                 measured_count: $measured_count,
-                pending_count: $pending_count
+                pending_count: $pending_count,
+                cache_workload_metric_count: $cache_workload_metric_count
             },
-            measurements: $measurements
+            measurements: $measurements,
+            cache_workload_metrics: $cache_workload_metrics
         }' > "$PERF_BASELINE_PATH"
 
     cp "$PERF_BASELINE_PATH" "$PERF_BASELINE_DATED_PATH"
@@ -595,6 +801,14 @@ date_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     for i in "${!BENCH_LABELS[@]}"; do
         echo "- \`${BENCH_COMMANDS[$i]}\`"
     done
+    if [ "${#CACHE_WORKLOAD_REPORT_PATHS[@]}" -gt 0 ]; then
+        echo ""
+        echo "### Cache Metrics Reports"
+        echo ""
+        for i in "${!CACHE_WORKLOAD_REPORT_PATHS[@]}"; do
+            echo "- policy \`${CACHE_WORKLOAD_REPORT_POLICIES[$i]}\` -> \`${CACHE_WORKLOAD_REPORT_PATHS[$i]}\`"
+        done
+    fi
     if [ "${#SKIPPED_LABELS[@]}" -gt 0 ]; then
         echo ""
         echo "### Skipped"
@@ -622,6 +836,36 @@ date_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         p99_ms="$(sec_to_ms "$p99_s")"
         echo "| ${BENCH_LABELS[$i]} | ${mean_ms} | ${std_ms} | ${p50_ms} | ${p95_ms} | ${p99_ms} | \`${json_file}\` |"
     done
+    echo ""
+    echo "## Cache Workload Metrics (ArcCache::metrics)"
+    echo ""
+    if [ "$(jq 'length' <<<"$CACHE_WORKLOAD_METRICS_JSON")" -eq 0 ]; then
+        echo "No cache workload metrics were captured."
+    else
+        echo "| Policy | Workload | Accesses | Hit Rate | Memory Overhead / Cached Block | Hits | Misses | Resident | Capacity | Ghost (B1+B2) | Source |"
+        echo "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|"
+        while IFS=$'\t' read -r policy workload accesses hit_rate overhead hits misses resident capacity ghost source_tsv; do
+            echo "| ${policy} | ${workload} | ${accesses} | ${hit_rate} | ${overhead} | ${hits} | ${misses} | ${resident} | ${capacity} | ${ghost} | \`${source_tsv}\` |"
+        done < <(
+            jq -r '
+                .[]
+                | [
+                    .policy,
+                    .workload,
+                    .accesses,
+                    .hit_rate,
+                    .memory_overhead_per_cached_block,
+                    .hits,
+                    .misses,
+                    .resident,
+                    .capacity,
+                    (.b1_len + .b2_len),
+                    .source_tsv
+                ]
+                | @tsv
+            ' <<<"$CACHE_WORKLOAD_METRICS_JSON"
+        )
+    fi
 } > "$REPORT_PATH"
 
 write_perf_baseline_json
@@ -697,6 +941,12 @@ echo "Wrote hyperfine exports:"
 for i in "${!BENCH_LABELS[@]}"; do
     echo "  - ${OUT_DIR}/${BENCH_FILES[$i]}"
 done
+if [ "${#CACHE_WORKLOAD_REPORT_PATHS[@]}" -gt 0 ]; then
+    echo "Wrote cache workload metric reports:"
+    for report_path in "${CACHE_WORKLOAD_REPORT_PATHS[@]}"; do
+        echo "  - ${report_path}"
+    done
+fi
 if [ "${#SKIPPED_LABELS[@]}" -gt 0 ]; then
     echo "Skipped commands:"
     for skipped in "${SKIPPED_LABELS[@]}"; do

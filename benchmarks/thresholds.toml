@@ -22,3 +22,43 @@ fail_percent = 20
 [operation_thresholds.read_metadata_scrub_ext4_reference]
 warn_percent = 10
 fail_percent = 20
+
+[operation_thresholds.block_cache_arc_sequential_scan]
+warn_percent = 10
+fail_percent = 20
+
+[operation_thresholds.block_cache_arc_zipf_distribution]
+warn_percent = 10
+fail_percent = 20
+
+[operation_thresholds.block_cache_arc_mixed_seq70_hot30]
+warn_percent = 10
+fail_percent = 20
+
+[operation_thresholds.block_cache_arc_compile_like]
+warn_percent = 10
+fail_percent = 20
+
+[operation_thresholds.block_cache_arc_database_like]
+warn_percent = 10
+fail_percent = 20
+
+[operation_thresholds.block_cache_s3fifo_sequential_scan]
+warn_percent = 10
+fail_percent = 20
+
+[operation_thresholds.block_cache_s3fifo_zipf_distribution]
+warn_percent = 10
+fail_percent = 20
+
+[operation_thresholds.block_cache_s3fifo_mixed_seq70_hot30]
+warn_percent = 10
+fail_percent = 20
+
+[operation_thresholds.block_cache_s3fifo_compile_like]
+warn_percent = 10
+fail_percent = 20
+
+[operation_thresholds.block_cache_s3fifo_database_like]
+warn_percent = 10
+fail_percent = 20
