@@ -4,6 +4,10 @@
 //! This crate is a thin translation layer: kernel FUSE requests arrive via the
 //! `fuser` crate, get forwarded to a [`FsOps`] implementation (from `ffs-core`),
 //! and errors are mapped through [`FfsError::to_errno()`].
+//!
+//! See [`per_core::PerCoreDispatcher`] for thread-per-core dispatch routing.
+
+pub mod per_core;
 
 use asupersync::Cx;
 use ffs_core::{
