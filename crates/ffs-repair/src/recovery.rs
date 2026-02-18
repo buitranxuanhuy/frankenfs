@@ -912,4 +912,210 @@ mod tests {
         assert_eq!(parsed.group, layout.group.0);
         assert_eq!(parsed.corrupt_count, 1);
     }
+
+    #[test]
+    fn recovery_noop_for_empty_corrupt_list() {
+        let cx = Cx::for_testing();
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+        let source_first = BlockNumber(0);
+        let source_count = 8;
+
+        write_source_blocks(&cx, &device, source_first, source_count, block_size);
+        bootstrap_storage(&cx, &device, layout, source_first, source_count, 4);
+
+        let orchestrator = GroupRecoveryOrchestrator::new(
+            &device,
+            test_uuid(),
+            layout,
+            source_first,
+            source_count,
+        )
+        .expect("orchestrator");
+        let result = orchestrator.recover_from_indices(&cx, &[]);
+        assert!(result.is_success());
+        assert_eq!(result.evidence.corrupt_count, 0);
+        assert!(result.repaired_blocks.is_empty());
+    }
+
+    #[test]
+    fn recovery_deduplicates_corrupt_indices() {
+        let cx = Cx::for_testing();
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+        let source_first = BlockNumber(0);
+        let source_count = 8;
+
+        let originals = write_source_blocks(&cx, &device, source_first, source_count, block_size);
+        bootstrap_storage(&cx, &device, layout, source_first, source_count, 4);
+
+        let corrupt_idx = 3_u32;
+        let corrupt_block = BlockNumber(source_first.0 + u64::from(corrupt_idx));
+        device
+            .write_block(&cx, corrupt_block, &vec![0xAA; block_size as usize])
+            .expect("inject corruption");
+
+        let orchestrator = GroupRecoveryOrchestrator::new(
+            &device,
+            test_uuid(),
+            layout,
+            source_first,
+            source_count,
+        )
+        .expect("orchestrator");
+        // Pass duplicates; should deduplicate to a single index.
+        let result = orchestrator.recover_from_indices(&cx, &[3, 3, 3]);
+        assert!(result.is_success(), "dedup recovery: {:?}", result.evidence);
+        assert_eq!(result.evidence.corrupt_count, 1);
+
+        let restored = device
+            .read_block(&cx, corrupt_block)
+            .expect("read restored");
+        assert_eq!(restored.as_slice(), originals[3].as_slice());
+    }
+
+    #[test]
+    fn recovery_rejects_out_of_range_index() {
+        let cx = Cx::for_testing();
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+        let source_first = BlockNumber(0);
+        let source_count = 8;
+
+        write_source_blocks(&cx, &device, source_first, source_count, block_size);
+        bootstrap_storage(&cx, &device, layout, source_first, source_count, 4);
+
+        let orchestrator = GroupRecoveryOrchestrator::new(
+            &device,
+            test_uuid(),
+            layout,
+            source_first,
+            source_count,
+        )
+        .expect("orchestrator");
+        let result = orchestrator.recover_from_indices(&cx, &[99]);
+        assert_eq!(result.evidence.outcome, RecoveryOutcome::Failed);
+        assert!(result.evidence.reason.as_deref().unwrap_or_default().contains("outside source range"));
+    }
+
+    #[test]
+    fn recover_from_corrupt_blocks_maps_absolute_to_relative() {
+        let cx = Cx::for_testing();
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 256);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 128, 0, 8).expect("layout");
+        let source_first = BlockNumber(10);
+        let source_count = 8;
+
+        let originals = write_source_blocks(&cx, &device, source_first, source_count, block_size);
+        bootstrap_storage(&cx, &device, layout, source_first, source_count, 4);
+
+        // Corrupt block at absolute position 12 (relative index 2).
+        let corrupt_abs = BlockNumber(12);
+        device
+            .write_block(&cx, corrupt_abs, &vec![0xDD; block_size as usize])
+            .expect("inject corruption");
+
+        let orchestrator = GroupRecoveryOrchestrator::new(
+            &device,
+            test_uuid(),
+            layout,
+            source_first,
+            source_count,
+        )
+        .expect("orchestrator");
+        let result = orchestrator.recover_from_corrupt_blocks(&cx, &[corrupt_abs]);
+        assert!(result.is_success(), "abs block recovery: {:?}", result.evidence);
+
+        let restored = device.read_block(&cx, corrupt_abs).expect("read restored");
+        assert_eq!(restored.as_slice(), originals[2].as_slice());
+    }
+
+    #[test]
+    fn recover_from_corrupt_blocks_rejects_block_outside_source() {
+        let cx = Cx::for_testing();
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 256);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 128, 0, 8).expect("layout");
+        let source_first = BlockNumber(10);
+        let source_count = 8;
+
+        write_source_blocks(&cx, &device, source_first, source_count, block_size);
+        bootstrap_storage(&cx, &device, layout, source_first, source_count, 4);
+
+        let orchestrator = GroupRecoveryOrchestrator::new(
+            &device,
+            test_uuid(),
+            layout,
+            source_first,
+            source_count,
+        )
+        .expect("orchestrator");
+
+        // Block 5 is before source_first (10).
+        let result = orchestrator.recover_from_corrupt_blocks(&cx, &[BlockNumber(5)]);
+        assert_eq!(result.evidence.outcome, RecoveryOutcome::Failed);
+        assert!(result.evidence.reason.as_deref().unwrap_or_default().contains("outside source range"));
+    }
+
+    #[test]
+    fn orchestrator_rejects_zero_source_block_count() {
+        let device = MemBlockDevice::new(256, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+        match GroupRecoveryOrchestrator::new(&device, test_uuid(), layout, BlockNumber(0), 0) {
+            Err(FfsError::RepairFailed(_)) => {}
+            Err(other) => panic!("expected RepairFailed, got {other:?}"),
+            Ok(_) => panic!("zero source_block_count should fail"),
+        }
+    }
+
+    #[test]
+    fn orchestrator_rejects_source_outside_group_data() {
+        let device = MemBlockDevice::new(256, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 32, 2, 4).expect("layout");
+
+        // Source range [20, 28) overlaps validation/repair tail starting at 24.
+        match GroupRecoveryOrchestrator::new(&device, test_uuid(), layout, BlockNumber(20), 8) {
+            Err(FfsError::RepairFailed(_)) => {}
+            Err(other) => panic!("expected RepairFailed, got {other:?}"),
+            Ok(_) => panic!("source overlapping tail should fail"),
+        }
+    }
+
+    #[test]
+    fn evidence_round_trip_preserves_partial_outcome() {
+        let evidence = RecoveryEvidence {
+            group: 5,
+            generation: 42,
+            corrupt_count: 3,
+            symbols_available: 10,
+            symbols_used: 10,
+            decoder_stats: RecoveryDecoderStats {
+                peeled: 2,
+                inactivated: 1,
+                gauss_ops: 15,
+                pivots_selected: 3,
+            },
+            outcome: RecoveryOutcome::Partial,
+            reason: Some("decoder returned incomplete recovery".to_owned()),
+        };
+
+        let json = evidence.to_json().expect("serialize");
+        let parsed: RecoveryEvidence = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed.outcome, RecoveryOutcome::Partial);
+        assert_eq!(parsed.group, 5);
+        assert_eq!(parsed.generation, 42);
+        assert_eq!(parsed.decoder_stats.peeled, 2);
+        assert_eq!(parsed.reason.as_deref(), Some("decoder returned incomplete recovery"));
+    }
 }

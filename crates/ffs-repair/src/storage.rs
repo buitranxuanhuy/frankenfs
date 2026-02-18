@@ -971,4 +971,207 @@ mod tests {
             other => panic!("expected RepairFailed, got {other:?}"),
         }
     }
+
+    #[test]
+    fn layout_rejects_zero_blocks_per_group() {
+        let err = RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 0, 0, 1)
+            .expect_err("zero blocks_per_group");
+        assert!(matches!(err, FfsError::InvalidGeometry(_)));
+    }
+
+    #[test]
+    fn layout_rejects_zero_repair_block_count() {
+        let err = RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 32, 0, 0)
+            .expect_err("zero repair_block_count");
+        assert!(matches!(err, FfsError::InvalidGeometry(_)));
+    }
+
+    #[test]
+    fn layout_rejects_reserved_exceeding_group_size() {
+        // validation(2) + repair(8) + desc(2) = 12 > blocks_per_group(10)
+        let err = RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 10, 2, 8)
+            .expect_err("reserved exceeds group");
+        assert!(matches!(err, FfsError::InvalidGeometry(_)));
+    }
+
+    #[test]
+    fn storage_rejects_generation_regression() {
+        let cx = Cx::for_testing();
+        let device = MemBlockDevice::new(256, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 32, 0, 4).expect("layout");
+        let storage = RepairGroupStorage::new(&device, layout);
+
+        let desc_g5 = make_desc(layout, 5, 32);
+        storage
+            .write_group_desc_ext(&cx, &desc_g5)
+            .expect("write generation 5");
+
+        let desc_g3 = make_desc(layout, 3, 32);
+        let err = storage
+            .write_group_desc_ext(&cx, &desc_g3)
+            .expect_err("regression must fail");
+        assert!(matches!(err, FfsError::RepairFailed(_)));
+    }
+
+    #[test]
+    fn storage_read_with_no_descriptors_returns_not_found() {
+        let cx = Cx::for_testing();
+        let device = MemBlockDevice::new(256, 64);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 16, 0, 2).expect("layout");
+        let storage = RepairGroupStorage::new(&device, layout);
+
+        let err = storage
+            .read_group_desc_ext(&cx)
+            .expect_err("no descriptors");
+        assert!(matches!(err, FfsError::NotFound(_)));
+    }
+
+    #[test]
+    fn storage_read_symbols_with_no_descriptors_returns_not_found() {
+        let cx = Cx::for_testing();
+        let device = MemBlockDevice::new(256, 64);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 16, 0, 2).expect("layout");
+        let storage = RepairGroupStorage::new(&device, layout);
+
+        let err = storage
+            .read_repair_symbols(&cx)
+            .expect_err("no descriptors");
+        assert!(matches!(err, FfsError::NotFound(_)));
+    }
+
+    #[test]
+    fn storage_bootstrap_generation_zero_returns_empty_symbols() {
+        let cx = Cx::for_testing();
+        let device = MemBlockDevice::new(256, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 32, 0, 4).expect("layout");
+        let storage = RepairGroupStorage::new(&device, layout);
+
+        let bootstrap = make_desc(layout, 0, 32);
+        storage
+            .write_group_desc_ext(&cx, &bootstrap)
+            .expect("write bootstrap");
+
+        let symbols = storage.read_repair_symbols(&cx).expect("bootstrap symbols");
+        assert!(symbols.is_empty(), "generation-0 bootstrap should return empty symbols");
+    }
+
+    #[test]
+    fn storage_write_repair_symbols_rejects_stale_generation() {
+        let cx = Cx::for_testing();
+        let device = MemBlockDevice::new(256, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 32, 0, 4).expect("layout");
+        let storage = RepairGroupStorage::new(&device, layout);
+
+        let bootstrap = make_desc(layout, 0, 32);
+        storage
+            .write_group_desc_ext(&cx, &bootstrap)
+            .expect("write bootstrap");
+
+        let symbols = make_symbols(1_000, 4, 32);
+        storage
+            .write_repair_symbols(&cx, &symbols, 1)
+            .expect("gen 1");
+
+        // Attempting to write generation 1 again (not strictly greater) must fail.
+        let err = storage
+            .write_repair_symbols(&cx, &symbols, 1)
+            .expect_err("stale generation");
+        assert!(matches!(err, FfsError::RepairFailed(_)));
+    }
+
+    #[test]
+    fn storage_multi_generation_upgrade() {
+        let cx = Cx::for_testing();
+        let device = MemBlockDevice::new(256, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 32, 0, 4).expect("layout");
+        let storage = RepairGroupStorage::new(&device, layout);
+
+        let bootstrap = make_desc(layout, 0, 32);
+        storage
+            .write_group_desc_ext(&cx, &bootstrap)
+            .expect("write bootstrap");
+
+        let symbols_g1 = make_symbols(100, 6, 32);
+        storage
+            .write_repair_symbols(&cx, &symbols_g1, 1)
+            .expect("gen 1");
+
+        let symbols_g2 = make_symbols(200, 8, 32);
+        storage
+            .write_repair_symbols(&cx, &symbols_g2, 2)
+            .expect("gen 2");
+
+        let active = storage.read_group_desc_ext(&cx).expect("active");
+        assert_eq!(active.repair_generation, 2);
+
+        let read_back = storage.read_repair_symbols(&cx).expect("symbols");
+        assert_eq!(read_back, symbols_g2, "should read generation 2 symbols");
+    }
+
+    #[test]
+    fn storage_rejects_mismatched_symbol_sizes_in_input() {
+        let cx = Cx::for_testing();
+        let device = MemBlockDevice::new(256, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 32, 0, 4).expect("layout");
+        let storage = RepairGroupStorage::new(&device, layout);
+
+        let bootstrap = make_desc(layout, 0, 32);
+        storage
+            .write_group_desc_ext(&cx, &bootstrap)
+            .expect("write bootstrap");
+
+        // Symbols with wrong sizes (desc says 32-byte symbols).
+        let bad_symbols = vec![
+            (100, vec![0xAA; 32]),
+            (101, vec![0xBB; 16]), // wrong size
+        ];
+        let err = storage
+            .write_repair_symbols(&cx, &bad_symbols, 1)
+            .expect_err("mismatched symbol size");
+        assert!(matches!(err, FfsError::RepairFailed(_)));
+    }
+
+    #[test]
+    fn storage_rejects_non_contiguous_esi_input() {
+        let cx = Cx::for_testing();
+        let device = MemBlockDevice::new(256, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 32, 0, 4).expect("layout");
+        let storage = RepairGroupStorage::new(&device, layout);
+
+        let bootstrap = make_desc(layout, 0, 32);
+        storage
+            .write_group_desc_ext(&cx, &bootstrap)
+            .expect("write bootstrap");
+
+        // Gap in ESI sequence: 100, 102 (skipping 101).
+        let gap_symbols = vec![
+            (100, vec![0xAA; 32]),
+            (102, vec![0xBB; 32]),
+        ];
+        let err = storage
+            .write_repair_symbols(&cx, &gap_symbols, 1)
+            .expect_err("non-contiguous ESI");
+        assert!(matches!(err, FfsError::RepairFailed(_)));
+    }
+
+    #[test]
+    fn layout_descriptor_blocks_at_group_boundary() {
+        // Minimal group: repair(1) + desc(2) = 3 blocks.
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(100), 3, 0, 1).expect("layout");
+        assert_eq!(layout.repair_start_block(), BlockNumber(100));
+        assert_eq!(
+            layout.descriptor_blocks(),
+            [BlockNumber(101), BlockNumber(102)]
+        );
+        assert_eq!(layout.group_end_exclusive(), 103);
+    }
 }
