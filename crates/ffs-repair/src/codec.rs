@@ -180,33 +180,13 @@ pub fn decode_group(
     }
 
     // Attempt decode.
-    let result: DecodeResult = decoder.decode(&received).map_err(|e| match e {
+    let result: DecodeResult = decoder.decode(&received).map_err(|error| match error {
         DecodeError::InsufficientSymbols { received, required } => FfsError::RepairFailed(format!(
             "insufficient symbols for group {}: have {received}, need {required}",
             group.0
         )),
-        DecodeError::SingularMatrix { row } => FfsError::RepairFailed(format!(
-            "singular matrix at row {row} for group {}",
-            group.0
-        )),
-        DecodeError::SymbolSizeMismatch { expected, actual } => FfsError::RepairFailed(format!(
-            "symbol size mismatch for group {}: expected {expected}, got {actual}",
-            group.0
-        )),
-        DecodeError::SymbolEquationArityMismatch {
-            esi,
-            columns,
-            coefficients,
-        } => FfsError::RepairFailed(format!(
-            "malformed repair equation for group {}: esi={esi}, columns={columns}, coefficients={coefficients}",
-            group.0
-        )),
-        DecodeError::ColumnIndexOutOfRange { esi, column, max_valid } => FfsError::RepairFailed(format!(
-            "column index out of range for group {}: esi={esi}, column={column}, max_valid={max_valid}",
-            group.0
-        )),
-        DecodeError::CorruptDecodedOutput { esi, byte_index, expected, actual } => FfsError::RepairFailed(format!(
-            "corrupt decoded output for group {}: esi={esi}, byte_index={byte_index}, expected={expected:#x}, actual={actual:#x}",
+        other => FfsError::RepairFailed(format!(
+            "decode failed for group {}: {other:?}",
             group.0
         )),
     })?;

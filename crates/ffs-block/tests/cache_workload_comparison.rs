@@ -14,11 +14,12 @@
 //! ```
 
 use asupersync::Cx;
-use ffs_block::{ArcCache, BlockBuf, BlockDevice, ByteBlockDevice, ByteDevice};
+use ffs_block::{ArcCache, BlockBuf, BlockCache, BlockDevice, ByteBlockDevice, ByteDevice};
 use ffs_error::Result;
 use ffs_types::{BlockNumber, ByteOffset};
 use parking_lot::Mutex;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 const BLOCK_SIZE_4K: u32 = 4096;
 
@@ -537,5 +538,137 @@ fn scan_resistance_preserves_hot_keys() {
         final_resident > 0,
         "cache empty after scan + hot re-access, policy={} has no scan resistance",
         policy_label()
+    );
+}
+
+/// Ensure S3-FIFO/ARC preserves the same external cache API contract:
+/// reads always return last-written bytes, and mixed operations do not panic.
+#[test]
+fn block_device_api_contract_no_stale_reads_under_mixed_ops() {
+    let cx = Cx::for_testing();
+    let cache = make_cache(BLOCK_SIZE_4K, 4_096, 256);
+    let mut rng = Rng64::seeded(0xC0DE_600D);
+    let mut expected: HashMap<u64, u8> = HashMap::new();
+    let mut read_ops = 0_u64;
+    let block_len = usize::try_from(BLOCK_SIZE_4K).expect("fits usize");
+    let start_metrics = cache.metrics();
+
+    for step in 0_u64..50_000_u64 {
+        let block = rng.next_usize(2_048) as u64;
+        let op = rng.next_usize(100);
+        if op < 35 {
+            let value = (((block.wrapping_mul(37)) ^ (step.wrapping_mul(13))) % 251) as u8 + 1;
+            let payload = vec![value; block_len];
+            cache
+                .write_block(&cx, BlockNumber(block), &payload)
+                .expect("write");
+            expected.insert(block, value);
+        } else if op < 93 {
+            let buf = cache.read_block(&cx, BlockNumber(block)).expect("read");
+            let expected_value = expected.get(&block).copied().unwrap_or(0);
+            assert!(
+                buf.as_slice().iter().all(|byte| *byte == expected_value),
+                "stale/corrupt read for block {block}: expected byte {expected_value}"
+            );
+            read_ops = read_ops.saturating_add(1);
+        } else if op < 97 {
+            cache.sync(&cx).expect("sync");
+        } else {
+            cache.evict(BlockNumber(block));
+        }
+
+        if step % 10_000 == 0 {
+            let metrics = cache.metrics();
+            assert!(
+                metrics.resident <= metrics.capacity,
+                "resident {} exceeded capacity {} at step {}",
+                metrics.resident,
+                metrics.capacity,
+                step
+            );
+        }
+    }
+
+    let metrics = cache.metrics();
+    let total_lookup_events = metrics
+        .hits
+        .saturating_sub(start_metrics.hits)
+        .saturating_add(metrics.misses.saturating_sub(start_metrics.misses));
+    assert!(
+        total_lookup_events >= read_ops,
+        "expected lookup accounting to include all explicit reads: accounting_delta={total_lookup_events} explicit_reads={read_ops}"
+    );
+    assert!(
+        metrics.resident <= metrics.capacity,
+        "resident {} exceeded capacity {}",
+        metrics.resident,
+        metrics.capacity
+    );
+}
+
+/// Filesystem-like read-path integration scenario for S3-FIFO:
+/// repeatedly-hot file blocks should survive a large cold-file scan.
+#[cfg(feature = "s3fifo")]
+#[test]
+fn s3fifo_filesystem_like_hot_files_survive_cold_scan() {
+    let cx = Cx::for_testing();
+    let cache = make_cache(BLOCK_SIZE_4K, 8_192, 512);
+    let block_len = usize::try_from(BLOCK_SIZE_4K).expect("fits usize");
+
+    // "Create files": one file per block with deterministic content.
+    for file_id in 0_u64..6_000_u64 {
+        let value = ((file_id.wrapping_mul(19)) % 251) as u8 + 1;
+        cache
+            .write_block(&cx, BlockNumber(file_id), &vec![value; block_len])
+            .expect("seed file payload");
+    }
+
+    // Hot set = first 100 files, repeatedly accessed.
+    let hot_files: Vec<u64> = (0_u64..100_u64).collect();
+    for _ in 0..10 {
+        for &file_id in &hot_files {
+            let expected = ((file_id.wrapping_mul(19)) % 251) as u8 + 1;
+            let buf = cache
+                .read_block(&cx, BlockNumber(file_id))
+                .expect("warm hot");
+            assert!(buf.as_slice().iter().all(|byte| *byte == expected));
+        }
+    }
+
+    // Cold scan of 5000 distinct files.
+    for file_id in 1_000_u64..6_000_u64 {
+        let expected = ((file_id.wrapping_mul(19)) % 251) as u8 + 1;
+        let buf = cache
+            .read_block(&cx, BlockNumber(file_id))
+            .expect("scan cold");
+        assert!(buf.as_slice().iter().all(|byte| *byte == expected));
+    }
+
+    // Re-read hot set and require substantial hit retention.
+    let hits_before_probe = cache.metrics().hits;
+    for &file_id in &hot_files {
+        let expected = ((file_id.wrapping_mul(19)) % 251) as u8 + 1;
+        let buf = cache
+            .read_block(&cx, BlockNumber(file_id))
+            .expect("probe hot");
+        assert!(buf.as_slice().iter().all(|byte| *byte == expected));
+    }
+    let metrics = cache.metrics();
+    let hot_hits_after_scan = metrics.hits.saturating_sub(hits_before_probe);
+
+    eprintln!(
+        "[s3fifo] filesystem-like scan resistance: hot_hits_after_scan={hot_hits_after_scan}/100, misses={}, evictions={}, resident={}/{}",
+        metrics.misses, metrics.evictions, metrics.resident, metrics.capacity
+    );
+
+    assert!(
+        hot_hits_after_scan >= 40,
+        "expected >=40/100 hot-file hits after cold scan, got {hot_hits_after_scan}"
+    );
+    assert!(
+        metrics.resident <= metrics.capacity,
+        "resident {} exceeded capacity {}",
+        metrics.resident,
+        metrics.capacity
     );
 }

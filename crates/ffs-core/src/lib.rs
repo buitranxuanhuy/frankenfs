@@ -2065,6 +2065,30 @@ impl OpenFs {
         }
     }
 
+    /// Translate VFS inode numbers to ext4 on-disk inode numbers.
+    ///
+    /// FsOps is consumed by FUSE, where inode `1` is the synthetic VFS root.
+    /// ext4 uses inode `2` as root on disk, so we canonicalize at the FsOps
+    /// boundary.
+    const fn ext4_canonical_inode(ino: InodeNumber) -> InodeNumber {
+        if ino.0 == 1 { InodeNumber(2) } else { ino }
+    }
+
+    /// Translate ext4 on-disk inode numbers back to VFS inode numbers.
+    const fn ext4_presented_inode(ino: InodeNumber) -> InodeNumber {
+        if ino.0 == 2 { InodeNumber(1) } else { ino }
+    }
+
+    fn ext4_present_attr(mut attr: InodeAttr) -> InodeAttr {
+        attr.ino = Self::ext4_presented_inode(attr.ino);
+        attr
+    }
+
+    fn ext4_present_dir_entry(mut entry: DirEntry) -> DirEntry {
+        entry.ino = Self::ext4_presented_inode(entry.ino);
+        entry
+    }
+
     /// Resolve and walk the default filesystem tree (`FS_TREE`).
     fn walk_btrfs_fs_tree(&self, cx: &Cx) -> Result<Vec<BtrfsLeafEntry>, FfsError> {
         let root_items = self.walk_btrfs_root_tree(cx)?;
@@ -5558,7 +5582,9 @@ impl OpenFs {
 impl FsOps for OpenFs {
     fn getattr(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<InodeAttr> {
         match &self.flavor {
-            FsFlavor::Ext4(_) => self.read_inode_attr(cx, ino),
+            FsFlavor::Ext4(_) => self
+                .read_inode_attr(cx, Self::ext4_canonical_inode(ino))
+                .map(Self::ext4_present_attr),
             FsFlavor::Btrfs(_) => self.btrfs_read_inode_attr(cx, ino),
         }
     }
@@ -5566,7 +5592,8 @@ impl FsOps for OpenFs {
     fn lookup(&self, cx: &Cx, parent: InodeNumber, name: &OsStr) -> ffs_error::Result<InodeAttr> {
         match &self.flavor {
             FsFlavor::Ext4(_) => {
-                let parent_inode = self.read_inode(cx, parent)?;
+                let parent_ino = Self::ext4_canonical_inode(parent);
+                let parent_inode = self.read_inode(cx, parent_ino)?;
                 if !parent_inode.is_dir() {
                     return Err(FfsError::NotDirectory);
                 }
@@ -5578,6 +5605,7 @@ impl FsOps for OpenFs {
 
                 let child_ino = InodeNumber(u64::from(entry.inode));
                 self.read_inode_attr(cx, child_ino)
+                    .map(Self::ext4_present_attr)
             }
             FsFlavor::Btrfs(_) => self.btrfs_lookup_child(cx, parent, name.as_encoded_bytes()),
         }
@@ -5586,7 +5614,7 @@ impl FsOps for OpenFs {
     fn readdir(&self, cx: &Cx, ino: InodeNumber, offset: u64) -> ffs_error::Result<Vec<DirEntry>> {
         match &self.flavor {
             FsFlavor::Ext4(_) => {
-                let inode = self.read_inode(cx, ino)?;
+                let inode = self.read_inode(cx, Self::ext4_canonical_inode(ino))?;
                 if !inode.is_dir() {
                     return Err(FfsError::NotDirectory);
                 }
@@ -5596,11 +5624,13 @@ impl FsOps for OpenFs {
                     .into_iter()
                     .enumerate()
                     .filter(|(idx, _)| (*idx as u64) >= offset)
-                    .map(|(idx, e)| DirEntry {
-                        ino: InodeNumber(u64::from(e.inode)),
-                        offset: (idx as u64) + 1,
-                        kind: dir_entry_file_type(e.file_type),
-                        name: e.name,
+                    .map(|(idx, e)| {
+                        Self::ext4_present_dir_entry(DirEntry {
+                            ino: InodeNumber(u64::from(e.inode)),
+                            offset: (idx as u64) + 1,
+                            kind: dir_entry_file_type(e.file_type),
+                            name: e.name,
+                        })
                     })
                     .collect();
                 Ok(entries)
@@ -5629,7 +5659,7 @@ impl FsOps for OpenFs {
         size: u32,
     ) -> ffs_error::Result<Vec<u8>> {
         match &self.flavor {
-            FsFlavor::Ext4(_) => self.read_file(cx, ino, offset, size),
+            FsFlavor::Ext4(_) => self.read_file(cx, Self::ext4_canonical_inode(ino), offset, size),
             FsFlavor::Btrfs(_) => self.btrfs_read_file(cx, ino, offset, size),
         }
     }
@@ -5637,7 +5667,7 @@ impl FsOps for OpenFs {
     fn readlink(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<Vec<u8>> {
         match &self.flavor {
             FsFlavor::Ext4(_) => {
-                let inode = self.read_inode(cx, ino)?;
+                let inode = self.read_inode(cx, Self::ext4_canonical_inode(ino))?;
                 self.read_symlink(cx, &inode)
             }
             FsFlavor::Btrfs(_) => {
@@ -5692,7 +5722,7 @@ impl FsOps for OpenFs {
     fn listxattr(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<Vec<String>> {
         match &self.flavor {
             FsFlavor::Ext4(_) => {
-                let inode = self.read_inode(cx, ino)?;
+                let inode = self.read_inode(cx, Self::ext4_canonical_inode(ino))?;
                 let mut xattrs =
                     ffs_ondisk::parse_ibody_xattrs(&inode).map_err(|e| parse_to_ffs_error(&e))?;
                 if inode.file_acl != 0 {
@@ -5715,7 +5745,7 @@ impl FsOps for OpenFs {
     ) -> ffs_error::Result<Option<Vec<u8>>> {
         match &self.flavor {
             FsFlavor::Ext4(_) => {
-                let inode = self.read_inode(cx, ino)?;
+                let inode = self.read_inode(cx, Self::ext4_canonical_inode(ino))?;
                 let mut xattrs =
                     ffs_ondisk::parse_ibody_xattrs(&inode).map_err(|e| parse_to_ffs_error(&e))?;
                 if inode.file_acl != 0 {
@@ -5745,14 +5775,16 @@ impl FsOps for OpenFs {
         mode: XattrSetMode,
     ) -> ffs_error::Result<()> {
         match &self.flavor {
-            FsFlavor::Ext4(_) => self.ext4_setxattr(cx, ino, name, value, mode),
+            FsFlavor::Ext4(_) => {
+                self.ext4_setxattr(cx, Self::ext4_canonical_inode(ino), name, value, mode)
+            }
             FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
         }
     }
 
     fn removexattr(&self, cx: &Cx, ino: InodeNumber, name: &str) -> ffs_error::Result<bool> {
         match &self.flavor {
-            FsFlavor::Ext4(_) => self.ext4_removexattr(cx, ino, name),
+            FsFlavor::Ext4(_) => self.ext4_removexattr(cx, Self::ext4_canonical_inode(ino), name),
             FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
         }
     }
@@ -5769,9 +5801,16 @@ impl FsOps for OpenFs {
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
         match &self.flavor {
-            FsFlavor::Ext4(_) => {
-                self.ext4_create(cx, parent, name.as_encoded_bytes(), mode, uid, gid)
-            }
+            FsFlavor::Ext4(_) => self
+                .ext4_create(
+                    cx,
+                    Self::ext4_canonical_inode(parent),
+                    name.as_encoded_bytes(),
+                    mode,
+                    uid,
+                    gid,
+                )
+                .map(Self::ext4_present_attr),
             FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
         }
     }
@@ -5786,23 +5825,40 @@ impl FsOps for OpenFs {
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
         match &self.flavor {
-            FsFlavor::Ext4(_) => {
-                self.ext4_mkdir(cx, parent, name.as_encoded_bytes(), mode, uid, gid)
-            }
+            FsFlavor::Ext4(_) => self
+                .ext4_mkdir(
+                    cx,
+                    Self::ext4_canonical_inode(parent),
+                    name.as_encoded_bytes(),
+                    mode,
+                    uid,
+                    gid,
+                )
+                .map(Self::ext4_present_attr),
             FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
         }
     }
 
     fn unlink(&self, cx: &Cx, parent: InodeNumber, name: &OsStr) -> ffs_error::Result<()> {
         match &self.flavor {
-            FsFlavor::Ext4(_) => self.ext4_unlink_impl(cx, parent, name.as_encoded_bytes(), false),
+            FsFlavor::Ext4(_) => self.ext4_unlink_impl(
+                cx,
+                Self::ext4_canonical_inode(parent),
+                name.as_encoded_bytes(),
+                false,
+            ),
             FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
         }
     }
 
     fn rmdir(&self, cx: &Cx, parent: InodeNumber, name: &OsStr) -> ffs_error::Result<()> {
         match &self.flavor {
-            FsFlavor::Ext4(_) => self.ext4_unlink_impl(cx, parent, name.as_encoded_bytes(), true),
+            FsFlavor::Ext4(_) => self.ext4_unlink_impl(
+                cx,
+                Self::ext4_canonical_inode(parent),
+                name.as_encoded_bytes(),
+                true,
+            ),
             FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
         }
     }
@@ -5818,9 +5874,9 @@ impl FsOps for OpenFs {
         match &self.flavor {
             FsFlavor::Ext4(_) => self.ext4_rename(
                 cx,
-                parent,
+                Self::ext4_canonical_inode(parent),
                 name.as_encoded_bytes(),
-                new_parent,
+                Self::ext4_canonical_inode(new_parent),
                 new_name.as_encoded_bytes(),
             ),
             FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
@@ -5829,7 +5885,7 @@ impl FsOps for OpenFs {
 
     fn write(&self, cx: &Cx, ino: InodeNumber, offset: u64, data: &[u8]) -> ffs_error::Result<u32> {
         match &self.flavor {
-            FsFlavor::Ext4(_) => self.ext4_write(cx, ino, offset, data),
+            FsFlavor::Ext4(_) => self.ext4_write(cx, Self::ext4_canonical_inode(ino), offset, data),
             FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
         }
     }
@@ -5842,7 +5898,14 @@ impl FsOps for OpenFs {
         new_name: &OsStr,
     ) -> ffs_error::Result<InodeAttr> {
         match &self.flavor {
-            FsFlavor::Ext4(_) => self.ext4_link(cx, ino, new_parent, new_name.as_encoded_bytes()),
+            FsFlavor::Ext4(_) => self
+                .ext4_link(
+                    cx,
+                    Self::ext4_canonical_inode(ino),
+                    Self::ext4_canonical_inode(new_parent),
+                    new_name.as_encoded_bytes(),
+                )
+                .map(Self::ext4_present_attr),
             FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
         }
     }
@@ -5857,9 +5920,16 @@ impl FsOps for OpenFs {
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
         match &self.flavor {
-            FsFlavor::Ext4(_) => {
-                self.ext4_symlink(cx, parent, name.as_encoded_bytes(), target, uid, gid)
-            }
+            FsFlavor::Ext4(_) => self
+                .ext4_symlink(
+                    cx,
+                    Self::ext4_canonical_inode(parent),
+                    name.as_encoded_bytes(),
+                    target,
+                    uid,
+                    gid,
+                )
+                .map(Self::ext4_present_attr),
             FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
         }
     }
@@ -5873,7 +5943,9 @@ impl FsOps for OpenFs {
         mode: i32,
     ) -> ffs_error::Result<()> {
         match &self.flavor {
-            FsFlavor::Ext4(_) => self.ext4_fallocate(cx, ino, offset, length, mode),
+            FsFlavor::Ext4(_) => {
+                self.ext4_fallocate(cx, Self::ext4_canonical_inode(ino), offset, length, mode)
+            }
             FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
         }
     }
@@ -5885,7 +5957,9 @@ impl FsOps for OpenFs {
         attrs: &SetAttrRequest,
     ) -> ffs_error::Result<InodeAttr> {
         match &self.flavor {
-            FsFlavor::Ext4(_) => self.ext4_setattr(cx, ino, attrs),
+            FsFlavor::Ext4(_) => self
+                .ext4_setattr(cx, Self::ext4_canonical_inode(ino), attrs)
+                .map(Self::ext4_present_attr),
             FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
         }
     }
@@ -10591,6 +10665,55 @@ mod tests {
     }
 
     #[test]
+    fn write_create_and_read_roundtrip_via_vfs_root_alias() {
+        let Some(fs) = open_writable_ext4() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(1); // VFS/FUSE root alias for ext4 inode 2
+
+        let root_attr = fs.getattr(&cx, root).expect("getattr root");
+        assert_eq!(root_attr.ino, root);
+        assert_eq!(root_attr.kind, FileType::Directory);
+
+        let root_entries = fs.readdir(&cx, root, 0).expect("readdir root");
+        let dot = root_entries
+            .iter()
+            .find(|entry| entry.name_str() == ".")
+            .expect("dot entry");
+        let dotdot = root_entries
+            .iter()
+            .find(|entry| entry.name_str() == "..")
+            .expect("dotdot entry");
+        assert_eq!(dot.ino, root);
+        assert_eq!(dotdot.ino, root);
+
+        let attr = fs
+            .create(
+                &cx,
+                root,
+                OsStr::new("test_rw_alias.txt"),
+                0o644,
+                1000,
+                1000,
+            )
+            .expect("create");
+        assert_eq!(attr.kind, FileType::RegularFile);
+
+        let payload = b"FrankenFS root-alias write test!";
+        let written = fs.write(&cx, attr.ino, 0, payload).expect("write");
+        assert_eq!(written as usize, payload.len());
+
+        let readback = fs.read(&cx, attr.ino, 0, 4096).expect("read");
+        assert_eq!(&readback[..payload.len()], payload);
+
+        let looked_up = fs
+            .lookup(&cx, root, OsStr::new("test_rw_alias.txt"))
+            .expect("lookup");
+        assert_eq!(looked_up.ino, attr.ino);
+    }
+
+    #[test]
     fn write_mkdir_and_lookup() {
         let Some(fs) = open_writable_ext4() else {
             return;
@@ -12166,10 +12289,7 @@ mod tests {
         // Manually set headroom (bypasses /proc).
         pressure.set_headroom(0.42);
         assert!((budget.current_headroom() - 0.42).abs() < f32::EPSILON);
-        assert!(std::ptr::eq(
-            budget.pressure().as_ref(),
-            pressure.as_ref()
-        ));
+        assert!(std::ptr::eq(budget.pressure().as_ref(), pressure.as_ref()));
     }
 
     #[test]
