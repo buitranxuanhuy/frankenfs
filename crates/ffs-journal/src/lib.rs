@@ -1924,4 +1924,256 @@ mod tests {
         assert_eq!(out.committed_sequences, vec![20, 21]);
         assert_eq!(out.stats.replayed_blocks, 2);
     }
+
+    // ── Edge-case unit tests ──────────────────────────────────────────────
+
+    #[test]
+    fn journal_region_resolve_in_range() {
+        let region = JournalRegion {
+            start: BlockNumber(100),
+            blocks: 10,
+        };
+        assert_eq!(region.resolve(0), Some(BlockNumber(100)));
+        assert_eq!(region.resolve(9), Some(BlockNumber(109)));
+    }
+
+    #[test]
+    fn journal_region_resolve_out_of_range() {
+        let region = JournalRegion {
+            start: BlockNumber(100),
+            blocks: 10,
+        };
+        assert_eq!(region.resolve(10), None);
+        assert_eq!(region.resolve(u64::MAX), None);
+    }
+
+    #[test]
+    fn journal_region_is_empty() {
+        let empty = JournalRegion {
+            start: BlockNumber(0),
+            blocks: 0,
+        };
+        assert!(empty.is_empty());
+
+        let non_empty = JournalRegion {
+            start: BlockNumber(0),
+            blocks: 1,
+        };
+        assert!(!non_empty.is_empty());
+    }
+
+    #[test]
+    fn replay_jbd2_empty_region_returns_error() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let region = JournalRegion {
+            start: BlockNumber(0),
+            blocks: 0,
+        };
+
+        let err = replay_jbd2(&cx, &dev, region).expect_err("empty region");
+        assert!(matches!(err, FfsError::Format(_)));
+    }
+
+    #[test]
+    fn native_cow_open_empty_region_returns_error() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let region = JournalRegion {
+            start: BlockNumber(0),
+            blocks: 0,
+        };
+
+        let err = NativeCowJournal::open(&cx, &dev, region).expect_err("empty region");
+        assert!(matches!(err, FfsError::Format(_)));
+    }
+
+    #[test]
+    fn native_cow_multi_commit_recovery() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 128);
+        let region = JournalRegion {
+            start: BlockNumber(40),
+            blocks: 32,
+        };
+
+        let mut journal = NativeCowJournal::open(&cx, &dev, region).expect("open");
+
+        journal
+            .append_write(&cx, &dev, CommitSeq(1), BlockNumber(10), &[0x11; 64])
+            .expect("write 1");
+        journal
+            .append_commit(&cx, &dev, CommitSeq(1))
+            .expect("commit 1");
+
+        journal
+            .append_write(&cx, &dev, CommitSeq(2), BlockNumber(11), &[0x22; 64])
+            .expect("write 2a");
+        journal
+            .append_write(&cx, &dev, CommitSeq(2), BlockNumber(12), &[0x33; 64])
+            .expect("write 2b");
+        journal
+            .append_commit(&cx, &dev, CommitSeq(2))
+            .expect("commit 2");
+
+        let recovered = recover_native_cow(&cx, &dev, region).expect("recover");
+        assert_eq!(recovered.len(), 2);
+
+        assert_eq!(recovered[0].commit_seq, CommitSeq(1));
+        assert_eq!(recovered[0].writes.len(), 1);
+
+        assert_eq!(recovered[1].commit_seq, CommitSeq(2));
+        assert_eq!(recovered[1].writes.len(), 2);
+        assert_eq!(recovered[1].writes[0].block, BlockNumber(11));
+        assert_eq!(recovered[1].writes[1].block, BlockNumber(12));
+    }
+
+    #[test]
+    fn native_cow_crc_corruption_detected() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 128);
+        let region = JournalRegion {
+            start: BlockNumber(40),
+            blocks: 16,
+        };
+
+        let mut journal = NativeCowJournal::open(&cx, &dev, region).expect("open");
+        journal
+            .append_write(&cx, &dev, CommitSeq(1), BlockNumber(5), &[0xAA; 64])
+            .expect("write");
+        journal
+            .append_commit(&cx, &dev, CommitSeq(1))
+            .expect("commit");
+
+        // Corrupt the payload bytes of the write record (first journal block).
+        let write_block = BlockNumber(40);
+        let mut raw = dev
+            .read_block(&cx, write_block)
+            .expect("read")
+            .as_slice()
+            .to_vec();
+        // Payload starts at COW_HEADER_SIZE (32). Flip a byte.
+        raw[COW_HEADER_SIZE] ^= 0xFF;
+        dev.raw_write(write_block, raw);
+
+        let err = recover_native_cow(&cx, &dev, region).expect_err("CRC mismatch");
+        assert!(
+            matches!(err, FfsError::Corruption { .. }),
+            "expected Corruption, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn native_cow_replay_rejects_oversized_payload() {
+        let commits = vec![RecoveredCommit {
+            commit_seq: CommitSeq(1),
+            writes: vec![CowWrite {
+                block: BlockNumber(5),
+                bytes: vec![0xFF; 1024], // Larger than 512-byte blocks.
+            }],
+        }];
+
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let err = replay_native_cow(&cx, &dev, &commits).expect_err("oversized payload");
+        assert!(matches!(err, FfsError::Format(_)));
+    }
+
+    #[test]
+    fn native_cow_journal_full_returns_no_space() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 128);
+        let region = JournalRegion {
+            start: BlockNumber(40),
+            blocks: 2,
+        };
+
+        let mut journal = NativeCowJournal::open(&cx, &dev, region).expect("open");
+        journal
+            .append_write(&cx, &dev, CommitSeq(1), BlockNumber(1), &[0x01; 32])
+            .expect("write 1");
+        journal
+            .append_commit(&cx, &dev, CommitSeq(1))
+            .expect("commit 1");
+
+        // Region is now full (2 blocks used).
+        let err = journal
+            .append_write(&cx, &dev, CommitSeq(2), BlockNumber(2), &[0x02; 32])
+            .expect_err("journal full");
+        assert!(matches!(err, FfsError::NoSpace));
+    }
+
+    #[test]
+    fn recover_native_cow_empty_region_returns_empty() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let region = JournalRegion {
+            start: BlockNumber(0),
+            blocks: 0,
+        };
+
+        let recovered = recover_native_cow(&cx, &dev, region).expect("recover empty");
+        assert!(recovered.is_empty());
+    }
+
+    #[test]
+    fn jbd2_writer_free_blocks_decreases_after_commit() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 256);
+        let region = JournalRegion {
+            start: BlockNumber(100),
+            blocks: 32,
+        };
+
+        let mut writer = Jbd2Writer::new(region, 1);
+        assert_eq!(writer.free_blocks(), 32);
+
+        let mut txn = writer.begin_transaction();
+        txn.add_write(BlockNumber(5), vec![0xAA; 512]);
+        writer.commit_transaction(&cx, &dev, &txn).expect("commit");
+
+        // Used: desc(1) + data(1) + commit(1) = 3 blocks.
+        assert_eq!(writer.free_blocks(), 29);
+        assert_eq!(writer.head(), 3);
+    }
+
+    #[test]
+    fn jbd2_writer_begin_transaction_increments_sequence() {
+        let region = JournalRegion {
+            start: BlockNumber(0),
+            blocks: 100,
+        };
+
+        let mut writer = Jbd2Writer::new(region, 10);
+        assert_eq!(writer.next_seq(), 10);
+
+        let txn1 = writer.begin_transaction();
+        assert_eq!(txn1.sequence(), 10);
+        assert_eq!(writer.next_seq(), 11);
+
+        let txn2 = writer.begin_transaction();
+        assert_eq!(txn2.sequence(), 11);
+        assert_eq!(writer.next_seq(), 12);
+    }
+
+    #[test]
+    fn jbd2_transaction_accessors() {
+        let region = JournalRegion {
+            start: BlockNumber(0),
+            blocks: 100,
+        };
+
+        let mut writer = Jbd2Writer::new(region, 1);
+        let mut txn = writer.begin_transaction();
+
+        assert_eq!(txn.write_count(), 0);
+        assert_eq!(txn.revoke_count(), 0);
+
+        txn.add_write(BlockNumber(1), vec![0; 512]);
+        txn.add_write(BlockNumber(2), vec![0; 512]);
+        txn.add_revoke(BlockNumber(3));
+
+        assert_eq!(txn.write_count(), 2);
+        assert_eq!(txn.revoke_count(), 1);
+    }
 }
