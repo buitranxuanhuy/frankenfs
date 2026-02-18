@@ -57,11 +57,11 @@ use tracing::{debug, info, trace, warn};
 ///
 /// // Reader path — no locks, no atomic increments
 /// let value = cell.load();
-/// assert_eq!(*value, 42);
+/// assert_eq!(**value, 42);
 ///
 /// // Writer path — atomic swap
 /// cell.update(100);
-/// assert_eq!(*cell.load(), 100);
+/// assert_eq!(**cell.load(), 100);
 /// ```
 pub struct RcuCell<T> {
     inner: ArcSwap<T>,
@@ -211,7 +211,8 @@ impl<K: fmt::Debug + Ord, V: fmt::Debug> fmt::Debug for RcuMap<K, V> {
         f.debug_struct("RcuMap")
             .field("entry_count", &snap.len())
             .field("update_count", &self.update_count.load(Ordering::Relaxed))
-            .finish()
+            .field("churn_threshold", &self.churn_threshold)
+            .finish_non_exhaustive()
     }
 }
 
@@ -266,12 +267,12 @@ impl<K: Clone + Ord + Hash + fmt::Debug, V: Clone + fmt::Debug> RcuMap<K, V> {
     /// Acquires the write-side mutex, clones the current map, inserts the
     /// entry, and publishes the new version atomically. Readers never block.
     pub fn insert(&self, key: K, value: V) {
-        let _guard = self.write_lock.lock();
+        let guard = self.write_lock.lock();
         let old = self.inner.load_full();
         let mut new_map = (*old).clone();
         new_map.insert(key, Arc::new(value));
         self.inner.store(Arc::new(new_map));
-        drop(_guard);
+        drop(guard);
 
         let count = self.update_count.fetch_add(1, Ordering::Relaxed) + 1;
         info!(
@@ -293,7 +294,7 @@ impl<K: Clone + Ord + Hash + fmt::Debug, V: Clone + fmt::Debug> RcuMap<K, V> {
     ///
     /// Returns `true` if the key was present and removed.
     pub fn remove(&self, key: &K) -> bool {
-        let _guard = self.write_lock.lock();
+        let guard = self.write_lock.lock();
         let old = self.inner.load_full();
         if !old.contains_key(key) {
             return false;
@@ -301,7 +302,7 @@ impl<K: Clone + Ord + Hash + fmt::Debug, V: Clone + fmt::Debug> RcuMap<K, V> {
         let mut new_map = (*old).clone();
         new_map.remove(key);
         self.inner.store(Arc::new(new_map));
-        drop(_guard);
+        drop(guard);
 
         self.update_count.fetch_add(1, Ordering::Relaxed);
         true

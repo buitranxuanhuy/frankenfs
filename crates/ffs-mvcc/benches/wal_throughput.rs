@@ -749,10 +749,193 @@ fn bench_ebr_memory_report(c: &mut Criterion) {
     });
 }
 
+/// Compare RCU vs RwLock vs Mutex read throughput under concurrent writer
+/// pressure.  Models the stat()/readdir() hot path where many readers access
+/// metadata while occasional writes update it.
+#[allow(clippy::too_many_lines)]
+fn bench_rcu_read_throughput(c: &mut Criterion) {
+    use ffs_mvcc::rcu::RcuCell;
+    use parking_lot::RwLock;
+    use std::sync::Barrier;
+
+    // Simulated metadata payload (inode-like: uid, gid, mode, size, timestamps).
+    #[derive(Clone, Debug)]
+    struct InodeMeta {
+        ino: u64,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        size: u64,
+        atime_ns: u64,
+        mtime_ns: u64,
+    }
+
+    impl InodeMeta {
+        fn new(ino: u64) -> Self {
+            Self {
+                ino,
+                uid: 1000,
+                gid: 1000,
+                mode: 0o100_644,
+                size: 4_096,
+                atime_ns: 1_700_000_000_000_000_000,
+                mtime_ns: 1_700_000_000_000_000_000,
+            }
+        }
+
+        fn digest(&self) -> u64 {
+            self.ino
+                .wrapping_add(u64::from(self.uid))
+                .wrapping_add(u64::from(self.gid))
+                .wrapping_add(u64::from(self.mode))
+                .wrapping_add(self.size)
+                .wrapping_add(self.atime_ns)
+                .wrapping_add(self.mtime_ns)
+        }
+    }
+
+    let reader_counts = [1_usize, 2, 4, 8, 16];
+    let reads_per_iter = 10_000_u64;
+
+    for &readers in &reader_counts {
+        // ── RcuCell benchmark ──────────────────────────────────────────
+        c.bench_function(&format!("rcu_cell_read_{readers}r_1w"), |b| {
+            b.iter_custom(|iters| {
+                let cell = Arc::new(RcuCell::new(InodeMeta::new(0)));
+                let total_reads = iters.saturating_mul(reads_per_iter);
+                let reads_per_thread = total_reads / u64::try_from(readers).expect("fits");
+                let barrier = Arc::new(Barrier::new(readers + 1));
+
+                // Writer: periodic updates.
+                let writer_cell = Arc::clone(&cell);
+                let writer_barrier = Arc::clone(&barrier);
+                let writer = thread::spawn(move || {
+                    writer_barrier.wait();
+                    for i in 0..reads_per_thread.min(5_000) {
+                        writer_cell.update(InodeMeta::new(i));
+                    }
+                });
+
+                // Readers: measure elapsed time.
+                let mut handles = Vec::with_capacity(readers);
+                for _ in 0..readers {
+                    let cell = Arc::clone(&cell);
+                    let barrier = Arc::clone(&barrier);
+                    handles.push(thread::spawn(move || {
+                        barrier.wait();
+                        let start = Instant::now();
+                        let mut sum = 0_u64;
+                        for _ in 0..reads_per_thread {
+                            let guard = cell.load();
+                            sum = sum.wrapping_add(guard.digest());
+                        }
+                        std::hint::black_box(sum);
+                        start.elapsed()
+                    }));
+                }
+
+                let _ = writer.join();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("reader thread"))
+                    .max()
+                    .unwrap_or_default()
+            });
+        });
+
+        // ── RwLock benchmark ───────────────────────────────────────────
+        c.bench_function(&format!("rwlock_read_{readers}r_1w"), |b| {
+            b.iter_custom(|iters| {
+                let lock = Arc::new(RwLock::new(InodeMeta::new(0)));
+                let total_reads = iters.saturating_mul(reads_per_iter);
+                let reads_per_thread = total_reads / u64::try_from(readers).expect("fits");
+                let barrier = Arc::new(Barrier::new(readers + 1));
+
+                let writer_lock = Arc::clone(&lock);
+                let writer_barrier = Arc::clone(&barrier);
+                let writer = thread::spawn(move || {
+                    writer_barrier.wait();
+                    for i in 0..reads_per_thread.min(5_000) {
+                        *writer_lock.write() = InodeMeta::new(i);
+                    }
+                });
+
+                let mut handles = Vec::with_capacity(readers);
+                for _ in 0..readers {
+                    let lock = Arc::clone(&lock);
+                    let barrier = Arc::clone(&barrier);
+                    handles.push(thread::spawn(move || {
+                        barrier.wait();
+                        let start = Instant::now();
+                        let mut sum = 0_u64;
+                        for _ in 0..reads_per_thread {
+                            let guard = lock.read();
+                            sum = sum.wrapping_add(guard.digest());
+                        }
+                        std::hint::black_box(sum);
+                        start.elapsed()
+                    }));
+                }
+
+                let _ = writer.join();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("reader thread"))
+                    .max()
+                    .unwrap_or_default()
+            });
+        });
+
+        // ── Mutex benchmark ────────────────────────────────────────────
+        c.bench_function(&format!("mutex_read_{readers}r_1w"), |b| {
+            b.iter_custom(|iters| {
+                let lock = Arc::new(Mutex::new(InodeMeta::new(0)));
+                let total_reads = iters.saturating_mul(reads_per_iter);
+                let reads_per_thread = total_reads / u64::try_from(readers).expect("fits");
+                let barrier = Arc::new(Barrier::new(readers + 1));
+
+                let writer_lock = Arc::clone(&lock);
+                let writer_barrier = Arc::clone(&barrier);
+                let writer = thread::spawn(move || {
+                    writer_barrier.wait();
+                    for i in 0..reads_per_thread.min(5_000) {
+                        *writer_lock.lock() = InodeMeta::new(i);
+                    }
+                });
+
+                let mut handles = Vec::with_capacity(readers);
+                for _ in 0..readers {
+                    let lock = Arc::clone(&lock);
+                    let barrier = Arc::clone(&barrier);
+                    handles.push(thread::spawn(move || {
+                        barrier.wait();
+                        let start = Instant::now();
+                        let mut sum = 0_u64;
+                        for _ in 0..reads_per_thread {
+                            let guard = lock.lock();
+                            sum = sum.wrapping_add(guard.digest());
+                        }
+                        std::hint::black_box(sum);
+                        start.elapsed()
+                    }));
+                }
+
+                let _ = writer.join();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("reader thread"))
+                    .max()
+                    .unwrap_or_default()
+            });
+        });
+    }
+}
+
 criterion_group!(
     wal_benches,
     bench_wal_commit_throughput,
     bench_ssi_overhead,
-    bench_ebr_memory_report
+    bench_ebr_memory_report,
+    bench_rcu_read_throughput
 );
 criterion_main!(wal_benches);
