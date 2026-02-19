@@ -14,7 +14,7 @@
 //!
 //! # Usage
 //!
-//! ```ignore
+//! ```text
 //! let report = Scrubber::new(&device, &validator)
 //!     .scrub_range(&cx, BlockNumber(0), 1000)?;
 //! for finding in &report.findings {

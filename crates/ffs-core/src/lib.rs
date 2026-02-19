@@ -28,7 +28,7 @@ use ffs_types::{
     BlockNumber, ByteOffset, CommitSeq, EXT4_EXTENTS_FL, GroupNumber, InodeNumber, ParseError,
     Snapshot, TxnId,
 };
-use ffs_xattr::{XattrStorage, XattrWriteAccess};
+use ffs_xattr::XattrWriteAccess;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -776,7 +776,7 @@ impl CrashRecoveryOutcome {
 ///
 /// # Opening a filesystem
 ///
-/// ```ignore
+/// ```text
 /// let cx = Cx::for_request();
 /// let fs = OpenFs::open(&cx, "/path/to/image.ext4")?;
 /// println!("block_size = {}", fs.block_size());
@@ -5477,18 +5477,40 @@ impl OpenFs {
             has_cap_fowner: false,
             has_cap_sys_admin: false,
         };
-        let storage = ffs_xattr::set_xattr(
+        let storage = match ffs_xattr::set_xattr(
             &mut inode,
             external_block.as_deref_mut(),
             name,
             value,
             access,
-        )?;
+        ) {
+            Ok(s) => s,
+            Err(FfsError::NoSpace) if inode.file_acl == 0 => {
+                // Inline region exhausted and no external block exists yet — allocate one.
+                let mut alloc = alloc_mutex.lock();
+                let ino_group = ffs_types::inode_to_group(ino, alloc.geo.inodes_per_group);
+                let hint = AllocHint {
+                    goal_group: Some(ino_group),
+                    goal_block: None,
+                };
+                let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+                let block_alloc = ffs_alloc::alloc_blocks(cx, &block_dev, geo, groups, 1, &hint)?;
+                let block_size = geo.block_size as usize;
+                drop(alloc);
 
-        if matches!(storage, XattrStorage::External) && inode.file_acl == 0 {
-            // We currently do not allocate a new external xattr block here.
-            return Err(FfsError::NoSpace);
-        }
+                external_block = Some(vec![0u8; block_size]);
+                inode.file_acl = block_alloc.start.0;
+
+                ffs_xattr::set_xattr(
+                    &mut inode,
+                    external_block.as_deref_mut(),
+                    name,
+                    value,
+                    access,
+                )?
+            }
+            Err(e) => return Err(e),
+        };
 
         if let Some(block) = external_block {
             block_dev.write_block(cx, BlockNumber(inode.file_acl), &block)?;
@@ -11182,7 +11204,7 @@ mod tests {
     }
 
     #[test]
-    fn write_setxattr_reports_enospc_when_inline_region_is_exhausted() {
+    fn write_setxattr_allocates_external_block_when_inline_exhausted() {
         let Some(fs) = open_writable_ext4() else {
             return;
         };
@@ -11190,16 +11212,18 @@ mod tests {
         let root = InodeNumber(2);
 
         let attr = fs
-            .create(&cx, root, OsStr::new("xattr_enospc.txt"), 0o644, 0, 0)
+            .create(&cx, root, OsStr::new("xattr_external.txt"), 0o644, 0, 0)
             .expect("create");
 
-        // Our ext4 write path does not yet allocate new external xattr blocks,
-        // so oversized values should fail when they do not fit inline.
+        // A 512-byte value does not fit in the inline ibody region, so
+        // ext4_setxattr must allocate an external xattr block on the fly.
         let large_value = vec![0xAB_u8; 512];
-        let err = fs
-            .setxattr(&cx, attr.ino, "user.large", &large_value, XattrSetMode::Set)
-            .unwrap_err();
-        assert_eq!(err.to_errno(), libc::ENOSPC);
+        fs.setxattr(&cx, attr.ino, "user.large", &large_value, XattrSetMode::Set)
+            .expect("setxattr should allocate external block");
+
+        // Read it back and verify.
+        let readback = fs.getxattr(&cx, attr.ino, "user.large").expect("getxattr");
+        assert_eq!(readback.as_deref(), Some(large_value.as_slice()));
     }
 
     #[test]

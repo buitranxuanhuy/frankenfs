@@ -115,10 +115,10 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
 name = "asupersync"
-version = "0.2.3"
+version = "0.2.5"
 dependencies = [
  "base64",
- "bincode",
+ "bincode-next",
  "crossbeam-queue",
  "franken-decision",
  "franken-evidence",
@@ -158,12 +158,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
-name = "bincode"
-version = "1.3.3"
+name = "bincode-next"
+version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+checksum = "dbe9e7e6d14aeb39557f226bff158a30e367fac279d0e69b8b42fb41999f9a86"
 dependencies = [
+ "bincode_derive-next",
  "serde",
+ "unty-next",
+]
+
+[[package]]
+name = "bincode_derive-next"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2af389a025376dbbe728c43dfa5c08f866116c0b62627787c21ca1c69e2b8dec"
+dependencies = [
+ "virtue-next",
 ]
 
 [[package]]
@@ -787,7 +798,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "franken-decision"
-version = "0.2.0"
+version = "0.2.5"
 dependencies = [
  "franken-evidence",
  "franken-kernel",
@@ -796,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "franken-evidence"
-version = "0.2.0"
+version = "0.2.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -804,14 +815,14 @@ dependencies = [
 
 [[package]]
 name = "franken-kernel"
-version = "0.2.0"
+version = "0.2.5"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "ftui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ftui-core",
  "ftui-extras",
@@ -825,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-backend"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ftui-core",
  "ftui-render",
@@ -833,7 +844,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -847,18 +858,18 @@ dependencies = [
 
 [[package]]
 name = "ftui-extras"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "web-time",
 ]
 
 [[package]]
 name = "ftui-i18n"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "ftui-layout"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ftui-core",
  "rustc-hash",
@@ -867,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-render"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ahash",
  "bitflags",
@@ -881,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-runtime"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ftui-backend",
  "ftui-core",
@@ -898,7 +909,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-style"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -908,7 +919,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-text"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ftui-core",
  "ftui-layout",
@@ -925,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-widgets"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ahash",
  "bitflags",
@@ -1925,6 +1936,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
+name = "unty-next"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bce2adbe4c8e63c3e7f79e9249b5409fb3c9bce989dd44337493cf1c8d7dea0"
+
+[[package]]
 name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1941,6 +1958,12 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "virtue-next"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "507787017685ff1c8dadaab8ca717bc1145b99163bddc0cbbbd210c3d76cb8b0"
 
 [[package]]
 name = "visibility"

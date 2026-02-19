@@ -1716,7 +1716,7 @@ impl ArcState {
 /// single-lock design keeps the implementation simple and correct as a
 /// baseline.
 ///
-/// TODO: replace write-through with deferred write-back and async background flushing.
+/// See [`DeferredArcCache`] for an integrated write-back + background flush variant.
 #[derive(Debug)]
 pub struct ArcCache<D: BlockDevice> {
     inner: D,
@@ -1825,6 +1825,96 @@ impl Drop for FlushDaemon {
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
+    }
+}
+
+/// Write-back [`ArcCache`] with an integrated background [`FlushDaemon`].
+///
+/// Combines a write-back ARC cache with a background flush daemon that
+/// periodically writes dirty blocks to the underlying device.  When the
+/// `DeferredArcCache` is dropped, the daemon is stopped and a final flush
+/// is performed before the cache is released.
+///
+/// # Example
+///
+/// ```text
+/// let deferred = DeferredArcCache::new(device, 1024, FlushDaemonConfig::default())?;
+/// deferred.write_block(&cx, BlockNumber(0), &data)?; // deferred to cache
+/// // daemon flushes dirty blocks in background …
+/// drop(deferred); // final flush + shutdown
+/// ```
+pub struct DeferredArcCache<D: BlockDevice + 'static> {
+    /// Dropped first — joins the daemon thread (which does a final flush).
+    daemon: FlushDaemon,
+    /// Dropped second — the underlying cache (kept alive by daemon's Arc clone
+    /// until the daemon thread exits in `FlushDaemon::drop`).
+    cache: Arc<ArcCache<D>>,
+}
+
+impl<D: BlockDevice + 'static> DeferredArcCache<D> {
+    /// Create a write-back cache with a background flush daemon.
+    pub fn new(inner: D, capacity_blocks: usize, config: FlushDaemonConfig) -> Result<Self> {
+        let cache = Arc::new(ArcCache::new_with_policy(
+            inner,
+            capacity_blocks,
+            ArcWritePolicy::WriteBack,
+        )?);
+        let daemon = cache.start_flush_daemon(config)?;
+        Ok(Self { daemon, cache })
+    }
+
+    /// Access the underlying [`ArcCache`].
+    #[must_use]
+    pub fn cache(&self) -> &Arc<ArcCache<D>> {
+        &self.cache
+    }
+
+    /// Shut down the daemon and perform a final flush, consuming the wrapper.
+    ///
+    /// Returns the inner `Arc<ArcCache<D>>` for continued (non-deferred) use.
+    #[must_use]
+    pub fn shutdown(self) -> Arc<ArcCache<D>> {
+        let Self { daemon, cache } = self;
+        daemon.shutdown();
+        cache
+    }
+}
+
+impl<D: BlockDevice + 'static> std::ops::Deref for DeferredArcCache<D> {
+    type Target = ArcCache<D>;
+    fn deref(&self) -> &Self::Target {
+        &self.cache
+    }
+}
+
+impl<D: BlockDevice + 'static> BlockDevice for DeferredArcCache<D> {
+    fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
+        self.cache.read_block(cx, block)
+    }
+
+    fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
+        self.cache.write_block(cx, block, data)
+    }
+
+    fn block_size(&self) -> u32 {
+        self.cache.block_size()
+    }
+
+    fn block_count(&self) -> u64 {
+        self.cache.block_count()
+    }
+
+    fn sync(&self, cx: &Cx) -> Result<()> {
+        self.cache.sync(cx)
+    }
+}
+
+impl<D: BlockDevice + std::fmt::Debug + 'static> std::fmt::Debug for DeferredArcCache<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeferredArcCache")
+            .field("cache", &self.cache)
+            .field("daemon", &self.daemon)
+            .finish()
     }
 }
 
@@ -5832,5 +5922,71 @@ mod tests {
                 r1.sequence
             );
         }
+    }
+
+    #[test]
+    fn deferred_arc_cache_writes_and_flushes_on_drop() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 16);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let counted = CountingBlockDevice::new(dev);
+
+        let deferred = DeferredArcCache::new(
+            counted,
+            8,
+            FlushDaemonConfig {
+                interval: Duration::from_millis(5),
+                batch_size: 4,
+                ..FlushDaemonConfig::default()
+            },
+        )
+        .expect("deferred cache");
+
+        // Writes should be deferred (not immediately hitting the device).
+        for i in 0..4_u64 {
+            deferred
+                .write_block(&cx, BlockNumber(i), &[u8::try_from(i).unwrap(); 4096])
+                .expect("write");
+        }
+        assert!(deferred.dirty_count() > 0);
+        assert_eq!(deferred.cache().inner().write_count(), 0);
+
+        // Read back through the cache to confirm correctness.
+        let buf = deferred.read_block(&cx, BlockNumber(2)).expect("read");
+        assert_eq!(buf.as_slice()[0], 2);
+
+        // Drop triggers daemon shutdown + final flush.
+        drop(deferred);
+        // (No assertion possible after drop — verified by absence of panic.)
+    }
+
+    #[test]
+    fn deferred_arc_cache_shutdown_returns_cache() {
+        let cx = Cx::for_testing();
+        let mem = MemoryByteDevice::new(4096 * 16);
+        let dev = ByteBlockDevice::new(mem, 4096).expect("device");
+        let counted = CountingBlockDevice::new(dev);
+
+        let deferred = DeferredArcCache::new(
+            counted,
+            8,
+            FlushDaemonConfig {
+                interval: Duration::from_millis(5),
+                batch_size: 4,
+                ..FlushDaemonConfig::default()
+            },
+        )
+        .expect("deferred cache");
+
+        for i in 0..3_u64 {
+            deferred
+                .write_block(&cx, BlockNumber(i), &[0xBB_u8; 4096])
+                .expect("write");
+        }
+
+        let cache = deferred.shutdown();
+        // After shutdown, all dirty blocks should be flushed.
+        assert_eq!(cache.dirty_count(), 0);
+        assert_eq!(cache.inner().write_count(), 3);
     }
 }

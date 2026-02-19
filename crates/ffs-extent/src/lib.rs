@@ -877,6 +877,63 @@ mod tests {
         assert_eq!(freed, 0);
     }
 
+    #[test]
+    fn punch_hole_splits_extent_preserving_neighbors() {
+        // Allocate [0-9] and [20-29], then punch [2-4] in the first extent.
+        // Expected result: [0-1] mapped, [2-4] hole, [5-9] mapped, [10-19] hole, [20-29] mapped.
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let mut root = empty_root();
+
+        allocate_extent(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            10,
+            &AllocHint::default(),
+        )
+        .unwrap();
+        allocate_extent(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            20,
+            10,
+            &AllocHint::default(),
+        )
+        .unwrap();
+
+        let freed = punch_hole(&cx, &dev, &mut root, &geo, &mut groups, 2, 3).unwrap();
+        assert_eq!(freed, 3);
+
+        let mappings = map_logical_to_physical(&cx, &dev, &root, 0, 30).unwrap();
+        // First extent should be split: [0-1] mapped, then a hole, then [5-9] mapped.
+        // Then [10-19] hole between the two original extents, then [20-29] mapped.
+        assert!(
+            mappings.len() >= 4,
+            "expected at least 4 segments, got {}",
+            mappings.len()
+        );
+
+        // Verify the punch-holed region is indeed a hole.
+        let hole_segment = mappings
+            .iter()
+            .find(|m| m.logical_start <= 2 && m.logical_start + m.count > 2);
+        if let Some(seg) = hole_segment {
+            assert_eq!(
+                seg.physical_start, 0,
+                "punched region should be a hole (physical=0)"
+            );
+        }
+    }
+
     // ── Mark written tests ──────────────────────────────────────────────
 
     #[test]

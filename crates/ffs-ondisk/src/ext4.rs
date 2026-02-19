@@ -2328,7 +2328,7 @@ impl Ext4DirEntryRef<'_> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```text
 /// let iter = DirBlockIter::new(block_data, block_size);
 /// for result in iter {
 ///     let entry = result?;
@@ -5853,6 +5853,87 @@ mod tests {
             .resolve_path_follow(&image, "/subdir/deep.txt")
             .unwrap();
         assert_eq!(ino, ffs_types::InodeNumber(13));
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn resolve_path_follow_detects_symlink_loop() {
+        // Build a minimal image where /loop → /loop (self-referential).
+        let block_size = 4096_usize;
+        let image_blocks = 64;
+        let mut image = vec![0_u8; block_size * image_blocks];
+
+        let sb_off = EXT4_SUPERBLOCK_OFFSET;
+        let mut sb = [0_u8; EXT4_SUPERBLOCK_SIZE];
+        sb[0x38..0x3A].copy_from_slice(&EXT4_SUPER_MAGIC.to_le_bytes());
+        sb[0x18..0x1C].copy_from_slice(&2_u32.to_le_bytes()); // log_block_size
+        sb[0x00..0x04].copy_from_slice(&8192_u32.to_le_bytes()); // inodes_count
+        sb[0x04..0x08].copy_from_slice(&(image_blocks as u32).to_le_bytes());
+        sb[0x14..0x18].copy_from_slice(&0_u32.to_le_bytes()); // first_data_block
+        sb[0x20..0x24].copy_from_slice(&(image_blocks as u32).to_le_bytes());
+        sb[0x28..0x2C].copy_from_slice(&8192_u32.to_le_bytes()); // blocks_per_group
+        sb[0x58..0x5A].copy_from_slice(&256_u16.to_le_bytes()); // inode_size
+        sb[0x54..0x58].copy_from_slice(&11_u32.to_le_bytes()); // first_ino
+        image[sb_off..sb_off + EXT4_SUPERBLOCK_SIZE].copy_from_slice(&sb);
+
+        let gdt_off = block_size;
+        let mut gd = [0_u8; 32];
+        gd[0x08..0x0C].copy_from_slice(&2_u32.to_le_bytes()); // inode_table
+        image[gdt_off..gdt_off + 32].copy_from_slice(&gd);
+
+        let itable_off = 2 * block_size;
+        let inode_size = 256_usize;
+
+        // Root dir (inode 2): extent-mapped at block 10
+        {
+            let off = itable_off + inode_size; // inode 2, zero-indexed at 1
+            image[off..off + 2].copy_from_slice(&0o040_755_u16.to_le_bytes());
+            image[off + 0x04..off + 0x08].copy_from_slice(&4096_u32.to_le_bytes());
+            image[off + 0x1A..off + 0x1C].copy_from_slice(&3_u16.to_le_bytes());
+            image[off + 0x20..off + 0x24].copy_from_slice(&0x0008_0000_u32.to_le_bytes());
+            image[off + 0x64..off + 0x68].copy_from_slice(&1_u32.to_le_bytes());
+            let eh = off + 0x28;
+            image[eh..eh + 2].copy_from_slice(&EXT4_EXTENT_MAGIC.to_le_bytes());
+            image[eh + 2..eh + 4].copy_from_slice(&1_u16.to_le_bytes());
+            image[eh + 4..eh + 6].copy_from_slice(&4_u16.to_le_bytes());
+            let ee = eh + 12;
+            image[ee + 4..ee + 6].copy_from_slice(&1_u16.to_le_bytes()); // len=1
+            image[ee + 8..ee + 12].copy_from_slice(&10_u32.to_le_bytes()); // block=10
+        }
+
+        // Self-referential symlink (inode 11): /loop → /loop (fast symlink)
+        {
+            let off = itable_off + (11 - 1) * inode_size;
+            image[off..off + 2].copy_from_slice(&0o120_777_u16.to_le_bytes());
+            let target = b"/loop";
+            image[off + 0x04..off + 0x08].copy_from_slice(&(target.len() as u32).to_le_bytes());
+            image[off + 0x1A..off + 0x1C].copy_from_slice(&1_u16.to_le_bytes());
+            image[off + 0x64..off + 0x68].copy_from_slice(&1_u32.to_le_bytes());
+            let ib = off + 0x28;
+            image[ib..ib + target.len()].copy_from_slice(target);
+        }
+
+        // Root directory data (block 10): contains "loop" entry
+        let root_blk = 10 * block_size;
+        write_dir_entry(&mut image, root_blk, 2, 2, b".", 12);
+        write_dir_entry(&mut image, root_blk + 12, 2, 2, b"..", 12);
+        let remaining: u16 = 4096 - 12 - 12;
+        write_dir_entry(&mut image, root_blk + 24, 11, 7, b"loop", remaining);
+
+        let reader = Ext4ImageReader::new(&image).unwrap();
+        let err = reader
+            .resolve_path_follow(&image, "/loop")
+            .expect_err("should detect symlink loop");
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "path",
+                    reason: "too many levels of symbolic links"
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
     }
 
     // ── Xattr parsing tests ─────────────────────────────────────────────

@@ -12,10 +12,20 @@
 //!
 //! # Usage
 //!
-//! ```ignore
+//! ```no_run
+//! # use ffs_repair::evidence::{EvidenceLedger, EvidenceRecord, CorruptionDetail};
+//! # fn example() -> std::io::Result<()> {
+//! let file = std::fs::File::create("/tmp/evidence.jsonl")?;
 //! let mut ledger = EvidenceLedger::new(file);
-//! let detail = CorruptionDetail { blocks_affected: 3, .. };
+//! let detail = CorruptionDetail {
+//!     blocks_affected: 3,
+//!     corruption_kind: "checksum_mismatch".into(),
+//!     severity: "error".into(),
+//!     detail: "block 42 CRC mismatch".into(),
+//! };
 //! ledger.append(&EvidenceRecord::corruption_detected(0, detail))?;
+//! # Ok(())
+//! # }
 //! ```
 
 use serde::{Deserialize, Serialize};

@@ -1045,6 +1045,88 @@ mod tests {
     }
 
     #[test]
+    fn encode_extra_timestamp_max_nsec() {
+        // 999_999_999 ns is the maximum valid nanosecond value.
+        let extra = encode_extra_timestamp(0, 999_999_999);
+        let nsec_back = extra & 0x3FFF_FFFC;
+        // The encoded value should be the nsec masked to bits 2-31.
+        assert_eq!(nsec_back, 0x3B9A_C9FC); // 999_999_999 & 0x3FFF_FFFC
+        // Verify the epoch bits (0-1) are zero for 32-bit timestamps.
+        assert_eq!(extra & 0x3, 0);
+    }
+
+    #[test]
+    fn timestamp_nsec_roundtrip_through_write_read() {
+        // Create an inode with specific nanosecond timestamps, write it, read back,
+        // and verify the nanosecond fields survive the roundtrip.
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+
+        let (ino, mut inode) = create_inode(
+            &cx,
+            &dev,
+            &geo,
+            &mut groups,
+            0o100_644,
+            1000,
+            1000,
+            GroupNumber(0),
+            0,
+            0,
+            0,
+        )
+        .expect("create inode");
+
+        // Set timestamps with specific nanosecond values.
+        touch_atime(&mut inode, 1_700_000_000, 123_456_788);
+        touch_mtime_ctime(&mut inode, 1_700_000_001, 999_999_996);
+
+        write_inode(&cx, &dev, &geo, &groups, ino, &inode, 0).expect("write");
+        let read_back = read_inode(&cx, &dev, &geo, &groups, ino).expect("read");
+
+        assert_eq!(read_back.atime, 1_700_000_000);
+        assert_eq!(read_back.atime_extra, inode.atime_extra);
+        assert_eq!(read_back.mtime, 1_700_000_001);
+        assert_eq!(read_back.mtime_extra, inode.mtime_extra);
+        assert_eq!(read_back.ctime, 1_700_000_001);
+        assert_eq!(read_back.ctime_extra, inode.ctime_extra);
+    }
+
+    #[test]
+    fn touch_ctime_preserves_mtime() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+
+        let (_ino, mut inode) = create_inode(
+            &cx,
+            &dev,
+            &geo,
+            &mut groups,
+            0o100_644,
+            0,
+            0,
+            GroupNumber(0),
+            0,
+            0,
+            0,
+        )
+        .expect("create");
+
+        touch_mtime_ctime(&mut inode, 100, 500_000_000);
+        touch_ctime(&mut inode, 200, 750_000_000);
+
+        // ctime should be updated
+        assert_eq!(inode.ctime, 200);
+        // mtime should remain unchanged
+        assert_eq!(inode.mtime, 100);
+        assert_eq!(inode.mtime_extra, encode_extra_timestamp(100, 500_000_000));
+    }
+
+    #[test]
     fn serialize_blocks_high_bits() {
         // Test 48-bit blocks field split.
         let inode = Ext4Inode {

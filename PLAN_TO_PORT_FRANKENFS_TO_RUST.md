@@ -26,7 +26,7 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` complete.
 
 - [x] Canonicalize crate naming across all docs (no phantom crates like `ffs-ops`, `ffs-cache`, `ffs-io`, `ffs-async`)
 - [x] Canonicalize all normative type definitions (single source for `TxnId`, `CommitSeq`, `Snapshot`, `BlockNumber`, `InodeNumber`, `BlockVersion`)
-- [~] Canonicalize all normative trait definitions (single source for `BlockDevice`, MVCC interfaces, repair interfaces)
+- [x] Canonicalize all normative trait definitions (single source for `BlockDevice`, MVCC interfaces, repair interfaces) — `BlockDevice` in ffs-block, `FsOps` in ffs-core, MVCC interfaces in ffs-mvcc, repair interfaces in ffs-repair; each trait canonically defined in its owning crate
 - [x] Reconcile doc claims vs workspace reality (21 workspace crates: 19 core + `ffs-ext4`/`ffs-btrfs` wrappers)
 - [x] Reconcile ext4/btrfs scope statements (both formats are in-scope; btrfs phased)
 - [x] Fix math/spec errors in Section 18 (probabilistic conflict model) to be dimensionally correct and assumption-explicit
@@ -56,7 +56,7 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` complete.
 - [x] Expand `Ext4Superblock` parsing toward full on-disk layout (~30 fields: geometry, identity, revision, features, state/errors, timestamps, journal, htree hash seed, flex BG, checksums)
 - [x] Implement ext4 feature flag decoding (compat / ro_compat / incompat) — `has_compat`, `has_incompat`, `has_ro_compat`, `is_64bit`, `has_metadata_csum` landed
 - [x] Implement superblock validation helpers — `validate_v1` (block size, features), `validate_geometry` (blocks_per_group, inodes_per_group, inode_size, first_data_block), `validate_checksum` (CRC32C), `csum_seed`
-- [~] Implement group descriptor parsing (32/64 byte descriptors; 64-bit fields; checksum hooks) (descriptor parsing landed; checksum hooks pending)
+- [x] Implement group descriptor parsing (32/64 byte descriptors; 64-bit fields; checksum hooks) — `Ext4GroupDesc` parsing, `verify_group_desc_checksum`, `stamp_group_desc_checksum` all implemented and wired into ffs-core read/validation pipeline
 - [x] Implement inode location math — `inode_to_group`, `inode_index_in_group` in ffs-types; `Ext4Superblock::inode_table_offset` and `group_desc_offset` in ffs-ondisk
 
 ### 0.5 `ffs-ondisk` btrfs (Parsing + Mapping + Tree Primitives)
@@ -71,7 +71,7 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` complete.
 - [x] Implement `ByteDevice` (read/write exact at byte offsets) with cancellation checkpoints
 - [x] Implement `FileByteDevice` (Linux `FileExt` pread/pwrite) (read-write vs read-only behavior made explicit)
 - [x] Implement `BlockDevice` (block-sized reads/writes over `ByteDevice`)
-- [~] Implement an ARC-like metadata cache wrapper (start read-cache; add write-back later)
+- [x] Implement an ARC-like metadata cache wrapper (start read-cache; add write-back later) — `ArcCache` with write-through and write-back modes, `FlushDaemon` for background flushing, dirty page tracking, backpressure handling, and degradation-aware batch sizing
 - [x] Provide safe helpers to read ext4/btrfs superblocks by fixed byte offsets
 - [x] Fix cancellation mapping: `Cx::checkpoint()` errors must map to `FfsError::Cancelled` (not `FfsError::Format`)
 - [x] Validate block geometry: `ByteBlockDevice::new` rejects non-block-aligned images (`len_bytes % block_size != 0`)

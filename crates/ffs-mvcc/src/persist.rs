@@ -6,7 +6,7 @@
 //!
 //! # Usage
 //!
-//! ```ignore
+//! ```text
 //! let store = PersistentMvccStore::open(cx, "/path/to/wal")?;
 //! let mut txn = store.begin();
 //! txn.stage_write(BlockNumber(1), vec![1, 2, 3]);
