@@ -41,10 +41,7 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` complete.
 
 ### 0.2 `ffs-types` (Canonical Newtypes + Shared Parsing Primitives)
 
-- [ ] Decide inode ID strategy:
-  - ext4 on-disk inode is `u32`
-  - btrfs objectid is `u64`
-  - pick canonical `InodeNumber` representation and add per-format wrappers if needed
+- [x] Decide inode ID strategy: canonical `InodeNumber(u64)` in shared APIs, with format-boundary wrappers `Ext4InodeNumber(u32)` and `BtrfsObjectId(u64)` plus explicit conversion helpers/tests in `crates/ffs-types/src/lib.rs`
 - [x] Add missing newtypes used by docs/spec: `BlockSize` (validated), `GroupNumber`, `Generation` (landed); `ByteOffset`/`DeviceId` deferred as not yet needed
 - [x] Add helpers: `BlockSize::byte_to_block/block_to_byte/shift`, `BlockNumber::checked_add/sub`, `block_to_group`, `group_first_block`, `inode_to_group`, `inode_index_in_group`
 
@@ -87,13 +84,13 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` complete.
 
 ### 0.8 Performance and Regression Gates
 
-- [ ] Update `scripts/benchmark.sh` if commands change
-- [ ] Add baseline entry for new parsing + I/O paths once stabilized
-- [ ] Profile hotspots only after correctness fixtures exist (per optimization discipline)
+- [x] Update `scripts/benchmark.sh` if commands change (script now routes cargo-heavy build/run/bench through `rch` offload by default with explicit `--local` fallback mode)
+- [x] Add baseline entry for new parsing + I/O paths once stabilized (recorded in `baselines/baseline-20260219.md` and `artifacts/baselines/perf_baseline-20260219.json` with measured ops `read_metadata_inspect_ext4_reference` and `read_metadata_scrub_ext4_reference`)
+- [x] Profile hotspots only after correctness fixtures exist (per optimization discipline; see `baselines/hotspots-20260219.md` and `artifacts/baselines/perf_baseline-20260219.json`)
 
 ### 0.9 Cleanup (Requires Explicit Permission)
 
-- [ ] Delete leftover bootstrap temp files (e.g. `.spec_*.md`) ONLY after explicit user permission (Rule 1)
+- [x] Delete leftover bootstrap temp files (e.g. `.spec_*.md`) ONLY after explicit user permission (Rule 1) — verified none present via `find . -type f -name '.spec_*.md'` on 2026-02-19 (no deletion executed)
 
 ## 1. Scope
 

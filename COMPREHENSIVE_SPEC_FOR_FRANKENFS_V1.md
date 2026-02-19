@@ -5491,6 +5491,11 @@ journal is replayed first, then MVCC takes over). Implementation resides in
    - `s_sequence`: expected next transaction sequence number
    - `s_start`: block number of start of log (0 = clean, no replay needed)
 
+   Journal I/O must follow the journal inode's logical block ordering.
+   Implementations MUST support journal inodes whose physical extents are
+   non-contiguous; replay walks the concatenated logical stream across segment
+   boundaries rather than assuming one contiguous physical run.
+
    If `s_start == 0`, the journal is clean and no replay is needed. FrankenFS
    MUST check this first and skip replay for clean journals.
 

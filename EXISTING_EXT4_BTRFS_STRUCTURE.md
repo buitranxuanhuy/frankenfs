@@ -1281,7 +1281,11 @@ operates as a circular log of metadata (and optionally data) changes.
 
 ### 8.1 Journal Structure (On-Disk)
 
-The journal occupies a contiguous region of blocks and contains:
+The journal occupies the logical block range of the journal inode (typically
+inode 8). Physical storage may be one extent or multiple non-contiguous
+extents. Replay semantics are defined by journal logical block order, not by
+physical contiguity, so recovery must iterate across extent boundaries in
+logical sequence. The journal contains:
 
 1. **Journal superblock**: Describes journal size, block size, sequence
    numbers, and feature flags. Located at the first block of the journal.
