@@ -1,0 +1,20 @@
+{
+  "results": [
+    {
+      "command": "target/release/ffs-cli inspect conformance/golden/ext4_8mb_reference.ext4 --json",
+      "mean": 0.0030675629000000005,
+      "stddev": null,
+      "median": 0.0030675629000000005,
+      "user": 0.00140534,
+      "system": 0.0017002999999999999,
+      "min": 0.0030675629000000005,
+      "max": 0.0030675629000000005,
+      "times": [
+        0.0030675629000000005
+      ],
+      "exit_codes": [
+        0
+      ]
+    }
+  ]
+}

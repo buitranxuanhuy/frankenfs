@@ -1,0 +1,3 @@
+Benchmark 1: target/release/ffs-cli parity --json
+  Time (abs ≡):          1.6 ms               [User: 0.8 ms, System: 0.8 ms]
+ 

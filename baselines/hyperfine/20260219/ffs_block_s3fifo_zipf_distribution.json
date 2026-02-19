@@ -1,0 +1,20 @@
+{
+  "results": [
+    {
+      "command": "rch exec -- cargo bench -p ffs-block --features s3fifo --bench arc_cache -- block_cache_s3fifo_zipf_distribution",
+      "mean": 67.6026980101,
+      "stddev": null,
+      "median": 67.6026980101,
+      "user": 0.47660203999999995,
+      "system": 0.36610958,
+      "min": 67.6026980101,
+      "max": 67.6026980101,
+      "times": [
+        67.6026980101
+      ],
+      "exit_codes": [
+        0
+      ]
+    }
+  ]
+}

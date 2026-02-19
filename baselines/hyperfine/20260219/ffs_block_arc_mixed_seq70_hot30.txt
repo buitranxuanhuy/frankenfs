@@ -1,0 +1,3 @@
+Benchmark 1: rch exec -- cargo bench -p ffs-block --bench arc_cache -- block_cache_arc_mixed_seq70_hot30
+  Time (abs ≡):        63.715 s               [User: 0.470 s, System: 0.352 s]
+ 

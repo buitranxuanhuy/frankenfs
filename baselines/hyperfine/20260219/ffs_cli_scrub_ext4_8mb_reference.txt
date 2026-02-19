@@ -1,0 +1,3 @@
+Benchmark 1: bash -lc '"target/release/ffs-cli" scrub "conformance/golden/ext4_8mb_reference.ext4" --json >/dev/null || [ $? -eq 2 ]'
+  Time (abs ≡):         44.0 ms               [User: 22.7 ms, System: 31.0 ms]
+ 

@@ -1,0 +1,3 @@
+Benchmark 1: target/release/ffs-harness check-fixtures
+  Time (abs ≡):        791.2 µs               [User: 0.0 µs, System: 1030.1 µs]
+ 

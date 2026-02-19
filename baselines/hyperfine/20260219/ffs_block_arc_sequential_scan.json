@@ -1,0 +1,20 @@
+{
+  "results": [
+    {
+      "command": "rch exec -- cargo bench -p ffs-block --bench arc_cache -- block_cache_arc_sequential_scan",
+      "mean": 62.6048721242,
+      "stddev": null,
+      "median": 62.6048721242,
+      "user": 0.48029345999999995,
+      "system": 0.32233714,
+      "min": 62.6048721242,
+      "max": 62.6048721242,
+      "times": [
+        62.6048721242
+      ],
+      "exit_codes": [
+        0
+      ]
+    }
+  ]
+}

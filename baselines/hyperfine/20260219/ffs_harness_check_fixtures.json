@@ -1,0 +1,20 @@
+{
+  "results": [
+    {
+      "command": "target/release/ffs-harness check-fixtures",
+      "mean": 0.00079118904,
+      "stddev": null,
+      "median": 0.00079118904,
+      "user": 0.0,
+      "system": 0.00103012,
+      "min": 0.00079118904,
+      "max": 0.00079118904,
+      "times": [
+        0.00079118904
+      ],
+      "exit_codes": [
+        0
+      ]
+    }
+  ]
+}

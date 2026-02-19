@@ -1,0 +1,3 @@
+Benchmark 1: rch exec -- cargo bench -p ffs-block --bench arc_cache -- writeback_write_random_4k
+  Time (abs ≡):        61.309 s               [User: 0.504 s, System: 0.378 s]
+ 

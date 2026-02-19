@@ -1,0 +1,3 @@
+Benchmark 1: target/release/ffs-harness parity
+  Time (abs ≡):        667.7 µs               [User: 0.0 µs, System: 927.3 µs]
+ 

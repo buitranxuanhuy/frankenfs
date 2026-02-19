@@ -1,0 +1,3 @@
+Benchmark 1: rch exec -- cargo bench -p ffs-block --features s3fifo --bench arc_cache -- block_cache_s3fifo_compile_like
+  Time (abs ≡):        63.593 s               [User: 0.462 s, System: 0.319 s]
+ 

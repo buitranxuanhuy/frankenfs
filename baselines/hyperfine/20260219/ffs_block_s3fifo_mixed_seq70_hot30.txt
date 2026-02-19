@@ -1,0 +1,3 @@
+Benchmark 1: rch exec -- cargo bench -p ffs-block --features s3fifo --bench arc_cache -- block_cache_s3fifo_mixed_seq70_hot30
+  Time (abs ≡):        64.990 s               [User: 0.515 s, System: 0.343 s]
+ 
