@@ -5955,9 +5955,9 @@ impl OpenFs {
                 .or_else(|_| alloc.fs_tree.insert(extent_key, &extent_bytes))
                 .map_err(|e| btrfs_mutation_to_ffs(&e))?;
         } else {
-            // If there's an existing inline extent at offset 0, remove it
-            // before allocating a regular extent — the two formats must not
-            // coexist for the same file.
+            // If there's an existing inline extent at offset 0, convert it
+            // to a regular extent to preserve its data before writing the
+            // new regular extent at the (possibly non-zero) write offset.
             let inline_key = BtrfsKey {
                 objectid: canonical,
                 item_type: BTRFS_ITEM_EXTENT_DATA,
@@ -5965,8 +5965,35 @@ impl OpenFs {
             };
             if let Ok(existing) = alloc.fs_tree.range(&inline_key, &inline_key) {
                 if let Some((_, edata)) = existing.first() {
-                    if matches!(parse_extent_data(edata), Ok(BtrfsExtentData::Inline { .. })) {
+                    if let Ok(BtrfsExtentData::Inline {
+                        data: prev_data, ..
+                    }) = parse_extent_data(edata)
+                    {
                         let _ = alloc.fs_tree.delete(&inline_key);
+                        // Persist the old inline data as a regular extent at
+                        // offset 0 so reads in [0, prev_data.len()) still work.
+                        if !prev_data.is_empty() && offset > 0 {
+                            let prev_alloc_size =
+                                (prev_data.len() as u64 + sectorsize - 1) & !(sectorsize - 1);
+                            if let Ok(prev_allocation) =
+                                alloc.extent_alloc.alloc_data(prev_alloc_size)
+                            {
+                                let _ = self.dev.write_all_at(
+                                    cx,
+                                    ByteOffset(prev_allocation.bytenr),
+                                    &prev_data,
+                                );
+                                let prev_extent = BtrfsExtentData::Regular {
+                                    extent_type: BTRFS_FILE_EXTENT_REG,
+                                    compression: 0,
+                                    disk_bytenr: prev_allocation.bytenr,
+                                    disk_num_bytes: prev_alloc_size,
+                                    extent_offset: 0,
+                                    num_bytes: prev_data.len() as u64,
+                                };
+                                let _ = alloc.fs_tree.insert(inline_key, &prev_extent.to_bytes());
+                            }
+                        }
                     }
                 }
             }
@@ -6512,32 +6539,57 @@ impl OpenFs {
         let canonical = self.btrfs_canonical_inode(ino)?;
 
         let mut alloc = alloc_mutex.lock();
-        let sectorsize = u64::from(alloc.nodesize.min(4096));
-        let alloc_size = (length + sectorsize - 1) & !(sectorsize - 1);
 
-        let allocation = alloc
-            .extent_alloc
-            .alloc_data(alloc_size)
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-
-        let extent = BtrfsExtentData::Regular {
-            extent_type: BTRFS_FILE_EXTENT_PREALLOC,
-            compression: 0,
-            disk_bytenr: allocation.bytenr,
-            disk_num_bytes: alloc_size,
-            extent_offset: 0,
-            num_bytes: length,
-        };
-        let extent_key = BtrfsKey {
+        // Check if a data extent (inline or regular non-prealloc) already
+        // exists at this offset.  If so, skip the prealloc to avoid
+        // overwriting the user's data.
+        let probe_key = BtrfsKey {
             objectid: canonical,
             item_type: BTRFS_ITEM_EXTENT_DATA,
             offset,
         };
-        alloc
+        let already_has_data = alloc
             .fs_tree
-            .update(&extent_key, &extent.to_bytes())
-            .or_else(|_| alloc.fs_tree.insert(extent_key, &extent.to_bytes()))
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            .range(&probe_key, &probe_key)
+            .is_ok_and(|existing| {
+                existing
+                    .first()
+                    .is_some_and(|(_, edata)| match parse_extent_data(edata) {
+                        Ok(BtrfsExtentData::Inline { .. }) => true,
+                        Ok(BtrfsExtentData::Regular { extent_type, .. }) => {
+                            extent_type != BTRFS_FILE_EXTENT_PREALLOC
+                        }
+                        Err(_) => false,
+                    })
+            });
+
+        if !already_has_data {
+            let sectorsize = u64::from(alloc.nodesize.min(4096));
+            let alloc_size = (length + sectorsize - 1) & !(sectorsize - 1);
+
+            let allocation = alloc
+                .extent_alloc
+                .alloc_data(alloc_size)
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+
+            let extent = BtrfsExtentData::Regular {
+                extent_type: BTRFS_FILE_EXTENT_PREALLOC,
+                compression: 0,
+                disk_bytenr: allocation.bytenr,
+                disk_num_bytes: alloc_size,
+                extent_offset: 0,
+                num_bytes: length,
+            };
+            let extent_key = BtrfsKey {
+                objectid: canonical,
+                item_type: BTRFS_ITEM_EXTENT_DATA,
+                offset,
+            };
+            alloc
+                .fs_tree
+                .insert(extent_key, &extent.to_bytes())
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        }
 
         // Update inode size if fallocate extends beyond current size.
         let mut inode = self.btrfs_read_inode_from_tree(&alloc, canonical)?;
@@ -14903,5 +14955,65 @@ mod tests {
         // File nlink should still be 1.
         let file_after = ops.getattr(&cx, file.ino).unwrap();
         assert_eq!(file_after.nlink, 1);
+    }
+
+    #[test]
+    fn btrfs_write_fallocate_preserves_data() {
+        let (fs, cx) = open_writable_btrfs();
+        let ops: &dyn FsOps = &fs;
+
+        let attr = ops
+            .create(&cx, InodeNumber(1), OsStr::new("predata.bin"), 0o644, 0, 0)
+            .unwrap();
+
+        // Write data at offset 0.
+        ops.write(&cx, attr.ino, 0, b"ORIGINAL_DATA").unwrap();
+
+        // Fallocate overlapping the same offset — should NOT destroy data.
+        ops.fallocate(&cx, attr.ino, 0, 4096, 0).unwrap();
+
+        // Size should be 4096 (fallocate extends).
+        let after = ops.getattr(&cx, attr.ino).unwrap();
+        assert_eq!(after.size, 4096);
+
+        // Original data should still be readable.
+        let data = ops.read(&cx, attr.ino, 0, 13).unwrap();
+        assert_eq!(
+            &data[..13],
+            b"ORIGINAL_DATA",
+            "fallocate destroyed existing data"
+        );
+    }
+
+    #[test]
+    fn btrfs_write_inline_to_regular_preserves_prefix() {
+        let (fs, cx) = open_writable_btrfs();
+        let ops: &dyn FsOps = &fs;
+
+        let attr = ops
+            .create(&cx, InodeNumber(1), OsStr::new("prefix.bin"), 0o644, 0, 0)
+            .unwrap();
+
+        // Write small data at offset 0 (inline).
+        ops.write(&cx, attr.ino, 0, b"PREFIX").unwrap();
+        let data = ops.read(&cx, attr.ino, 0, 100).unwrap();
+        assert_eq!(&data, b"PREFIX");
+
+        // Write large data at a non-zero offset (forces regular extent).
+        let big = vec![0x42_u8; 4096];
+        ops.write(&cx, attr.ino, 4096, &big).unwrap();
+
+        // Prefix data at offset 0 should still be readable.
+        let data = ops.read(&cx, attr.ino, 0, 6).unwrap();
+        assert_eq!(
+            &data[..6],
+            b"PREFIX",
+            "inline prefix data lost during inline-to-regular transition"
+        );
+
+        // Data at offset 4096 should also be correct.
+        let data = ops.read(&cx, attr.ino, 4096, 4096).unwrap();
+        assert_eq!(data.len(), 4096);
+        assert!(data.iter().all(|&b| b == 0x42));
     }
 }
