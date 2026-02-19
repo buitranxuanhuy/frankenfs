@@ -291,13 +291,12 @@ mod tests {
         let threshold = RegressionThreshold::new(5.0, 10.0);
 
         // Latency: 2.5% increase → Ok.
-        let outcome = classify_latency_regression(100.0, 102.5, threshold)
-            .expect("valid baseline");
+        let outcome = classify_latency_regression(100.0, 102.5, threshold).expect("valid baseline");
         assert_eq!(outcome.status, RegressionStatus::Ok);
 
         // Throughput: 2.5% drop → Ok.
-        let outcome = classify_throughput_regression(1000.0, 975.0, threshold)
-            .expect("valid baseline");
+        let outcome =
+            classify_throughput_regression(1000.0, 975.0, threshold).expect("valid baseline");
         assert_eq!(outcome.status, RegressionStatus::Ok);
     }
 
@@ -308,8 +307,7 @@ mod tests {
 
         // 5% latency increase: would be Ok with defaults (10%/20%),
         // but is Warn with tight thresholds.
-        let outcome = classify_latency_regression(100.0, 105.0, tight)
-            .expect("valid baseline");
+        let outcome = classify_latency_regression(100.0, 105.0, tight).expect("valid baseline");
         assert_eq!(outcome.status, RegressionStatus::Warn);
 
         // Same value with default thresholds: Ok.

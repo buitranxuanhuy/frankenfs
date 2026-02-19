@@ -1,0 +1,1 @@
+Benchmark 1: target/release/ffs-cli scrub conformance/golden/ext4_8mb_reference.ext4 --json

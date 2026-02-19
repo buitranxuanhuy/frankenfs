@@ -1,0 +1,24 @@
+{
+  "results": [
+    {
+      "command": "sudo -n scripts/mount_benchmark_probe.sh --bin target/release/ffs-cli --image baselines/hyperfine/20260218/mount_probe.ext4 --mount-root /tmp/ffs_mount_probe_manual_cold --mode cold",
+      "mean": 0.03701186294666667,
+      "stddev": 0.0031685562699747525,
+      "median": 0.03602925528,
+      "user": 0.007562579999999999,
+      "system": 0.030537286666666667,
+      "min": 0.03445101828,
+      "max": 0.04055531528,
+      "times": [
+        0.04055531528,
+        0.03602925528,
+        0.03445101828
+      ],
+      "exit_codes": [
+        0,
+        0,
+        0
+      ]
+    }
+  ]
+}

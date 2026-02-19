@@ -32,6 +32,11 @@ What this does:
    - `ffs-harness check-fixtures`
    - `ffs-block` ARC criterion workload commands for the five workloads above
    - `ffs-block` S3-FIFO criterion workload commands for the same five workloads
+   - `ffs-block` write-path and fsync-path criterion commands:
+     - `writeback_write_seq_4k`
+     - `writeback_write_random_4k`
+     - `writeback_sync_single_4k`
+     - `writeback_sync_100x4k`
 5. Writes artifacts to:
    - `baselines/baseline-YYYYMMDD.md`
    - `baselines/hyperfine/YYYYMMDD/*.json`
@@ -40,7 +45,7 @@ What this does:
    - `artifacts/baselines/perf_baseline.json`
    - `artifacts/baselines/perf_baseline-YYYYMMDD.json`
 
-`perf_baseline.json` always carries the full target operation matrix; operations not yet automated in the benchmark harness are emitted with `"status": "pending"` so progress is explicit and machine-auditable. Cache workload metric rows are also embedded under `cache_workload_metrics`.
+`perf_baseline.json` always carries the full target operation matrix; operations not yet automated or unsupported on the current host are emitted with `"status": "pending"` so progress is explicit and machine-auditable. `benchmark_record.sh` now attempts rootless FUSE mount probes (`mount_cold`, `mount_warm`, `mount_recovery`) via `scripts/mount_benchmark_probe.sh` whenever a local `target/release/ffs-cli` binary and `/dev/fuse` are available. `mount_recovery` uses a journal-enabled probe image so journal replay scanning is exercised during mount. If rootless FUSE is blocked but passwordless sudo exists, you can opt in to privileged probes with `FFS_MOUNT_PROBE_USE_SUDO=1` (or `--mount-probe-use-sudo`). If a probe still fails, the script records the concrete failure reason in the relevant pending entry. Cache workload metric rows are also embedded under `cache_workload_metrics`.
 
 ## Regression Policy (p99)
 

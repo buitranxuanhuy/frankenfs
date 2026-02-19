@@ -514,6 +514,39 @@ fn bench_metrics_snapshot(c: &mut Criterion) {
     });
 }
 
+fn bench_writeback_write_seq_4k(c: &mut Criterion) {
+    let cx = Cx::for_testing();
+    let cache = make_writeback_cache(BLOCK_SIZE_4K, 2048, 1024);
+    let payload = vec![0x91; BLOCK_SIZE_4K as usize];
+    let mut block = 0_u64;
+
+    c.bench_function("writeback_write_seq_4k", |b| {
+        b.iter(|| {
+            let target = BlockNumber(block % 1024);
+            cache
+                .write_block(black_box(&cx), black_box(target), black_box(&payload))
+                .expect("write");
+            block = block.wrapping_add(1);
+        });
+    });
+}
+
+fn bench_writeback_write_random_4k(c: &mut Criterion) {
+    let cx = Cx::for_testing();
+    let cache = make_writeback_cache(BLOCK_SIZE_4K, 2048, 1024);
+    let payload = vec![0x92; BLOCK_SIZE_4K as usize];
+    let mut rng = Rng64::seeded(0xBEEF_1001);
+
+    c.bench_function("writeback_write_random_4k", |b| {
+        b.iter(|| {
+            let target = BlockNumber(rng.next_u64() % 1024);
+            cache
+                .write_block(black_box(&cx), black_box(target), black_box(&payload))
+                .expect("write");
+        });
+    });
+}
+
 fn bench_writeback_sync_single_4k(c: &mut Criterion) {
     let cx = Cx::for_testing();
     let cache = make_writeback_cache(BLOCK_SIZE_4K, 512, 256);
@@ -578,6 +611,8 @@ criterion_group!(
     bench_cache_miss,
     bench_cache_mixed_workload,
     bench_metrics_snapshot,
+    bench_writeback_write_seq_4k,
+    bench_writeback_write_random_4k,
     bench_writeback_sync_single_4k,
     bench_writeback_sync_100x4k,
     bench_workload_sequential_scan,

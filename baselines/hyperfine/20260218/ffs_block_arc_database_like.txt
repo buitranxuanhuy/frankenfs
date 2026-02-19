@@ -1,0 +1,3 @@
+Benchmark 1: rch exec -- cargo bench -p ffs-block --bench arc_cache -- block_cache_arc_database_like
+  Time (abs ≡):        75.938 s               [User: 0.444 s, System: 0.381 s]
+ 

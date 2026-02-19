@@ -1,0 +1,20 @@
+{
+  "results": [
+    {
+      "command": "rch exec -- cargo bench -p ffs-block --features s3fifo --bench arc_cache -- block_cache_s3fifo_sequential_scan",
+      "mean": 75.35201920460001,
+      "stddev": null,
+      "median": 75.35201920460001,
+      "user": 0.47344848,
+      "system": 0.35330142,
+      "min": 75.35201920460001,
+      "max": 75.35201920460001,
+      "times": [
+        75.35201920460001
+      ],
+      "exit_codes": [
+        0
+      ]
+    }
+  ]
+}

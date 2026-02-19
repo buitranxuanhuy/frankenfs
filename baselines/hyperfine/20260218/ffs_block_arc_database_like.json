@@ -1,0 +1,20 @@
+{
+  "results": [
+    {
+      "command": "rch exec -- cargo bench -p ffs-block --bench arc_cache -- block_cache_arc_database_like",
+      "mean": 75.93800755954,
+      "stddev": null,
+      "median": 75.93800755954,
+      "user": 0.44418598,
+      "system": 0.38090741999999994,
+      "min": 75.93800755954,
+      "max": 75.93800755954,
+      "times": [
+        75.93800755954
+      ],
+      "exit_codes": [
+        0
+      ]
+    }
+  ]
+}

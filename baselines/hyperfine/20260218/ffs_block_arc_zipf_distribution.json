@@ -1,0 +1,20 @@
+{
+  "results": [
+    {
+      "command": "rch exec -- cargo bench -p ffs-block --bench arc_cache -- block_cache_arc_zipf_distribution",
+      "mean": 75.57314269308,
+      "stddev": null,
+      "median": 75.57314269308,
+      "user": 0.4931389,
+      "system": 0.34057718000000003,
+      "min": 75.57314269308,
+      "max": 75.57314269308,
+      "times": [
+        75.57314269308
+      ],
+      "exit_codes": [
+        0
+      ]
+    }
+  ]
+}

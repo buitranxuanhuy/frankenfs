@@ -1,0 +1,4 @@
+Benchmark 1: target/release/ffs-harness check-fixtures
+  Time (mean ± σ):     820.1 µs ± 106.6 µs    [User: 211.6 µs, System: 804.7 µs]
+  Range (min … max):   672.4 µs … 1030.1 µs    10 runs
+ 

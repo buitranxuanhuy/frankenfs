@@ -1,0 +1,3 @@
+Benchmark 1: rch exec -- cargo bench -p ffs-block --bench arc_cache -- block_cache_arc_sequential_scan
+  Time (abs ≡):        85.197 s               [User: 4.659 s, System: 6.772 s]
+ 

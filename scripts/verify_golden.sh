@@ -29,6 +29,10 @@ warn() { echo -e "${YELLOW}WARN${NC} $1"; }
 
 FAILED=0
 
+cargo_exec() {
+    rch exec -- cargo "$@"
+}
+
 if [ "${1:-}" = "--update" ]; then
     echo "Updating checksums..."
     (cd conformance/fixtures && sha256sum *.json > checksums.sha256)
@@ -60,7 +64,7 @@ fi
 
 # ── 3. Parity report consistency ─────────────────────────────────
 echo "--- Parity report ---"
-if cargo test -p ffs-harness -- parity_report_matches_feature_parity_md --quiet 2>/dev/null; then
+if cargo_exec test -p ffs-harness -- parity_report_matches_feature_parity_md --quiet 2>/dev/null; then
     pass "ParityReport matches FEATURE_PARITY.md"
 else
     fail "ParityReport vs FEATURE_PARITY.md mismatch"
@@ -68,7 +72,7 @@ fi
 
 # ── 4. Conformance fixture validation ────────────────────────────
 echo "--- Conformance fixtures ---"
-if cargo test -p ffs-harness --test conformance --quiet 2>/dev/null; then
+if cargo_exec test -p ffs-harness --test conformance --quiet 2>/dev/null; then
     pass "all conformance fixtures validate"
 else
     fail "conformance fixture validation failed"
@@ -76,7 +80,7 @@ fi
 
 # ── 5. Golden JSON structural validation ─────────────────────────
 echo "--- Golden JSON validation ---"
-if cargo test -p ffs-harness --test kernel_reference golden_json_parses_and_is_consistent --quiet 2>/dev/null; then
+if cargo_exec test -p ffs-harness --test kernel_reference golden_json_parses_and_is_consistent --quiet 2>/dev/null; then
     pass "golden JSON parses and is consistent"
 else
     fail "golden JSON validation failed"

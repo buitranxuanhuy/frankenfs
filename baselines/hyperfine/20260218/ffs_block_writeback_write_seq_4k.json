@@ -1,0 +1,20 @@
+{
+  "results": [
+    {
+      "command": "rch exec -- cargo bench -p ffs-block --bench arc_cache -- writeback_write_seq_4k",
+      "mean": 75.47346308034,
+      "stddev": null,
+      "median": 75.47346308034,
+      "user": 0.44663324,
+      "system": 0.38615192,
+      "min": 75.47346308034,
+      "max": 75.47346308034,
+      "times": [
+        75.47346308034
+      ],
+      "exit_codes": [
+        0
+      ]
+    }
+  ]
+}

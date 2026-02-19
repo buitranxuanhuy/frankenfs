@@ -13,6 +13,7 @@ REF_IMAGE="conformance/golden/ext4_8mb_reference.ext4"
 P99_WARN_THRESHOLD=10
 P99_FAIL_THRESHOLD=20
 P99_FAIL_THRESHOLD_OVERRIDE=""
+MOUNT_PROBE_USE_SUDO="${FFS_MOUNT_PROBE_USE_SUDO:-0}"
 PERF_BASELINE_PATH="artifacts/baselines/perf_baseline.json"
 THRESHOLDS_PATH="benchmarks/thresholds.toml"
 BENCHMARK_BASELINE_LATEST_PATH="benchmarks/baselines/latest.json"
@@ -49,7 +50,7 @@ extract_cache_report_from_log() {
 usage() {
     cat <<'USAGE'
 Usage:
-  scripts/benchmark_record.sh [--date YYYYMMDD] [--warmup N] [--runs N] [--compare] [--skip-verify-golden] [--thresholds PATH] [--p99-fail-threshold N] [--out-json PATH]
+  scripts/benchmark_record.sh [--date YYYYMMDD] [--warmup N] [--runs N] [--compare] [--skip-verify-golden] [--thresholds PATH] [--p99-fail-threshold N] [--mount-probe-use-sudo] [--out-json PATH]
 
 Options:
   --date YYYYMMDD          Override date-tag for output paths (default: today)
@@ -59,6 +60,7 @@ Options:
   --skip-verify-golden     Skip scripts/verify_golden.sh preflight
   --thresholds PATH        Read warn/fail thresholds from TOML (default: benchmarks/thresholds.toml)
   --p99-fail-threshold N   Fail compare if p99 regression exceeds N percent (default: 20)
+  --mount-probe-use-sudo   Run mount probe helper via `sudo -n` (or set FFS_MOUNT_PROBE_USE_SUDO=1)
   --out-json PATH          Structured baseline JSON output path (default: artifacts/baselines/perf_baseline.json)
   -h, --help               Show this help
 USAGE
@@ -93,6 +95,10 @@ while [ $# -gt 0 ]; do
             [ $# -ge 2 ] || { echo "missing value for --p99-fail-threshold" >&2; exit 2; }
             P99_FAIL_THRESHOLD_OVERRIDE="$2"
             shift 2
+            ;;
+        --mount-probe-use-sudo)
+            MOUNT_PROBE_USE_SUDO=1
+            shift
             ;;
         --thresholds)
             [ $# -ge 2 ] || { echo "missing value for --thresholds" >&2; exit 2; }
@@ -224,8 +230,21 @@ CLI_BIN="${TARGET_DIR}/release/ffs-cli"
 HARNESS_BIN="${TARGET_DIR}/release/ffs-harness"
 USE_LOCAL_RELEASE_BINS=1
 if [ ! -x "$CLI_BIN" ] || [ ! -x "$HARNESS_BIN" ]; then
-    USE_LOCAL_RELEASE_BINS=0
-    echo "warning: missing local release binaries under ${TARGET_DIR}; falling back to rch cargo run commands" >&2
+    # In environments with a non-default CARGO_TARGET_DIR, rch artifact
+    # retrieval often materializes under ./target. Prefer that local path
+    # before degrading to remote cargo run per benchmark sample.
+    local_target_dir="target"
+    local_cli_fallback="${local_target_dir}/release/ffs-cli"
+    local_harness_fallback="${local_target_dir}/release/ffs-harness"
+    if [ -x "$local_cli_fallback" ] && [ -x "$local_harness_fallback" ]; then
+        TARGET_DIR="$local_target_dir"
+        CLI_BIN="$local_cli_fallback"
+        HARNESS_BIN="$local_harness_fallback"
+        echo "warning: missing local release binaries under original target directory; using ${TARGET_DIR}/release fallback" >&2
+    else
+        USE_LOCAL_RELEASE_BINS=0
+        echo "warning: missing local release binaries under ${TARGET_DIR}; falling back to rch cargo run commands" >&2
+    fi
 fi
 
 declare -a BENCH_LABELS=()
@@ -236,6 +255,15 @@ declare -a BENCH_PAYLOAD_MB=()
 declare -a SKIPPED_LABELS=()
 declare -a CACHE_WORKLOAD_REPORT_PATHS=()
 declare -a CACHE_WORKLOAD_REPORT_POLICIES=()
+declare -A PENDING_REASONS=(
+    ["mount_cold"]="mount latency benchmark requires a FUSE-capable CI runner and automated mount lifecycle probe"
+    ["mount_warm"]="warm mount benchmark requires repeated FUSE mount lifecycle automation in benchmark_record.sh"
+    ["mount_recovery"]="recovery mount benchmark requires journal-enabled probe image mount automation"
+)
+
+MOUNT_BENCH_IMAGE=""
+MOUNT_RECOVERY_IMAGE=""
+MOUNT_BENCH_ROOT=""
 
 add_bench() {
     BENCH_LABELS+=("$1")
@@ -243,6 +271,179 @@ add_bench() {
     BENCH_FILES+=("$3")
     BENCH_OPERATIONS+=("$4")
     BENCH_PAYLOAD_MB+=("${5:-0}")
+}
+
+single_line_text() {
+    tr '\n' ' ' | sed 's/[[:space:]]\+/ /g' | sed 's/^ //; s/ $//'
+}
+
+set_mount_pending_reasons() {
+    local reason="$1"
+    local recovery_reason="$2"
+    PENDING_REASONS["mount_cold"]="$reason"
+    PENDING_REASONS["mount_warm"]="$reason"
+    PENDING_REASONS["mount_recovery"]="$recovery_reason"
+}
+
+record_mount_pending_labels() {
+    local operation
+    for operation in mount_cold mount_warm mount_recovery; do
+        if [ -n "${PENDING_REASONS[$operation]:-}" ]; then
+            SKIPPED_LABELS+=("${operation} (pending: ${PENDING_REASONS[$operation]})")
+        fi
+    done
+}
+
+configure_mount_benchmarks() {
+    local recovery_reason
+    recovery_reason="mount recovery benchmark requires journal-enabled ext4 probe image + automated recovery mount probe"
+    local -a mount_probe_prefix=()
+    local mount_probe_prefix_str=""
+
+    if [ "$MOUNT_PROBE_USE_SUDO" -eq 1 ]; then
+        if ! command -v sudo >/dev/null 2>&1; then
+            set_mount_pending_reasons \
+                "FFS_MOUNT_PROBE_USE_SUDO=1 requested but sudo is unavailable" \
+                "$recovery_reason"
+            return
+        fi
+        if ! sudo -n true >/dev/null 2>&1; then
+            set_mount_pending_reasons \
+                "FFS_MOUNT_PROBE_USE_SUDO=1 requested but sudo -n is not permitted on this host" \
+                "$recovery_reason"
+            return
+        fi
+        mount_probe_prefix=(sudo -n)
+        mount_probe_prefix_str="sudo -n "
+    fi
+
+    if [ "$USE_LOCAL_RELEASE_BINS" -ne 1 ] || [ ! -x "$CLI_BIN" ]; then
+        set_mount_pending_reasons \
+            "mount benchmarks require a local release ffs-cli binary at ${CLI_BIN} (rch remote binaries cannot mount local FUSE)" \
+            "$recovery_reason"
+        return
+    fi
+
+    if [ ! -e /dev/fuse ] || [ ! -r /dev/fuse ] || [ ! -w /dev/fuse ]; then
+        set_mount_pending_reasons \
+            "/dev/fuse is unavailable or lacks rw access on this host" \
+            "$recovery_reason"
+        return
+    fi
+
+    if ! command -v mkfs.ext4 >/dev/null 2>&1; then
+        set_mount_pending_reasons \
+            "mkfs.ext4 is required for mount probe image generation" \
+            "$recovery_reason"
+        return
+    fi
+
+    if ! command -v mountpoint >/dev/null 2>&1; then
+        set_mount_pending_reasons \
+            "mountpoint utility is required for FUSE readiness checks" \
+            "$recovery_reason"
+        return
+    fi
+
+    if [ ! -x "scripts/mount_benchmark_probe.sh" ]; then
+        set_mount_pending_reasons \
+            "scripts/mount_benchmark_probe.sh is missing or not executable" \
+            "$recovery_reason"
+        return
+    fi
+
+    MOUNT_BENCH_IMAGE="${OUT_DIR}/mount_probe.ext4"
+    MOUNT_RECOVERY_IMAGE="${OUT_DIR}/mount_recovery_probe.ext4"
+    MOUNT_BENCH_ROOT="${OUT_DIR}/mount_probe_mounts"
+    mkdir -p "$MOUNT_BENCH_ROOT"
+
+    if ! dd if=/dev/zero of="$MOUNT_BENCH_IMAGE" bs=1M count=16 status=none; then
+        set_mount_pending_reasons \
+            "failed to create mount probe image at ${MOUNT_BENCH_IMAGE}" \
+            "$recovery_reason"
+        return
+    fi
+
+    if ! mkfs.ext4 -F -O extent,filetype,^has_journal -L ffs_mount_probe "$MOUNT_BENCH_IMAGE" >/dev/null 2>&1; then
+        set_mount_pending_reasons \
+            "mkfs.ext4 failed while preparing mount probe image" \
+            "$recovery_reason"
+        return
+    fi
+
+    if ! dd if=/dev/zero of="$MOUNT_RECOVERY_IMAGE" bs=1M count=32 status=none; then
+        set_mount_pending_reasons \
+            "failed to create recovery mount probe image at ${MOUNT_RECOVERY_IMAGE}" \
+            "$recovery_reason"
+        return
+    fi
+
+    if ! mkfs.ext4 -F -O extent,filetype -L ffs_mount_recovery_probe "$MOUNT_RECOVERY_IMAGE" >/dev/null 2>&1; then
+        set_mount_pending_reasons \
+            "mkfs.ext4 failed while preparing recovery mount probe image" \
+            "$recovery_reason"
+        return
+    fi
+
+    local probe_err
+    probe_err="${OUT_DIR}/ffs_cli_mount_probe.stderr"
+    if "${mount_probe_prefix[@]}" scripts/mount_benchmark_probe.sh \
+        --bin "$CLI_BIN" \
+        --image "$MOUNT_BENCH_IMAGE" \
+        --mount-root "$MOUNT_BENCH_ROOT" \
+        --mode cold \
+        >/dev/null 2>"$probe_err"; then
+        local cmd_base
+        cmd_base="${mount_probe_prefix_str}scripts/mount_benchmark_probe.sh --bin $(printf '%q' "$CLI_BIN") --image $(printf '%q' "$MOUNT_BENCH_IMAGE") --mount-root $(printf '%q' "$MOUNT_BENCH_ROOT")"
+
+        add_bench "ffs-cli mount cold ext4 probe (fuse)" \
+            "${cmd_base} --mode cold" \
+            "ffs_cli_mount_cold_probe.json" \
+            "mount_cold" \
+            "0"
+        add_bench "ffs-cli mount warm ext4 probe (fuse)" \
+            "${cmd_base} --mode warm" \
+            "ffs_cli_mount_warm_probe.json" \
+            "mount_warm" \
+            "0"
+
+        unset 'PENDING_REASONS[mount_cold]'
+        unset 'PENDING_REASONS[mount_warm]'
+
+        local recovery_probe_err
+        recovery_probe_err="${OUT_DIR}/ffs_cli_mount_recovery_probe.stderr"
+        local recovery_cmd_base
+        recovery_cmd_base="${mount_probe_prefix_str}scripts/mount_benchmark_probe.sh --bin $(printf '%q' "$CLI_BIN") --image $(printf '%q' "$MOUNT_RECOVERY_IMAGE") --mount-root $(printf '%q' "$MOUNT_BENCH_ROOT")"
+        if "${mount_probe_prefix[@]}" scripts/mount_benchmark_probe.sh \
+            --bin "$CLI_BIN" \
+            --image "$MOUNT_RECOVERY_IMAGE" \
+            --mount-root "$MOUNT_BENCH_ROOT" \
+            --mode recovery \
+            >/dev/null 2>"$recovery_probe_err"; then
+            add_bench "ffs-cli mount recovery ext4 probe (journal replay)" \
+                "${recovery_cmd_base} --mode recovery" \
+                "ffs_cli_mount_recovery_probe.json" \
+                "mount_recovery" \
+                "0"
+            unset 'PENDING_REASONS[mount_recovery]'
+        else
+            local recovery_probe_reason
+            recovery_probe_reason="$(single_line_text < "$recovery_probe_err")"
+            if [ -z "$recovery_probe_reason" ]; then
+                recovery_probe_reason="mount recovery probe failed with unknown error"
+            fi
+            PENDING_REASONS["mount_recovery"]="mount recovery probe failed on this host: ${recovery_probe_reason} (set FFS_MOUNT_PROBE_USE_SUDO=1 or --mount-probe-use-sudo if passwordless sudo is available)"
+        fi
+    else
+        local probe_reason
+        probe_reason="$(single_line_text < "$probe_err")"
+        if [ -z "$probe_reason" ]; then
+            probe_reason="mount benchmark probe failed with unknown error"
+        fi
+        set_mount_pending_reasons \
+            "mount benchmark probe failed on this host: ${probe_reason} (set FFS_MOUNT_PROBE_USE_SUDO=1 or --mount-probe-use-sudo if passwordless sudo is available)" \
+            "$recovery_reason"
+    fi
 }
 
 if [ "$USE_LOCAL_RELEASE_BINS" -eq 1 ]; then
@@ -285,6 +486,7 @@ fi
 
 if [ -f "$REF_IMAGE" ]; then
     probe_stderr="${OUT_DIR}/ffs_cli_inspect_probe.stderr"
+    scrub_probe_stderr="${OUT_DIR}/ffs_cli_scrub_probe.stderr"
     if [ "$USE_LOCAL_RELEASE_BINS" -eq 1 ]; then
         if "$CLI_BIN" inspect "$REF_IMAGE" --json >/dev/null 2>"$probe_stderr"; then
             add_bench "ffs-cli inspect ext4_8mb_reference.ext4 --json" \
@@ -292,11 +494,19 @@ if [ -f "$REF_IMAGE" ]; then
                 "ffs_cli_inspect_ext4_8mb_reference.json" \
                 "read_metadata_inspect_ext4_reference" \
                 "8"
-            add_bench "ffs-cli scrub ext4_8mb_reference.ext4 --json" \
-                "${CLI_BIN} scrub ${REF_IMAGE} --json" \
-                "ffs_cli_scrub_ext4_8mb_reference.json" \
-                "read_metadata_scrub_ext4_reference" \
-                "8"
+            if "$CLI_BIN" scrub "$REF_IMAGE" --json >/dev/null 2>"$scrub_probe_stderr"; then
+                add_bench "ffs-cli scrub ext4_8mb_reference.ext4 --json" \
+                    "${CLI_BIN} scrub ${REF_IMAGE} --json" \
+                    "ffs_cli_scrub_ext4_8mb_reference.json" \
+                    "read_metadata_scrub_ext4_reference" \
+                    "8"
+            else
+                scrub_probe_reason="$(single_line_text < "$scrub_probe_stderr")"
+                if [ -z "$scrub_probe_reason" ]; then
+                    scrub_probe_reason="scrub probe returned non-zero with no stderr output"
+                fi
+                SKIPPED_LABELS+=("ffs-cli scrub ext4_8mb_reference.ext4 --json (scrub probe failed: ${scrub_probe_reason})")
+            fi
         else
             probe_reason="$(tr '\n' ' ' < "$probe_stderr" | sed 's/[[:space:]]\+/ /g' | sed 's/^ //; s/ $//')"
             SKIPPED_LABELS+=("ffs-cli inspect ext4_8mb_reference.ext4 --json (unsupported by current parser: ${probe_reason})")
@@ -309,11 +519,19 @@ if [ -f "$REF_IMAGE" ]; then
                 "ffs_cli_inspect_ext4_8mb_reference.json" \
                 "read_metadata_inspect_ext4_reference" \
                 "8"
-            add_bench "ffs-cli scrub ext4_8mb_reference.ext4 --json" \
-                "rch exec -- cargo run -p ffs-cli --release --quiet -- scrub ${REF_IMAGE} --json" \
-                "ffs_cli_scrub_ext4_8mb_reference.json" \
-                "read_metadata_scrub_ext4_reference" \
-                "8"
+            if rch exec -- cargo run -p ffs-cli --release --quiet -- scrub "$REF_IMAGE" --json >/dev/null 2>"$scrub_probe_stderr"; then
+                add_bench "ffs-cli scrub ext4_8mb_reference.ext4 --json" \
+                    "rch exec -- cargo run -p ffs-cli --release --quiet -- scrub ${REF_IMAGE} --json" \
+                    "ffs_cli_scrub_ext4_8mb_reference.json" \
+                    "read_metadata_scrub_ext4_reference" \
+                    "8"
+            else
+                scrub_probe_reason="$(single_line_text < "$scrub_probe_stderr")"
+                if [ -z "$scrub_probe_reason" ]; then
+                    scrub_probe_reason="scrub probe returned non-zero with no stderr output"
+                fi
+                SKIPPED_LABELS+=("ffs-cli scrub ext4_8mb_reference.ext4 --json (scrub probe failed: ${scrub_probe_reason})")
+            fi
         else
             probe_reason="$(tr '\n' ' ' < "$probe_stderr" | sed 's/[[:space:]]\+/ /g' | sed 's/^ //; s/ $//')"
             SKIPPED_LABELS+=("ffs-cli inspect ext4_8mb_reference.ext4 --json (unsupported by current parser: ${probe_reason})")
@@ -384,6 +602,33 @@ add_bench "ffs-block s3fifo database-like (criterion)" \
     "ffs_block_s3fifo_database_like.json" \
     "block_cache_s3fifo_database_like" \
     "0"
+
+add_bench "ffs-block writeback write seq 4k (criterion)" \
+    "rch exec -- cargo bench -p ffs-block --bench arc_cache -- writeback_write_seq_4k" \
+    "ffs_block_writeback_write_seq_4k.json" \
+    "write_seq_4k" \
+    "0.00390625"
+
+add_bench "ffs-block writeback write random 4k (criterion)" \
+    "rch exec -- cargo bench -p ffs-block --bench arc_cache -- writeback_write_random_4k" \
+    "ffs_block_writeback_write_random_4k.json" \
+    "write_random_4k" \
+    "0.00390625"
+
+add_bench "ffs-block writeback fsync single write (criterion)" \
+    "rch exec -- cargo bench -p ffs-block --bench arc_cache -- writeback_sync_single_4k" \
+    "ffs_block_writeback_sync_single_4k.json" \
+    "fsync_single_write" \
+    "0.00390625"
+
+add_bench "ffs-block writeback fsync batch 100x4k (criterion)" \
+    "rch exec -- cargo bench -p ffs-block --bench arc_cache -- writeback_sync_100x4k" \
+    "ffs_block_writeback_sync_100x4k.json" \
+    "fsync_batch_100" \
+    "0.390625"
+
+configure_mount_benchmarks
+record_mount_pending_labels
 
 json_mean() {
     jq -r '.results[0].mean' "$1"
@@ -558,6 +803,39 @@ for i in "${!BENCH_LABELS[@]}"; do
 done
 echo ""
 
+build_pending_json() {
+    local pending_json
+    pending_json='[]'
+    local operation
+    for operation in mount_cold mount_warm mount_recovery; do
+        local reason
+        reason="${PENDING_REASONS[$operation]:-}"
+        if [ -z "$reason" ]; then
+            continue
+        fi
+        pending_json="$(
+            jq -n \
+                --argjson prior "$pending_json" \
+                --arg operation "$operation" \
+                --arg reason "$reason" \
+                '$prior + [{
+                    operation: $operation,
+                    metric: "latency",
+                    command: "",
+                    source_json: "",
+                    p50_us: 0,
+                    p95_us: 0,
+                    p99_us: 0,
+                    throughput_ops_sec: 0,
+                    throughput_mb_sec: 0,
+                    status: "pending",
+                    reason: $reason
+                }]'
+        )"
+    done
+    echo "$pending_json"
+}
+
 write_perf_baseline_json() {
     local tmp_measurements
     tmp_measurements="$(mktemp)"
@@ -608,100 +886,9 @@ write_perf_baseline_json() {
 
     local measured_json
     local measurements_json
+    local pending_json
     measured_json="$(jq -s '.' "$tmp_measurements")"
-    local pending_json='[
-      {
-        "operation": "write_seq_4k",
-        "metric": "latency",
-        "command": "",
-        "source_json": "",
-        "p50_us": 0,
-        "p95_us": 0,
-        "p99_us": 0,
-        "throughput_ops_sec": 0,
-        "throughput_mb_sec": 0,
-        "status": "pending",
-        "reason": "write-path benchmark scenario not yet automated in benchmark_record.sh"
-      },
-      {
-        "operation": "write_random_4k",
-        "metric": "latency",
-        "command": "",
-        "source_json": "",
-        "p50_us": 0,
-        "p95_us": 0,
-        "p99_us": 0,
-        "throughput_ops_sec": 0,
-        "throughput_mb_sec": 0,
-        "status": "pending",
-        "reason": "write-path benchmark scenario not yet automated in benchmark_record.sh"
-      },
-      {
-        "operation": "fsync_single_write",
-        "metric": "latency",
-        "command": "",
-        "source_json": "",
-        "p50_us": 0,
-        "p95_us": 0,
-        "p99_us": 0,
-        "throughput_ops_sec": 0,
-        "throughput_mb_sec": 0,
-        "status": "pending",
-        "reason": "fsync benchmark scenario not yet automated in benchmark_record.sh"
-      },
-      {
-        "operation": "fsync_batch_100",
-        "metric": "latency",
-        "command": "",
-        "source_json": "",
-        "p50_us": 0,
-        "p95_us": 0,
-        "p99_us": 0,
-        "throughput_ops_sec": 0,
-        "throughput_mb_sec": 0,
-        "status": "pending",
-        "reason": "fsync benchmark scenario not yet automated in benchmark_record.sh"
-      },
-      {
-        "operation": "mount_cold",
-        "metric": "latency",
-        "command": "",
-        "source_json": "",
-        "p50_us": 0,
-        "p95_us": 0,
-        "p99_us": 0,
-        "throughput_ops_sec": 0,
-        "throughput_mb_sec": 0,
-        "status": "pending",
-        "reason": "mount latency scenario not yet automated in benchmark_record.sh"
-      },
-      {
-        "operation": "mount_warm",
-        "metric": "latency",
-        "command": "",
-        "source_json": "",
-        "p50_us": 0,
-        "p95_us": 0,
-        "p99_us": 0,
-        "throughput_ops_sec": 0,
-        "throughput_mb_sec": 0,
-        "status": "pending",
-        "reason": "mount latency scenario not yet automated in benchmark_record.sh"
-      },
-      {
-        "operation": "mount_recovery",
-        "metric": "latency",
-        "command": "",
-        "source_json": "",
-        "p50_us": 0,
-        "p95_us": 0,
-        "p99_us": 0,
-        "throughput_ops_sec": 0,
-        "throughput_mb_sec": 0,
-        "status": "pending",
-        "reason": "mount recovery scenario not yet automated in benchmark_record.sh"
-      }
-    ]'
+    pending_json="$(build_pending_json)"
     measurements_json="$(jq -n --argjson measured "$measured_json" --argjson pending "$pending_json" '$measured + $pending')"
 
     jq -n \

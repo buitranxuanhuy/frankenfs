@@ -1,1 +1,4 @@
-Benchmark 1: rch exec -- cargo run -p ffs-cli --release --quiet -- parity --json
+Benchmark 1: target/release/ffs-cli parity --json
+  Time (mean ± σ):       1.2 ms ±   0.2 ms    [User: 0.6 ms, System: 0.8 ms]
+  Range (min … max):     0.9 ms …   1.6 ms    10 runs
+ 

@@ -1,0 +1,4 @@
+Benchmark 1: target/release/ffs-harness parity
+  Time (mean ± σ):     781.0 µs ± 365.5 µs    [User: 519.7 µs, System: 461.6 µs]
+  Range (min … max):   479.9 µs … 1752.2 µs    10 runs
+ 

@@ -1,0 +1,3 @@
+Benchmark 1: rch exec -- cargo bench -p ffs-block --features s3fifo --bench arc_cache -- block_cache_s3fifo_zipf_distribution
+  Time (abs ≡):        76.541 s               [User: 0.472 s, System: 0.356 s]
+ 

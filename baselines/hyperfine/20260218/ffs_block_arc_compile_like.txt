@@ -1,0 +1,3 @@
+Benchmark 1: rch exec -- cargo bench -p ffs-block --bench arc_cache -- block_cache_arc_compile_like
+  Time (abs ≡):        76.424 s               [User: 0.500 s, System: 0.368 s]
+ 

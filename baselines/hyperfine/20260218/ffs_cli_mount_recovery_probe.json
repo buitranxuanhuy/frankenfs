@@ -1,0 +1,24 @@
+{
+  "results": [
+    {
+      "command": "sudo -n scripts/mount_benchmark_probe.sh --bin target/release/ffs-cli --image baselines/hyperfine/20260218/mount_recovery_probe.ext4 --mount-root /tmp/ffs_mount_probe_manual_recovery --mode recovery",
+      "mean": 0.03513855820666666,
+      "stddev": 0.0006674481508224705,
+      "median": 0.03502049354,
+      "user": 0.00952894,
+      "system": 0.029271153333333338,
+      "min": 0.03453802054,
+      "max": 0.03585716054,
+      "times": [
+        0.03453802054,
+        0.03502049354,
+        0.03585716054
+      ],
+      "exit_codes": [
+        0,
+        0,
+        0
+      ]
+    }
+  ]
+}
