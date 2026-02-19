@@ -217,10 +217,10 @@ fn compute_and_set_checksum(raw: &mut [u8], csum_seed: u32, ino: u32) {
         return;
     }
 
-    // Per-inode seed: crc32c(csum_seed, le_ino) then crc32c(ino_seed, le_gen).
-    let ino_seed = crc32c::crc32c_append(csum_seed, &ino.to_le_bytes());
+    // Per-inode seed: ext4_chksum(csum_seed, le_ino) then ext4_chksum(ino_seed, le_gen).
+    let ino_seed = ffs_ondisk::ext4_chksum(csum_seed, &ino.to_le_bytes());
     let generation = u32::from_le_bytes([raw[0x64], raw[0x65], raw[0x66], raw[0x67]]);
-    let ino_seed = crc32c::crc32c_append(ino_seed, &generation.to_le_bytes());
+    let ino_seed = ffs_ondisk::ext4_chksum(ino_seed, &generation.to_le_bytes());
 
     // Zero out checksum fields before computing.
     raw[INODE_CHECKSUM_LO_OFFSET] = 0;
@@ -231,7 +231,7 @@ fn compute_and_set_checksum(raw: &mut [u8], csum_seed: u32, ino: u32) {
     }
 
     // CRC the entire raw inode.
-    let csum = crc32c::crc32c_append(ino_seed, raw);
+    let csum = ffs_ondisk::ext4_chksum(ino_seed, raw);
 
     // Store checksum.
     let lo = (csum & 0xFFFF) as u16;
@@ -282,6 +282,28 @@ pub fn create_inode(
         }
     }
 
+    // Read old generation from the on-disk inode slot so we can bump it.
+    // This is the NFS-style generation counter: when an inode number is reused,
+    // incrementing the generation lets the FUSE/NFS layer detect stale handles.
+    let old_generation = locate_inode(alloc.ino, geo, groups)
+        .and_then(|loc| {
+            let buf = dev.read_block(cx, loc.block).ok()?;
+            let data = buf.as_slice();
+            let off = loc.byte_offset;
+            // generation lives at offset 0x64 in the raw inode (4 bytes LE).
+            if off + 0x68 <= data.len() {
+                Some(u32::from_le_bytes([
+                    data[off + 0x64],
+                    data[off + 0x65],
+                    data[off + 0x66],
+                    data[off + 0x67],
+                ]))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+
     // Initialize extent tree root (empty tree: magic + 0 entries, max 4, depth 0).
     let mut extent_bytes = vec![0u8; 60];
     extent_bytes[0] = (EXT4_EXTENT_MAGIC & 0xFF) as u8;
@@ -300,7 +322,7 @@ pub fn create_inode(
         links_count: if is_dir { 2 } else { 1 },
         blocks: 0,
         flags: EXT4_EXTENTS_FL,
-        generation: 0,
+        generation: old_generation.wrapping_add(1),
         file_acl: 0,
         atime: now_secs,
         ctime: now_secs,
@@ -1159,5 +1181,61 @@ mod tests {
         let parsed = Ext4Inode::parse_from_bytes(&raw).unwrap();
         assert_eq!(parsed.blocks, 0x1_2345_6789);
         assert_eq!(parsed.file_acl, 0x2_0000_0000);
+    }
+
+    #[test]
+    fn create_inode_bumps_generation_on_reuse() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+
+        // Create first inode — on a zeroed device the old generation is 0,
+        // so the new generation should be 1.
+        let (ino1, inode1) = create_inode(
+            &cx,
+            &dev,
+            &geo,
+            &mut groups,
+            0o100_644,
+            0,
+            0,
+            GroupNumber(0),
+            0,
+            1_700_000_000,
+            0,
+        )
+        .unwrap();
+        assert_eq!(inode1.generation, 1, "first alloc: 0 → 1");
+
+        // Delete then re-create at the same inode slot.
+        let mut del = inode1;
+        delete_inode(
+            &cx,
+            &dev,
+            &geo,
+            &mut groups,
+            ino1,
+            &mut del,
+            0,
+            1_700_000_001,
+        )
+        .unwrap();
+        let (ino2, inode2) = create_inode(
+            &cx,
+            &dev,
+            &geo,
+            &mut groups,
+            0o100_644,
+            0,
+            0,
+            GroupNumber(0),
+            0,
+            1_700_000_002,
+            0,
+        )
+        .unwrap();
+        assert_eq!(ino2, ino1, "should reuse the freed inode number");
+        assert_eq!(inode2.generation, 2, "reuse: 1 → 2");
     }
 }

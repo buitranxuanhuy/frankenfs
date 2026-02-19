@@ -1814,7 +1814,7 @@ mod tests {
         sb[0x64..0x68].copy_from_slice(&Ext4RoCompatFeatures::METADATA_CSUM.0.to_le_bytes());
         sb[0x175] = 1; // checksum_type=crc32c
 
-        let checksum = crc32c::crc32c_append(!0_u32, &sb[..0x3FC]);
+        let checksum = ffs_ondisk::ext4_chksum(!0_u32, &sb[..0x3FC]);
         sb[0x3FC..0x400].copy_from_slice(&checksum.to_le_bytes());
         sb
     }

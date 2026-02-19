@@ -199,6 +199,26 @@ enum Command {
         #[arg(long)]
         tail: Option<usize>,
     },
+    /// Create a new ext4 filesystem image.
+    ///
+    /// Wraps `mkfs.ext4` to create a properly formatted ext4 image,
+    /// then verifies the result via FrankenFS parsing.
+    Mkfs {
+        /// Output path for the new image file.
+        output: PathBuf,
+        /// Image size in megabytes.
+        #[arg(long, default_value = "64")]
+        size_mb: u64,
+        /// Block size in bytes (1024, 2048, or 4096).
+        #[arg(long, default_value = "4096")]
+        block_size: u32,
+        /// Volume label.
+        #[arg(long, default_value = "frankenfs")]
+        label: String,
+        /// Output in JSON format.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl Command {
@@ -210,6 +230,7 @@ impl Command {
             Self::Scrub { .. } => "scrub",
             Self::Parity { .. } => "parity",
             Self::Evidence { .. } => "evidence",
+            Self::Mkfs { .. } => "mkfs",
         }
     }
 }
@@ -324,6 +345,13 @@ fn run() -> Result<()> {
             event_type,
             tail,
         } => evidence_cmd(&ledger, json, event_type.as_deref(), tail),
+        Command::Mkfs {
+            output,
+            size_mb,
+            block_size,
+            label,
+            json,
+        } => mkfs_cmd(&output, size_mb, block_size, &label, json),
     };
 
     let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -1212,6 +1240,115 @@ fn parity(json: bool) -> Result<()> {
         overall_coverage_percent = report.overall_coverage_percent,
         duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
         "parity_complete"
+    );
+
+    Ok(())
+}
+
+// ── Mkfs command ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct MkfsOutput {
+    path: String,
+    size_bytes: u64,
+    block_size: u32,
+    label: String,
+    block_count: u64,
+    groups_count: u32,
+    inodes_count: u32,
+}
+
+fn mkfs_cmd(
+    output: &PathBuf,
+    size_mb: u64,
+    block_size: u32,
+    label: &str,
+    json: bool,
+) -> Result<()> {
+    if ![1024, 2048, 4096].contains(&block_size) {
+        bail!("block_size must be 1024, 2048, or 4096 (got {block_size})");
+    }
+    if size_mb == 0 {
+        bail!("size_mb must be > 0");
+    }
+    if output.exists() {
+        bail!("output file already exists: {}", output.display());
+    }
+
+    let size_bytes = size_mb * 1024 * 1024;
+
+    // Create sparse image file.
+    let f = std::fs::File::create(output)
+        .with_context(|| format!("create image file {}", output.display()))?;
+    f.set_len(size_bytes)
+        .with_context(|| format!("set image size to {size_bytes}"))?;
+    drop(f);
+
+    // Run mkfs.ext4.
+    let mkfs_output = std::process::Command::new("mkfs.ext4")
+        .args([
+            "-F",
+            "-b",
+            &block_size.to_string(),
+            "-L",
+            label,
+            &output.display().to_string(),
+        ])
+        .output()
+        .context("failed to run mkfs.ext4 (is it installed?)")?;
+
+    if !mkfs_output.status.success() {
+        let stderr = String::from_utf8_lossy(&mkfs_output.stderr);
+        // Clean up the partial image on failure.
+        let _ = std::fs::remove_file(output);
+        bail!("mkfs.ext4 failed: {stderr}");
+    }
+
+    // Verify the new image by opening it with FrankenFS.
+    let cx = cli_cx();
+    let fs = OpenFs::open(&cx, output)
+        .with_context(|| format!("verify new image at {}", output.display()))?;
+
+    let result = match &fs.flavor {
+        FsFlavor::Ext4(sb) => MkfsOutput {
+            path: output.display().to_string(),
+            size_bytes,
+            block_size: sb.block_size,
+            label: label.to_owned(),
+            block_count: sb.blocks_count,
+            groups_count: sb.groups_count(),
+            inodes_count: sb.inodes_count,
+        },
+        FsFlavor::Btrfs(_) => unreachable!("mkfs.ext4 created a btrfs image"),
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).context("serialize mkfs output")?
+        );
+    } else {
+        println!("FrankenFS mkfs");
+        println!("  Path:        {}", result.path);
+        println!(
+            "  Size:        {} MiB ({} bytes)",
+            size_mb, result.size_bytes
+        );
+        println!("  Block size:  {}", result.block_size);
+        println!("  Label:       {}", result.label);
+        println!("  Blocks:      {}", result.block_count);
+        println!("  Groups:      {}", result.groups_count);
+        println!("  Inodes:      {}", result.inodes_count);
+        println!("Image created successfully.");
+    }
+
+    info!(
+        target: "ffs::cli",
+        path = %output.display(),
+        size_bytes,
+        block_size,
+        label,
+        "mkfs_complete"
     );
 
     Ok(())

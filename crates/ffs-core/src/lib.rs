@@ -2671,7 +2671,11 @@ impl OpenFs {
 
     /// Read a group descriptor via the device.
     ///
+    /// When `metadata_csum` is enabled, verifies the CRC32C checksum embedded
+    /// in the descriptor before returning it.
+    ///
     /// Returns `FfsError::Format` if this is not an ext4 filesystem.
+    #[expect(clippy::cast_possible_truncation)]
     pub fn read_group_desc(&self, cx: &Cx, group: GroupNumber) -> Result<Ext4GroupDesc, FfsError> {
         let sb = self
             .ext4_superblock()
@@ -2683,6 +2687,20 @@ impl OpenFs {
 
         let mut buf = vec![0_u8; usize::from(desc_size)];
         self.dev.read_exact_at(cx, ByteOffset(offset), &mut buf)?;
+
+        // Verify checksum if metadata_csum is enabled.
+        if let Some(geom) = &self.ext4_geometry {
+            if geom.has_metadata_csum {
+                ffs_ondisk::ext4::verify_group_desc_checksum(
+                    &buf,
+                    geom.csum_seed,
+                    group.0 as u32,
+                    desc_size,
+                )
+                .map_err(|e| parse_to_ffs_error(&e))?;
+            }
+        }
+
         Ext4GroupDesc::parse_from_bytes(&buf, desc_size).map_err(|e| parse_to_ffs_error(&e))
     }
 

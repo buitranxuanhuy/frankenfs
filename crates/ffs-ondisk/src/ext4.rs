@@ -12,6 +12,22 @@ use serde::{Deserialize, Serialize};
 const EXT4_EXTENT_MAGIC: u16 = 0xF30A;
 const EXT_INIT_MAX_LEN: u16 = 1_u16 << 15;
 
+/// Match the Linux kernel's `ext4_chksum()` / `crc32c_le()` convention.
+///
+/// The kernel's `crc32c_le(crc, data, len)` operates on **raw** CRC register
+/// values — no initial or final XOR.  The Rust `crc32c` crate's
+/// `crc32c_append(seed, data)` applies `!` (bitwise complement) to both
+/// input and output, matching the standard CRC32C convention where
+/// `crc32c(data) == crc32c_append(0, data)`.
+///
+/// This wrapper bridges the two conventions:
+/// `ext4_chksum(raw_crc, data) == !crc32c_append(!raw_crc, data)`.
+#[inline]
+#[must_use]
+pub fn ext4_chksum(raw_crc: u32, data: &[u8]) -> u32 {
+    !crc32c::crc32c_append(!raw_crc, data)
+}
+
 // ── ext4 superblock state flags ──────────────────────────────────────────
 
 /// Filesystem was cleanly unmounted.
@@ -656,16 +672,15 @@ impl Ext4Superblock {
     /// If `INCOMPAT_CSUM_SEED` is set, uses the precomputed `checksum_seed` field.
     /// Otherwise, computes `ext4_chksum(~0, uuid)`.
     ///
-    /// The kernel's `ext4_chksum(sbi, seed, data, len)` maps to
-    /// `crc32c::crc32c_append(seed, data)` — **not** `crc32c::crc32c(data)`,
-    /// which uses a different initial value.
+    /// Returns a **raw** CRC register value matching the kernel's convention
+    /// (i.e. the value stored in `sbi->s_csum_seed`).
     #[must_use]
     pub fn csum_seed(&self) -> u32 {
         if self.has_incompat(Ext4IncompatFeatures::CSUM_SEED) {
             self.checksum_seed
         } else {
-            // kernel: ext4_chksum(sbi, ~0, uuid, 16) = crc32c_append(!0, uuid)
-            crc32c::crc32c_append(!0u32, &self.uuid)
+            // kernel: sbi->s_csum_seed = ext4_chksum(~0, uuid, 16) = crc32c_le(!0, uuid)
+            ext4_chksum(!0u32, &self.uuid)
         }
     }
 
@@ -684,7 +699,7 @@ impl Ext4Superblock {
             });
         }
         // kernel: ext4_chksum(sbi, ~0, es, offsetof(s_checksum))
-        let computed = crc32c::crc32c_append(!0u32, &raw_region[..0x3FC]);
+        let computed = ext4_chksum(!0u32, &raw_region[..0x3FC]);
         if computed != self.checksum {
             return Err(ParseError::InvalidField {
                 field: "s_checksum",
@@ -1155,15 +1170,15 @@ pub fn verify_group_desc_checksum(
     let le_group = group_number.to_le_bytes();
 
     // kernel: csum = ext4_chksum(csum_seed, &le_group, 4)
-    let mut csum = crc32c::crc32c_append(csum_seed, &le_group);
+    let mut csum = ext4_chksum(csum_seed, &le_group);
     // kernel: csum = ext4_chksum(csum, gd[0..bg_checksum_offset], offset)
-    csum = crc32c::crc32c_append(csum, &raw_gd[..GD_CHECKSUM_OFFSET]);
+    csum = ext4_chksum(csum, &raw_gd[..GD_CHECKSUM_OFFSET]);
     // kernel: csum = ext4_chksum(csum, &dummy_csum, 2)  (zero out checksum field)
-    csum = crc32c::crc32c_append(csum, &[0, 0]);
+    csum = ext4_chksum(csum, &[0, 0]);
     // kernel: if offset+2 < desc_size, csum rest
     let after_csum = GD_CHECKSUM_OFFSET + 2;
     if after_csum < ds {
-        csum = crc32c::crc32c_append(csum, &raw_gd[after_csum..ds]);
+        csum = ext4_chksum(csum, &raw_gd[after_csum..ds]);
     }
 
     let expected = (csum & 0xFFFF) as u16;
@@ -1194,12 +1209,12 @@ pub fn stamp_group_desc_checksum(
         return;
     }
     let le_group = group_number.to_le_bytes();
-    let mut csum = crc32c::crc32c_append(csum_seed, &le_group);
-    csum = crc32c::crc32c_append(csum, &raw_gd[..GD_CHECKSUM_OFFSET]);
-    csum = crc32c::crc32c_append(csum, &[0, 0]);
+    let mut csum = ext4_chksum(csum_seed, &le_group);
+    csum = ext4_chksum(csum, &raw_gd[..GD_CHECKSUM_OFFSET]);
+    csum = ext4_chksum(csum, &[0, 0]);
     let after_csum = GD_CHECKSUM_OFFSET + 2;
     if after_csum < ds {
-        csum = crc32c::crc32c_append(csum, &raw_gd[after_csum..ds]);
+        csum = ext4_chksum(csum, &raw_gd[after_csum..ds]);
     }
     write_le_u16(raw_gd, GD_CHECKSUM_OFFSET, (csum & 0xFFFF) as u16);
 }
@@ -1234,22 +1249,22 @@ pub fn verify_inode_checksum(
     // Per-inode seed: ext4_chksum(csum_seed, &le_ino, 4)
     //   then:        ext4_chksum(ino_seed, &le_gen, 4)
     let le_ino = ino.to_le_bytes();
-    let ino_seed = crc32c::crc32c_append(csum_seed, &le_ino);
+    let ino_seed = ext4_chksum(csum_seed, &le_ino);
     let generation = read_le_u32(raw_inode, 0x64)?;
     let le_gen = generation.to_le_bytes();
-    let ino_seed = crc32c::crc32c_append(ino_seed, &le_gen);
+    let ino_seed = ext4_chksum(ino_seed, &le_gen);
 
     // CRC base inode (128 bytes), skipping i_checksum_lo at 0x7C (2 bytes)
-    let mut csum = crc32c::crc32c_append(ino_seed, &raw_inode[..INODE_CHECKSUM_LO_OFFSET]);
-    csum = crc32c::crc32c_append(csum, &[0, 0]); // zero out checksum_lo
+    let mut csum = ext4_chksum(ino_seed, &raw_inode[..INODE_CHECKSUM_LO_OFFSET]);
+    csum = ext4_chksum(csum, &[0, 0]); // zero out checksum_lo
     let after_csum_lo = INODE_CHECKSUM_LO_OFFSET + 2;
-    csum = crc32c::crc32c_append(csum, &raw_inode[after_csum_lo..128]);
+    csum = ext4_chksum(csum, &raw_inode[after_csum_lo..128]);
 
     // Extended area (when inode_size > 128)
     if is > 128 {
         // CRC bytes from 128 up to i_checksum_hi (0x82), but don't exceed inode_size
         let hi_bound = INODE_CHECKSUM_HI_OFFSET.min(is);
-        csum = crc32c::crc32c_append(csum, &raw_inode[128..hi_bound]);
+        csum = ext4_chksum(csum, &raw_inode[128..hi_bound]);
 
         // Only handle checksum_hi if the inode is large enough to contain it
         if is >= INODE_CHECKSUM_HI_OFFSET + 2 {
@@ -1258,18 +1273,18 @@ pub fn verify_inode_checksum(
             let extra_end = 128 + usize::from(extra_isize);
             if extra_end >= INODE_CHECKSUM_HI_OFFSET + 2 {
                 // Zero out checksum_hi
-                csum = crc32c::crc32c_append(csum, &[0, 0]);
+                csum = ext4_chksum(csum, &[0, 0]);
                 let after_csum_hi = INODE_CHECKSUM_HI_OFFSET + 2;
                 if after_csum_hi < is {
-                    csum = crc32c::crc32c_append(csum, &raw_inode[after_csum_hi..is]);
+                    csum = ext4_chksum(csum, &raw_inode[after_csum_hi..is]);
                 }
             } else {
                 // No checksum_hi field per extra_isize, CRC the rest
-                csum = crc32c::crc32c_append(csum, &raw_inode[INODE_CHECKSUM_HI_OFFSET..is]);
+                csum = ext4_chksum(csum, &raw_inode[INODE_CHECKSUM_HI_OFFSET..is]);
             }
         } else if hi_bound < is {
             // inode_size < 132: no room for checksum_hi, CRC remaining bytes
-            csum = crc32c::crc32c_append(csum, &raw_inode[hi_bound..is]);
+            csum = ext4_chksum(csum, &raw_inode[hi_bound..is]);
         }
     }
 
@@ -1338,14 +1353,14 @@ pub fn verify_dir_block_checksum(
     // Stored checksum is at block_size - 4.
     let stored = read_le_u32(dir_block, bs - 4)?;
 
-    // Per-inode seed: i_csum_seed = crc32c(crc32c(csum_seed, le_ino), le_gen)
-    let seed = crc32c::crc32c_append(csum_seed, &ino.to_le_bytes());
-    let seed = crc32c::crc32c_append(seed, &generation.to_le_bytes());
+    // Per-inode seed: i_csum_seed = ext4_chksum(ext4_chksum(csum_seed, le_ino), le_gen)
+    let seed = ext4_chksum(csum_seed, &ino.to_le_bytes());
+    let seed = ext4_chksum(seed, &generation.to_le_bytes());
 
     // Kernel checksums block[0..block_size - 12]: the dir entry data before
     // the 12-byte tail. The entire tail struct is excluded from coverage.
     let coverage_end = bs - 12;
-    let computed = crc32c::crc32c_append(seed, &dir_block[..coverage_end]);
+    let computed = ext4_chksum(seed, &dir_block[..coverage_end]);
 
     if computed != stored {
         return Err(ParseError::InvalidField {
@@ -1400,9 +1415,9 @@ pub fn verify_extent_block_checksum(
 
     let stored = read_le_u32(extent_block, tail_off)?;
 
-    let seed = crc32c::crc32c_append(csum_seed, &ino.to_le_bytes());
-    let seed = crc32c::crc32c_append(seed, &generation.to_le_bytes());
-    let computed = crc32c::crc32c_append(seed, &extent_block[..tail_off]);
+    let seed = ext4_chksum(csum_seed, &ino.to_le_bytes());
+    let seed = ext4_chksum(seed, &generation.to_le_bytes());
+    let computed = ext4_chksum(seed, &extent_block[..tail_off]);
 
     if computed != stored {
         return Err(ParseError::InvalidField {
@@ -4905,8 +4920,8 @@ mod tests {
     #[test]
     fn group_desc_checksum_round_trip() {
         let uuid = [1_u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
-        // Compute csum_seed = ext4_chksum(~0, uuid, 16) = crc32c_append(!0, uuid)
-        let csum_seed = crc32c::crc32c_append(!0u32, &uuid);
+        // Compute csum_seed = ext4_chksum(~0, uuid, 16)
+        let csum_seed = ext4_chksum(!0u32, &uuid);
 
         let group_number: u32 = 0;
         let desc_size: u16 = 32;
@@ -4920,12 +4935,12 @@ mod tests {
 
         // Compute the checksum the same way the kernel does
         let le_group = group_number.to_le_bytes();
-        let mut csum = crc32c::crc32c_append(csum_seed, &le_group);
-        csum = crc32c::crc32c_append(csum, &gd[..GD_CHECKSUM_OFFSET]);
-        csum = crc32c::crc32c_append(csum, &[0, 0]);
+        let mut csum = ext4_chksum(csum_seed, &le_group);
+        csum = ext4_chksum(csum, &gd[..GD_CHECKSUM_OFFSET]);
+        csum = ext4_chksum(csum, &[0, 0]);
         let after = GD_CHECKSUM_OFFSET + 2;
         if after < 32 {
-            csum = crc32c::crc32c_append(csum, &gd[after..32]);
+            csum = ext4_chksum(csum, &gd[after..32]);
         }
         let checksum = (csum & 0xFFFF) as u16;
 
@@ -4946,7 +4961,7 @@ mod tests {
     #[test]
     fn inode_checksum_round_trip() {
         let uuid = [0xAA_u8; 16];
-        let csum_seed = crc32c::crc32c_append(!0u32, &uuid);
+        let csum_seed = ext4_chksum(!0u32, &uuid);
         let ino: u32 = 2;
         let inode_size: u16 = 256;
 
@@ -4961,20 +4976,20 @@ mod tests {
         raw[0x80..0x82].copy_from_slice(&32_u16.to_le_bytes());
 
         // Compute checksum:
-        // ino_seed = crc32c_append(csum_seed, le_ino)
-        // ino_seed = crc32c_append(ino_seed, le_gen)
-        let ino_seed = crc32c::crc32c_append(csum_seed, &ino.to_le_bytes());
-        let ino_seed = crc32c::crc32c_append(ino_seed, &42_u32.to_le_bytes());
+        // ino_seed = ext4_chksum(csum_seed, le_ino)
+        // ino_seed = ext4_chksum(ino_seed, le_gen)
+        let ino_seed = ext4_chksum(csum_seed, &ino.to_le_bytes());
+        let ino_seed = ext4_chksum(ino_seed, &42_u32.to_le_bytes());
 
         // CRC base inode, zeroing i_checksum_lo at 0x7C
-        let mut csum = crc32c::crc32c_append(ino_seed, &raw[..INODE_CHECKSUM_LO_OFFSET]);
-        csum = crc32c::crc32c_append(csum, &[0, 0]);
-        csum = crc32c::crc32c_append(csum, &raw[INODE_CHECKSUM_LO_OFFSET + 2..128]);
+        let mut csum = ext4_chksum(ino_seed, &raw[..INODE_CHECKSUM_LO_OFFSET]);
+        csum = ext4_chksum(csum, &[0, 0]);
+        csum = ext4_chksum(csum, &raw[INODE_CHECKSUM_LO_OFFSET + 2..128]);
 
         // Extended area, zeroing i_checksum_hi at 0x82
-        csum = crc32c::crc32c_append(csum, &raw[128..INODE_CHECKSUM_HI_OFFSET]);
-        csum = crc32c::crc32c_append(csum, &[0, 0]);
-        csum = crc32c::crc32c_append(csum, &raw[INODE_CHECKSUM_HI_OFFSET + 2..256]);
+        csum = ext4_chksum(csum, &raw[128..INODE_CHECKSUM_HI_OFFSET]);
+        csum = ext4_chksum(csum, &[0, 0]);
+        csum = ext4_chksum(csum, &raw[INODE_CHECKSUM_HI_OFFSET + 2..256]);
 
         // Store lo and hi
         let csum_lo = (csum & 0xFFFF) as u16;
@@ -6637,9 +6652,9 @@ mod tests {
         block[tail_off + 7] = EXT4_FT_DIR_CSUM; // 0xDE
 
         // Compute expected checksum: coverage excludes the entire 12-byte tail
-        let seed = crc32c::crc32c_append(csum_seed, &ino.to_le_bytes());
-        let seed = crc32c::crc32c_append(seed, &generation.to_le_bytes());
-        let checksum = crc32c::crc32c_append(seed, &block[..block_size - 12]);
+        let seed = ext4_chksum(csum_seed, &ino.to_le_bytes());
+        let seed = ext4_chksum(seed, &generation.to_le_bytes());
+        let checksum = ext4_chksum(seed, &block[..block_size - 12]);
 
         // Store checksum in tail (last 4 bytes)
         block[block_size - 4..].copy_from_slice(&checksum.to_le_bytes());
@@ -6681,9 +6696,9 @@ mod tests {
         // Compute checksum: tail is at 12 + 12 * eh_max = 12 + 12 * 4 = 60
         let eh_max = 4_usize;
         let tail_off = 12 + 12 * eh_max;
-        let seed = crc32c::crc32c_append(csum_seed, &ino.to_le_bytes());
-        let seed = crc32c::crc32c_append(seed, &generation.to_le_bytes());
-        let checksum = crc32c::crc32c_append(seed, &block[..tail_off]);
+        let seed = ext4_chksum(csum_seed, &ino.to_le_bytes());
+        let seed = ext4_chksum(seed, &generation.to_le_bytes());
+        let checksum = ext4_chksum(seed, &block[..tail_off]);
 
         // Store at tail (right after the extent entry slots)
         block[tail_off..tail_off + 4].copy_from_slice(&checksum.to_le_bytes());

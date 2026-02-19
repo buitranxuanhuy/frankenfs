@@ -658,11 +658,14 @@ dependencies = [
  "ffs-block",
  "ffs-core",
  "ffs-error",
+ "ffs-fuse",
  "ffs-ondisk",
  "ffs-types",
+ "fuser",
  "hex",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

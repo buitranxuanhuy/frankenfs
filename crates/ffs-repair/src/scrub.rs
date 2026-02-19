@@ -720,7 +720,7 @@ mod tests {
         sb[0x64..0x68].copy_from_slice(&Ext4RoCompatFeatures::METADATA_CSUM.0.to_le_bytes());
         sb[0x175] = 1; // checksum_type=crc32c
 
-        let checksum = crc32c::crc32c_append(!0_u32, &sb[..0x3FC]);
+        let checksum = ffs_ondisk::ext4_chksum(!0_u32, &sb[..0x3FC]);
         sb[0x3FC..0x400].copy_from_slice(&checksum.to_le_bytes());
         sb
     }
@@ -947,7 +947,7 @@ mod tests {
         sb[0x20..0x24].copy_from_slice(&8192_u32.to_le_bytes()); // blocks_per_group
         sb[0x24..0x28].copy_from_slice(&8192_u32.to_le_bytes()); // clusters_per_group
         sb[0x04..0x08].copy_from_slice(&8193_u32.to_le_bytes()); // blocks_count_lo
-        let checksum = crc32c::crc32c_append(!0_u32, &sb[..0x3FC]);
+        let checksum = ffs_ondisk::ext4_chksum(!0_u32, &sb[..0x3FC]);
         sb[0x3FC..0x400].copy_from_slice(&checksum.to_le_bytes());
         dev.write(BlockNumber(1), sb.to_vec());
 
