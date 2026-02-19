@@ -14835,4 +14835,73 @@ mod tests {
         let dotdot = entries.iter().find(|e| e.name == b"..").unwrap();
         assert_eq!(dotdot.ino, dir_b.ino);
     }
+
+    #[test]
+    fn btrfs_write_rename_dir_cross_parent_nlink() {
+        let (fs, cx) = open_writable_btrfs();
+        let ops: &dyn FsOps = &fs;
+
+        let dir_a = ops
+            .mkdir(&cx, InodeNumber(1), OsStr::new("a"), 0o755, 0, 0)
+            .unwrap();
+        let dir_b = ops
+            .mkdir(&cx, InodeNumber(1), OsStr::new("b"), 0o755, 0, 0)
+            .unwrap();
+
+        // Create a subdirectory under a/.
+        ops.mkdir(&cx, dir_a.ino, OsStr::new("sub"), 0o755, 0, 0)
+            .unwrap();
+
+        // dir_a has nlink=3 (., .., sub's ..), dir_b has nlink=2 (., ..)
+        let a_before = ops.getattr(&cx, dir_a.ino).unwrap();
+        let b_before = ops.getattr(&cx, dir_b.ino).unwrap();
+        assert_eq!(a_before.nlink, 3, "a should have nlink=3 before rename");
+        assert_eq!(b_before.nlink, 2, "b should have nlink=2 before rename");
+
+        // Rename sub from a/ to b/.
+        ops.rename(
+            &cx,
+            dir_a.ino,
+            OsStr::new("sub"),
+            dir_b.ino,
+            OsStr::new("sub"),
+        )
+        .unwrap();
+
+        // After: dir_a nlink=2, dir_b nlink=3.
+        let a_after = ops.getattr(&cx, dir_a.ino).unwrap();
+        let b_after = ops.getattr(&cx, dir_b.ino).unwrap();
+        assert_eq!(a_after.nlink, 2, "a should have nlink=2 after rename");
+        assert_eq!(b_after.nlink, 3, "b should have nlink=3 after rename");
+    }
+
+    #[test]
+    fn btrfs_write_rename_file_same_parent_nlink_unchanged() {
+        let (fs, cx) = open_writable_btrfs();
+        let ops: &dyn FsOps = &fs;
+
+        let file = ops
+            .create(&cx, InodeNumber(1), OsStr::new("old.txt"), 0o644, 0, 0)
+            .unwrap();
+
+        let root_before = ops.getattr(&cx, InodeNumber(1)).unwrap();
+
+        // Rename file within the same directory.
+        ops.rename(
+            &cx,
+            InodeNumber(1),
+            OsStr::new("old.txt"),
+            InodeNumber(1),
+            OsStr::new("new.txt"),
+        )
+        .unwrap();
+
+        // Root nlink should be unchanged (files don't affect parent nlink).
+        let root_after = ops.getattr(&cx, InodeNumber(1)).unwrap();
+        assert_eq!(root_before.nlink, root_after.nlink);
+
+        // File nlink should still be 1.
+        let file_after = ops.getattr(&cx, file.ino).unwrap();
+        assert_eq!(file_after.nlink, 1);
+    }
 }
