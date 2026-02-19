@@ -1001,7 +1001,14 @@ mod tests {
         .expect("orchestrator");
         let result = orchestrator.recover_from_indices(&cx, &[99]);
         assert_eq!(result.evidence.outcome, RecoveryOutcome::Failed);
-        assert!(result.evidence.reason.as_deref().unwrap_or_default().contains("outside source range"));
+        assert!(
+            result
+                .evidence
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("outside source range")
+        );
     }
 
     #[test]
@@ -1032,7 +1039,11 @@ mod tests {
         )
         .expect("orchestrator");
         let result = orchestrator.recover_from_corrupt_blocks(&cx, &[corrupt_abs]);
-        assert!(result.is_success(), "abs block recovery: {:?}", result.evidence);
+        assert!(
+            result.is_success(),
+            "abs block recovery: {:?}",
+            result.evidence
+        );
 
         let restored = device.read_block(&cx, corrupt_abs).expect("read restored");
         assert_eq!(restored.as_slice(), originals[2].as_slice());
@@ -1063,7 +1074,14 @@ mod tests {
         // Block 5 is before source_first (10).
         let result = orchestrator.recover_from_corrupt_blocks(&cx, &[BlockNumber(5)]);
         assert_eq!(result.evidence.outcome, RecoveryOutcome::Failed);
-        assert!(result.evidence.reason.as_deref().unwrap_or_default().contains("outside source range"));
+        assert!(
+            result
+                .evidence
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("outside source range")
+        );
     }
 
     #[test]
@@ -1116,6 +1134,9 @@ mod tests {
         assert_eq!(parsed.group, 5);
         assert_eq!(parsed.generation, 42);
         assert_eq!(parsed.decoder_stats.peeled, 2);
-        assert_eq!(parsed.reason.as_deref(), Some("decoder returned incomplete recovery"));
+        assert_eq!(
+            parsed.reason.as_deref(),
+            Some("decoder returned incomplete recovery")
+        );
     }
 }

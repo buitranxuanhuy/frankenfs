@@ -285,8 +285,7 @@ impl SuccinctBitmap {
             }
         }
         let super_idx = lo;
-        let zeros_before_super =
-            (super_idx as u32) * SUPERBLOCK_BITS - self.superblocks[super_idx];
+        let zeros_before_super = (super_idx as u32) * SUPERBLOCK_BITS - self.superblocks[super_idx];
         let mut remaining = k - zeros_before_super;
 
         // Linear search within blocks.
@@ -306,8 +305,7 @@ impl SuccinctBitmap {
                 next_bit_start - (super_idx as u32) * SUPERBLOCK_BITS - next_local_ones
             } else {
                 let end_bit = (self.len).min(((super_idx + 1) as u32) * SUPERBLOCK_BITS);
-                let total_ones =
-                    self.superblocks[super_idx + 1] - self.superblocks[super_idx];
+                let total_ones = self.superblocks[super_idx + 1] - self.superblocks[super_idx];
                 end_bit - (super_idx as u32) * SUPERBLOCK_BITS - total_ones
             };
 
@@ -513,7 +511,6 @@ fn popcount_range(bitmap: &[u8], bit_start: u32, count: u32) -> u32 {
     total
 }
 
-
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -524,7 +521,7 @@ mod tests {
     fn bitmap_from_pattern(pattern: &str) -> Vec<u8> {
         let bits: Vec<bool> = pattern.chars().map(|c| c == '1').collect();
         let len = bits.len();
-        let bytes = (len as u32).div_ceil(8) as usize;
+        let bytes = len.div_ceil(8);
         let mut bitmap = vec![0_u8; bytes];
         for (i, &bit) in bits.iter().enumerate() {
             if bit {
@@ -713,7 +710,7 @@ mod tests {
     #[test]
     fn partial_byte_len() {
         // Only 5 valid bits in 1 byte.
-        let bitmap = vec![0b00010110_u8]; // bits: 0=0, 1=1, 2=1, 3=0, 4=1
+        let bitmap = vec![0b0001_0110_u8]; // bits: 0=0, 1=1, 2=1, 3=0, 4=1
         let sb = SuccinctBitmap::build(&bitmap, 5);
         assert_eq!(sb.count_ones(), 3);
         assert_eq!(sb.count_zeros(), 2);
@@ -758,7 +755,7 @@ mod tests {
 
         let bitmap_size = 4096;
         let index_overhead = sb.superblocks.len() * 4 + sb.blocks.len() * 2;
-        let overhead_pct = (index_overhead as f64 / bitmap_size as f64) * 100.0;
+        let overhead_pct = (index_overhead as f64 / f64::from(bitmap_size)) * 100.0;
 
         // Must be under 10% as per acceptance criteria.
         assert!(

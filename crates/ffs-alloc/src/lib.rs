@@ -1523,18 +1523,12 @@ mod tests {
 
         // Verify used blocks report correctly.
         for i in 0..10 {
-            assert!(
-                bitmap_get(&bm, i),
-                "block {i} should be used (allocated)"
-            );
+            assert!(bitmap_get(&bm, i), "block {i} should be used (allocated)");
         }
 
         // Verify free blocks report correctly.
         for i in 10..64 {
-            assert!(
-                !bitmap_get(&bm, i),
-                "block {i} should be free"
-            );
+            assert!(!bitmap_get(&bm, i), "block {i} should be free");
         }
     }
 
@@ -1581,7 +1575,8 @@ mod tests {
         let free = bitmap_count_free(&bm, blocks_per_group);
         let expected_free = blocks_per_group - u32::try_from(allocated.len()).unwrap();
         assert_eq!(
-            free, expected_free,
+            free,
+            expected_free,
             "free count ({free}) should equal blocks_per_group ({blocks_per_group}) minus allocated ({})",
             allocated.len()
         );

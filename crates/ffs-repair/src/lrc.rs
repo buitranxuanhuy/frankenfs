@@ -563,7 +563,9 @@ mod tests {
         (0..k)
             .map(|i| {
                 (0..block_size)
-                    .map(|j| ((i * 37 + j * 53) & 0xFF) as u8)
+                    .map(|j| {
+                        u8::try_from((i * 37 + j * 53) & 0xFF).expect("pattern byte fits in u8")
+                    })
                     .collect()
             })
             .collect()
@@ -690,12 +692,7 @@ mod tests {
 
         // 2 failures but only 1 global parity → cannot repair.
         let availability = BlockAvailability {
-            data: vec![
-                None,
-                None,
-                Some(data[2].clone()),
-                Some(data[3].clone()),
-            ],
+            data: vec![None, None, Some(data[2].clone()), Some(data[3].clone())],
             local_parity: vec![],
             global_parity: global.iter().map(|p| Some(p.clone())).collect(),
         };
@@ -721,7 +718,7 @@ mod tests {
         let local = encode_local(&cfg, &data);
 
         // Test local repair in each group.
-        for group in 0..3 {
+        for (group, local_parity) in local.iter().enumerate() {
             let base = group * 4;
             for missing in 0..4 {
                 let available: Vec<Option<&[u8]>> = (0..4)
@@ -734,13 +731,10 @@ mod tests {
                     })
                     .collect();
 
-                let recovered = repair_local_single(
-                    &cfg,
-                    group as u32,
-                    missing as u32,
-                    &available,
-                    &local[group],
-                );
+                let group_u32 = u32::try_from(group).expect("group index fits in u32");
+                let missing_u32 = u32::try_from(missing).expect("missing index fits in u32");
+                let recovered =
+                    repair_local_single(&cfg, group_u32, missing_u32, &available, local_parity);
                 assert_eq!(
                     recovered.as_ref(),
                     Some(&data[base + missing]),

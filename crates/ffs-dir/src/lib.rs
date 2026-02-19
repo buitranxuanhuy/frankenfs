@@ -564,10 +564,7 @@ mod tests {
 
     #[test]
     fn htree_find_leaf_single_entry() {
-        let entries = vec![HtreeEntry {
-            hash: 0,
-            block: 42,
-        }];
+        let entries = vec![HtreeEntry { hash: 0, block: 42 }];
         // Any hash should map to the single leaf block.
         assert_eq!(htree_find_leaf(&entries, 0), Some(42));
         assert_eq!(htree_find_leaf(&entries, 0xFFFF_FFFF), Some(42));

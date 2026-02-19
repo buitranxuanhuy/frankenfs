@@ -162,19 +162,17 @@ impl IoEngine for PreadPwriteEngine {
         let results: Vec<IoCompletion> = ops
             .into_iter()
             .map(|op| match op {
-                IoOp::Read { offset, mut buf } => {
-                    match self.file.read_exact_at(&mut buf, offset) {
-                        Ok(()) => {
-                            let n = buf.len() as u64;
-                            let mut s = self.stats.lock();
-                            s.reads += 1;
-                            s.bytes_read += n;
-                            drop(s);
-                            IoCompletion::Read(buf)
-                        }
-                        Err(e) => IoCompletion::Error(FfsError::Io(e)),
+                IoOp::Read { offset, mut buf } => match self.file.read_exact_at(&mut buf, offset) {
+                    Ok(()) => {
+                        let n = buf.len() as u64;
+                        let mut s = self.stats.lock();
+                        s.reads += 1;
+                        s.bytes_read += n;
+                        drop(s);
+                        IoCompletion::Read(buf)
                     }
-                }
+                    Err(e) => IoCompletion::Error(FfsError::Io(e)),
+                },
                 IoOp::Write { offset, data } => match self.file.write_all_at(&data, offset) {
                     Ok(()) => {
                         let mut s = self.stats.lock();
@@ -455,9 +453,10 @@ mod tests {
 
         // Write blocks individually.
         for i in 0..4 {
+            let byte = u8::try_from(i + 1).expect("test byte fits in u8");
             engine.submit_batch(vec![IoOp::Write {
                 offset: i * 2048,
-                data: vec![(i as u8) + 1; 2048],
+                data: vec![byte; 2048],
             }]);
         }
 
@@ -482,9 +481,10 @@ mod tests {
         ]);
 
         for (i, comp) in completions.iter().enumerate() {
+            let expected = u8::try_from(i + 1).expect("test byte fits in u8");
             match comp {
                 IoCompletion::Read(buf) => {
-                    assert_eq!(buf[0], (i as u8) + 1, "block {i} mismatch");
+                    assert_eq!(buf[0], expected, "block {i} mismatch");
                 }
                 other => panic!("expected Read, got {other:?}"),
             }

@@ -4250,7 +4250,7 @@ mod tests {
         let ext0_off = 3000_u32;
         write_leaf_item(&mut leaf, 1, 256, BTRFS_ITEM_EXTENT_DATA, ext0_off, 32);
         // Set key offset to 0 (file offset)
-        let base1 = HEADER_SIZE + 1 * ITEM_SIZE;
+        let base1 = HEADER_SIZE + ITEM_SIZE;
         leaf[base1 + 9..base1 + 17].copy_from_slice(&0_u64.to_le_bytes());
         leaf[ext0_off as usize..(ext0_off + 32) as usize].copy_from_slice(&inline_payload);
 
@@ -4290,7 +4290,11 @@ mod tests {
             .filter(|e| e.key.objectid == 256 && e.key.item_type == BTRFS_ITEM_EXTENT_DATA)
             .collect();
 
-        assert_eq!(extents.len(), 2, "expected 2 extent_data items for inode 256");
+        assert_eq!(
+            extents.len(),
+            2,
+            "expected 2 extent_data items for inode 256"
+        );
         assert_eq!(extents[0].key.offset, 0, "first extent at file offset 0");
         assert_eq!(
             extents[1].key.offset, 4096,
@@ -4303,7 +4307,7 @@ mod tests {
             BtrfsExtentData::Inline { data, .. } => {
                 assert_eq!(data, b"hello world", "inline extent data mismatch");
             }
-            _ => panic!("expected inline extent, got regular"),
+            BtrfsExtentData::Regular { .. } => panic!("expected inline extent, got regular"),
         }
 
         // Verify regular extent
@@ -4317,7 +4321,7 @@ mod tests {
                 assert_eq!(disk_bytenr, 0x10_000);
                 assert_eq!(num_bytes, 4096);
             }
-            _ => panic!("expected regular extent, got inline"),
+            BtrfsExtentData::Inline { .. } => panic!("expected regular extent, got inline"),
         }
     }
 
@@ -4360,22 +4364,36 @@ mod tests {
         };
 
         // Place two leaf items
-        let entry_a_len = u32::try_from(dir_entry_a.len()).unwrap();
-        let entry_b_len = u32::try_from(dir_entry_b.len()).unwrap();
+        let file_entry_len = u32::try_from(dir_entry_a.len()).unwrap();
+        let subdir_entry_len = u32::try_from(dir_entry_b.len()).unwrap();
         let off_a = 3500_u32;
-        let off_b = off_a + entry_a_len;
+        let off_b = off_a + file_entry_len;
 
         write_header(&mut leaf, logical, 2, 0, BTRFS_FS_TREE_OBJECTID, 10);
-        write_leaf_item(&mut leaf, 0, 256, BTRFS_ITEM_DIR_ITEM, off_a, entry_a_len);
-        write_leaf_item(&mut leaf, 1, 256, BTRFS_ITEM_DIR_ITEM, off_b, entry_b_len);
+        write_leaf_item(
+            &mut leaf,
+            0,
+            256,
+            BTRFS_ITEM_DIR_ITEM,
+            off_a,
+            file_entry_len,
+        );
+        write_leaf_item(
+            &mut leaf,
+            1,
+            256,
+            BTRFS_ITEM_DIR_ITEM,
+            off_b,
+            subdir_entry_len,
+        );
         // Set different key offsets (hash of name) so they are distinct items
         let base0 = HEADER_SIZE;
         leaf[base0 + 9..base0 + 17].copy_from_slice(&100_u64.to_le_bytes());
         let base1 = HEADER_SIZE + ITEM_SIZE;
         leaf[base1 + 9..base1 + 17].copy_from_slice(&200_u64.to_le_bytes());
 
-        leaf[off_a as usize..(off_a + entry_a_len) as usize].copy_from_slice(&dir_entry_a);
-        leaf[off_b as usize..(off_b + entry_b_len) as usize].copy_from_slice(&dir_entry_b);
+        leaf[off_a as usize..(off_a + file_entry_len) as usize].copy_from_slice(&dir_entry_a);
+        leaf[off_b as usize..(off_b + subdir_entry_len) as usize].copy_from_slice(&dir_entry_b);
 
         let blocks: HashMap<u64, Vec<u8>> = [(logical, leaf)].into();
         let mut read = |phys: u64| -> Result<Vec<u8>, ParseError> {
@@ -4712,7 +4730,10 @@ mod tests {
             .expect("no error")
             .expect("should map");
         assert_eq!(m0.devid, 1);
-        assert_eq!(m0.physical, 0x20_0000, "start of chunk maps to start of stripe");
+        assert_eq!(
+            m0.physical, 0x20_0000,
+            "start of chunk maps to start of stripe"
+        );
 
         // Test middle of chunk
         let m1 = map_logical_to_physical(&chunks, 0x10_0000 + 0x4_0000)
@@ -4811,7 +4832,10 @@ mod tests {
             extent.bytenr + extent.num_bytes,
             bg_start + bg_size
         );
-        assert_eq!(extent.num_bytes, 4096, "allocated size should match request");
+        assert_eq!(
+            extent.num_bytes, 4096,
+            "allocated size should match request"
+        );
         assert_eq!(extent.block_group_start, bg_start);
     }
 
@@ -4824,7 +4848,7 @@ mod tests {
         alloc.add_block_group(bg_start, make_data_bg(bg_start, bg_size));
 
         let a1 = alloc.alloc_data(8192).expect("alloc");
-        let bg_after_alloc = alloc.block_group(bg_start).expect("bg").clone();
+        let bg_after_alloc = *alloc.block_group(bg_start).expect("bg");
         assert_eq!(bg_after_alloc.used_bytes, 8192);
         assert_eq!(bg_after_alloc.free_bytes(), bg_size - 8192);
 
@@ -4832,7 +4856,10 @@ mod tests {
             .free_extent(a1.bytenr, a1.num_bytes, false)
             .expect("free");
         let bg_after_free = alloc.block_group(bg_start).expect("bg");
-        assert_eq!(bg_after_free.used_bytes, 0, "used should be zero after free");
+        assert_eq!(
+            bg_after_free.used_bytes, 0,
+            "used should be zero after free"
+        );
         assert_eq!(
             bg_after_free.free_bytes(),
             bg_size,

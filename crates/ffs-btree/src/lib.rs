@@ -2120,7 +2120,7 @@ mod tests {
 
         // Verify all freed ranges.
         let mut physical_starts: Vec<u64> = freed.iter().map(|f| f.physical_start).collect();
-        physical_starts.sort();
+        physical_starts.sort_unstable();
         assert_eq!(physical_starts, vec![1000, 1100, 1200]);
 
         // Tree should be empty now.

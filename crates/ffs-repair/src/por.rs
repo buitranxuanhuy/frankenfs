@@ -350,11 +350,8 @@ where
     let mut failed_indices = Vec::new();
 
     // Build response lookup.
-    let response_map: std::collections::HashMap<u64, &ChallengeResponse> = responses
-        .responses
-        .iter()
-        .map(|r| (r.index, r))
-        .collect();
+    let response_map: std::collections::HashMap<u64, &ChallengeResponse> =
+        responses.responses.iter().map(|r| (r.index, r)).collect();
 
     for challenge in &challenges.challenges {
         let Some(response) = response_map.get(&challenge.index) else {
@@ -432,13 +429,21 @@ mod tests {
         *blake3::hash(b"test-por-key-for-frankenfs").as_bytes()
     }
 
+    fn get_block(blocks: &[Vec<u8>], idx: u64) -> Option<Vec<u8>> {
+        usize::try_from(idx)
+            .ok()
+            .and_then(|i| blocks.get(i))
+            .cloned()
+    }
+
     fn make_blocks(n: usize, block_size: usize) -> Vec<Vec<u8>> {
         (0..n)
             .map(|i| {
                 let mut block = vec![0_u8; block_size];
                 // Fill with deterministic pattern.
                 for (j, byte) in block.iter_mut().enumerate() {
-                    *byte = ((i * 257 + j * 131) & 0xFF) as u8;
+                    *byte =
+                        u8::try_from((i * 257 + j * 131) & 0xFF).expect("pattern byte fits in u8");
                 }
                 block
             })
@@ -456,13 +461,12 @@ mod tests {
     #[test]
     fn authenticator_detects_corruption() {
         let key = test_key();
-        let block = vec![42_u8; 4096];
+        let mut block = vec![42_u8; 4096];
         let auth = compute_authenticator(&key, 0, &block);
 
         // Corrupt one byte.
-        let mut corrupted = block.clone();
-        corrupted[100] ^= 0xFF;
-        assert!(!verify_authenticator(&key, 0, &corrupted, &auth));
+        block[100] ^= 0xFF;
+        assert!(!verify_authenticator(&key, 0, &block, &auth));
     }
 
     #[test]
@@ -490,7 +494,10 @@ mod tests {
         let blocks = make_blocks(100, 4096);
         let table = AuthenticatorTable::build(
             &key,
-            blocks.iter().enumerate().map(|(i, b)| (i as u64, b.as_slice())),
+            blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (i as u64, b.as_slice())),
         );
 
         assert_eq!(table.len(), 100);
@@ -542,7 +549,10 @@ mod tests {
         // Setup: build authenticator table.
         let table = AuthenticatorTable::build(
             &key,
-            blocks.iter().enumerate().map(|(i, b)| (i as u64, b.as_slice())),
+            blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (i as u64, b.as_slice())),
         );
 
         // Challenge.
@@ -550,16 +560,12 @@ mod tests {
         let challenges = ChallengeSet::generate(&seed, 256, 50);
 
         // Response.
-        let responses = respond_to_challenges(&challenges, &table, |idx| {
-            blocks.get(idx as usize).cloned()
-        });
+        let responses = respond_to_challenges(&challenges, &table, |idx| get_block(&blocks, idx));
 
         assert_eq!(responses.responses.len(), 50);
 
         // Verification.
-        let result = verify_responses(&key, &challenges, &responses, |idx| {
-            blocks.get(idx as usize).cloned()
-        });
+        let result = verify_responses(&key, &challenges, &responses, |idx| get_block(&blocks, idx));
 
         assert!(result.audit_passed);
         assert_eq!(result.passed, 50);
@@ -575,7 +581,10 @@ mod tests {
         // Setup with original data.
         let table = AuthenticatorTable::build(
             &key,
-            blocks.iter().enumerate().map(|(i, b)| (i as u64, b.as_slice())),
+            blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (i as u64, b.as_slice())),
         );
 
         // Corrupt block 10.
@@ -586,13 +595,9 @@ mod tests {
         let seed = *blake3::hash(b"detect-corruption").as_bytes();
         let challenges = ChallengeSet::generate(&seed, 256, 256); // all blocks
 
-        let responses = respond_to_challenges(&challenges, &table, |idx| {
-            blocks.get(idx as usize).cloned()
-        });
+        let responses = respond_to_challenges(&challenges, &table, |idx| get_block(&blocks, idx));
 
-        let result = verify_responses(&key, &challenges, &responses, |idx| {
-            blocks.get(idx as usize).cloned()
-        });
+        let result = verify_responses(&key, &challenges, &responses, |idx| get_block(&blocks, idx));
 
         assert!(!result.audit_passed);
         assert_eq!(result.failed, 1);
@@ -606,20 +611,25 @@ mod tests {
 
         let table = AuthenticatorTable::build(
             &key,
-            blocks.iter().enumerate().map(|(i, b)| (i as u64, b.as_slice())),
+            blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (i as u64, b.as_slice())),
         );
 
         let seed = *blake3::hash(b"missing-test").as_bytes();
         let challenges = ChallengeSet::generate(&seed, 100, 100);
 
         // Prover can read all blocks.
-        let responses = respond_to_challenges(&challenges, &table, |idx| {
-            blocks.get(idx as usize).cloned()
-        });
+        let responses = respond_to_challenges(&challenges, &table, |idx| get_block(&blocks, idx));
 
         // Verifier cannot read block 50 (simulates data loss).
         let result = verify_responses(&key, &challenges, &responses, |idx| {
-            if idx == 50 { None } else { blocks.get(idx as usize).cloned() }
+            if idx == 50 {
+                None
+            } else {
+                get_block(&blocks, idx)
+            }
         });
 
         assert!(!result.audit_passed);
@@ -632,21 +642,21 @@ mod tests {
         let blocks = make_blocks(10, 4096);
         let table = AuthenticatorTable::build(
             &key,
-            blocks.iter().enumerate().map(|(i, b)| (i as u64, b.as_slice())),
+            blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (i as u64, b.as_slice())),
         );
 
         let seed = *blake3::hash(b"nonce-test").as_bytes();
         let challenges = ChallengeSet::generate(&seed, 10, 5);
-        let mut responses = respond_to_challenges(&challenges, &table, |idx| {
-            blocks.get(idx as usize).cloned()
-        });
+        let mut responses =
+            respond_to_challenges(&challenges, &table, |idx| get_block(&blocks, idx));
 
         // Tamper with nonce.
         responses.nonce[0] ^= 0xFF;
 
-        let result = verify_responses(&key, &challenges, &responses, |idx| {
-            blocks.get(idx as usize).cloned()
-        });
+        let result = verify_responses(&key, &challenges, &responses, |idx| get_block(&blocks, idx));
 
         assert!(!result.audit_passed);
         assert_eq!(result.failed, 5); // all fail due to nonce mismatch
@@ -657,7 +667,10 @@ mod tests {
         // With 1% corruption, DEFAULT_CHALLENGE_COUNT should give < 2^{-128}.
         let prob = false_negative_probability(0.01, DEFAULT_CHALLENGE_COUNT);
         let bits = -(prob.log2());
-        assert!(bits > 128.0, "security level {bits:.1} bits, expected > 128");
+        assert!(
+            bits > 128.0,
+            "security level {bits:.1} bits, expected > 128"
+        );
     }
 
     #[test]
@@ -675,7 +688,10 @@ mod tests {
         assert_eq!(min_challenges(1.0, 128), 0);
         // 50% corruption needs very few challenges.
         let n = min_challenges(0.5, 128);
-        assert!(n < 200, "50% corruption should need <200 challenges, got {n}");
+        assert!(
+            n < 200,
+            "50% corruption should need <200 challenges, got {n}"
+        );
     }
 
     #[test]
@@ -695,7 +711,10 @@ mod tests {
         let blocks = make_blocks(10, 4096);
         let table = AuthenticatorTable::build(
             &key,
-            blocks.iter().enumerate().map(|(i, b)| (i as u64, b.as_slice())),
+            blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (i as u64, b.as_slice())),
         );
 
         let json = serde_json::to_string(&table).expect("serialize");

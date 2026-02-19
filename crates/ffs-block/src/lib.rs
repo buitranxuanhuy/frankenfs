@@ -3777,6 +3777,27 @@ mod tests {
 
     #[cfg(feature = "s3fifo")]
     #[test]
+    fn s3fifo_small_queue_evicts_in_fifo_order() {
+        // With capacity 20: small_capacity=2.
+        let mut state = ArcState::new(20);
+
+        for key in 0..5_u64 {
+            s3_access(&mut state, BlockNumber(key));
+        }
+
+        let expected_ghost = VecDeque::from(vec![BlockNumber(0), BlockNumber(1), BlockNumber(2)]);
+        assert_eq!(
+            state.b1, expected_ghost,
+            "small-queue victims should enter ghost in FIFO order"
+        );
+        assert!(
+            state.t2.is_empty(),
+            "single-touch keys should not be promoted to main during small-queue eviction"
+        );
+    }
+
+    #[cfg(feature = "s3fifo")]
+    #[test]
     fn s3fifo_second_chance_rotation_in_main() {
         // With capacity 10: small_capacity=1, main_capacity=9.
         let mut state = ArcState::new(10);
@@ -3854,6 +3875,38 @@ mod tests {
         assert!(
             hot_after >= 2,
             "at least 2 of 5 hot keys should survive the scan, got {hot_after}"
+        );
+    }
+
+    #[cfg(feature = "s3fifo")]
+    #[test]
+    fn s3fifo_sequential_scan_cold_keys_stay_out_of_main() {
+        let mut state = ArcState::new(20);
+        let hot_keys: Vec<BlockNumber> = (0..8_u64).map(BlockNumber).collect();
+
+        for &key in &hot_keys {
+            for _ in 0..3 {
+                s3_access(&mut state, key);
+            }
+        }
+        assert!(
+            hot_keys.iter().any(|key| state.t2.contains(key)),
+            "warming should place at least one hot key into main queue"
+        );
+
+        for key in 100..160_u64 {
+            s3_access(&mut state, BlockNumber(key));
+        }
+
+        for key in 100..160_u64 {
+            assert!(
+                !state.t2.contains(&BlockNumber(key)),
+                "cold scan key {key} should remain filtered from main queue"
+            );
+        }
+        assert!(
+            state.t2.iter().all(|key| hot_keys.contains(key)),
+            "main queue should only contain hot keys after scan"
         );
     }
 
@@ -5081,7 +5134,11 @@ mod tests {
                     }
                 })
                 .expect("create reader task");
-            runtime.scheduler.lock().schedule(task_id, 0);
+            runtime
+                .scheduler
+                .lock()
+                .expect("scheduler lock not poisoned")
+                .schedule(task_id, 0);
         }
 
         for writer in 0..WRITERS {
@@ -5102,7 +5159,11 @@ mod tests {
                     }
                 })
                 .expect("create writer task");
-            runtime.scheduler.lock().schedule(task_id, 0);
+            runtime
+                .scheduler
+                .lock()
+                .expect("scheduler lock not poisoned")
+                .schedule(task_id, 0);
         }
 
         runtime.run_until_quiescent();

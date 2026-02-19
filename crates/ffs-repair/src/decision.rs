@@ -86,30 +86,30 @@ pub fn loss(state: RepairState, action: RepairAction) -> f64 {
         // Clean state: repairs are unnecessary overhead.
         (Clean, RepairLocal) => 5.0,
         (Clean, RepairGlobal) => 20.0,
-        (Clean, DeferRepair) => 0.0,   // correct: do nothing
+        (Clean, DeferRepair) => 0.0,      // correct: do nothing
         (Clean, DegradeReadonly) => 50.0, // massive over-reaction
         (Clean, EmergencyBackup) => 100.0,
 
         // Minor corruption: local repair is the expected case.
-        (MinorCorruption, RepairLocal) => 2.0,     // best action
-        (MinorCorruption, RepairGlobal) => 10.0,    // overkill
-        (MinorCorruption, DeferRepair) => 15.0,     // risky delay
-        (MinorCorruption, DegradeReadonly) => 40.0,  // over-reaction
+        (MinorCorruption, RepairLocal) => 2.0,   // best action
+        (MinorCorruption, RepairGlobal) => 10.0, // overkill
+        (MinorCorruption, DeferRepair) => 15.0,  // risky delay
+        (MinorCorruption, DegradeReadonly) => 40.0, // over-reaction
         (MinorCorruption, EmergencyBackup) => 80.0,
 
         // Severe corruption: need stronger intervention.
-        (SevereCorruption, RepairLocal) => 30.0,     // may not suffice
-        (SevereCorruption, RepairGlobal) => 8.0,     // best action
-        (SevereCorruption, DeferRepair) => 60.0,     // high data-loss risk
-        (SevereCorruption, DegradeReadonly) => 20.0,  // safe but costly
+        (SevereCorruption, RepairLocal) => 30.0, // may not suffice
+        (SevereCorruption, RepairGlobal) => 8.0, // best action
+        (SevereCorruption, DeferRepair) => 60.0, // high data-loss risk
+        (SevereCorruption, DegradeReadonly) => 20.0, // safe but costly
         (SevereCorruption, EmergencyBackup) => 25.0,
 
         // I/O stall: repairs are unreliable, safety first.
-        (IoStall, RepairLocal) => 50.0,       // repair may fail
-        (IoStall, RepairGlobal) => 50.0,      // repair may fail
-        (IoStall, DeferRepair) => 70.0,       // hardware degrading
-        (IoStall, DegradeReadonly) => 10.0,    // best action
-        (IoStall, EmergencyBackup) => 15.0,   // also reasonable
+        (IoStall, RepairLocal) => 50.0,     // repair may fail
+        (IoStall, RepairGlobal) => 50.0,    // repair may fail
+        (IoStall, DeferRepair) => 70.0,     // hardware degrading
+        (IoStall, DegradeReadonly) => 10.0, // best action
+        (IoStall, EmergencyBackup) => 15.0, // also reasonable
     }
 }
 
@@ -331,11 +331,7 @@ mod tests {
         assert!(!at_threshold.safety_override);
 
         // Just above threshold, override kicks in.
-        let above = select_action(
-            RepairState::Clean,
-            SAFETY_POSTERIOR_THRESHOLD + 0.001,
-            true,
-        );
+        let above = select_action(RepairState::Clean, SAFETY_POSTERIOR_THRESHOLD + 0.001, true);
         assert!(above.safety_override);
     }
 }

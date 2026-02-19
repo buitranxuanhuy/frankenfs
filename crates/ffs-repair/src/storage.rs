@@ -1056,7 +1056,10 @@ mod tests {
             .expect("write bootstrap");
 
         let symbols = storage.read_repair_symbols(&cx).expect("bootstrap symbols");
-        assert!(symbols.is_empty(), "generation-0 bootstrap should return empty symbols");
+        assert!(
+            symbols.is_empty(),
+            "generation-0 bootstrap should return empty symbols"
+        );
     }
 
     #[test]
@@ -1152,10 +1155,7 @@ mod tests {
             .expect("write bootstrap");
 
         // Gap in ESI sequence: 100, 102 (skipping 101).
-        let gap_symbols = vec![
-            (100, vec![0xAA; 32]),
-            (102, vec![0xBB; 32]),
-        ];
+        let gap_symbols = vec![(100, vec![0xAA; 32]), (102, vec![0xBB; 32])];
         let err = storage
             .write_repair_symbols(&cx, &gap_symbols, 1)
             .expect_err("non-contiguous ESI");

@@ -31,6 +31,29 @@ const COW_HEADER_SIZE: usize = 32;
 
 /// Journal region expressed in block coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalSegment {
+    pub start: BlockNumber,
+    pub blocks: u64,
+}
+
+impl JournalSegment {
+    /// Resolve a segment-relative index to an absolute block number.
+    #[must_use]
+    pub fn resolve(self, index: u64) -> Option<BlockNumber> {
+        if index >= self.blocks {
+            return None;
+        }
+        self.start.0.checked_add(index).map(BlockNumber)
+    }
+
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.blocks == 0
+    }
+}
+
+/// Journal region expressed in block coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JournalRegion {
     pub start: BlockNumber,
     pub blocks: u64,
@@ -130,7 +153,48 @@ pub fn replay_jbd2(
     dev: &dyn BlockDevice,
     journal_region: JournalRegion,
 ) -> Result<ReplayOutcome> {
-    if journal_region.is_empty() {
+    replay_jbd2_inner(cx, dev, journal_region.blocks, |index| {
+        resolve_region_block(journal_region, index)
+    })
+}
+
+/// Replay JBD2 descriptor/commit/revoke blocks from non-contiguous segments.
+///
+/// Segment order defines the journal index order, so the first block of the
+/// second segment immediately follows the last block of the first segment.
+pub fn replay_jbd2_segments(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    journal_segments: &[JournalSegment],
+) -> Result<ReplayOutcome> {
+    if journal_segments.is_empty() {
+        return Err(FfsError::Format(
+            "journal segment list must contain at least one segment".to_owned(),
+        ));
+    }
+    if journal_segments.iter().any(|segment| segment.is_empty()) {
+        return Err(FfsError::Format(
+            "journal segments must not contain zero-length entries".to_owned(),
+        ));
+    }
+
+    let total_blocks = journal_segments.iter().try_fold(0_u64, |acc, segment| {
+        acc.checked_add(segment.blocks)
+            .ok_or_else(|| FfsError::Format("journal segment length overflow".to_owned()))
+    })?;
+
+    replay_jbd2_inner(cx, dev, total_blocks, |index| {
+        resolve_segment_block(journal_segments, index, total_blocks)
+    })
+}
+
+fn replay_jbd2_inner(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    total_blocks: u64,
+    mut resolve_block: impl FnMut(u64) -> Result<BlockNumber>,
+) -> Result<ReplayOutcome> {
+    if total_blocks == 0 {
         return Err(FfsError::Format(
             "journal region must contain at least one block".to_owned(),
         ));
@@ -141,8 +205,8 @@ pub fn replay_jbd2(
     let mut committed_sequences = Vec::new();
 
     let mut idx = 0_u64;
-    while idx < journal_region.blocks {
-        let absolute = resolve_region_block(journal_region, idx)?;
+    while idx < total_blocks {
+        let absolute = resolve_block(idx)?;
         let raw = dev.read_block(cx, absolute)?;
         stats.scanned_blocks = stats.scanned_blocks.saturating_add(1);
 
@@ -174,7 +238,7 @@ pub fn replay_jbd2(
                     let data_index = idx.checked_add(offset_from_descriptor).ok_or_else(|| {
                         FfsError::Format("journal descriptor data index overflow".to_owned())
                     })?;
-                    let data_block = resolve_region_block(journal_region, data_index)?;
+                    let data_block = resolve_block(data_index)?;
                     let data = dev.read_block(cx, data_block)?.as_slice().to_vec();
                     staged.push((tag.target, data));
                 }
@@ -812,6 +876,29 @@ fn resolve_region_block(region: JournalRegion, index: u64) -> Result<BlockNumber
             region.blocks
         ))
     })
+}
+
+fn resolve_segment_block(
+    segments: &[JournalSegment],
+    index: u64,
+    total_blocks: u64,
+) -> Result<BlockNumber> {
+    let mut remaining = index;
+    for segment in segments {
+        if remaining < segment.blocks {
+            return segment.resolve(remaining).ok_or_else(|| {
+                FfsError::Format(format!(
+                    "journal segment offset {remaining} out of range for segment size={}",
+                    segment.blocks
+                ))
+            });
+        }
+        remaining = remaining.saturating_sub(segment.blocks);
+    }
+
+    Err(FfsError::Format(format!(
+        "journal block index {index} out of range (region size={total_blocks})",
+    )))
 }
 
 #[must_use]
@@ -1925,7 +2012,47 @@ mod tests {
         assert_eq!(out.stats.replayed_blocks, 2);
     }
 
+    #[test]
+    fn replay_jbd2_segments_handles_non_contiguous_layout() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let segments = [
+            JournalSegment {
+                start: BlockNumber(10),
+                blocks: 2,
+            },
+            JournalSegment {
+                start: BlockNumber(20),
+                blocks: 2,
+            },
+        ];
+
+        // Descriptor in first segment index 0, payload in first segment index 1.
+        let descriptor = descriptor_block(512, 7, &[(6, JBD2_TAG_FLAG_LAST)]);
+        dev.raw_write(BlockNumber(10), descriptor);
+        dev.raw_write(BlockNumber(11), vec![0xA6; 512]);
+        // Commit in second segment index 0 (global journal index 2).
+        dev.raw_write(BlockNumber(20), commit_block(512, 7));
+
+        let out = replay_jbd2_segments(&cx, &dev, &segments).expect("replay");
+        let target = dev.read_block(&cx, BlockNumber(6)).expect("read target");
+        assert_eq!(target.as_slice(), &[0xA6; 512]);
+        assert_eq!(out.committed_sequences, vec![7]);
+        assert_eq!(out.stats.replayed_blocks, 1);
+    }
+
     // ── Edge-case unit tests ──────────────────────────────────────────────
+
+    #[test]
+    fn journal_segment_resolve_in_range() {
+        let segment = JournalSegment {
+            start: BlockNumber(50),
+            blocks: 4,
+        };
+        assert_eq!(segment.resolve(0), Some(BlockNumber(50)));
+        assert_eq!(segment.resolve(3), Some(BlockNumber(53)));
+        assert_eq!(segment.resolve(4), None);
+    }
 
     #[test]
     fn journal_region_resolve_in_range() {
@@ -1972,6 +2099,22 @@ mod tests {
         };
 
         let err = replay_jbd2(&cx, &dev, region).expect_err("empty region");
+        assert!(matches!(err, FfsError::Format(_)));
+    }
+
+    #[test]
+    fn replay_jbd2_segments_rejects_empty_or_zero_length_segments() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+
+        let err = replay_jbd2_segments(&cx, &dev, &[]).expect_err("empty segments");
+        assert!(matches!(err, FfsError::Format(_)));
+
+        let segments = [JournalSegment {
+            start: BlockNumber(5),
+            blocks: 0,
+        }];
+        let err = replay_jbd2_segments(&cx, &dev, &segments).expect_err("zero-length segment");
         assert!(matches!(err, FfsError::Format(_)));
     }
 

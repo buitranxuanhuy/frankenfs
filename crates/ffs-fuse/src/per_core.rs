@@ -33,8 +33,8 @@
 //! uses standard threads with advisory core assignment via thread naming
 //! and OS scheduler hints. True pinning requires a future `pin` feature.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ── Per-core metrics ───────────────────────────────────────────────────────
 
@@ -172,8 +172,7 @@ pub struct PerCoreConfig {
 impl Default for PerCoreConfig {
     #[expect(clippy::cast_possible_truncation)] // .min(16) always fits u32
     fn default() -> Self {
-        let num_cores = std::thread::available_parallelism()
-            .map_or(4, |n| n.get().min(16) as u32);
+        let num_cores = std::thread::available_parallelism().map_or(4, |n| n.get().min(16) as u32);
         Self {
             num_cores,
             cache_blocks_per_core: 4096,
@@ -189,8 +188,7 @@ impl PerCoreConfig {
     #[expect(clippy::cast_possible_truncation)] // .min(16) always fits u32
     pub fn resolved_cores(&self) -> u32 {
         if self.num_cores == 0 {
-            std::thread::available_parallelism()
-                .map_or(4, |n| n.get().min(16) as u32)
+            std::thread::available_parallelism().map_or(4, |n| n.get().min(16) as u32)
         } else {
             self.num_cores
         }
@@ -536,7 +534,7 @@ mod tests {
     #[test]
     fn hit_rate_calculation() {
         let m = CoreMetrics::new();
-        assert_eq!(m.snapshot().hit_rate(), 0.0); // no data
+        assert!(m.snapshot().hit_rate().abs() < f64::EPSILON); // no data
 
         for _ in 0..7 {
             m.record_hit();

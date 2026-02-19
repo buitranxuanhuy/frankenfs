@@ -270,9 +270,12 @@ struct BlockVersionStatsOutput {
 
 #[derive(Debug, Serialize)]
 struct EbrVersionStatsOutput {
-    retired_versions: u64,
-    reclaimed_versions: u64,
-    pending_versions: u64,
+    #[serde(rename = "retired_versions")]
+    retired: u64,
+    #[serde(rename = "reclaimed_versions")]
+    reclaimed: u64,
+    #[serde(rename = "pending_versions")]
+    pending: u64,
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -475,6 +478,7 @@ fn mvcc_stats_cmd(path: &PathBuf, json: bool) -> Result<()> {
     let mvcc_guard = open_fs.mvcc_store().read();
     let block_stats = mvcc_guard.block_version_stats();
     let ebr_stats = mvcc_guard.ebr_stats();
+    drop(mvcc_guard);
 
     let output = MvccStatsOutput {
         block_versions: BlockVersionStatsOutput {
@@ -486,9 +490,9 @@ fn mvcc_stats_cmd(path: &PathBuf, json: bool) -> Result<()> {
             critical_chain_length: block_stats.critical_chain_length,
         },
         ebr_versions: EbrVersionStatsOutput {
-            retired_versions: ebr_stats.retired_versions,
-            reclaimed_versions: ebr_stats.reclaimed_versions,
-            pending_versions: ebr_stats.pending_versions(),
+            retired: ebr_stats.retired_versions,
+            reclaimed: ebr_stats.reclaimed_versions,
+            pending: ebr_stats.pending_versions(),
         },
     };
 
@@ -519,25 +523,16 @@ fn mvcc_stats_cmd(path: &PathBuf, json: bool) -> Result<()> {
             output.block_versions.critical_chain_length
         );
         println!("ebr_versions:");
-        println!(
-            "  retired_versions: {}",
-            output.ebr_versions.retired_versions
-        );
-        println!(
-            "  reclaimed_versions: {}",
-            output.ebr_versions.reclaimed_versions
-        );
-        println!(
-            "  pending_versions: {}",
-            output.ebr_versions.pending_versions
-        );
+        println!("  retired_versions: {}", output.ebr_versions.retired);
+        println!("  reclaimed_versions: {}", output.ebr_versions.reclaimed);
+        println!("  pending_versions: {}", output.ebr_versions.pending);
     }
 
     info!(
         target: "ffs::cli::mvcc_stats",
         tracked_blocks = output.block_versions.tracked_blocks,
         max_chain_length = output.block_versions.max_chain_length,
-        pending_versions = output.ebr_versions.pending_versions,
+        pending_versions = output.ebr_versions.pending,
         duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
         "mvcc_stats_complete"
     );

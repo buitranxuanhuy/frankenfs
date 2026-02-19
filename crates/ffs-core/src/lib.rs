@@ -1,30 +1,32 @@
 #![forbid(unsafe_code)]
 
 use asupersync::{Cx, RaptorQConfig, SystemPressure};
-use ffs_alloc::{bitmap_count_free, AllocHint, FsGeometry, GroupStats, PersistCtx};
+use ffs_alloc::{AllocHint, FsGeometry, GroupStats, PersistCtx, bitmap_count_free};
 use ffs_block::{
-    read_btrfs_superblock_region, read_ext4_superblock_region, BlockBuf, BlockDevice, ByteDevice,
-    FileByteDevice,
+    BlockBuf, BlockDevice, ByteDevice, FileByteDevice, read_btrfs_superblock_region,
+    read_ext4_superblock_region,
 };
 use ffs_btrfs::{
-    map_logical_to_physical, parse_dir_items, parse_extent_data, parse_inode_item, parse_root_item,
-    walk_tree, BtrfsExtentData, BtrfsInodeItem, BtrfsLeafEntry, BTRFS_FILE_EXTENT_PREALLOC,
-    BTRFS_FILE_EXTENT_REG, BTRFS_FS_TREE_OBJECTID, BTRFS_FT_BLKDEV, BTRFS_FT_CHRDEV, BTRFS_FT_DIR,
-    BTRFS_FT_FIFO, BTRFS_FT_SOCK, BTRFS_FT_SYMLINK, BTRFS_ITEM_DIR_INDEX, BTRFS_ITEM_DIR_ITEM,
-    BTRFS_ITEM_EXTENT_DATA, BTRFS_ITEM_INODE_ITEM, BTRFS_ITEM_ROOT_ITEM,
+    BTRFS_FILE_EXTENT_PREALLOC, BTRFS_FILE_EXTENT_REG, BTRFS_FS_TREE_OBJECTID, BTRFS_FT_BLKDEV,
+    BTRFS_FT_CHRDEV, BTRFS_FT_DIR, BTRFS_FT_FIFO, BTRFS_FT_SOCK, BTRFS_FT_SYMLINK,
+    BTRFS_ITEM_DIR_INDEX, BTRFS_ITEM_DIR_ITEM, BTRFS_ITEM_EXTENT_DATA, BTRFS_ITEM_INODE_ITEM,
+    BTRFS_ITEM_ROOT_ITEM, BtrfsExtentData, BtrfsInodeItem, BtrfsLeafEntry, map_logical_to_physical,
+    parse_dir_items, parse_extent_data, parse_inode_item, parse_root_item, walk_tree,
 };
 use ffs_error::FfsError;
-use ffs_journal::{replay_jbd2, Jbd2WriteStats, Jbd2Writer, JournalRegion, ReplayOutcome};
+use ffs_journal::{
+    Jbd2WriteStats, Jbd2Writer, JournalSegment, ReplayOutcome, replay_jbd2_segments,
+};
 use ffs_mvcc::{CommitError, MvccStore, Transaction};
 use ffs_ondisk::{
-    lookup_in_dir_block, parse_dir_block, parse_extent_tree, parse_inode_extent_tree,
-    parse_sys_chunk_array, BtrfsChunkEntry, BtrfsSuperblock, Ext4DirEntry, Ext4Extent,
-    Ext4FileType, Ext4GroupDesc, Ext4ImageReader, Ext4Inode, Ext4Superblock, Ext4Xattr, ExtentTree,
-    EXT4_ERROR_FS, EXT4_ORPHAN_FS, EXT4_VALID_FS,
+    BtrfsChunkEntry, BtrfsSuperblock, EXT4_ERROR_FS, EXT4_ORPHAN_FS, EXT4_VALID_FS, Ext4DirEntry,
+    Ext4Extent, Ext4FileType, Ext4GroupDesc, Ext4ImageReader, Ext4Inode, Ext4Superblock, Ext4Xattr,
+    ExtentTree, lookup_in_dir_block, parse_dir_block, parse_extent_tree, parse_inode_extent_tree,
+    parse_sys_chunk_array,
 };
 use ffs_types::{
-    BlockNumber, ByteOffset, CommitSeq, GroupNumber, InodeNumber, ParseError, Snapshot, TxnId,
-    EXT4_EXTENTS_FL,
+    BlockNumber, ByteOffset, CommitSeq, EXT4_EXTENTS_FL, GroupNumber, InodeNumber, ParseError,
+    Snapshot, TxnId,
 };
 use ffs_xattr::{XattrStorage, XattrWriteAccess};
 use parking_lot::{Mutex, RwLock};
@@ -1482,39 +1484,43 @@ impl OpenFs {
         }
 
         let mut total_blocks = 0_u64;
-        let mut expected_start = extents[0].physical_start;
+        let mut segments = Vec::with_capacity(extents.len());
         for ext in &extents {
-            if ext.physical_start != expected_start {
-                return Err(FfsError::UnsupportedFeature(
-                    "non-contiguous ext4 journal extents are not supported".to_owned(),
-                ));
-            }
             let len = u64::from(ext.actual_len());
+            if len == 0 {
+                return Err(FfsError::Corruption {
+                    block: ext.physical_start,
+                    detail: "ext4 journal extent has zero length".to_owned(),
+                });
+            }
             total_blocks = total_blocks
                 .checked_add(len)
                 .ok_or_else(|| FfsError::Format("journal extent length overflow".to_owned()))?;
-            expected_start = expected_start
-                .checked_add(len)
-                .ok_or_else(|| FfsError::Format("journal extent range overflow".to_owned()))?;
+            segments.push(JournalSegment {
+                start: BlockNumber(ext.physical_start),
+                blocks: len,
+            });
+        }
+        if segments.is_empty() {
+            return Ok(None);
         }
 
-        let region = JournalRegion {
-            start: BlockNumber(extents[0].physical_start),
-            blocks: total_blocks,
-        };
         let block_dev = ByteDeviceBlockAdapter {
             dev: &*self.dev,
             block_size,
         };
 
+        let journal_start_block = segments[0].start.0;
+        let journal_segment_count = segments.len();
         info!(
             journal_inum,
-            journal_start_block = region.start.0,
-            journal_blocks = region.blocks,
+            journal_start_block,
+            journal_blocks = total_blocks,
+            journal_segments = journal_segment_count,
             replay_mode = ?mode,
             "ext4 journal replay start"
         );
-        let outcome = replay_jbd2(cx, &block_dev, region)?;
+        let outcome = replay_jbd2_segments(cx, &block_dev, &segments)?;
         info!(
             journal_inum,
             scanned_blocks = outcome.stats.scanned_blocks,
@@ -2071,20 +2077,12 @@ impl OpenFs {
     /// ext4 uses inode `2` as root on disk, so we canonicalize at the FsOps
     /// boundary.
     const fn ext4_canonical_inode(ino: InodeNumber) -> InodeNumber {
-        if ino.0 == 1 {
-            InodeNumber(2)
-        } else {
-            ino
-        }
+        if ino.0 == 1 { InodeNumber(2) } else { ino }
     }
 
     /// Translate ext4 on-disk inode numbers back to VFS inode numbers.
     const fn ext4_presented_inode(ino: InodeNumber) -> InodeNumber {
-        if ino.0 == 2 {
-            InodeNumber(1)
-        } else {
-            ino
-        }
+        if ino.0 == 2 { InodeNumber(1) } else { ino }
     }
 
     fn ext4_present_attr(mut attr: InodeAttr) -> InodeAttr {
@@ -3583,7 +3581,7 @@ pub trait FsOps: Send + Sync {
     /// file identified by `ino`. Returns fewer bytes at EOF. Returns
     /// `FfsError::IsDirectory` if `ino` is a directory.
     fn read(&self, cx: &Cx, ino: InodeNumber, offset: u64, size: u32)
-        -> ffs_error::Result<Vec<u8>>;
+    -> ffs_error::Result<Vec<u8>>;
 
     /// Read the target of a symbolic link.
     ///
@@ -6161,11 +6159,7 @@ fn erfc_approx(x: f64) -> f64 {
             + t * (-0.284_496_736
                 + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
     let result = poly * (-x * x).exp();
-    if x >= 0.0 {
-        result
-    } else {
-        2.0 - result
-    }
+    if x >= 0.0 { result } else { 2.0 - result }
 }
 
 /// ln(Beta(a, b)) = ln(Γ(a)) + ln(Γ(b)) - ln(Γ(a+b))
@@ -6787,8 +6781,8 @@ impl FrankenFsEngine {
 mod tests {
     use super::*;
     use ffs_types::{
-        ByteOffset, BTRFS_MAGIC, BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE,
-        EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, EXT4_SUPER_MAGIC,
+        BTRFS_MAGIC, BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE, ByteOffset, EXT4_SUPER_MAGIC,
+        EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE,
     };
     use std::sync::Mutex;
 
@@ -7342,6 +7336,25 @@ mod tests {
     }
 
     #[test]
+    fn open_fs_replays_non_contiguous_internal_journal_transaction() {
+        let image = build_ext4_image_with_non_contiguous_internal_journal();
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let replay = fs
+            .ext4_journal_replay()
+            .expect("journal replay outcome should be present");
+
+        assert_eq!(replay.committed_sequences, vec![1]);
+        assert_eq!(replay.stats.replayed_blocks, 1);
+        assert_eq!(replay.stats.skipped_revoked_blocks, 0);
+
+        let target = fs.read_block_vec(&cx, BlockNumber(15)).unwrap();
+        assert_eq!(&target[..16], b"JBD2-REPLAY-TEST");
+    }
+
+    #[test]
     fn open_fs_skip_mode_reports_journal_present_without_replay() {
         let image = build_ext4_image_with_internal_journal();
         let baseline = image[15 * 4096..15 * 4096 + 16].to_vec();
@@ -7829,6 +7842,69 @@ mod tests {
 
         // Journal block 22: commit.
         let j_commit = 22 * 4096;
+        write_jbd2_header(&mut image[j_commit..j_commit + 4096], 2, 1);
+
+        image
+    }
+
+    /// Build an ext4 image with an internal journal inode backed by two
+    /// non-contiguous extents and one committed JBD2 transaction that rewrites
+    /// block 15.
+    #[allow(clippy::cast_possible_truncation)]
+    fn build_ext4_image_with_non_contiguous_internal_journal() -> Vec<u8> {
+        let mut image = build_ext4_image_with_extents();
+        let sb_off = EXT4_SUPERBLOCK_OFFSET;
+
+        // Enable HAS_JOURNAL and point to internal journal inode #8.
+        let compat = u32::from_le_bytes([
+            image[sb_off + 0x5C],
+            image[sb_off + 0x5D],
+            image[sb_off + 0x5E],
+            image[sb_off + 0x5F],
+        ]);
+        image[sb_off + 0x5C..sb_off + 0x60].copy_from_slice(&(compat | 0x0004).to_le_bytes());
+        image[sb_off + 0xE0..sb_off + 0xE4].copy_from_slice(&8_u32.to_le_bytes());
+
+        // Inode #8 (index 7) -> journal extents:
+        // logical [0..=1] -> physical [20..=21]
+        // logical [2..=2] -> physical [40..=40]
+        let ino8_off: usize = 4 * 4096 + 7 * 256;
+        image[ino8_off..ino8_off + 2].copy_from_slice(&0o100_600_u16.to_le_bytes());
+        image[ino8_off + 4..ino8_off + 8].copy_from_slice(&(3_u32 * 4096).to_le_bytes());
+        image[ino8_off + 0x1A..ino8_off + 0x1C].copy_from_slice(&1_u16.to_le_bytes());
+        image[ino8_off + 0x20..ino8_off + 0x24].copy_from_slice(&0x0008_0000_u32.to_le_bytes());
+        image[ino8_off + 0x80..ino8_off + 0x82].copy_from_slice(&32_u16.to_le_bytes());
+
+        let e = ino8_off + 0x28;
+        image[e..e + 2].copy_from_slice(&0xF30A_u16.to_le_bytes()); // extent magic
+        image[e + 2..e + 4].copy_from_slice(&2_u16.to_le_bytes()); // entries
+        image[e + 4..e + 6].copy_from_slice(&4_u16.to_le_bytes()); // max
+        image[e + 6..e + 8].copy_from_slice(&0_u16.to_le_bytes()); // depth=0
+
+        // extent[0]: logical 0, len 2, start 20
+        image[e + 12..e + 16].copy_from_slice(&0_u32.to_le_bytes());
+        image[e + 16..e + 18].copy_from_slice(&2_u16.to_le_bytes());
+        image[e + 18..e + 20].copy_from_slice(&0_u16.to_le_bytes());
+        image[e + 20..e + 24].copy_from_slice(&20_u32.to_le_bytes());
+
+        // extent[1]: logical 2, len 1, start 40
+        image[e + 24..e + 28].copy_from_slice(&2_u32.to_le_bytes());
+        image[e + 28..e + 30].copy_from_slice(&1_u16.to_le_bytes());
+        image[e + 30..e + 32].copy_from_slice(&0_u16.to_le_bytes());
+        image[e + 32..e + 36].copy_from_slice(&40_u32.to_le_bytes());
+
+        // Journal block 20: descriptor, one tag to target block 15.
+        let j_desc = 20 * 4096;
+        write_jbd2_header(&mut image[j_desc..j_desc + 4096], 1, 1);
+        image[j_desc + 12..j_desc + 16].copy_from_slice(&15_u32.to_be_bytes());
+        image[j_desc + 16..j_desc + 20].copy_from_slice(&0x0000_0008_u32.to_be_bytes()); // LAST_TAG
+
+        // Journal block 21: replay payload.
+        let j_data = 21 * 4096;
+        image[j_data..j_data + 16].copy_from_slice(b"JBD2-REPLAY-TEST");
+
+        // Journal block 40: commit.
+        let j_commit = 40 * 4096;
         write_jbd2_header(&mut image[j_commit..j_commit + 4096], 2, 1);
 
         image
@@ -11067,13 +11143,15 @@ mod tests {
             Some(b"application/octet-stream".to_vec())
         );
 
-        assert!(fs
-            .removexattr(&cx, ino, "user.mime")
-            .expect("removexattr first call"));
+        assert!(
+            fs.removexattr(&cx, ino, "user.mime")
+                .expect("removexattr first call")
+        );
         assert_eq!(fs.getxattr(&cx, ino, "user.mime").expect("getxattr"), None);
-        assert!(!fs
-            .removexattr(&cx, ino, "user.mime")
-            .expect("removexattr second call"));
+        assert!(
+            !fs.removexattr(&cx, ino, "user.mime")
+                .expect("removexattr second call")
+        );
     }
 
     #[test]

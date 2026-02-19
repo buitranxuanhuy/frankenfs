@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::autopilot::{DurabilityAutopilot, OverheadDecision};
-use crate::codec::{encode_group, EncodedGroup};
+use crate::codec::{EncodedGroup, encode_group};
 use crate::evidence::{
     CorruptionDetail, EvidenceLedger, EvidenceRecord, PolicyDecisionDetail, RepairDetail,
     SymbolRefreshDetail,
@@ -1683,7 +1683,7 @@ mod tests {
     use crate::symbol::RepairGroupDescExt;
     use ffs_block::{ArcCache, ArcWritePolicy, BlockBuf, RepairFlushLifecycle};
     use ffs_ondisk::{Ext4IncompatFeatures, Ext4RoCompatFeatures};
-    use ffs_types::{EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, EXT4_SUPER_MAGIC};
+    use ffs_types::{EXT4_SUPER_MAGIC, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE};
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
@@ -2687,15 +2687,21 @@ mod tests {
             records[0].event_type,
             crate::evidence::EvidenceEventType::CorruptionDetected
         );
-        assert!(records
-            .iter()
-            .any(|r| { r.event_type == crate::evidence::EvidenceEventType::RepairAttempted }));
-        assert!(records
-            .iter()
-            .any(|r| { r.event_type == crate::evidence::EvidenceEventType::RepairSucceeded }));
-        assert!(records
-            .iter()
-            .any(|r| { r.event_type == crate::evidence::EvidenceEventType::SymbolRefresh }));
+        assert!(
+            records
+                .iter()
+                .any(|r| { r.event_type == crate::evidence::EvidenceEventType::RepairAttempted })
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| { r.event_type == crate::evidence::EvidenceEventType::RepairSucceeded })
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| { r.event_type == crate::evidence::EvidenceEventType::SymbolRefresh })
+        );
     }
 
     #[test]
@@ -3453,10 +3459,12 @@ mod tests {
             read_generation(&cx, cache.inner(), layout),
             generation_before + 1
         );
-        assert!(queue
-            .drain_queued_groups()
-            .expect("drain queue after daemon run")
-            .is_empty());
+        assert!(
+            queue
+                .drain_queued_groups()
+                .expect("drain queue after daemon run")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3514,12 +3522,16 @@ mod tests {
         let (pipeline, _metrics) = daemon.into_parts();
         let ledger = pipeline.into_ledger();
         let records = crate::evidence::parse_evidence_ledger(ledger);
-        assert!(records
-            .iter()
-            .any(|r| { r.event_type == crate::evidence::EvidenceEventType::ScrubCycleComplete }));
-        assert!(records
-            .iter()
-            .any(|r| r.event_type == crate::evidence::EvidenceEventType::RepairSucceeded));
+        assert!(
+            records.iter().any(|r| {
+                r.event_type == crate::evidence::EvidenceEventType::ScrubCycleComplete
+            })
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| r.event_type == crate::evidence::EvidenceEventType::RepairSucceeded)
+        );
     }
 
     #[test]
