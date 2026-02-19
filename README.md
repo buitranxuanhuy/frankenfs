@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Dicklesworthstone/frankenfs/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
+  <a href="https://github.com/Dicklesworthstone/frankenfs/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg" alt="MIT+Rider License"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-nightly%202024-orange.svg" alt="Rust Nightly"></a>
   <img src="https://img.shields.io/badge/parity-100%25-brightgreen" alt="Parity 100%">
   <img src="https://img.shields.io/badge/unsafe-forbidden-brightgreen.svg" alt="Unsafe Forbidden">
@@ -56,7 +56,7 @@ cargo run -p ffs-harness -- check-fixtures
 cargo run -p ffs-harness -- parity
 
 # One-command self-healing adoption wedge (no FUSE, temp raw image)
-cargo run --example self_heal_demo
+cargo run --bin ffs-demo -- self-healing
 
 # Full CI gate
 cargo fmt --check
@@ -461,4 +461,4 @@ Please don't take this the wrong way, but I do not accept outside contributions 
 
 ## License
 
-[MIT](LICENSE)
+[MIT License (with OpenAI/Anthropic Rider)](LICENSE)

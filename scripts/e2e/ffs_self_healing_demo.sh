@@ -61,21 +61,27 @@ e2e_step "Phase 2: run self-healing demo E2E test suite"
 
 e2e_assert $CARGO_CMD test -p ffs-repair --test self_healing_demo_e2e -- --nocapture
 
-# ── Phase 3: run existing unit-level demo test ───────────────────────────────
+# ── Phase 3: verify single-command binary path ───────────────────────────────
 
-e2e_step "Phase 3: run demo unit test"
+e2e_step "Phase 3: verify ffs-demo binary command"
+
+e2e_assert $CARGO_CMD run -p ffs-repair --bin ffs-demo -- self-healing
+
+# ── Phase 4: run existing unit-level demo test ───────────────────────────────
+
+e2e_step "Phase 4: run demo unit test"
 
 e2e_assert $CARGO_CMD test -p ffs-repair demo::tests::demo_output_has_expected_shape -- --nocapture
 
-# ── Phase 4: run basic integration test ──────────────────────────────────────
+# ── Phase 5: run basic integration test ──────────────────────────────────────
 
-e2e_step "Phase 4: run basic integration test"
+e2e_step "Phase 5: run basic integration test"
 
 e2e_assert $CARGO_CMD test -p ffs-repair --test self_heal_demo -- --nocapture
 
-# ── Phase 5: summary ────────────────────────────────────────────────────────
+# ── Phase 6: summary ────────────────────────────────────────────────────────
 
-e2e_step "Phase 5: summary"
+e2e_step "Phase 6: summary"
 e2e_log "All self-healing demo E2E tests passed:"
 e2e_log "  - Output structure: 6 structured lines with expected prefixes"
 e2e_log "  - Zero data loss: corrupted_blocks == repaired_blocks (2% and 5%)"

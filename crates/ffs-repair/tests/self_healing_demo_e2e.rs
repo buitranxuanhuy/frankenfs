@@ -4,6 +4,7 @@
 //! output, achieves zero data loss, completes within 30 seconds, and
 //! integrates with the evidence ledger.
 
+use std::process::Command;
 use std::time::Instant;
 
 use asupersync::Cx;
@@ -42,13 +43,68 @@ fn run_and_report(label: &str, config: &SelfHealDemoConfig) -> SelfHealDemoResul
     result
 }
 
+fn parse_metric(line: &str, key: &str) -> usize {
+    line.split_whitespace()
+        .find_map(|token| token.strip_prefix(key))
+        .unwrap_or_else(|| panic!("missing metric {key} in line: {line}"))
+        .parse::<usize>()
+        .unwrap_or_else(|err| panic!("invalid metric {key} in line '{line}': {err}"))
+}
+
+// ── Test 0: binary command path ─────────────────────────────────────────────
+
+#[test]
+fn demo_binary_runs_via_self_healing_command() {
+    let started = Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_ffs-demo"))
+        .arg("self-healing")
+        .output()
+        .expect("failed to run ffs-demo binary");
+    let elapsed = started.elapsed();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "ffs-demo failed with status {:?}; stderr:\n{}",
+        output.status.code(),
+        stderr
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout must be utf8");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 6, "expected six output lines, got:\n{stdout}");
+    assert!(lines[0].starts_with("demo start:"));
+    assert!(lines[1].starts_with("image created:"));
+    assert!(lines[2].starts_with("corruption injected:"));
+    assert!(lines[3].starts_with("repair complete:"));
+    assert!(lines[4].starts_with("verification:"));
+    assert_eq!(lines[5], "demo result: PASS");
+
+    let corrupted = parse_metric(lines[2], "blocks_corrupted=");
+    let repaired = parse_metric(lines[3], "blocks_repaired=");
+    assert_eq!(
+        corrupted, repaired,
+        "binary run must repair every corrupted block"
+    );
+    assert!(lines[4].contains("all_ok=true"));
+    assert!(
+        elapsed.as_secs() < 30,
+        "binary command must finish in <30s, took {:.2}s",
+        elapsed.as_secs_f64()
+    );
+}
+
 // ── Test 1: output structure ────────────────────────────────────────────────
 
 #[test]
 fn demo_output_has_six_structured_lines() {
     let result = run_and_report("output_structure", &SelfHealDemoConfig::default());
 
-    assert_eq!(result.output_lines.len(), 6, "expected exactly 6 output lines");
+    assert_eq!(
+        result.output_lines.len(),
+        6,
+        "expected exactly 6 output lines"
+    );
     assert!(
         result.output_lines[0].starts_with("demo start:"),
         "line 0 should start with 'demo start:', got: {}",
@@ -86,7 +142,10 @@ fn demo_output_has_six_structured_lines() {
 fn demo_zero_data_loss_default_config() {
     let result = run_and_report("zero_data_loss_2pct", &SelfHealDemoConfig::default());
 
-    assert!(result.all_ok, "all payload checksums must verify after repair");
+    assert!(
+        result.all_ok,
+        "all payload checksums must verify after repair"
+    );
     assert_eq!(
         result.corrupted_blocks, result.repaired_blocks,
         "every corrupted block must be repaired"
@@ -158,12 +217,27 @@ fn demo_deterministic_with_fixed_seed() {
     assert_eq!(r1.all_ok, r2.all_ok, "same seed must produce same outcome");
 
     // Output lines should match (except timing-dependent fields)
-    assert_eq!(r1.output_lines[0], r2.output_lines[0], "demo start line must match");
-    assert_eq!(r1.output_lines[1], r2.output_lines[1], "image created line must match");
-    assert_eq!(r1.output_lines[2], r2.output_lines[2], "corruption injected line must match");
+    assert_eq!(
+        r1.output_lines[0], r2.output_lines[0],
+        "demo start line must match"
+    );
+    assert_eq!(
+        r1.output_lines[1], r2.output_lines[1],
+        "image created line must match"
+    );
+    assert_eq!(
+        r1.output_lines[2], r2.output_lines[2],
+        "corruption injected line must match"
+    );
     // Line 3 (repair complete) has duration_ms which may differ — skip exact match
-    assert_eq!(r1.output_lines[4], r2.output_lines[4], "verification line must match");
-    assert_eq!(r1.output_lines[5], r2.output_lines[5], "result line must match");
+    assert_eq!(
+        r1.output_lines[4], r2.output_lines[4],
+        "verification line must match"
+    );
+    assert_eq!(
+        r1.output_lines[5], r2.output_lines[5],
+        "result line must match"
+    );
 }
 
 // ── Test 5: evidence ledger integration ─────────────────────────────────────
@@ -196,7 +270,9 @@ fn demo_evidence_ledger_captures_repair_lifecycle() {
             },
         )
         .with_block_range(0, u64::try_from(result.corrupted_blocks).unwrap_or(0));
-        ledger.append(&corruption_record).expect("append corruption");
+        ledger
+            .append(&corruption_record)
+            .expect("append corruption");
 
         // Record repair success
         let repair_record = EvidenceRecord::repair_succeeded(
@@ -242,7 +318,11 @@ fn demo_evidence_ledger_captures_repair_lifecycle() {
         assert_eq!(parsed.block_group, record.block_group);
     }
 
-    eprintln!("  evidence ledger: {} records, {} bytes JSONL", records.len(), buf.len());
+    eprintln!(
+        "  evidence ledger: {} records, {} bytes JSONL",
+        records.len(),
+        buf.len()
+    );
 }
 
 // ── Test 6: output line content parsing ─────────────────────────────────────

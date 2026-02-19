@@ -2,7 +2,7 @@
 name = "ffs-repair"
 version = "0.1.0"
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
@@ -21,6 +21,10 @@ tracing = { workspace = true }
 [dev-dependencies]
 parking_lot = { workspace = true }
 proptest = { workspace = true }
+
+[[bin]]
+name = "ffs-demo"
+path = "src/bin/ffs-demo.rs"
 
 [lints]
 workspace = true
