@@ -277,6 +277,28 @@ single_line_text() {
     tr '\n' ' ' | sed 's/[[:space:]]\+/ /g' | sed 's/^ //; s/ $//'
 }
 
+scrub_probe_is_acceptable() {
+    local exit_code="$1"
+    local stdout_file="$2"
+    if [ "$exit_code" -eq 0 ]; then
+        return 0
+    fi
+    # `ffs-cli scrub --json` returns exit 2 when integrity findings are present.
+    # Treat that as benchmarkable if structured scrub JSON was emitted.
+    if [ "$exit_code" -eq 2 ]; then
+        local scrub_json_tmp
+        scrub_json_tmp="$(mktemp)"
+        sed -n '/^[[:space:]]*{/,${p;}' "$stdout_file" \
+            | sed '/^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}T/,$d' > "$scrub_json_tmp"
+        if [ -s "$scrub_json_tmp" ] && jq -e 'has("blocks_scanned") and has("findings")' "$scrub_json_tmp" >/dev/null 2>&1; then
+            rm -f "$scrub_json_tmp"
+            return 0
+        fi
+        rm -f "$scrub_json_tmp"
+    fi
+    return 1
+}
+
 set_mount_pending_reasons() {
     local reason="$1"
     local recovery_reason="$2"
@@ -487,6 +509,7 @@ fi
 if [ -f "$REF_IMAGE" ]; then
     probe_stderr="${OUT_DIR}/ffs_cli_inspect_probe.stderr"
     scrub_probe_stderr="${OUT_DIR}/ffs_cli_scrub_probe.stderr"
+    scrub_probe_stdout="${OUT_DIR}/ffs_cli_scrub_probe.stdout"
     if [ "$USE_LOCAL_RELEASE_BINS" -eq 1 ]; then
         if "$CLI_BIN" inspect "$REF_IMAGE" --json >/dev/null 2>"$probe_stderr"; then
             add_bench "ffs-cli inspect ext4_8mb_reference.ext4 --json" \
@@ -494,9 +517,15 @@ if [ -f "$REF_IMAGE" ]; then
                 "ffs_cli_inspect_ext4_8mb_reference.json" \
                 "read_metadata_inspect_ext4_reference" \
                 "8"
-            if "$CLI_BIN" scrub "$REF_IMAGE" --json >/dev/null 2>"$scrub_probe_stderr"; then
+            scrub_probe_exit=0
+            if "$CLI_BIN" scrub "$REF_IMAGE" --json >"$scrub_probe_stdout" 2>"$scrub_probe_stderr"; then
+                scrub_probe_exit=0
+            else
+                scrub_probe_exit=$?
+            fi
+            if scrub_probe_is_acceptable "$scrub_probe_exit" "$scrub_probe_stdout"; then
                 add_bench "ffs-cli scrub ext4_8mb_reference.ext4 --json" \
-                    "${CLI_BIN} scrub ${REF_IMAGE} --json" \
+                    "bash -lc '\"${CLI_BIN}\" scrub \"${REF_IMAGE}\" --json >/dev/null || [ \$? -eq 2 ]'" \
                     "ffs_cli_scrub_ext4_8mb_reference.json" \
                     "read_metadata_scrub_ext4_reference" \
                     "8"
@@ -505,11 +534,11 @@ if [ -f "$REF_IMAGE" ]; then
                 if [ -z "$scrub_probe_reason" ]; then
                     scrub_probe_reason="scrub probe returned non-zero with no stderr output"
                 fi
-                SKIPPED_LABELS+=("ffs-cli scrub ext4_8mb_reference.ext4 --json (scrub probe failed: ${scrub_probe_reason})")
+                SKIPPED_LABELS+=("ffs-cli scrub ext4_8mb_reference.ext4 --json (scrub probe failed with exit ${scrub_probe_exit}: ${scrub_probe_reason})")
             fi
         else
             probe_reason="$(tr '\n' ' ' < "$probe_stderr" | sed 's/[[:space:]]\+/ /g' | sed 's/^ //; s/ $//')"
-            SKIPPED_LABELS+=("ffs-cli inspect ext4_8mb_reference.ext4 --json (unsupported by current parser: ${probe_reason})")
+            SKIPPED_LABELS+=("ffs-cli inspect ext4_8mb_reference.ext4 --json (inspect probe failed: ${probe_reason})")
             SKIPPED_LABELS+=("ffs-cli scrub ext4_8mb_reference.ext4 --json (skipped because inspect probe failed)")
         fi
     else
@@ -519,9 +548,15 @@ if [ -f "$REF_IMAGE" ]; then
                 "ffs_cli_inspect_ext4_8mb_reference.json" \
                 "read_metadata_inspect_ext4_reference" \
                 "8"
-            if rch exec -- cargo run -p ffs-cli --release --quiet -- scrub "$REF_IMAGE" --json >/dev/null 2>"$scrub_probe_stderr"; then
+            scrub_probe_exit=0
+            if rch exec -- cargo run -p ffs-cli --release --quiet -- scrub "$REF_IMAGE" --json >"$scrub_probe_stdout" 2>"$scrub_probe_stderr"; then
+                scrub_probe_exit=0
+            else
+                scrub_probe_exit=$?
+            fi
+            if scrub_probe_is_acceptable "$scrub_probe_exit" "$scrub_probe_stdout"; then
                 add_bench "ffs-cli scrub ext4_8mb_reference.ext4 --json" \
-                    "rch exec -- cargo run -p ffs-cli --release --quiet -- scrub ${REF_IMAGE} --json" \
+                    "bash -lc 'rch exec -- cargo run -p ffs-cli --release --quiet -- scrub \"${REF_IMAGE}\" --json >/dev/null || [ \$? -eq 2 ]'" \
                     "ffs_cli_scrub_ext4_8mb_reference.json" \
                     "read_metadata_scrub_ext4_reference" \
                     "8"
@@ -530,11 +565,11 @@ if [ -f "$REF_IMAGE" ]; then
                 if [ -z "$scrub_probe_reason" ]; then
                     scrub_probe_reason="scrub probe returned non-zero with no stderr output"
                 fi
-                SKIPPED_LABELS+=("ffs-cli scrub ext4_8mb_reference.ext4 --json (scrub probe failed: ${scrub_probe_reason})")
+                SKIPPED_LABELS+=("ffs-cli scrub ext4_8mb_reference.ext4 --json (scrub probe failed with exit ${scrub_probe_exit}: ${scrub_probe_reason})")
             fi
         else
             probe_reason="$(tr '\n' ' ' < "$probe_stderr" | sed 's/[[:space:]]\+/ /g' | sed 's/^ //; s/ $//')"
-            SKIPPED_LABELS+=("ffs-cli inspect ext4_8mb_reference.ext4 --json (unsupported by current parser: ${probe_reason})")
+            SKIPPED_LABELS+=("ffs-cli inspect ext4_8mb_reference.ext4 --json (inspect probe failed: ${probe_reason})")
             SKIPPED_LABELS+=("ffs-cli scrub ext4_8mb_reference.ext4 --json (skipped because inspect probe failed)")
         fi
     fi

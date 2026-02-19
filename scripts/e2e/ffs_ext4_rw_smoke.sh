@@ -177,10 +177,6 @@ start_mount() {
     if [[ "$mode" == "rw" ]] && grep -qiE "read-write mount is not yet supported|not yet supported|read-only mode only" "$CURRENT_MOUNT_LOG"; then
         e2e_skip "RW mount is not supported in this build/environment"
     fi
-    if grep -qiE "unsupported feature: non-contiguous ext4 journal extents" "$CURRENT_MOUNT_LOG"; then
-        e2e_skip "Current ext4 mount path does not support this journal layout"
-    fi
-
     if [[ "$allow_failure" == "1" ]]; then
         return 1
     fi

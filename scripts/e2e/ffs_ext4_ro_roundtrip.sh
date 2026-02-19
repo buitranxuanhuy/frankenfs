@@ -339,10 +339,6 @@ start_mount_ro() {
     if grep -qiE "fusermount3: mount failed: Permission denied|fusermount: failed to open /dev/fuse: Operation not permitted|fusermount: mount failed: Operation not permitted" "$CURRENT_MOUNT_LOG"; then
         e2e_skip "FUSE is present but mount is not permitted in this environment"
     fi
-    if grep -qiE "unsupported feature: non-contiguous ext4 journal extents" "$CURRENT_MOUNT_LOG"; then
-        e2e_skip "Current ext4 mount path does not support this journal layout"
-    fi
-
     if [[ $ready_result -eq 2 ]]; then
         e2e_fail "Mount timed out after ${timeout_seconds}s"
     fi
