@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+use asupersync::Cx;
+use ffs_core::{OpenFs, OpenOptions};
 use ffs_harness::{
     GoldenReference, ParityReport, validate_btrfs_chunk_fixture, validate_btrfs_fixture,
     validate_btrfs_leaf_fixture, validate_dir_block_fixture, validate_ext4_fixture,
@@ -225,6 +227,32 @@ fn parity_report_totals_are_consistent() {
 
     assert_eq!(implemented_sum, report.overall_implemented);
     assert_eq!(total_sum, report.overall_total);
+}
+
+#[test]
+fn ext4_reference_image_opens_with_journal_replay_segments() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let image_path = workspace.join("conformance/golden/ext4_8mb_reference.ext4");
+    assert!(
+        image_path.exists(),
+        "expected golden ext4 image at {}",
+        image_path.display()
+    );
+
+    let cx = Cx::for_testing();
+    let fs = OpenFs::open_with_options(&cx, &image_path, &OpenOptions::default())
+        .expect("open ext4 golden image with journal replay");
+    let replay = fs
+        .ext4_journal_replay()
+        .expect("journal-enabled reference image should expose replay outcome");
+
+    assert!(
+        replay.stats.scanned_blocks > 0,
+        "journal replay should scan at least one journal block"
+    );
 }
 
 /// CI gate: verify that every fixture listed in checksums.sha256 exists,

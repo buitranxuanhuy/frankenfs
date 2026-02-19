@@ -359,9 +359,14 @@ impl PersistentMvccStore {
         txn: Transaction,
         use_ssi: bool,
     ) -> std::result::Result<CommitSeq, CommitError> {
-        // Prepare the WAL record before acquiring the store lock.
-        // This minimizes lock contention by doing serialization outside the lock.
+        // Prepare WAL payload metadata before acquiring locks.
         let txn_id = txn.id;
+        let write_blocks: Vec<BlockNumber> = txn.write_set().keys().copied().collect();
+        let cow_blocks: Vec<BlockNumber> = write_blocks
+            .iter()
+            .copied()
+            .filter(|block| txn.staged_physical(*block).is_some())
+            .collect();
         let writes: Vec<WalWrite> = txn
             .write_set()
             .iter()
@@ -371,16 +376,15 @@ impl PersistentMvccStore {
             })
             .collect();
 
-        // Acquire exclusive store lock and commit
+        // Acquire exclusive store lock, apply commit in-memory, then persist to WAL
+        // before releasing visibility to readers.
         let mut store_guard = self.store.write();
         let commit_seq = if use_ssi {
             store_guard.commit_ssi(txn)?
         } else {
             store_guard.commit(txn)?
         };
-        drop(store_guard);
 
-        // Write to WAL (outside store lock to reduce contention)
         let wal_commit = WalCommit {
             commit_seq,
             txn_id,
@@ -394,14 +398,35 @@ impl PersistentMvccStore {
         })?;
 
         let mut wal_guard = self.wal.write();
-        if let Err(_e) = wal_guard.append(&encoded) {
-            // WAL write failed - this is a serious error but the in-memory
-            // commit already happened. In a production system we'd need
-            // more sophisticated error handling here.
-            // For now, we return success since the commit did succeed in memory.
-            // The durability guarantee is weakened in this edge case.
-        } else if self.options.sync_on_commit {
-            let _ = wal_guard.sync();
+        if wal_guard.append(&encoded).is_err() {
+            rollback_in_memory_commit(
+                &mut store_guard,
+                txn_id.0,
+                commit_seq,
+                &write_blocks,
+                &cow_blocks,
+                use_ssi,
+            );
+            return Err(CommitError::Conflict {
+                block: BlockNumber(0),
+                snapshot: CommitSeq(0),
+                observed: CommitSeq(0),
+            });
+        }
+        if self.options.sync_on_commit && wal_guard.sync().is_err() {
+            rollback_in_memory_commit(
+                &mut store_guard,
+                txn_id.0,
+                commit_seq,
+                &write_blocks,
+                &cow_blocks,
+                use_ssi,
+            );
+            return Err(CommitError::Conflict {
+                block: BlockNumber(0),
+                snapshot: CommitSeq(0),
+                observed: CommitSeq(0),
+            });
         }
 
         let mut stats = self.stats.write();
@@ -562,6 +587,59 @@ impl PersistentMvccStore {
 
         Ok(())
     }
+}
+
+fn rollback_in_memory_commit(
+    store: &mut MvccStore,
+    txn_id: u64,
+    commit_seq: CommitSeq,
+    write_blocks: &[BlockNumber],
+    cow_blocks: &[BlockNumber],
+    use_ssi: bool,
+) {
+    for block in write_blocks {
+        let remove_entry = store.versions.get_mut(block).is_some_and(|versions| {
+            if versions
+                .last()
+                .is_some_and(|v| v.commit_seq == commit_seq && v.writer.0 == txn_id)
+            {
+                versions.pop();
+            }
+            versions.is_empty()
+        });
+        if remove_entry {
+            store.versions.remove(block);
+        }
+    }
+
+    for block in cow_blocks {
+        let remove_entry = store
+            .physical_versions
+            .get_mut(block)
+            .is_some_and(|versions| {
+                if versions
+                    .last()
+                    .is_some_and(|v| v.commit_seq == commit_seq && v.writer.0 == txn_id)
+                {
+                    versions.pop();
+                }
+                versions.is_empty()
+            });
+        if remove_entry {
+            store.physical_versions.remove(block);
+        }
+    }
+
+    if use_ssi
+        && let Some(last) = store.ssi_log.last()
+        && last.commit_seq == commit_seq
+        && last.txn_id.0 == txn_id
+    {
+        store.ssi_log.pop();
+    }
+
+    // Roll commit sequence back so the next successful commit can reuse this slot.
+    store.next_commit = commit_seq.0;
 }
 
 /// Write a checkpoint to a writer.
@@ -1095,6 +1173,76 @@ mod tests {
         store.commit(txn).expect("commit");
 
         assert_eq!(store.version_count(), 3);
+    }
+
+    #[test]
+    fn wal_append_failure_rolls_back_commit_state() {
+        let cx = test_cx();
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+
+        let store = PersistentMvccStore::open(&cx, &path).expect("open");
+        let before = store.current_snapshot();
+
+        // Force WAL append failure (invalid seek offset).
+        {
+            let mut wal_guard = store.wal.write();
+            wal_guard.write_pos = u64::MAX;
+        }
+
+        let mut txn = store.begin();
+        txn.stage_write(BlockNumber(77), vec![7; 8]);
+        let result = store.commit(txn);
+        assert!(result.is_err(), "commit must fail when WAL append fails");
+
+        // In-memory state must be unchanged.
+        let after = store.current_snapshot();
+        assert_eq!(after.high, before.high);
+        assert_eq!(store.version_count(), 0);
+        assert_eq!(store.read_visible(BlockNumber(77), after), None);
+
+        let stats = store.wal_stats();
+        assert_eq!(stats.commits_written, 0);
+    }
+
+    #[test]
+    fn wal_append_failure_rolls_back_ssi_log_and_commit_seq() {
+        let cx = test_cx();
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+
+        let store = PersistentMvccStore::open(&cx, &path).expect("open");
+
+        // Force WAL append failure for SSI path too.
+        {
+            let mut wal_guard = store.wal.write();
+            wal_guard.write_pos = u64::MAX;
+        }
+
+        let mut txn = store.begin();
+        txn.stage_write(BlockNumber(91), vec![9; 16]);
+        let result = store.commit_ssi(txn);
+        assert!(
+            result.is_err(),
+            "SSI commit must fail when WAL append fails"
+        );
+
+        // No committed data, no SSI history side-effects.
+        assert_eq!(store.current_snapshot().high, CommitSeq(0));
+        assert_eq!(
+            store.read_visible(BlockNumber(91), store.current_snapshot()),
+            None
+        );
+        let guard = store.store.read();
+        assert!(
+            guard.ssi_log.is_empty(),
+            "failed SSI commit must not leave residual ssi_log entries"
+        );
+        assert_eq!(
+            guard.next_commit, 1,
+            "failed commit must restore next_commit"
+        );
+        drop(guard);
     }
 
     // ── Checkpoint tests ────────────────────────────────────────────────────

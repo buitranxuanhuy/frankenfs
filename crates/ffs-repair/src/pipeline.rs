@@ -439,7 +439,13 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
         ledger_writer: W,
         repair_symbol_count: u32,
     ) -> Self {
-        let metadata_groups = BTreeSet::from([0_u32]);
+        // Default metadata-critical policy applies to the lowest configured
+        // group id (typically the filesystem's primary metadata group).
+        let metadata_groups = groups
+            .iter()
+            .map(|group_cfg| group_cfg.layout.group.0)
+            .min()
+            .map_or_else(BTreeSet::new, |group| BTreeSet::from([group]));
         let refresh_states = groups
             .iter()
             .map(|group_cfg| {
@@ -3353,6 +3359,67 @@ mod tests {
             refresh_detail.symbols_generated,
             policy_detail.symbols_selected
         );
+    }
+
+    #[test]
+    fn default_metadata_group_uses_lowest_configured_group_id() {
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 256);
+        let validator = CorruptBlockValidator::new(vec![]);
+
+        let high_group = GroupConfig {
+            layout: RepairGroupLayout::new(GroupNumber(9), BlockNumber(64), 64, 0, 4)
+                .expect("high layout"),
+            source_first_block: BlockNumber(64),
+            source_block_count: 16,
+        };
+        let low_group = GroupConfig {
+            layout: RepairGroupLayout::new(GroupNumber(7), BlockNumber(0), 64, 0, 4)
+                .expect("low layout"),
+            source_first_block: BlockNumber(0),
+            source_block_count: 16,
+        };
+
+        let mut ledger_buf = Vec::new();
+        let pipeline = ScrubWithRecovery::new(
+            &device,
+            &validator,
+            test_uuid(),
+            vec![high_group, low_group],
+            &mut ledger_buf,
+            4,
+        );
+
+        assert_eq!(pipeline.metadata_groups, BTreeSet::from([7_u32]));
+        assert_eq!(
+            pipeline.refresh_states.get(&7).map(|state| state.policy),
+            Some(RefreshPolicy::Eager)
+        );
+        assert_eq!(
+            pipeline.refresh_states.get(&9).map(|state| state.policy),
+            Some(RefreshPolicy::Lazy {
+                max_staleness: Duration::from_secs(30),
+            })
+        );
+    }
+
+    #[test]
+    fn default_metadata_group_is_empty_when_no_groups_configured() {
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 64);
+        let validator = CorruptBlockValidator::new(vec![]);
+        let mut ledger_buf = Vec::new();
+        let pipeline = ScrubWithRecovery::new(
+            &device,
+            &validator,
+            test_uuid(),
+            Vec::new(),
+            &mut ledger_buf,
+            4,
+        );
+
+        assert!(pipeline.metadata_groups.is_empty());
+        assert!(pipeline.refresh_states.is_empty());
     }
 
     #[test]

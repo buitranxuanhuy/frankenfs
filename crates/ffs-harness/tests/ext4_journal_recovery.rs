@@ -23,6 +23,7 @@ const JBD2_LAST_TAG: u32 = 0x0000_0008;
 #[derive(Clone, Copy, Debug)]
 enum JournalScenario {
     Committed,
+    NonContiguousCommitted,
     Uncommitted,
     Revoked,
 }
@@ -131,6 +132,29 @@ fn ext4_journal_recovery_replays_committed_transaction() {
         replay.stats.skipped_revoked_blocks,
         replay.stats.incomplete_transactions
     );
+
+    assert_eq!(replay.committed_sequences, vec![1]);
+    assert_eq!(replay.stats.replayed_blocks, 1);
+    assert_eq!(replay.stats.skipped_revoked_blocks, 0);
+    assert_eq!(replay.stats.incomplete_transactions, 0);
+    assert_eq!(
+        inspector.read_block_prefix(TARGET_BLOCK, TARGET_PREFIX_LEN),
+        b"JBD2-REPLAY-TEST"
+    );
+}
+
+#[test]
+fn ext4_journal_recovery_replays_non_contiguous_committed_transaction() {
+    let image = build_ext4_image_with_journal(JournalScenario::NonContiguousCommitted);
+    let dev = MemByteDevice::new(image);
+    let inspector = dev.clone();
+    let cx = Cx::for_testing();
+
+    let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default())
+        .expect("open ext4 with non-contiguous committed journal");
+    let replay = fs
+        .ext4_journal_replay()
+        .expect("replay outcome should be present");
 
     assert_eq!(replay.committed_sequences, vec![1]);
     assert_eq!(replay.stats.replayed_blocks, 1);
@@ -264,10 +288,24 @@ fn build_ext4_image_with_journal(scenario: JournalScenario) -> Vec<u8> {
 
     let journal_len_blocks: u16 = match scenario {
         JournalScenario::Revoked => 4,
-        JournalScenario::Committed | JournalScenario::Uncommitted => 3,
+        JournalScenario::Committed
+        | JournalScenario::NonContiguousCommitted
+        | JournalScenario::Uncommitted => 3,
     };
 
-    // Inode #8 (index 7) -> journal extent [block 20..].
+    write_journal_inode_extents(&mut image, scenario, journal_len_blocks);
+    write_journal_payload_prefix(&mut image);
+    write_journal_terminal_block(&mut image, scenario);
+
+    image
+}
+
+fn write_journal_inode_extents(
+    image: &mut [u8],
+    scenario: JournalScenario,
+    journal_len_blocks: u16,
+) {
+    // Inode #8 (index 7) -> journal extents.
     let ino8_off = 4 * BLOCK_SIZE + 7 * 256;
     image[ino8_off..ino8_off + 2].copy_from_slice(&0o100_600_u16.to_le_bytes());
     image[ino8_off + 4..ino8_off + 8]
@@ -278,11 +316,25 @@ fn build_ext4_image_with_journal(scenario: JournalScenario) -> Vec<u8> {
 
     let e = ino8_off + 0x28;
     image[e..e + 2].copy_from_slice(&0xF30A_u16.to_le_bytes()); // extent magic
-    image[e + 2..e + 4].copy_from_slice(&1_u16.to_le_bytes()); // entries
+    image[e + 2..e + 4].copy_from_slice(
+        &(if matches!(scenario, JournalScenario::NonContiguousCommitted) {
+            2_u16
+        } else {
+            1_u16
+        })
+        .to_le_bytes(),
+    );
     image[e + 4..e + 6].copy_from_slice(&4_u16.to_le_bytes()); // max
     image[e + 6..e + 8].copy_from_slice(&0_u16.to_le_bytes()); // depth=0
     image[e + 12..e + 16].copy_from_slice(&0_u32.to_le_bytes()); // logical 0
-    image[e + 16..e + 18].copy_from_slice(&journal_len_blocks.to_le_bytes());
+    image[e + 16..e + 18].copy_from_slice(
+        &(if matches!(scenario, JournalScenario::NonContiguousCommitted) {
+            2_u16
+        } else {
+            journal_len_blocks
+        })
+        .to_le_bytes(),
+    );
     image[e + 18..e + 20].copy_from_slice(&0_u16.to_le_bytes()); // start_hi
     image[e + 20..e + 24].copy_from_slice(
         &u32::try_from(JOURNAL_START_BLOCK)
@@ -290,6 +342,16 @@ fn build_ext4_image_with_journal(scenario: JournalScenario) -> Vec<u8> {
             .to_le_bytes(),
     );
 
+    if matches!(scenario, JournalScenario::NonContiguousCommitted) {
+        // logical [2..=2] -> physical [40..=40]
+        image[e + 24..e + 28].copy_from_slice(&2_u32.to_le_bytes());
+        image[e + 28..e + 30].copy_from_slice(&1_u16.to_le_bytes());
+        image[e + 30..e + 32].copy_from_slice(&0_u16.to_le_bytes());
+        image[e + 32..e + 36].copy_from_slice(&40_u32.to_le_bytes());
+    }
+}
+
+fn write_journal_payload_prefix(image: &mut [u8]) {
     // Baseline payload in target block so tests can prove whether replay wrote.
     let target_off = TARGET_BLOCK * BLOCK_SIZE;
     image[target_off..target_off + TARGET_PREFIX_LEN].copy_from_slice(b"BLOCK15-ORIGINAL");
@@ -311,10 +373,20 @@ fn build_ext4_image_with_journal(scenario: JournalScenario) -> Vec<u8> {
     // Journal block +1: staged payload for target block 15.
     let j_data = (JOURNAL_START_BLOCK + 1) * BLOCK_SIZE;
     image[j_data..j_data + TARGET_PREFIX_LEN].copy_from_slice(b"JBD2-REPLAY-TEST");
+}
 
+fn write_journal_terminal_block(image: &mut [u8], scenario: JournalScenario) {
     match scenario {
         JournalScenario::Committed => {
             let j_commit = (JOURNAL_START_BLOCK + 2) * BLOCK_SIZE;
+            write_jbd2_header(
+                &mut image[j_commit..j_commit + BLOCK_SIZE],
+                JBD2_BLOCKTYPE_COMMIT,
+                1,
+            );
+        }
+        JournalScenario::NonContiguousCommitted => {
+            let j_commit = 40 * BLOCK_SIZE;
             write_jbd2_header(
                 &mut image[j_commit..j_commit + BLOCK_SIZE],
                 JBD2_BLOCKTYPE_COMMIT,
@@ -348,8 +420,6 @@ fn build_ext4_image_with_journal(scenario: JournalScenario) -> Vec<u8> {
             );
         }
     }
-
-    image
 }
 
 fn write_jbd2_header(block: &mut [u8], block_type: u32, sequence: u32) {

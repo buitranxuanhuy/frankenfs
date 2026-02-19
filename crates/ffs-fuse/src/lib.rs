@@ -41,6 +41,7 @@ const MIN_SEQUENTIAL_READS_FOR_BATCH: u32 = 2;
 const COALESCED_FETCH_MULTIPLIER: u32 = 4;
 const MAX_COALESCED_READ_SIZE: u32 = 256 * 1024;
 const MAX_PENDING_READAHEAD_ENTRIES: usize = 64;
+const MAX_ACCESS_PREDICTOR_ENTRIES: usize = 4096;
 const XATTR_FLAG_CREATE: i32 = 0x1;
 const XATTR_FLAG_REPLACE: i32 = 0x2;
 
@@ -278,20 +279,41 @@ struct AccessPattern {
     last_size: u32,
     sequential_count: u32,
     direction: AccessDirection,
+    last_touch: u64,
 }
 
 #[derive(Debug, Default)]
+struct AccessPredictorState {
+    history: BTreeMap<u64, AccessPattern>,
+    next_touch: u64,
+}
+
+#[derive(Debug)]
 struct AccessPredictor {
-    history: Mutex<BTreeMap<u64, AccessPattern>>,
+    state: Mutex<AccessPredictorState>,
+    max_entries: usize,
+}
+
+impl Default for AccessPredictor {
+    fn default() -> Self {
+        Self::new(MAX_ACCESS_PREDICTOR_ENTRIES)
+    }
 }
 
 impl AccessPredictor {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            state: Mutex::new(AccessPredictorState::default()),
+            max_entries: max_entries.max(1),
+        }
+    }
+
     fn fetch_size(&self, ino: InodeNumber, offset: u64, requested: u32) -> u32 {
-        let guard = match self.history.lock() {
+        let guard = match self.state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let pattern = guard.get(&ino.0).copied();
+        let pattern = guard.history.get(&ino.0).copied();
         drop(guard);
 
         let Some(pattern) = pattern else {
@@ -318,35 +340,51 @@ impl AccessPredictor {
             return;
         }
         {
-            let mut guard = match self.history.lock() {
+            let mut guard = match self.state.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            {
-                let entry = guard.entry(ino.0).or_insert(AccessPattern {
-                    last_offset: offset,
-                    last_size: size,
-                    sequential_count: 1,
-                    direction: AccessDirection::Forward,
-                });
 
-                let next_forward_offset =
-                    entry.last_offset.saturating_add(u64::from(entry.last_size));
-                let next_backward_offset = offset.saturating_add(u64::from(size));
+            guard.next_touch = guard.next_touch.saturating_add(1);
+            let touch = guard.next_touch;
+            let entry = guard.history.entry(ino.0).or_insert(AccessPattern {
+                last_offset: offset,
+                last_size: size,
+                sequential_count: 1,
+                direction: AccessDirection::Forward,
+                last_touch: touch,
+            });
 
-                if entry.last_size == size && next_forward_offset == offset {
-                    entry.sequential_count = entry.sequential_count.saturating_add(1);
-                    entry.direction = AccessDirection::Forward;
-                } else if entry.last_size == size && next_backward_offset == entry.last_offset {
-                    entry.sequential_count = entry.sequential_count.saturating_add(1);
-                    entry.direction = AccessDirection::Backward;
-                } else {
-                    entry.sequential_count = 1;
-                    entry.direction = AccessDirection::Forward;
-                }
-                entry.last_offset = offset;
-                entry.last_size = size;
+            let next_forward_offset = entry.last_offset.saturating_add(u64::from(entry.last_size));
+            let next_backward_offset = offset.saturating_add(u64::from(size));
+
+            if entry.last_size == size && next_forward_offset == offset {
+                entry.sequential_count = entry.sequential_count.saturating_add(1);
+                entry.direction = AccessDirection::Forward;
+            } else if entry.last_size == size && next_backward_offset == entry.last_offset {
+                entry.sequential_count = entry.sequential_count.saturating_add(1);
+                entry.direction = AccessDirection::Backward;
+            } else {
+                entry.sequential_count = 1;
+                entry.direction = AccessDirection::Forward;
             }
+            entry.last_offset = offset;
+            entry.last_size = size;
+            entry.last_touch = touch;
+
+            while guard.history.len() > self.max_entries {
+                let oldest_inode = guard
+                    .history
+                    .iter()
+                    .min_by_key(|(inode, pattern)| (pattern.last_touch, *inode))
+                    .map(|(inode, _)| *inode);
+                if let Some(oldest_inode) = oldest_inode {
+                    let _ = guard.history.remove(&oldest_inode);
+                } else {
+                    break;
+                }
+            }
+
             drop(guard);
         }
     }
@@ -3051,6 +3089,53 @@ mod tests {
 
         // Inode 31 has no history — should not batch.
         assert_eq!(predictor.fetch_size(InodeNumber(31), 0, size), size);
+    }
+
+    #[test]
+    fn access_predictor_history_is_bounded() {
+        let predictor = AccessPredictor::new(3);
+        let size = 4096_u32;
+
+        for ino in 0..10_u64 {
+            predictor.record_read(InodeNumber(100 + ino), 0, size);
+        }
+
+        let tracked = {
+            let guard = match predictor.state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.history.len()
+        };
+        assert_eq!(tracked, 3);
+    }
+
+    #[test]
+    fn access_predictor_evicts_least_recent_inode() {
+        let predictor = AccessPredictor::new(2);
+        let size = 4096_u32;
+
+        predictor.record_read(InodeNumber(1), 0, size);
+        predictor.record_read(InodeNumber(2), 0, size);
+        predictor.record_read(InodeNumber(1), u64::from(size), size);
+        predictor.record_read(InodeNumber(3), 0, size);
+
+        let (tracked, has_one, has_two, has_three) = {
+            let guard = match predictor.state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            (
+                guard.history.len(),
+                guard.history.contains_key(&1),
+                guard.history.contains_key(&2),
+                guard.history.contains_key(&3),
+            )
+        };
+        assert_eq!(tracked, 2);
+        assert!(has_one);
+        assert!(!has_two);
+        assert!(has_three);
     }
 
     // ── Concurrent AccessPredictor stress ────────────────────────────────
