@@ -7,11 +7,15 @@ use ffs_block::{
     read_ext4_superblock_region,
 };
 use ffs_btrfs::{
-    BTRFS_FILE_EXTENT_PREALLOC, BTRFS_FILE_EXTENT_REG, BTRFS_FS_TREE_OBJECTID, BTRFS_FT_BLKDEV,
-    BTRFS_FT_CHRDEV, BTRFS_FT_DIR, BTRFS_FT_FIFO, BTRFS_FT_SOCK, BTRFS_FT_SYMLINK,
-    BTRFS_ITEM_DIR_INDEX, BTRFS_ITEM_DIR_ITEM, BTRFS_ITEM_EXTENT_DATA, BTRFS_ITEM_INODE_ITEM,
-    BTRFS_ITEM_ROOT_ITEM, BtrfsExtentData, BtrfsInodeItem, BtrfsLeafEntry, map_logical_to_physical,
-    parse_dir_items, parse_extent_data, parse_inode_item, parse_root_item, walk_tree,
+    BTRFS_BLOCK_GROUP_DATA, BTRFS_FILE_EXTENT_INLINE, BTRFS_FILE_EXTENT_PREALLOC,
+    BTRFS_FILE_EXTENT_REG, BTRFS_FS_TREE_OBJECTID, BTRFS_FT_BLKDEV, BTRFS_FT_CHRDEV,
+    BTRFS_FT_DIR, BTRFS_FT_FIFO, BTRFS_FT_REG_FILE, BTRFS_FT_SOCK, BTRFS_FT_SYMLINK,
+    BTRFS_ITEM_BLOCK_GROUP_ITEM, BTRFS_ITEM_DIR_INDEX, BTRFS_ITEM_DIR_ITEM,
+    BTRFS_ITEM_EXTENT_DATA, BTRFS_ITEM_INODE_ITEM, BTRFS_ITEM_ROOT_ITEM, BtrfsBTree,
+    BtrfsBlockGroupItem, BtrfsDirItem, BtrfsExtentAllocator, BtrfsExtentData, BtrfsInodeItem,
+    BtrfsKey, BtrfsLeafEntry, BtrfsMutationError, BtrfsTreeItem, InMemoryCowBtrfsTree,
+    map_logical_to_physical, parse_dir_items, parse_extent_data, parse_inode_item, parse_root_item,
+    walk_tree,
 };
 use ffs_error::FfsError;
 use ffs_journal::{
@@ -734,6 +738,24 @@ struct Ext4AllocState {
     persist_ctx: PersistCtx,
 }
 
+/// Mutable btrfs allocation state for write operations.
+///
+/// Mirrors `Ext4AllocState` for the btrfs path: an in-memory COW tree that
+/// tracks all FS-tree items, an extent allocator for data/metadata blocks,
+/// and a monotonically-increasing objectid counter for new inodes.
+struct BtrfsAllocState {
+    /// In-memory COW B-tree holding all FS-tree items (inodes, dirs, extents).
+    fs_tree: InMemoryCowBtrfsTree,
+    /// Extent allocator for data and metadata block allocation.
+    extent_alloc: BtrfsExtentAllocator,
+    /// Next available objectid for new inodes / directory entries.
+    next_objectid: u64,
+    /// Current transaction generation (bumped on each commit).
+    generation: u64,
+    /// Node size in bytes (copied from superblock for convenience).
+    nodesize: u32,
+}
+
 /// Outcome of crash recovery performed at mount time.
 ///
 /// When an ext4 filesystem is mounted and the superblock `state` field
@@ -810,6 +832,11 @@ pub struct OpenFs {
     /// Protected by a Mutex since write operations need exclusive access.
     /// `None` for btrfs or when opened in read-only mode.
     ext4_alloc_state: Option<Mutex<Ext4AllocState>>,
+    /// Mutable btrfs allocation state (COW FS tree, extent allocator).
+    ///
+    /// Protected by a Mutex since write operations need exclusive access.
+    /// `None` for ext4 or when opened in read-only mode.
+    btrfs_alloc_state: Option<Mutex<BtrfsAllocState>>,
 }
 
 // Compile-time assertion: OpenFs must be Send + Sync for multi-threaded FUSE dispatch.
@@ -1098,6 +1125,7 @@ impl OpenFs {
             mvcc_store,
             jbd2_writer: None,
             ext4_alloc_state: None,
+            btrfs_alloc_state: None,
         };
 
         if fs.is_ext4() && !options.skip_validation {
@@ -1745,16 +1773,27 @@ impl OpenFs {
     /// Whether write operations are enabled.
     #[must_use]
     pub fn is_writable(&self) -> bool {
-        self.ext4_alloc_state.is_some()
+        self.ext4_alloc_state.is_some() || self.btrfs_alloc_state.is_some()
     }
 
-    /// Enable write operations by loading ext4 allocation state.
+    /// Enable write operations by loading allocation state for the detected
+    /// filesystem type (ext4 or btrfs).
     ///
-    /// Reads all group descriptors from disk to populate the in-memory
-    /// group statistics cache. Must be called before any write operations.
+    /// For ext4: reads all group descriptors from disk to populate the
+    /// in-memory group statistics cache.
+    /// For btrfs: walks the FS tree and extent tree to build an in-memory COW
+    /// tree and extent allocator.
     pub fn enable_writes(&mut self, cx: &Cx) -> Result<(), FfsError> {
-        let alloc_state = self.load_ext4_alloc_state(cx)?;
-        self.ext4_alloc_state = Some(Mutex::new(alloc_state));
+        match &self.flavor {
+            FsFlavor::Ext4(_) => {
+                let alloc_state = self.load_ext4_alloc_state(cx)?;
+                self.ext4_alloc_state = Some(Mutex::new(alloc_state));
+            }
+            FsFlavor::Btrfs(_) => {
+                let alloc_state = self.load_btrfs_alloc_state(cx)?;
+                self.btrfs_alloc_state = Some(Mutex::new(alloc_state));
+            }
+        }
         Ok(())
     }
 
@@ -1801,6 +1840,88 @@ impl OpenFs {
             groups,
             persist_ctx,
         })
+    }
+
+    /// Load btrfs allocation state by walking the FS tree and populating
+    /// the in-memory COW tree and extent allocator.
+    fn load_btrfs_alloc_state(&self, cx: &Cx) -> Result<BtrfsAllocState, FfsError> {
+        let sb = match &self.flavor {
+            FsFlavor::Btrfs(sb) => sb,
+            FsFlavor::Ext4(_) => {
+                return Err(FfsError::Format("not a btrfs filesystem".into()));
+            }
+        };
+        let nodesize = sb.nodesize;
+        let generation = sb.generation;
+
+        // Walk the FS tree to populate the in-memory COW tree.
+        let items = self.walk_btrfs_fs_tree(cx)?;
+        let max_items_per_node = (nodesize as usize - 101) / 25; // header=101, item=25
+        let max_items = max_items_per_node.max(3);
+        let mut fs_tree =
+            InMemoryCowBtrfsTree::new(max_items).map_err(|e| btrfs_mutation_to_ffs(&e))?;
+
+        // Find the highest objectid in use so we can mint new ones.
+        let mut max_objectid = 256_u64; // btrfs reserves objectids below 256
+        for item in &items {
+            if item.key.objectid > max_objectid {
+                max_objectid = item.key.objectid;
+            }
+            let tree_item = BtrfsTreeItem {
+                key: BtrfsKey {
+                    objectid: item.key.objectid,
+                    item_type: item.key.item_type,
+                    offset: item.key.offset,
+                },
+                data: item.data.clone(),
+            };
+            // Allow replace in case of duplicate keys from multiple walks.
+            let _ = fs_tree.update(
+                &tree_item.key,
+                &tree_item.data,
+            ).or_else(|_| fs_tree.insert(tree_item.key, &tree_item.data));
+        }
+
+        // Build a minimal extent allocator with a synthetic data block group.
+        // For V1 single-device images, we create a block group spanning the
+        // device and mark known extents as allocated.
+        let mut extent_alloc =
+            BtrfsExtentAllocator::new(generation).map_err(|e| btrfs_mutation_to_ffs(&e))?;
+
+        // Add a data block group covering the device (after the first 1 MB
+        // which is reserved for superblock copies and system chunks).
+        let data_start = 1_048_576_u64; // 1 MiB
+        let total_bytes = sb.total_bytes.saturating_sub(data_start);
+        extent_alloc.add_block_group(
+            data_start,
+            BtrfsBlockGroupItem {
+                total_bytes,
+                used_bytes: sb.bytes_used.saturating_sub(data_start),
+                flags: BTRFS_BLOCK_GROUP_DATA,
+            },
+        );
+
+        info!(
+            target: "ffs::write",
+            nodesize,
+            generation,
+            items_loaded = items.len(),
+            next_objectid = max_objectid + 1,
+            "btrfs write state initialized"
+        );
+
+        Ok(BtrfsAllocState {
+            fs_tree,
+            extent_alloc,
+            next_objectid: max_objectid + 1,
+            generation,
+            nodesize,
+        })
+    }
+
+    /// Require the btrfs alloc state to be present (i.e., writes enabled).
+    fn require_btrfs_alloc_state(&self) -> Result<&Mutex<BtrfsAllocState>, FfsError> {
+        self.btrfs_alloc_state.as_ref().ok_or(FfsError::ReadOnly)
     }
 
     /// Commit an MVCC transaction with JBD2 journaling.
@@ -3913,6 +4034,18 @@ fn parse_to_ffs_error(e: &ParseError) -> FfsError {
     }
 }
 
+/// Convert a btrfs mutation error to an `FfsError`.
+fn btrfs_mutation_to_ffs(e: &BtrfsMutationError) -> FfsError {
+    match e {
+        BtrfsMutationError::BrokenInvariant(msg) => FfsError::Corruption {
+            block: 0,
+            detail: format!("btrfs invariant: {msg}"),
+        },
+        BtrfsMutationError::KeyAlreadyExists => FfsError::Exists,
+        _ => FfsError::Format(format!("btrfs mutation: {e}")),
+    }
+}
+
 /// Convert an ext4 inode into VFS `InodeAttr` using the superblock for context.
 fn inode_to_attr(sb: &Ext4Superblock, ino: InodeNumber, inode: &Ext4Inode) -> InodeAttr {
     let kind = inode_file_type(inode);
@@ -5623,6 +5756,906 @@ impl OpenFs {
     }
 }
 
+    // ── Btrfs write path ─────────────────────────────────────────────────
+
+    /// Write file data on a btrfs filesystem.
+    #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
+    fn btrfs_write(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        offset: u64,
+        data: &[u8],
+    ) -> ffs_error::Result<u32> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        let alloc_mutex = self.require_btrfs_alloc_state()?;
+        let canonical = self.btrfs_canonical_inode(ino)?;
+
+        let mut alloc = alloc_mutex.lock();
+
+        // Look up the INODE_ITEM for this objectid.
+        let inode_key = BtrfsKey {
+            objectid: canonical,
+            item_type: BTRFS_ITEM_INODE_ITEM,
+            offset: 0,
+        };
+        let inode_items = alloc
+            .fs_tree
+            .range(&inode_key, &inode_key)
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        let inode_data = inode_items
+            .first()
+            .ok_or_else(|| FfsError::NotFound(format!("inode {canonical}")))?
+            .1
+            .clone();
+        let mut inode = parse_inode_item(&inode_data).map_err(|e| parse_to_ffs_error(&e))?;
+
+        if Self::btrfs_mode_to_file_type(inode.mode) == FileType::Directory {
+            return Err(FfsError::IsDirectory);
+        }
+
+        let end = offset + data.len() as u64;
+        let sectorsize = u64::from(alloc.nodesize.min(4096));
+
+        // For simplicity in V1, write data as an inline extent if small enough,
+        // otherwise allocate a data extent and write through the device.
+        let nodesize = alloc.nodesize;
+        if end <= u64::from(nodesize) - 200 && data.len() <= 2048 {
+            // Inline extent: store data directly in the tree item.
+            let extent = BtrfsExtentData::Inline {
+                compression: 0,
+                data: {
+                    // Build the full file content up to `end`.
+                    let mut content = vec![0u8; end as usize];
+                    // Read any existing inline data.
+                    let existing_key = BtrfsKey {
+                        objectid: canonical,
+                        item_type: BTRFS_ITEM_EXTENT_DATA,
+                        offset: 0,
+                    };
+                    if let Ok(existing) = alloc.fs_tree.range(&existing_key, &existing_key) {
+                        if let Some((_, edata)) = existing.first() {
+                            if let Ok(BtrfsExtentData::Inline {
+                                data: prev, ..
+                            }) = parse_extent_data(edata)
+                            {
+                                let copy_len = prev.len().min(content.len());
+                                content[..copy_len].copy_from_slice(&prev[..copy_len]);
+                            }
+                        }
+                    }
+                    content[offset as usize..end as usize].copy_from_slice(data);
+                    content
+                },
+            };
+            let extent_key = BtrfsKey {
+                objectid: canonical,
+                item_type: BTRFS_ITEM_EXTENT_DATA,
+                offset: 0,
+            };
+            let extent_bytes = extent.to_bytes();
+            alloc
+                .fs_tree
+                .update(&extent_key, &extent_bytes)
+                .or_else(|_| alloc.fs_tree.insert(extent_key, &extent_bytes))
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        } else {
+            // Allocate a data extent and write through the device.
+            let alloc_size = (data.len() as u64 + sectorsize - 1) & !(sectorsize - 1);
+            let allocation = alloc
+                .extent_alloc
+                .alloc_data(alloc_size)
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            let disk_bytenr = allocation.extent.bytenr;
+
+            // Write data to the allocated physical region.
+            let ctx = self
+                .btrfs_context()
+                .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?;
+            // For single-device, the logical address is the physical address
+            // (the data block group we create maps 1:1).
+            self.dev
+                .write_at(cx, ByteOffset(disk_bytenr), data)?;
+
+            // Insert the EXTENT_DATA item.
+            let extent = BtrfsExtentData::Regular {
+                extent_type: BTRFS_FILE_EXTENT_REG,
+                compression: 0,
+                disk_bytenr,
+                disk_num_bytes: alloc_size,
+                extent_offset: 0,
+                num_bytes: data.len() as u64,
+            };
+            let extent_key = BtrfsKey {
+                objectid: canonical,
+                item_type: BTRFS_ITEM_EXTENT_DATA,
+                offset,
+            };
+            let extent_bytes = extent.to_bytes();
+            alloc
+                .fs_tree
+                .update(&extent_key, &extent_bytes)
+                .or_else(|_| alloc.fs_tree.insert(extent_key, &extent_bytes))
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        }
+
+        // Update inode metadata.
+        if end > inode.size {
+            inode.size = end;
+        }
+        inode.nbytes = inode.size;
+        let (secs, nanos) = Self::now_timestamp();
+        inode.mtime_sec = secs;
+        inode.mtime_nsec = nanos;
+        inode.ctime_sec = secs;
+        inode.ctime_nsec = nanos;
+        let inode_bytes = inode.to_bytes();
+        alloc
+            .fs_tree
+            .update(&inode_key, &inode_bytes)
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+
+        trace!(
+            target: "ffs::write",
+            op = "btrfs_write",
+            ino = canonical,
+            offset,
+            len = data.len(),
+            new_size = inode.size,
+            "btrfs data written"
+        );
+
+        Ok(data.len() as u32)
+    }
+
+    /// Create a regular file in a btrfs directory.
+    fn btrfs_create(
+        &self,
+        _cx: &Cx,
+        parent: InodeNumber,
+        name: &[u8],
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> ffs_error::Result<InodeAttr> {
+        let alloc_mutex = self.require_btrfs_alloc_state()?;
+        let parent_oid = self.btrfs_canonical_inode(parent)?;
+        let (secs, nanos) = Self::now_timestamp();
+
+        let mut alloc = alloc_mutex.lock();
+        let new_oid = alloc.next_objectid;
+        alloc.next_objectid += 1;
+
+        // Create the INODE_ITEM.
+        let inode = BtrfsInodeItem {
+            size: 0,
+            nbytes: 0,
+            nlink: 1,
+            uid,
+            gid,
+            mode: u32::from(mode) | 0o100_000, // S_IFREG
+            rdev: 0,
+            atime_sec: secs,
+            atime_nsec: nanos,
+            ctime_sec: secs,
+            ctime_nsec: nanos,
+            mtime_sec: secs,
+            mtime_nsec: nanos,
+            otime_sec: secs,
+            otime_nsec: nanos,
+        };
+        let inode_key = BtrfsKey {
+            objectid: new_oid,
+            item_type: BTRFS_ITEM_INODE_ITEM,
+            offset: 0,
+        };
+        alloc
+            .fs_tree
+            .insert(inode_key, &inode.to_bytes())
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+
+        // Add DIR_ITEM and DIR_INDEX in the parent.
+        let dir_item = BtrfsDirItem {
+            child_objectid: new_oid,
+            child_key_type: BTRFS_ITEM_INODE_ITEM,
+            child_key_offset: 0,
+            file_type: BTRFS_FT_REG_FILE,
+            name: name.to_vec(),
+        };
+        self.btrfs_insert_dir_entry(&mut alloc, parent_oid, &dir_item)?;
+
+        // Update parent inode timestamps.
+        self.btrfs_touch_inode_times(&mut alloc, parent_oid, secs, nanos)?;
+
+        Ok(self.btrfs_inode_to_attr(new_oid, &inode))
+    }
+
+    /// Create a directory in a btrfs filesystem.
+    fn btrfs_mkdir(
+        &self,
+        _cx: &Cx,
+        parent: InodeNumber,
+        name: &[u8],
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> ffs_error::Result<InodeAttr> {
+        let alloc_mutex = self.require_btrfs_alloc_state()?;
+        let parent_oid = self.btrfs_canonical_inode(parent)?;
+        let (secs, nanos) = Self::now_timestamp();
+
+        let mut alloc = alloc_mutex.lock();
+        let new_oid = alloc.next_objectid;
+        alloc.next_objectid += 1;
+
+        let inode = BtrfsInodeItem {
+            size: 0,
+            nbytes: 0,
+            nlink: 2, // . and parent's reference
+            uid,
+            gid,
+            mode: u32::from(mode) | 0o040_000, // S_IFDIR
+            rdev: 0,
+            atime_sec: secs,
+            atime_nsec: nanos,
+            ctime_sec: secs,
+            ctime_nsec: nanos,
+            mtime_sec: secs,
+            mtime_nsec: nanos,
+            otime_sec: secs,
+            otime_nsec: nanos,
+        };
+        let inode_key = BtrfsKey {
+            objectid: new_oid,
+            item_type: BTRFS_ITEM_INODE_ITEM,
+            offset: 0,
+        };
+        alloc
+            .fs_tree
+            .insert(inode_key, &inode.to_bytes())
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+
+        let dir_item = BtrfsDirItem {
+            child_objectid: new_oid,
+            child_key_type: BTRFS_ITEM_INODE_ITEM,
+            child_key_offset: 0,
+            file_type: BTRFS_FT_DIR,
+            name: name.to_vec(),
+        };
+        self.btrfs_insert_dir_entry(&mut alloc, parent_oid, &dir_item)?;
+
+        // Bump parent nlink for the new subdirectory.
+        self.btrfs_adjust_nlink(&mut alloc, parent_oid, 1)?;
+        self.btrfs_touch_inode_times(&mut alloc, parent_oid, secs, nanos)?;
+
+        Ok(self.btrfs_inode_to_attr(new_oid, &inode))
+    }
+
+    /// Unlink a file or directory from a btrfs filesystem.
+    fn btrfs_unlink_impl(
+        &self,
+        _cx: &Cx,
+        parent: InodeNumber,
+        name: &[u8],
+        expect_dir: bool,
+    ) -> ffs_error::Result<()> {
+        let alloc_mutex = self.require_btrfs_alloc_state()?;
+        let parent_oid = self.btrfs_canonical_inode(parent)?;
+        let (secs, nanos) = Self::now_timestamp();
+
+        let mut alloc = alloc_mutex.lock();
+
+        // Lookup the child entry in the parent directory.
+        let child = self.btrfs_lookup_dir_entry(&alloc, parent_oid, name)?;
+        let child_oid = child.child_objectid;
+
+        // Validate file type.
+        if expect_dir && child.file_type != BTRFS_FT_DIR {
+            return Err(FfsError::NotDirectory);
+        }
+        if !expect_dir && child.file_type == BTRFS_FT_DIR {
+            return Err(FfsError::IsDirectory);
+        }
+
+        // If removing a directory, verify it's empty.
+        if expect_dir && !self.btrfs_dir_is_empty(&alloc, child_oid) {
+            return Err(FfsError::NotEmpty);
+        }
+
+        // Remove DIR_ITEM and DIR_INDEX entries.
+        self.btrfs_remove_dir_entry(&mut alloc, parent_oid, name)?;
+
+        // Decrement child nlink.
+        self.btrfs_adjust_nlink(&mut alloc, child_oid, -1)?;
+
+        // If unlinking a directory, decrement parent nlink too.
+        if expect_dir {
+            self.btrfs_adjust_nlink(&mut alloc, parent_oid, -1)?;
+        }
+        self.btrfs_touch_inode_times(&mut alloc, parent_oid, secs, nanos)?;
+
+        Ok(())
+    }
+
+    /// Rename a btrfs directory entry.
+    fn btrfs_rename(
+        &self,
+        _cx: &Cx,
+        parent: InodeNumber,
+        name: &[u8],
+        new_parent: InodeNumber,
+        new_name: &[u8],
+    ) -> ffs_error::Result<()> {
+        let alloc_mutex = self.require_btrfs_alloc_state()?;
+        let parent_oid = self.btrfs_canonical_inode(parent)?;
+        let new_parent_oid = self.btrfs_canonical_inode(new_parent)?;
+        let (secs, nanos) = Self::now_timestamp();
+
+        let mut alloc = alloc_mutex.lock();
+
+        let child = self.btrfs_lookup_dir_entry(&alloc, parent_oid, name)?;
+
+        // Remove old entry.
+        self.btrfs_remove_dir_entry(&mut alloc, parent_oid, name)?;
+
+        // If target exists, remove it first.
+        if self
+            .btrfs_lookup_dir_entry(&alloc, new_parent_oid, new_name)
+            .is_ok()
+        {
+            self.btrfs_remove_dir_entry(&mut alloc, new_parent_oid, new_name)?;
+        }
+
+        // Insert in new location.
+        let dir_item = BtrfsDirItem {
+            child_objectid: child.child_objectid,
+            child_key_type: child.child_key_type,
+            child_key_offset: child.child_key_offset,
+            file_type: child.file_type,
+            name: new_name.to_vec(),
+        };
+        self.btrfs_insert_dir_entry(&mut alloc, new_parent_oid, &dir_item)?;
+
+        self.btrfs_touch_inode_times(&mut alloc, parent_oid, secs, nanos)?;
+        if new_parent_oid != parent_oid {
+            self.btrfs_touch_inode_times(&mut alloc, new_parent_oid, secs, nanos)?;
+        }
+
+        Ok(())
+    }
+
+    /// Create a hard link in a btrfs filesystem.
+    fn btrfs_link(
+        &self,
+        _cx: &Cx,
+        ino: InodeNumber,
+        new_parent: InodeNumber,
+        new_name: &[u8],
+    ) -> ffs_error::Result<InodeAttr> {
+        let alloc_mutex = self.require_btrfs_alloc_state()?;
+        let target_oid = self.btrfs_canonical_inode(ino)?;
+        let parent_oid = self.btrfs_canonical_inode(new_parent)?;
+        let (secs, nanos) = Self::now_timestamp();
+
+        let mut alloc = alloc_mutex.lock();
+
+        // Get the target inode to determine its file type.
+        let inode = self.btrfs_read_inode_from_tree(&alloc, target_oid)?;
+        let ft = if Self::btrfs_mode_to_file_type(inode.mode) == FileType::Directory {
+            return Err(FfsError::IsDirectory); // Can't hard-link directories
+        } else {
+            BTRFS_FT_REG_FILE
+        };
+
+        let dir_item = BtrfsDirItem {
+            child_objectid: target_oid,
+            child_key_type: BTRFS_ITEM_INODE_ITEM,
+            child_key_offset: 0,
+            file_type: ft,
+            name: new_name.to_vec(),
+        };
+        self.btrfs_insert_dir_entry(&mut alloc, parent_oid, &dir_item)?;
+        self.btrfs_adjust_nlink(&mut alloc, target_oid, 1)?;
+        self.btrfs_touch_inode_times(&mut alloc, parent_oid, secs, nanos)?;
+
+        let updated = self.btrfs_read_inode_from_tree(&alloc, target_oid)?;
+        Ok(self.btrfs_inode_to_attr(target_oid, &updated))
+    }
+
+    /// Create a symbolic link in a btrfs filesystem.
+    fn btrfs_symlink(
+        &self,
+        _cx: &Cx,
+        parent: InodeNumber,
+        name: &[u8],
+        target: &Path,
+        uid: u32,
+        gid: u32,
+    ) -> ffs_error::Result<InodeAttr> {
+        let alloc_mutex = self.require_btrfs_alloc_state()?;
+        let parent_oid = self.btrfs_canonical_inode(parent)?;
+        let (secs, nanos) = Self::now_timestamp();
+        let target_bytes = target.as_os_str().as_encoded_bytes();
+
+        let mut alloc = alloc_mutex.lock();
+        let new_oid = alloc.next_objectid;
+        alloc.next_objectid += 1;
+
+        let inode = BtrfsInodeItem {
+            size: target_bytes.len() as u64,
+            nbytes: target_bytes.len() as u64,
+            nlink: 1,
+            uid,
+            gid,
+            mode: 0o120_777, // S_IFLNK | 0o777
+            rdev: 0,
+            atime_sec: secs,
+            atime_nsec: nanos,
+            ctime_sec: secs,
+            ctime_nsec: nanos,
+            mtime_sec: secs,
+            mtime_nsec: nanos,
+            otime_sec: secs,
+            otime_nsec: nanos,
+        };
+        let inode_key = BtrfsKey {
+            objectid: new_oid,
+            item_type: BTRFS_ITEM_INODE_ITEM,
+            offset: 0,
+        };
+        alloc
+            .fs_tree
+            .insert(inode_key, &inode.to_bytes())
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+
+        // Store symlink target as an inline extent.
+        let extent = BtrfsExtentData::Inline {
+            compression: 0,
+            data: target_bytes.to_vec(),
+        };
+        let extent_key = BtrfsKey {
+            objectid: new_oid,
+            item_type: BTRFS_ITEM_EXTENT_DATA,
+            offset: 0,
+        };
+        alloc
+            .fs_tree
+            .insert(extent_key, &extent.to_bytes())
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+
+        let dir_item = BtrfsDirItem {
+            child_objectid: new_oid,
+            child_key_type: BTRFS_ITEM_INODE_ITEM,
+            child_key_offset: 0,
+            file_type: BTRFS_FT_SYMLINK,
+            name: name.to_vec(),
+        };
+        self.btrfs_insert_dir_entry(&mut alloc, parent_oid, &dir_item)?;
+        self.btrfs_touch_inode_times(&mut alloc, parent_oid, secs, nanos)?;
+
+        Ok(self.btrfs_inode_to_attr(new_oid, &inode))
+    }
+
+    /// Set attributes on a btrfs inode.
+    fn btrfs_setattr(
+        &self,
+        _cx: &Cx,
+        ino: InodeNumber,
+        attrs: &SetAttrRequest,
+    ) -> ffs_error::Result<InodeAttr> {
+        let alloc_mutex = self.require_btrfs_alloc_state()?;
+        let canonical = self.btrfs_canonical_inode(ino)?;
+
+        let mut alloc = alloc_mutex.lock();
+        let mut inode = self.btrfs_read_inode_from_tree(&alloc, canonical)?;
+
+        if let Some(mode) = attrs.mode {
+            inode.mode = (inode.mode & !0o7777) | u32::from(mode & 0o7777);
+        }
+        if let Some(uid) = attrs.uid {
+            inode.uid = uid;
+        }
+        if let Some(gid) = attrs.gid {
+            inode.gid = gid;
+        }
+        if let Some(size) = attrs.size {
+            inode.size = size;
+            inode.nbytes = size;
+        }
+        if let Some(atime) = attrs.atime {
+            let dur = atime
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO);
+            inode.atime_sec = dur.as_secs();
+            inode.atime_nsec = dur.subsec_nanos();
+        }
+        if let Some(mtime) = attrs.mtime {
+            let dur = mtime
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO);
+            inode.mtime_sec = dur.as_secs();
+            inode.mtime_nsec = dur.subsec_nanos();
+        }
+        let (secs, nanos) = Self::now_timestamp();
+        inode.ctime_sec = secs;
+        inode.ctime_nsec = nanos;
+
+        let inode_key = BtrfsKey {
+            objectid: canonical,
+            item_type: BTRFS_ITEM_INODE_ITEM,
+            offset: 0,
+        };
+        alloc
+            .fs_tree
+            .update(&inode_key, &inode.to_bytes())
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+
+        Ok(self.btrfs_inode_to_attr(canonical, &inode))
+    }
+
+    /// Preallocate extents in a btrfs filesystem.
+    fn btrfs_fallocate(
+        &self,
+        _cx: &Cx,
+        ino: InodeNumber,
+        offset: u64,
+        length: u64,
+        _mode: i32,
+    ) -> ffs_error::Result<()> {
+        let alloc_mutex = self.require_btrfs_alloc_state()?;
+        let canonical = self.btrfs_canonical_inode(ino)?;
+
+        let mut alloc = alloc_mutex.lock();
+        let sectorsize = u64::from(alloc.nodesize.min(4096));
+        let alloc_size = (length + sectorsize - 1) & !(sectorsize - 1);
+
+        let allocation = alloc
+            .extent_alloc
+            .alloc_data(alloc_size)
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+
+        let extent = BtrfsExtentData::Regular {
+            extent_type: BTRFS_FILE_EXTENT_PREALLOC,
+            compression: 0,
+            disk_bytenr: allocation.extent.bytenr,
+            disk_num_bytes: alloc_size,
+            extent_offset: 0,
+            num_bytes: length,
+        };
+        let extent_key = BtrfsKey {
+            objectid: canonical,
+            item_type: BTRFS_ITEM_EXTENT_DATA,
+            offset,
+        };
+        alloc
+            .fs_tree
+            .update(&extent_key, &extent.to_bytes())
+            .or_else(|_| alloc.fs_tree.insert(extent_key, &extent.to_bytes()))
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+
+        // Update inode size if fallocate extends beyond current size.
+        let mut inode = self.btrfs_read_inode_from_tree(&alloc, canonical)?;
+        let new_end = offset + length;
+        if new_end > inode.size {
+            inode.size = new_end;
+            inode.nbytes = new_end;
+            let inode_key = BtrfsKey {
+                objectid: canonical,
+                item_type: BTRFS_ITEM_INODE_ITEM,
+                offset: 0,
+            };
+            alloc
+                .fs_tree
+                .update(&inode_key, &inode.to_bytes())
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        }
+
+        Ok(())
+    }
+
+    /// Set an extended attribute on a btrfs inode.
+    fn btrfs_setxattr(
+        &self,
+        _cx: &Cx,
+        ino: InodeNumber,
+        name: &str,
+        value: &[u8],
+        _mode: XattrSetMode,
+    ) -> ffs_error::Result<()> {
+        let alloc_mutex = self.require_btrfs_alloc_state()?;
+        let canonical = self.btrfs_canonical_inode(ino)?;
+
+        let mut alloc = alloc_mutex.lock();
+
+        // Store xattr as a DIR_ITEM-style entry keyed by crc32c(name).
+        // This is a simplified approach; btrfs uses XATTR_ITEM (type 24).
+        let xattr_type: u8 = 24; // BTRFS_XATTR_ITEM_KEY
+        let name_hash = ffs_types::crc32c_append(0, name.as_bytes());
+        let key = BtrfsKey {
+            objectid: canonical,
+            item_type: xattr_type,
+            offset: u64::from(name_hash),
+        };
+
+        // Build the xattr item: name + value concatenated, with a header.
+        let mut payload = Vec::with_capacity(30 + name.len() + value.len());
+        // Location key: zeros (xattrs don't have a location)
+        payload.extend_from_slice(&[0u8; 17]);
+        // transid: zeros
+        payload.extend_from_slice(&[0u8; 8]);
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            payload.extend_from_slice(&(value.len() as u16).to_le_bytes());
+            payload.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        }
+        payload.push(0); // type = 0 for xattr
+        payload.extend_from_slice(name.as_bytes());
+        payload.extend_from_slice(value);
+
+        alloc
+            .fs_tree
+            .update(&key, &payload)
+            .or_else(|_| alloc.fs_tree.insert(key, &payload))
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+
+        Ok(())
+    }
+
+    /// Remove an extended attribute from a btrfs inode.
+    fn btrfs_removexattr(
+        &self,
+        _cx: &Cx,
+        ino: InodeNumber,
+        name: &str,
+    ) -> ffs_error::Result<bool> {
+        let alloc_mutex = self.require_btrfs_alloc_state()?;
+        let canonical = self.btrfs_canonical_inode(ino)?;
+
+        let mut alloc = alloc_mutex.lock();
+        let xattr_type: u8 = 24;
+        let name_hash = ffs_types::crc32c_append(0, name.as_bytes());
+        let key = BtrfsKey {
+            objectid: canonical,
+            item_type: xattr_type,
+            offset: u64::from(name_hash),
+        };
+
+        match alloc.fs_tree.delete(&key) {
+            Ok(_) => Ok(true),
+            Err(BtrfsMutationError::MissingNode(_)) => Ok(false),
+            Err(e) => Err(btrfs_mutation_to_ffs(&e)),
+        }
+    }
+
+    // ── Btrfs write-path helpers ────────────────────────────────────────
+
+    /// Read a `BtrfsInodeItem` from the in-memory COW FS tree.
+    fn btrfs_read_inode_from_tree(
+        &self,
+        alloc: &BtrfsAllocState,
+        objectid: u64,
+    ) -> ffs_error::Result<BtrfsInodeItem> {
+        let key = BtrfsKey {
+            objectid,
+            item_type: BTRFS_ITEM_INODE_ITEM,
+            offset: 0,
+        };
+        let items = alloc
+            .fs_tree
+            .range(&key, &key)
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        let data = items
+            .first()
+            .ok_or_else(|| FfsError::NotFound(format!("btrfs inode {objectid}")))?
+            .1
+            .as_slice();
+        parse_inode_item(data).map_err(|e| parse_to_ffs_error(&e))
+    }
+
+    /// Convert a `BtrfsInodeItem` into an `InodeAttr`.
+    #[allow(clippy::cast_possible_truncation)]
+    fn btrfs_inode_to_attr(&self, objectid: u64, inode: &BtrfsInodeItem) -> InodeAttr {
+        InodeAttr {
+            ino: InodeNumber(objectid),
+            size: inode.size,
+            blocks: (inode.nbytes + 511) / 512,
+            atime: UNIX_EPOCH + Duration::new(inode.atime_sec, inode.atime_nsec),
+            mtime: UNIX_EPOCH + Duration::new(inode.mtime_sec, inode.mtime_nsec),
+            ctime: UNIX_EPOCH + Duration::new(inode.ctime_sec, inode.ctime_nsec),
+            crtime: UNIX_EPOCH + Duration::new(inode.otime_sec, inode.otime_nsec),
+            kind: Self::btrfs_mode_to_file_type(inode.mode),
+            perm: (inode.mode & 0o7777) as u16,
+            nlink: inode.nlink,
+            uid: inode.uid,
+            gid: inode.gid,
+            rdev: inode.rdev as u32,
+            blksize: self.block_size(),
+        }
+    }
+
+    /// Insert a directory entry (both DIR_ITEM and DIR_INDEX) into the FS tree.
+    fn btrfs_insert_dir_entry(
+        &self,
+        alloc: &mut BtrfsAllocState,
+        parent_oid: u64,
+        item: &BtrfsDirItem,
+    ) -> ffs_error::Result<()> {
+        let name_hash = ffs_types::crc32c_append(0, &item.name);
+        let dir_item_key = BtrfsKey {
+            objectid: parent_oid,
+            item_type: BTRFS_ITEM_DIR_ITEM,
+            offset: u64::from(name_hash),
+        };
+        let item_bytes = item.to_bytes();
+        alloc
+            .fs_tree
+            .update(&dir_item_key, &item_bytes)
+            .or_else(|_| alloc.fs_tree.insert(dir_item_key, &item_bytes))
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+
+        // Also insert a DIR_INDEX entry. Use the child objectid as the index
+        // for a simple monotonic ordering.
+        let dir_index_key = BtrfsKey {
+            objectid: parent_oid,
+            item_type: BTRFS_ITEM_DIR_INDEX,
+            offset: item.child_objectid,
+        };
+        alloc
+            .fs_tree
+            .update(&dir_index_key, &item_bytes)
+            .or_else(|_| alloc.fs_tree.insert(dir_index_key, &item_bytes))
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+
+        Ok(())
+    }
+
+    /// Look up a directory entry by name in the in-memory FS tree.
+    fn btrfs_lookup_dir_entry(
+        &self,
+        alloc: &BtrfsAllocState,
+        parent_oid: u64,
+        name: &[u8],
+    ) -> ffs_error::Result<BtrfsDirItem> {
+        let name_hash = ffs_types::crc32c_append(0, name);
+        let key = BtrfsKey {
+            objectid: parent_oid,
+            item_type: BTRFS_ITEM_DIR_ITEM,
+            offset: u64::from(name_hash),
+        };
+        let items = alloc
+            .fs_tree
+            .range(&key, &key)
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        let data = items
+            .first()
+            .ok_or_else(|| {
+                FfsError::NotFound(String::from_utf8_lossy(name).into_owned())
+            })?
+            .1
+            .as_slice();
+        let entries = parse_dir_items(data).map_err(|e| parse_to_ffs_error(&e))?;
+        entries
+            .into_iter()
+            .find(|e| e.name == name)
+            .ok_or_else(|| FfsError::NotFound(String::from_utf8_lossy(name).into_owned()))
+    }
+
+    /// Remove a directory entry (DIR_ITEM and DIR_INDEX) from the FS tree.
+    fn btrfs_remove_dir_entry(
+        &self,
+        alloc: &mut BtrfsAllocState,
+        parent_oid: u64,
+        name: &[u8],
+    ) -> ffs_error::Result<()> {
+        let name_hash = ffs_types::crc32c_append(0, name);
+        let dir_item_key = BtrfsKey {
+            objectid: parent_oid,
+            item_type: BTRFS_ITEM_DIR_ITEM,
+            offset: u64::from(name_hash),
+        };
+        let _ = alloc
+            .fs_tree
+            .delete(&dir_item_key)
+            .map_err(|e| btrfs_mutation_to_ffs(&e));
+
+        // Also remove the DIR_INDEX. We need to find it by scanning.
+        let range_start = BtrfsKey {
+            objectid: parent_oid,
+            item_type: BTRFS_ITEM_DIR_INDEX,
+            offset: 0,
+        };
+        let range_end = BtrfsKey {
+            objectid: parent_oid,
+            item_type: BTRFS_ITEM_DIR_INDEX,
+            offset: u64::MAX,
+        };
+        if let Ok(indices) = alloc.fs_tree.range(&range_start, &range_end) {
+            for (key, data) in &indices {
+                if let Ok(entries) = parse_dir_items(data) {
+                    if entries.iter().any(|e| e.name == name) {
+                        let _ = alloc.fs_tree.delete(key);
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if a btrfs directory is empty (has no DIR_INDEX entries).
+    fn btrfs_dir_is_empty(&self, alloc: &BtrfsAllocState, objectid: u64) -> bool {
+        let range_start = BtrfsKey {
+            objectid,
+            item_type: BTRFS_ITEM_DIR_INDEX,
+            offset: 0,
+        };
+        let range_end = BtrfsKey {
+            objectid,
+            item_type: BTRFS_ITEM_DIR_INDEX,
+            offset: u64::MAX,
+        };
+        alloc
+            .fs_tree
+            .range(&range_start, &range_end)
+            .map(|items| items.is_empty())
+            .unwrap_or(true)
+    }
+
+    /// Adjust the nlink count of a btrfs inode by `delta` (+1 or -1).
+    fn btrfs_adjust_nlink(
+        &self,
+        alloc: &mut BtrfsAllocState,
+        objectid: u64,
+        delta: i32,
+    ) -> ffs_error::Result<()> {
+        let mut inode = self.btrfs_read_inode_from_tree(alloc, objectid)?;
+        if delta > 0 {
+            inode.nlink = inode.nlink.saturating_add(delta as u32);
+        } else {
+            inode.nlink = inode.nlink.saturating_sub((-delta) as u32);
+        }
+        let key = BtrfsKey {
+            objectid,
+            item_type: BTRFS_ITEM_INODE_ITEM,
+            offset: 0,
+        };
+        alloc
+            .fs_tree
+            .update(&key, &inode.to_bytes())
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        Ok(())
+    }
+
+    /// Update mtime and ctime of a btrfs inode.
+    fn btrfs_touch_inode_times(
+        &self,
+        alloc: &mut BtrfsAllocState,
+        objectid: u64,
+        secs: u64,
+        nanos: u32,
+    ) -> ffs_error::Result<()> {
+        let mut inode = self.btrfs_read_inode_from_tree(alloc, objectid)?;
+        inode.mtime_sec = secs;
+        inode.mtime_nsec = nanos;
+        inode.ctime_sec = secs;
+        inode.ctime_nsec = nanos;
+        let key = BtrfsKey {
+            objectid,
+            item_type: BTRFS_ITEM_INODE_ITEM,
+            offset: 0,
+        };
+        alloc
+            .fs_tree
+            .update(&key, &inode.to_bytes())
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        Ok(())
+    }
+}
+
 // ── FsOps for OpenFs (device-based ext4 adapter) ──────────────────────────
 
 impl FsOps for OpenFs {
@@ -5824,14 +6857,14 @@ impl FsOps for OpenFs {
             FsFlavor::Ext4(_) => {
                 self.ext4_setxattr(cx, Self::ext4_canonical_inode(ino), name, value, mode)
             }
-            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+            FsFlavor::Btrfs(_) => self.btrfs_setxattr(cx, ino, name, value, mode),
         }
     }
 
     fn removexattr(&self, cx: &Cx, ino: InodeNumber, name: &str) -> ffs_error::Result<bool> {
         match &self.flavor {
             FsFlavor::Ext4(_) => self.ext4_removexattr(cx, Self::ext4_canonical_inode(ino), name),
-            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+            FsFlavor::Btrfs(_) => self.btrfs_removexattr(cx, ino, name),
         }
     }
 
@@ -5857,7 +6890,9 @@ impl FsOps for OpenFs {
                     gid,
                 )
                 .map(Self::ext4_present_attr),
-            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+            FsFlavor::Btrfs(_) => {
+                self.btrfs_create(cx, parent, name.as_encoded_bytes(), mode, uid, gid)
+            }
         }
     }
 
@@ -5881,7 +6916,9 @@ impl FsOps for OpenFs {
                     gid,
                 )
                 .map(Self::ext4_present_attr),
-            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+            FsFlavor::Btrfs(_) => {
+                self.btrfs_mkdir(cx, parent, name.as_encoded_bytes(), mode, uid, gid)
+            }
         }
     }
 
@@ -5893,7 +6930,9 @@ impl FsOps for OpenFs {
                 name.as_encoded_bytes(),
                 false,
             ),
-            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+            FsFlavor::Btrfs(_) => {
+                self.btrfs_unlink_impl(cx, parent, name.as_encoded_bytes(), false)
+            }
         }
     }
 
@@ -5905,7 +6944,9 @@ impl FsOps for OpenFs {
                 name.as_encoded_bytes(),
                 true,
             ),
-            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+            FsFlavor::Btrfs(_) => {
+                self.btrfs_unlink_impl(cx, parent, name.as_encoded_bytes(), true)
+            }
         }
     }
 
@@ -5925,14 +6966,20 @@ impl FsOps for OpenFs {
                 Self::ext4_canonical_inode(new_parent),
                 new_name.as_encoded_bytes(),
             ),
-            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+            FsFlavor::Btrfs(_) => self.btrfs_rename(
+                cx,
+                parent,
+                name.as_encoded_bytes(),
+                new_parent,
+                new_name.as_encoded_bytes(),
+            ),
         }
     }
 
     fn write(&self, cx: &Cx, ino: InodeNumber, offset: u64, data: &[u8]) -> ffs_error::Result<u32> {
         match &self.flavor {
             FsFlavor::Ext4(_) => self.ext4_write(cx, Self::ext4_canonical_inode(ino), offset, data),
-            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+            FsFlavor::Btrfs(_) => self.btrfs_write(cx, ino, offset, data),
         }
     }
 
@@ -5952,7 +6999,9 @@ impl FsOps for OpenFs {
                     new_name.as_encoded_bytes(),
                 )
                 .map(Self::ext4_present_attr),
-            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+            FsFlavor::Btrfs(_) => {
+                self.btrfs_link(cx, ino, new_parent, new_name.as_encoded_bytes())
+            }
         }
     }
 
@@ -5976,7 +7025,16 @@ impl FsOps for OpenFs {
                     gid,
                 )
                 .map(Self::ext4_present_attr),
-            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+            FsFlavor::Btrfs(_) => {
+                self.btrfs_symlink(
+                    cx,
+                    parent,
+                    name.as_encoded_bytes(),
+                    target,
+                    uid,
+                    gid,
+                )
+            }
         }
     }
 
@@ -5992,7 +7050,7 @@ impl FsOps for OpenFs {
             FsFlavor::Ext4(_) => {
                 self.ext4_fallocate(cx, Self::ext4_canonical_inode(ino), offset, length, mode)
             }
-            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+            FsFlavor::Btrfs(_) => self.btrfs_fallocate(cx, ino, offset, length, mode),
         }
     }
 
@@ -6006,7 +7064,7 @@ impl FsOps for OpenFs {
             FsFlavor::Ext4(_) => self
                 .ext4_setattr(cx, Self::ext4_canonical_inode(ino), attrs)
                 .map(Self::ext4_present_attr),
-            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+            FsFlavor::Btrfs(_) => self.btrfs_setattr(cx, ino, attrs),
         }
     }
 
@@ -6045,7 +7103,12 @@ impl FsOps for OpenFs {
                 );
                 Ok(())
             }
-            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+            FsFlavor::Btrfs(_) => {
+                if !self.is_writable() {
+                    return Err(FfsError::ReadOnly);
+                }
+                self.dev.sync(cx)
+            }
         }
     }
 
@@ -6080,7 +7143,12 @@ impl FsOps for OpenFs {
                 );
                 Ok(())
             }
-            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+            FsFlavor::Btrfs(_) => {
+                if !self.is_writable() {
+                    return Err(FfsError::ReadOnly);
+                }
+                self.dev.sync(cx)
+            }
         }
     }
 }

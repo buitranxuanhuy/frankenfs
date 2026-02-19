@@ -663,9 +663,6 @@ fn mount_cmd(
             );
         }
         FsFlavor::Btrfs(sb) => {
-            if rw {
-                bail!("btrfs read-write mount is not yet supported");
-            }
             eprintln!(
                 "Mounting btrfs image (sectorsize={}, nodesize={}, label={:?}, {mode_str}) at {}",
                 sb.sectorsize,

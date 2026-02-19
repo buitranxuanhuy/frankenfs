@@ -98,6 +98,39 @@ pub struct BtrfsInodeItem {
     pub otime_nsec: u32,
 }
 
+impl BtrfsInodeItem {
+    /// Serialize to the 160-byte on-disk representation.
+    ///
+    /// Layout matches the kernel `btrfs_inode_item` struct. Fields we do not
+    /// track (generation, block_group, sequence, flags, reserved) are zeroed.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = vec![0u8; 160];
+        // generation at 0..8 (zero)
+        // transid at 8..16 (zero)
+        buf[16..24].copy_from_slice(&self.size.to_le_bytes());
+        buf[24..32].copy_from_slice(&self.nbytes.to_le_bytes());
+        // block_group at 32..40 (zero)
+        buf[40..44].copy_from_slice(&self.nlink.to_le_bytes());
+        buf[44..48].copy_from_slice(&self.uid.to_le_bytes());
+        buf[48..52].copy_from_slice(&self.gid.to_le_bytes());
+        buf[52..56].copy_from_slice(&self.mode.to_le_bytes());
+        buf[56..64].copy_from_slice(&self.rdev.to_le_bytes());
+        // flags at 64..72 (zero)
+        // sequence at 72..80 (zero)
+        // reserved[4] at 80..112 (zero)
+        buf[112..120].copy_from_slice(&self.atime_sec.to_le_bytes());
+        buf[120..124].copy_from_slice(&self.atime_nsec.to_le_bytes());
+        buf[124..132].copy_from_slice(&self.ctime_sec.to_le_bytes());
+        buf[132..136].copy_from_slice(&self.ctime_nsec.to_le_bytes());
+        buf[136..144].copy_from_slice(&self.mtime_sec.to_le_bytes());
+        buf[144..148].copy_from_slice(&self.mtime_nsec.to_le_bytes());
+        buf[148..156].copy_from_slice(&self.otime_sec.to_le_bytes());
+        buf[156..160].copy_from_slice(&self.otime_nsec.to_le_bytes());
+        buf
+    }
+}
+
 /// One decoded directory entry from DIR_ITEM / DIR_INDEX payload bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BtrfsDirItem {
@@ -106,6 +139,31 @@ pub struct BtrfsDirItem {
     pub child_key_offset: u64,
     pub file_type: u8,
     pub name: Vec<u8>,
+}
+
+impl BtrfsDirItem {
+    /// Serialize to the on-disk DIR_ITEM / DIR_INDEX layout.
+    ///
+    /// Layout: location key (objectid:8 + type:1 + offset:8) + transid(8) +
+    /// data_len(2) + name_len(2) + file_type(1) + name bytes.
+    /// `transid` is set to zero (not tracked in our VFS layer).
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let name_len = self.name.len();
+        let mut buf = vec![0u8; 30 + name_len];
+        buf[0..8].copy_from_slice(&self.child_objectid.to_le_bytes());
+        buf[8] = self.child_key_type;
+        buf[9..17].copy_from_slice(&self.child_key_offset.to_le_bytes());
+        // transid at 17..25 (zero)
+        // data_len at 25..27 (zero — no trailing payload)
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            buf[27..29].copy_from_slice(&(name_len as u16).to_le_bytes());
+        }
+        buf[29] = self.file_type;
+        buf[30..30 + name_len].copy_from_slice(&self.name);
+        buf
+    }
 }
 
 /// Parsed EXTENT_DATA payload.
@@ -124,6 +182,53 @@ pub enum BtrfsExtentData {
         extent_offset: u64,
         num_bytes: u64,
     },
+}
+
+impl BtrfsExtentData {
+    /// Serialize to the on-disk EXTENT_DATA layout.
+    ///
+    /// Fixed header (21 bytes): generation(8) + ram_bytes(8) + compression(1)
+    /// + encryption(1) + other_encoding(2) + type(1).
+    /// Inline: header + data bytes.
+    /// Regular: header + disk_bytenr(8) + disk_num_bytes(8) + offset(8) + num_bytes(8).
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Inline { compression, data } => {
+                let mut buf = vec![0u8; 21 + data.len()];
+                // generation at 0..8 (zero)
+                // ram_bytes at 8..16 — set to data length
+                buf[8..16].copy_from_slice(&(data.len() as u64).to_le_bytes());
+                buf[16] = *compression;
+                // encryption at 17 (zero)
+                // other_encoding at 18..20 (zero)
+                buf[20] = BTRFS_FILE_EXTENT_INLINE;
+                buf[21..21 + data.len()].copy_from_slice(data);
+                buf
+            }
+            Self::Regular {
+                extent_type,
+                compression,
+                disk_bytenr,
+                disk_num_bytes,
+                extent_offset,
+                num_bytes,
+            } => {
+                let mut buf = vec![0u8; 53];
+                // generation at 0..8 (zero)
+                buf[8..16].copy_from_slice(&num_bytes.to_le_bytes()); // ram_bytes
+                buf[16] = *compression;
+                // encryption at 17 (zero)
+                // other_encoding at 18..20 (zero)
+                buf[20] = *extent_type;
+                buf[21..29].copy_from_slice(&disk_bytenr.to_le_bytes());
+                buf[29..37].copy_from_slice(&disk_num_bytes.to_le_bytes());
+                buf[37..45].copy_from_slice(&extent_offset.to_le_bytes());
+                buf[45..53].copy_from_slice(&num_bytes.to_le_bytes());
+                buf
+            }
+        }
+    }
 }
 
 fn read_exact<const N: usize>(
