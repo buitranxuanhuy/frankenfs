@@ -10,7 +10,6 @@ use ffs_alloc::{FsGeometry, GroupStats};
 use ffs_block::BlockDevice;
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::Ext4Inode;
-use ffs_types as crc32c;
 use ffs_types::{BlockNumber, GroupNumber, InodeNumber};
 
 // ── Constants ────────────────────────────────────────────────────────────────

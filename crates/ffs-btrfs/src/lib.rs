@@ -29,6 +29,8 @@ pub const BTRFS_FS_TREE_OBJECTID: u64 = 5;
 pub const BTRFS_ITEM_INODE_ITEM: u8 = 1;
 pub const BTRFS_ITEM_DIR_ITEM: u8 = 84;
 pub const BTRFS_ITEM_DIR_INDEX: u8 = 96;
+pub const BTRFS_ITEM_INODE_REF: u8 = 12;
+pub const BTRFS_ITEM_XATTR_ITEM: u8 = 24;
 pub const BTRFS_ITEM_EXTENT_DATA: u8 = 108;
 pub const BTRFS_ITEM_ROOT_ITEM: u8 = 132;
 
@@ -166,6 +168,68 @@ impl BtrfsDirItem {
     }
 }
 
+/// Parsed XATTR_ITEM payload.
+///
+/// Uses the same on-disk layout as `BtrfsDirItem` but with `data_len > 0`:
+/// the value bytes follow the name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BtrfsXattrItem {
+    /// The extended attribute name (e.g. `user.foo`).
+    pub name: Vec<u8>,
+    /// The extended attribute value.
+    pub value: Vec<u8>,
+}
+
+/// Parse one or more XATTR_ITEM entries from the concatenated payload bytes.
+///
+/// The format is the same DIR_ITEM header (30 bytes) followed by `name_len`
+/// bytes of name and `data_len` bytes of value.
+pub fn parse_xattr_items(data: &[u8]) -> Result<Vec<BtrfsXattrItem>, ParseError> {
+    const HEADER: usize = 30;
+    let mut out = Vec::new();
+    let mut cur = 0_usize;
+    while cur < data.len() {
+        if cur + HEADER > data.len() {
+            return Err(ParseError::InsufficientData {
+                needed: HEADER,
+                offset: cur,
+                actual: data.len() - cur,
+            });
+        }
+        let data_len = usize::from(read_u16(data, cur + 25, "xattr.data_len")?);
+        let name_len = usize::from(read_u16(data, cur + 27, "xattr.name_len")?);
+
+        let name_start = cur + HEADER;
+        let name_end = name_start
+            .checked_add(name_len)
+            .ok_or(ParseError::InvalidField {
+                field: "xattr.name_len",
+                reason: "overflow",
+            })?;
+        let value_end = name_end
+            .checked_add(data_len)
+            .ok_or(ParseError::InvalidField {
+                field: "xattr.data_len",
+                reason: "overflow",
+            })?;
+
+        if value_end > data.len() {
+            return Err(ParseError::InsufficientData {
+                needed: value_end,
+                offset: cur,
+                actual: data.len(),
+            });
+        }
+
+        out.push(BtrfsXattrItem {
+            name: data[name_start..name_end].to_vec(),
+            value: data[name_end..value_end].to_vec(),
+        });
+        cur = value_end;
+    }
+    Ok(out)
+}
+
 /// Parsed EXTENT_DATA payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BtrfsExtentData {
@@ -189,8 +253,8 @@ impl BtrfsExtentData {
     ///
     /// Fixed header (21 bytes): generation(8) + ram_bytes(8) + compression(1)
     /// + encryption(1) + other_encoding(2) + type(1).
-    /// Inline: header + data bytes.
-    /// Regular: header + disk_bytenr(8) + disk_num_bytes(8) + offset(8) + num_bytes(8).
+    ///   Inline: header + data bytes.
+    ///   Regular: header + disk_bytenr(8) + disk_num_bytes(8) + offset(8) + num_bytes(8).
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
@@ -564,6 +628,20 @@ pub enum BtrfsMutationError {
     AddressOverflow,
 }
 
+impl std::fmt::Display for BtrfsMutationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidConfig(msg) => write!(f, "invalid config: {msg}"),
+            Self::InvalidRange => write!(f, "invalid key range"),
+            Self::KeyAlreadyExists => write!(f, "key already exists"),
+            Self::KeyNotFound => write!(f, "key not found"),
+            Self::MissingNode(block) => write!(f, "missing tree node {block}"),
+            Self::BrokenInvariant(msg) => write!(f, "broken invariant: {msg}"),
+            Self::AddressOverflow => write!(f, "address overflow"),
+        }
+    }
+}
+
 /// Key/value payload stored in leaf nodes for the in-memory COW model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BtrfsTreeItem {
@@ -587,7 +665,7 @@ pub enum BtrfsCowNode {
 ///
 /// The in-memory tree uses this to allocate new node addresses and to
 /// report nodes that became unreachable after a successful mutation.
-pub trait BtrfsAllocator: std::fmt::Debug {
+pub trait BtrfsAllocator: std::fmt::Debug + Send + Sync {
     fn alloc_block(&mut self) -> Result<u64, BtrfsMutationError>;
     fn defer_free(&mut self, block: u64);
 }
@@ -3792,6 +3870,277 @@ mod tests {
             }
             BtrfsExtentData::Inline { .. } => panic!("expected regular extent"),
         }
+    }
+
+    // ── Serialization round-trip tests ────────────────────────────────────
+
+    #[test]
+    fn inode_item_round_trip() {
+        let original = BtrfsInodeItem {
+            size: 65536,
+            nbytes: 65536,
+            nlink: 3,
+            uid: 1000,
+            gid: 1000,
+            mode: 0o100_644,
+            rdev: 0,
+            atime_sec: 1_700_000_000,
+            atime_nsec: 123_456_789,
+            ctime_sec: 1_700_000_001,
+            ctime_nsec: 987_654_321,
+            mtime_sec: 1_700_000_002,
+            mtime_nsec: 111_111_111,
+            otime_sec: 1_700_000_003,
+            otime_nsec: 222_222_222,
+        };
+        let bytes = original.to_bytes();
+        assert_eq!(bytes.len(), 160);
+        let parsed = parse_inode_item(&bytes).expect("round-trip parse");
+        assert_eq!(parsed.size, original.size);
+        assert_eq!(parsed.nbytes, original.nbytes);
+        assert_eq!(parsed.nlink, original.nlink);
+        assert_eq!(parsed.uid, original.uid);
+        assert_eq!(parsed.gid, original.gid);
+        assert_eq!(parsed.mode, original.mode);
+        assert_eq!(parsed.rdev, original.rdev);
+        assert_eq!(parsed.atime_sec, original.atime_sec);
+        assert_eq!(parsed.atime_nsec, original.atime_nsec);
+        assert_eq!(parsed.ctime_sec, original.ctime_sec);
+        assert_eq!(parsed.ctime_nsec, original.ctime_nsec);
+        assert_eq!(parsed.mtime_sec, original.mtime_sec);
+        assert_eq!(parsed.mtime_nsec, original.mtime_nsec);
+        assert_eq!(parsed.otime_sec, original.otime_sec);
+        assert_eq!(parsed.otime_nsec, original.otime_nsec);
+    }
+
+    #[test]
+    fn dir_item_round_trip() {
+        let original = BtrfsDirItem {
+            child_objectid: 258,
+            child_key_type: BTRFS_ITEM_INODE_ITEM,
+            child_key_offset: 0,
+            file_type: BTRFS_FT_REG_FILE,
+            name: b"my_test_file.txt".to_vec(),
+        };
+        let bytes = original.to_bytes();
+        assert_eq!(bytes.len(), 30 + original.name.len());
+        let parsed = parse_dir_items(&bytes).expect("round-trip parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0], original);
+    }
+
+    #[test]
+    fn dir_item_round_trip_directory() {
+        let original = BtrfsDirItem {
+            child_objectid: 300,
+            child_key_type: BTRFS_ITEM_INODE_ITEM,
+            child_key_offset: 0,
+            file_type: BTRFS_FT_DIR,
+            name: b"subdir".to_vec(),
+        };
+        let bytes = original.to_bytes();
+        let parsed = parse_dir_items(&bytes).expect("round-trip parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0], original);
+    }
+
+    #[test]
+    fn dir_item_multiple_entries_concatenated() {
+        // btrfs stores multiple dir entries with the same hash in one payload.
+        let entry_a = BtrfsDirItem {
+            child_objectid: 258,
+            child_key_type: BTRFS_ITEM_INODE_ITEM,
+            child_key_offset: 0,
+            file_type: BTRFS_FT_REG_FILE,
+            name: b"file_a".to_vec(),
+        };
+        let entry_b = BtrfsDirItem {
+            child_objectid: 259,
+            child_key_type: BTRFS_ITEM_INODE_ITEM,
+            child_key_offset: 0,
+            file_type: BTRFS_FT_SYMLINK,
+            name: b"link_b".to_vec(),
+        };
+        let mut payload = entry_a.to_bytes();
+        payload.extend_from_slice(&entry_b.to_bytes());
+        let parsed = parse_dir_items(&payload).expect("parse concatenated entries");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0], entry_a);
+        assert_eq!(parsed[1], entry_b);
+    }
+
+    #[test]
+    fn extent_data_inline_round_trip() {
+        let data = b"Hello, btrfs inline extent!".to_vec();
+        let original = BtrfsExtentData::Inline {
+            compression: 0,
+            data: data.clone(),
+        };
+        let bytes = original.to_bytes();
+        assert_eq!(bytes.len(), 21 + data.len());
+        let parsed = parse_extent_data(&bytes).expect("round-trip parse");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn extent_data_regular_round_trip() {
+        let original = BtrfsExtentData::Regular {
+            extent_type: BTRFS_FILE_EXTENT_REG,
+            compression: 0,
+            disk_bytenr: 0x10_0000,
+            disk_num_bytes: 4096,
+            extent_offset: 0,
+            num_bytes: 3500,
+        };
+        let bytes = original.to_bytes();
+        assert_eq!(bytes.len(), 53);
+        let parsed = parse_extent_data(&bytes).expect("round-trip parse");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn extent_data_prealloc_round_trip() {
+        let original = BtrfsExtentData::Regular {
+            extent_type: BTRFS_FILE_EXTENT_PREALLOC,
+            compression: 0,
+            disk_bytenr: 0x20_0000,
+            disk_num_bytes: 8192,
+            extent_offset: 512,
+            num_bytes: 7680,
+        };
+        let bytes = original.to_bytes();
+        let parsed = parse_extent_data(&bytes).expect("round-trip parse");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn inode_item_zero_fields_round_trip() {
+        let original = BtrfsInodeItem {
+            size: 0,
+            nbytes: 0,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            mode: 0o100_000,
+            rdev: 0,
+            atime_sec: 0,
+            atime_nsec: 0,
+            ctime_sec: 0,
+            ctime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            otime_sec: 0,
+            otime_nsec: 0,
+        };
+        let bytes = original.to_bytes();
+        let parsed = parse_inode_item(&bytes).expect("round-trip parse");
+        assert_eq!(parsed.size, 0);
+        assert_eq!(parsed.nlink, 1);
+        assert_eq!(parsed.mode, 0o100_000);
+    }
+
+    #[test]
+    fn inode_item_max_values_round_trip() {
+        let original = BtrfsInodeItem {
+            size: u64::MAX,
+            nbytes: u64::MAX,
+            nlink: u32::MAX,
+            uid: u32::MAX,
+            gid: u32::MAX,
+            mode: u32::MAX,
+            rdev: u64::MAX,
+            atime_sec: u64::MAX,
+            atime_nsec: u32::MAX,
+            ctime_sec: u64::MAX,
+            ctime_nsec: u32::MAX,
+            mtime_sec: u64::MAX,
+            mtime_nsec: u32::MAX,
+            otime_sec: u64::MAX,
+            otime_nsec: u32::MAX,
+        };
+        let bytes = original.to_bytes();
+        let parsed = parse_inode_item(&bytes).expect("round-trip parse");
+        assert_eq!(parsed.size, u64::MAX);
+        assert_eq!(parsed.nlink, u32::MAX);
+        assert_eq!(parsed.rdev, u64::MAX);
+        assert_eq!(parsed.atime_sec, u64::MAX);
+        assert_eq!(parsed.otime_nsec, u32::MAX);
+    }
+
+    #[test]
+    fn extent_data_inline_empty() {
+        let original = BtrfsExtentData::Inline {
+            compression: 0,
+            data: vec![],
+        };
+        let bytes = original.to_bytes();
+        assert_eq!(bytes.len(), 21);
+        let parsed = parse_extent_data(&bytes).expect("round-trip parse");
+        assert_eq!(parsed, original);
+    }
+
+    // ── Xattr item parse tests ───────────────────────────────────────────
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn xattr_item_round_trip() {
+        // Build xattr payload in the same format btrfs_setxattr uses.
+        let name = b"user.myattr";
+        let value = b"some-value";
+        let mut payload = Vec::with_capacity(30 + name.len() + value.len());
+        payload.extend_from_slice(&[0u8; 17]); // location key
+        payload.extend_from_slice(&[0u8; 8]); // transid
+        payload.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        payload.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        payload.push(0); // type
+        payload.extend_from_slice(name);
+        payload.extend_from_slice(value);
+
+        let parsed = parse_xattr_items(&payload).expect("parse xattr");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, name);
+        assert_eq!(parsed[0].value, value);
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn xattr_item_empty_value() {
+        let name = b"user.empty";
+        let mut payload = Vec::with_capacity(30 + name.len());
+        payload.extend_from_slice(&[0u8; 17]);
+        payload.extend_from_slice(&[0u8; 8]);
+        payload.extend_from_slice(&0_u16.to_le_bytes()); // data_len=0
+        payload.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        payload.push(0);
+        payload.extend_from_slice(name);
+
+        let parsed = parse_xattr_items(&payload).expect("parse xattr empty value");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, name);
+        assert!(parsed[0].value.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn xattr_item_multiple_concatenated() {
+        // Two xattr items concatenated (would happen with hash collisions).
+        let mut payload = Vec::new();
+        for (name, value) in [("user.a", b"val1" as &[u8]), ("user.b", b"val2")] {
+            payload.extend_from_slice(&[0u8; 17]);
+            payload.extend_from_slice(&[0u8; 8]);
+            payload.extend_from_slice(&(value.len() as u16).to_le_bytes());
+            payload.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            payload.push(0);
+            payload.extend_from_slice(name.as_bytes());
+            payload.extend_from_slice(value);
+        }
+
+        let parsed = parse_xattr_items(&payload).expect("parse multiple xattrs");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, b"user.a");
+        assert_eq!(parsed[0].value, b"val1");
+        assert_eq!(parsed[1].name, b"user.b");
+        assert_eq!(parsed[1].value, b"val2");
     }
 
     // ── Extent allocator tests ──────────────────────────────────────────

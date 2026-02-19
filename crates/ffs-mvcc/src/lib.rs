@@ -3009,11 +3009,7 @@ mod tests {
                     results.lock().unwrap()[i] = Some(outcome.map(|seq| seq.0).map_err(|_| i));
                 })
                 .expect("create task");
-            runtime
-                .scheduler
-                .lock()
-                .expect("scheduler lock not poisoned")
-                .schedule(task_id, 0);
+            runtime.scheduler.lock().schedule(task_id, 0);
         }
 
         let steps = runtime.run_until_quiescent();
@@ -3109,11 +3105,7 @@ mod tests {
                         }
                     })
                     .expect("create task");
-                runtime
-                    .scheduler
-                    .lock()
-                    .expect("scheduler lock not poisoned")
-                    .schedule(task_id, 0);
+                runtime.scheduler.lock().schedule(task_id, 0);
             }
 
             runtime.run_until_quiescent();
@@ -3182,11 +3174,7 @@ mod tests {
                         *reader_result.lock().unwrap() = Some(data);
                     })
                     .expect("create task");
-                runtime
-                    .scheduler
-                    .lock()
-                    .expect("scheduler lock not poisoned")
-                    .schedule(task_id, 0);
+                runtime.scheduler.lock().schedule(task_id, 0);
             }
 
             // Writer tasks: commit new versions.
@@ -3202,11 +3190,7 @@ mod tests {
                         s.commit(txn).expect("writer commit");
                     })
                     .expect("create task");
-                runtime
-                    .scheduler
-                    .lock()
-                    .expect("scheduler lock not poisoned")
-                    .schedule(task_id, 0);
+                runtime.scheduler.lock().schedule(task_id, 0);
             }
 
             runtime.run_until_quiescent();
@@ -3292,11 +3276,7 @@ mod tests {
                         outcomes.lock().unwrap().0 = Some(result.is_ok());
                     })
                     .expect("create task");
-                runtime
-                    .scheduler
-                    .lock()
-                    .expect("scheduler lock not poisoned")
-                    .schedule(task_id, 0);
+                runtime.scheduler.lock().schedule(task_id, 0);
             }
 
             // T2: writes A to 2 (based on having seen B=1 at snapshot).
@@ -3317,11 +3297,7 @@ mod tests {
                         outcomes.lock().unwrap().1 = Some(result.is_ok());
                     })
                     .expect("create task");
-                runtime
-                    .scheduler
-                    .lock()
-                    .expect("scheduler lock not poisoned")
-                    .schedule(task_id, 0);
+                runtime.scheduler.lock().schedule(task_id, 0);
             }
 
             runtime.run_until_quiescent();
@@ -3396,11 +3372,7 @@ mod tests {
                         }
                     })
                     .expect("create task");
-                runtime
-                    .scheduler
-                    .lock()
-                    .expect("scheduler lock not poisoned")
-                    .schedule(task_id, 0);
+                runtime.scheduler.lock().schedule(task_id, 0);
             }
 
             runtime.run_until_quiescent();
@@ -4820,11 +4792,7 @@ mod tests {
                         outcomes.lock().unwrap().0 = Some(result.is_ok());
                     })
                     .expect("create task");
-                runtime
-                    .scheduler
-                    .lock()
-                    .expect("scheduler lock not poisoned")
-                    .schedule(task_id, 0);
+                runtime.scheduler.lock().schedule(task_id, 0);
             }
 
             // T2: reads B, writes A.
@@ -4846,11 +4814,7 @@ mod tests {
                         outcomes.lock().unwrap().1 = Some(result.is_ok());
                     })
                     .expect("create task");
-                runtime
-                    .scheduler
-                    .lock()
-                    .expect("scheduler lock not poisoned")
-                    .schedule(task_id, 0);
+                runtime.scheduler.lock().schedule(task_id, 0);
             }
 
             runtime.run_until_quiescent();
@@ -4930,11 +4894,7 @@ mod tests {
                         outcomes.lock().unwrap().0 = Some(r.is_ok());
                     })
                     .expect("create");
-                runtime
-                    .scheduler
-                    .lock()
-                    .expect("scheduler lock not poisoned")
-                    .schedule(task_id, 0);
+                runtime.scheduler.lock().schedule(task_id, 0);
             }
 
             {
@@ -4951,11 +4911,7 @@ mod tests {
                         outcomes.lock().unwrap().1 = Some(r.is_ok());
                     })
                     .expect("create");
-                runtime
-                    .scheduler
-                    .lock()
-                    .expect("scheduler lock not poisoned")
-                    .schedule(task_id, 0);
+                runtime.scheduler.lock().schedule(task_id, 0);
             }
 
             runtime.run_until_quiescent();
@@ -5015,11 +4971,7 @@ mod tests {
                         }
                     })
                     .expect("create");
-                runtime
-                    .scheduler
-                    .lock()
-                    .expect("scheduler lock not poisoned")
-                    .schedule(task_id, 0);
+                runtime.scheduler.lock().schedule(task_id, 0);
             }
 
             runtime.run_until_quiescent();
@@ -5128,11 +5080,7 @@ mod tests {
                         }
                     })
                     .expect("create");
-                runtime
-                    .scheduler
-                    .lock()
-                    .expect("scheduler lock not poisoned")
-                    .schedule(task_id, 0);
+                runtime.scheduler.lock().schedule(task_id, 0);
             }
 
             runtime.run_until_quiescent();
@@ -5204,11 +5152,7 @@ mod tests {
                         }
                     })
                     .expect("create");
-                runtime
-                    .scheduler
-                    .lock()
-                    .expect("scheduler lock not poisoned")
-                    .schedule(task_id, 0);
+                runtime.scheduler.lock().schedule(task_id, 0);
             }
 
             runtime.run_until_quiescent();
