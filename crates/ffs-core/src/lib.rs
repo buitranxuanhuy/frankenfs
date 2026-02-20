@@ -5910,7 +5910,9 @@ impl OpenFs {
             return Err(FfsError::IsDirectory);
         }
 
-        let end = offset + data.len() as u64;
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| FfsError::InvalidGeometry("offset + length overflow".into()))?;
         let sectorsize = u64::from(alloc.nodesize.min(4096));
 
         // For simplicity in V1, write data as an inline extent if small enough,
@@ -5973,8 +5975,9 @@ impl OpenFs {
                         // Persist the old inline data as a regular extent at
                         // offset 0 so reads in [0, prev_data.len()) still work.
                         if !prev_data.is_empty() && offset > 0 {
-                            let prev_alloc_size =
-                                (prev_data.len() as u64 + sectorsize - 1) & !(sectorsize - 1);
+                            let prev_alloc_size = (prev_data.len() as u64)
+                                .saturating_add(sectorsize - 1)
+                                & !(sectorsize - 1);
                             if let Ok(prev_allocation) =
                                 alloc.extent_alloc.alloc_data(prev_alloc_size)
                             {
@@ -5999,7 +6002,7 @@ impl OpenFs {
             }
 
             // Allocate a data extent and write through the device.
-            let alloc_size = (data.len() as u64 + sectorsize - 1) & !(sectorsize - 1);
+            let alloc_size = (data.len() as u64).saturating_add(sectorsize - 1) & !(sectorsize - 1);
             let allocation = alloc
                 .extent_alloc
                 .alloc_data(alloc_size)
@@ -6079,7 +6082,7 @@ impl OpenFs {
 
         let mut alloc = alloc_mutex.lock();
         let new_oid = alloc.next_objectid;
-        alloc.next_objectid += 1;
+        alloc.next_objectid = alloc.next_objectid.saturating_add(1);
 
         // Create the INODE_ITEM.
         let inode = BtrfsInodeItem {
@@ -6145,7 +6148,7 @@ impl OpenFs {
 
         let mut alloc = alloc_mutex.lock();
         let new_oid = alloc.next_objectid;
-        alloc.next_objectid += 1;
+        alloc.next_objectid = alloc.next_objectid.saturating_add(1);
 
         let inode = BtrfsInodeItem {
             size: 0,
@@ -6377,7 +6380,7 @@ impl OpenFs {
 
         let mut alloc = alloc_mutex.lock();
         let new_oid = alloc.next_objectid;
-        alloc.next_objectid += 1;
+        alloc.next_objectid = alloc.next_objectid.saturating_add(1);
 
         let inode = BtrfsInodeItem {
             size: target_bytes.len() as u64,
@@ -6565,7 +6568,10 @@ impl OpenFs {
 
         if !already_has_data {
             let sectorsize = u64::from(alloc.nodesize.min(4096));
-            let alloc_size = (length + sectorsize - 1) & !(sectorsize - 1);
+            let alloc_size = length
+                .checked_add(sectorsize - 1)
+                .ok_or_else(|| FfsError::InvalidGeometry("offset + length overflow".into()))?
+                & !(sectorsize - 1);
 
             let allocation = alloc
                 .extent_alloc
@@ -6593,7 +6599,9 @@ impl OpenFs {
 
         // Update inode size if fallocate extends beyond current size.
         let mut inode = self.btrfs_read_inode_from_tree(&alloc, canonical)?;
-        let new_end = offset + length;
+        let new_end = offset
+            .checked_add(length)
+            .ok_or_else(|| FfsError::InvalidGeometry("offset + length overflow".into()))?;
         if new_end > inode.size {
             inode.size = new_end;
             inode.nbytes = new_end;

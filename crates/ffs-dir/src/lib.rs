@@ -632,14 +632,19 @@ mod tests {
     fn dx_hash_different_names_produce_different_hashes() {
         let seed = [0xDEAD_BEEF, 0xCAFE_BABE, 0x1234_5678, 0xABCD_EF01];
         let names: Vec<&[u8]> = vec![
-            b"a", b"b", b"ab", b"ba", b"file.txt", b"FILE.TXT",
-            b"index.html", b"readme.md", b"Cargo.toml", b"lib.rs",
+            b"a",
+            b"b",
+            b"ab",
+            b"ba",
+            b"file.txt",
+            b"FILE.TXT",
+            b"index.html",
+            b"readme.md",
+            b"Cargo.toml",
+            b"lib.rs",
         ];
 
-        let hashes: Vec<u32> = names
-            .iter()
-            .map(|n| compute_dx_hash(1, n, &seed))
-            .collect();
+        let hashes: Vec<u32> = names.iter().map(|n| compute_dx_hash(1, n, &seed)).collect();
 
         // Check for uniqueness — with 10 distinct names, we expect at least
         // 8 distinct hashes (allowing some collision, but not total collision).
@@ -665,7 +670,10 @@ mod tests {
         let hash_zero = compute_dx_hash(1, name, &seed_zero);
 
         // Different seeds should (almost certainly) produce different hashes.
-        assert_ne!(hash_a, hash_b, "different seeds should produce different hashes");
+        assert_ne!(
+            hash_a, hash_b,
+            "different seeds should produce different hashes"
+        );
         assert_ne!(hash_a, hash_zero, "non-zero vs zero seed should differ");
     }
 
@@ -698,6 +706,9 @@ mod tests {
         // A name with very different content should hash differently.
         let different: Vec<u8> = (0..255).map(|i| b'a' + (i % 26)).collect();
         let h2 = compute_dx_hash(1, &different, &seed);
-        assert_ne!(h, h2, "structurally different long names should hash differently");
+        assert_ne!(
+            h, h2,
+            "structurally different long names should hash differently"
+        );
     }
 }
