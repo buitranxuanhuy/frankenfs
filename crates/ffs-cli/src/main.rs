@@ -231,7 +231,7 @@ enum Command {
         #[arg(long)]
         verify_only: bool,
         /// Maximum worker threads for repair workflow.
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
         max_threads: Option<u32>,
         /// Output in JSON format.
         #[arg(long)]
@@ -3407,6 +3407,145 @@ fn repair_cmd(path: &PathBuf, options: RepairCommandOptions) -> Result<()> {
     Ok(())
 }
 
+fn repair_worker_limit(requested: Option<u32>) -> (usize, Option<u32>) {
+    let available = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    let requested_raw = requested.unwrap_or(1).max(1);
+    let requested_threads = usize::try_from(requested_raw).unwrap_or(usize::MAX);
+    let effective = requested_threads.min(available).max(1);
+    let capped = (requested_threads > effective).then_some(requested_raw);
+    (effective, capped)
+}
+
+fn partition_scrub_range(
+    start: BlockNumber,
+    count: u64,
+    workers: usize,
+) -> Vec<(BlockNumber, u64)> {
+    if count == 0 || workers == 0 {
+        return Vec::new();
+    }
+
+    let workers_u64 = u64::try_from(workers).unwrap_or(u64::MAX).min(count);
+    let base = count / workers_u64;
+    let remainder = count % workers_u64;
+    let mut cursor = start.0;
+    let mut ranges = Vec::with_capacity(usize::try_from(workers_u64).unwrap_or(usize::MAX));
+    for worker_idx in 0..workers_u64 {
+        let width = base + if worker_idx < remainder { 1 } else { 0 };
+        ranges.push((BlockNumber(cursor), width));
+        cursor = cursor.saturating_add(width);
+    }
+    ranges
+}
+
+fn merge_scrub_reports(reports: Vec<ScrubReport>) -> ScrubReport {
+    let mut merged = ScrubReport {
+        findings: Vec::new(),
+        blocks_scanned: 0,
+        blocks_corrupt: 0,
+        blocks_io_error: 0,
+    };
+    for report in reports {
+        merged.blocks_scanned = merged.blocks_scanned.saturating_add(report.blocks_scanned);
+        merged.blocks_corrupt = merged.blocks_corrupt.saturating_add(report.blocks_corrupt);
+        merged.blocks_io_error = merged
+            .blocks_io_error
+            .saturating_add(report.blocks_io_error);
+        merged.findings.extend(report.findings);
+    }
+    merged
+}
+
+fn scrub_range_for_repair(
+    path: &PathBuf,
+    flavor: &FsFlavor,
+    block_size: u32,
+    start: BlockNumber,
+    count: u64,
+    max_threads: Option<u32>,
+    limitations: &mut Vec<String>,
+) -> Result<ScrubReport> {
+    let seed_dev = FileByteDevice::open(path)
+        .with_context(|| format!("failed to open image: {}", path.display()))?;
+    let seed_block_dev = ByteBlockDevice::new(seed_dev, block_size)
+        .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
+    let available_blocks = seed_block_dev.block_count();
+    let effective_count = if start.0 >= available_blocks {
+        0
+    } else {
+        count.min(available_blocks.saturating_sub(start.0))
+    };
+    if effective_count == 0 {
+        return Ok(ScrubReport {
+            findings: Vec::new(),
+            blocks_scanned: 0,
+            blocks_corrupt: 0,
+            blocks_io_error: 0,
+        });
+    }
+
+    let (worker_limit, capped_from) = repair_worker_limit(max_threads);
+    if let Some(requested) = capped_from {
+        limitations.push(format!(
+            "--max-threads={requested} exceeds host parallelism; capped at {worker_limit}"
+        ));
+    }
+
+    if worker_limit <= 1 || effective_count <= 1 {
+        let validator = scrub_validator(flavor, block_size);
+        let cx = cli_cx();
+        return Scrubber::new(&seed_block_dev, &*validator)
+            .scrub_range(&cx, start, effective_count)
+            .with_context(|| {
+                format!(
+                    "failed to scrub range starting at block {} for {} blocks",
+                    start.0, effective_count
+                )
+            });
+    }
+
+    drop(seed_block_dev);
+    let ranges = partition_scrub_range(start, effective_count, worker_limit);
+    let mut reports = Vec::with_capacity(ranges.len());
+
+    std::thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::with_capacity(ranges.len());
+        for (worker_idx, (range_start, range_count)) in ranges.into_iter().enumerate() {
+            let path = path.clone();
+            let shard_flavor = flavor.clone();
+            handles.push(scope.spawn(move || -> Result<ScrubReport> {
+                let cx = cli_cx();
+                let byte_dev = FileByteDevice::open(&path)
+                    .with_context(|| format!("failed to open image: {}", path.display()))?;
+                let block_dev = ByteBlockDevice::new(byte_dev, block_size).with_context(|| {
+                    format!("failed to create block device (block_size={block_size})")
+                })?;
+                let validator = scrub_validator(&shard_flavor, block_size);
+                Scrubber::new(&block_dev, &*validator)
+                    .scrub_range(&cx, range_start, range_count)
+                    .with_context(|| {
+                        format!(
+                            "repair scrub worker {worker_idx} failed at block {} for {} blocks",
+                            range_start.0, range_count
+                        )
+                    })
+            }));
+        }
+
+        for handle in handles {
+            let shard = handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("repair scrub worker panicked"))??;
+            reports.push(shard);
+        }
+        Ok(())
+    })?;
+
+    Ok(merge_scrub_reports(reports))
+}
+
 #[allow(clippy::too_many_lines)]
 fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Result<RepairOutput> {
     let flags = options.flags;
@@ -3436,16 +3575,18 @@ fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Result<
     let (scope, report) = match &flavor {
         FsFlavor::Ext4(sb) => {
             let block_size = sb.block_size;
-            let block_dev = ByteBlockDevice::new(byte_dev, block_size).with_context(|| {
-                format!("failed to create block device (block_size={block_size})")
-            })?;
-            let validator = scrub_validator(&flavor, block_size);
-
             if let Some(group) = options.block_group {
                 let (start, count) = ext4_group_scrub_scope(sb, group)?;
-                let report = Scrubber::new(&block_dev, &*validator)
-                    .scrub_range(&cx, start, count)
-                    .with_context(|| format!("failed to scrub ext4 group {group}"))?;
+                let report = scrub_range_for_repair(
+                    path,
+                    &flavor,
+                    block_size,
+                    start,
+                    count,
+                    options.max_threads,
+                    &mut limitations,
+                )
+                .with_context(|| format!("failed to scrub ext4 group {group}"))?;
                 (
                     RepairScopeOutput::Ext4BlockGroup {
                         group,
@@ -3461,9 +3602,16 @@ fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Result<
                             .to_owned(),
                     );
                 }
-                let report = Scrubber::new(&block_dev, &*validator)
-                    .scrub_all(&cx)
-                    .context("failed to scrub ext4 image")?;
+                let report = scrub_range_for_repair(
+                    path,
+                    &flavor,
+                    block_size,
+                    BlockNumber(0),
+                    u64::MAX,
+                    options.max_threads,
+                    &mut limitations,
+                )
+                .context("failed to scrub ext4 image")?;
                 (RepairScopeOutput::Full, report)
             }
         }
@@ -3488,13 +3636,16 @@ fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Result<
                         sb.nodesize, sb.sectorsize
                     )
                 })?;
-            let block_dev = ByteBlockDevice::new(byte_dev, block_size).with_context(|| {
-                format!("failed to create block device (block_size={block_size})")
-            })?;
-            let validator = scrub_validator(&flavor, block_size);
-            let report = Scrubber::new(&block_dev, &*validator)
-                .scrub_all(&cx)
-                .context("failed to scrub btrfs image")?;
+            let report = scrub_range_for_repair(
+                path,
+                &flavor,
+                block_size,
+                BlockNumber(0),
+                u64::MAX,
+                options.max_threads,
+                &mut limitations,
+            )
+            .context("failed to scrub btrfs image")?;
             (RepairScopeOutput::Full, report)
         }
     };
@@ -3505,12 +3656,6 @@ fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Result<
                 .to_owned(),
         );
     }
-    if options.max_threads.is_some() {
-        limitations.push(
-            "--max-threads is currently a no-op; repair currently runs single-threaded".to_owned(),
-        );
-    }
-
     let scrub = repair_scrub_from_report(&report);
     let action = if flags.verify_only() {
         RepairActionOutput::VerifyOnly
@@ -4041,6 +4186,7 @@ fn mkfs_cmd(
 mod tests {
     use super::{
         Cli, Command, DumpCommand, Ext4JournalReplayMode, LogFormat, ext4_mount_replay_mode,
+        merge_scrub_reports, partition_scrub_range, repair_worker_limit,
     };
     use clap::Parser;
     use serde_json::Value;
@@ -4408,5 +4554,42 @@ mod tests {
             }
             _ => panic!("expected repair command"),
         }
+    }
+
+    #[test]
+    fn repair_worker_limit_defaults_to_single() {
+        let (workers, capped) = repair_worker_limit(None);
+        assert_eq!(workers, 1);
+        assert_eq!(capped, None);
+    }
+
+    #[test]
+    fn partition_scrub_range_covers_exact_range() {
+        let ranges = partition_scrub_range(super::BlockNumber(10), 11, 3);
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[0], (super::BlockNumber(10), 4));
+        assert_eq!(ranges[1], (super::BlockNumber(14), 4));
+        assert_eq!(ranges[2], (super::BlockNumber(18), 3));
+    }
+
+    #[test]
+    fn merge_scrub_reports_accumulates_counts() {
+        let merged = merge_scrub_reports(vec![
+            super::ScrubReport {
+                findings: Vec::new(),
+                blocks_scanned: 10,
+                blocks_corrupt: 2,
+                blocks_io_error: 1,
+            },
+            super::ScrubReport {
+                findings: Vec::new(),
+                blocks_scanned: 7,
+                blocks_corrupt: 0,
+                blocks_io_error: 3,
+            },
+        ]);
+        assert_eq!(merged.blocks_scanned, 17);
+        assert_eq!(merged.blocks_corrupt, 2);
+        assert_eq!(merged.blocks_io_error, 4);
     }
 }
