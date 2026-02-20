@@ -1803,9 +1803,7 @@ fn ext4_appears_clean_state(state: u16) -> bool {
     const EXT4_ERROR_FS: u16 = 0x0002;
     const EXT4_ORPHAN_FS: u16 = 0x0004;
 
-    (state & EXT4_VALID_FS) != 0
-        && (state & EXT4_ERROR_FS) == 0
-        && (state & EXT4_ORPHAN_FS) == 0
+    (state & EXT4_VALID_FS) != 0 && (state & EXT4_ERROR_FS) == 0 && (state & EXT4_ORPHAN_FS) == 0
 }
 
 fn ext4_group_flag_names(flags: u16) -> Vec<String> {
@@ -4221,14 +4219,16 @@ fn mkfs_cmd(
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, DumpCommand, Ext4JournalReplayMode, LogFormat, ext4_appears_clean_state,
-        ext4_mount_replay_mode,
-        merge_scrub_reports, partition_scrub_range, repair_worker_limit,
+        Cli, Command, DumpCommand, Ext4JournalReplayMode, FsckCommandOptions, FsckFlags, LogFormat,
+        build_fsck_output, ext4_appears_clean_state, ext4_mount_replay_mode, merge_scrub_reports,
+        partition_scrub_range, repair_worker_limit,
     };
     use clap::Parser;
     use serde_json::Value;
     use std::io::{self, Write};
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tracing::{info, info_span};
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::fmt::MakeWriter;
@@ -4280,6 +4280,55 @@ mod tests {
             .find(|line| !line.trim().is_empty())
             .expect("expected at least one log line");
         serde_json::from_str(line).expect("line should parse as JSON")
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn build_test_ext4_image_with_state(state: u16) -> Vec<u8> {
+        const BLOCK_SIZE_LOG: u32 = 2; // 4K blocks
+        let block_size = 1024_u32 << BLOCK_SIZE_LOG;
+        let image_size: u32 = 128 * 1024;
+        let mut image = vec![0_u8; image_size as usize];
+        let sb_off = ffs_types::EXT4_SUPERBLOCK_OFFSET;
+
+        // Core superblock fields needed by parser + geometry checks.
+        image[sb_off + 0x38..sb_off + 0x3A]
+            .copy_from_slice(&ffs_types::EXT4_SUPER_MAGIC.to_le_bytes());
+        image[sb_off + 0x18..sb_off + 0x1C].copy_from_slice(&BLOCK_SIZE_LOG.to_le_bytes());
+        let blocks_count = image_size / block_size;
+        image[sb_off + 0x04..sb_off + 0x08].copy_from_slice(&blocks_count.to_le_bytes());
+        image[sb_off..sb_off + 0x04].copy_from_slice(&128_u32.to_le_bytes()); // inodes_count
+        image[sb_off + 0x14..sb_off + 0x18].copy_from_slice(&0_u32.to_le_bytes()); // first_data_block
+        image[sb_off + 0x20..sb_off + 0x24].copy_from_slice(&blocks_count.to_le_bytes()); // blocks_per_group
+        image[sb_off + 0x28..sb_off + 0x2C].copy_from_slice(&128_u32.to_le_bytes()); // inodes_per_group
+        image[sb_off + 0x58..sb_off + 0x5A].copy_from_slice(&256_u16.to_le_bytes()); // inode_size
+        image[sb_off + 0x4C..sb_off + 0x50].copy_from_slice(&1_u32.to_le_bytes()); // rev_level
+        image[sb_off + 0x54..sb_off + 0x58].copy_from_slice(&11_u32.to_le_bytes()); // first_ino
+        let filetype: u32 = 0x0002;
+        let extents: u32 = 0x0040;
+        image[sb_off + 0x60..sb_off + 0x64].copy_from_slice(&(filetype | extents).to_le_bytes());
+        image[sb_off + 0x3A..sb_off + 0x3C].copy_from_slice(&state.to_le_bytes());
+
+        // Minimal group descriptor so group-descriptor validation succeeds.
+        let gdt_off = block_size as usize;
+        image[gdt_off + 0x08..gdt_off + 0x0C].copy_from_slice(&5_u32.to_le_bytes()); // inode table block
+
+        image
+    }
+
+    fn with_temp_image_path<T>(image: &[u8], f: impl FnOnce(PathBuf) -> T) -> T {
+        let mut path = std::env::temp_dir();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be monotonic")
+            .as_nanos();
+        path.push(format!(
+            "ffs-cli-fsck-force-{}-{ts}.img",
+            std::process::id()
+        ));
+        std::fs::write(&path, image).expect("write test filesystem image");
+        let result = f(path.clone());
+        let _ = std::fs::remove_file(path);
+        result
     }
 
     #[test]
@@ -4636,5 +4685,68 @@ mod tests {
         assert!(!ext4_appears_clean_state(0x0000));
         assert!(!ext4_appears_clean_state(0x0001 | 0x0002));
         assert!(!ext4_appears_clean_state(0x0001 | 0x0004));
+    }
+
+    #[test]
+    fn fsck_skips_clean_ext4_scrub_without_force() {
+        const EXT4_VALID_FS: u16 = 0x0001;
+        let image = build_test_ext4_image_with_state(EXT4_VALID_FS);
+        let output = with_temp_image_path(&image, |path| {
+            build_fsck_output(
+                &path,
+                FsckCommandOptions {
+                    flags: FsckFlags::empty(),
+                    block_group: None,
+                },
+            )
+            .expect("build fsck output for clean ext4 image")
+        });
+
+        assert_eq!(output.scrub.scanned, 0);
+        assert_eq!(output.scrub.corrupt, 0);
+        assert_eq!(output.scrub.error_or_higher, 0);
+        let scrub_phase = output
+            .phases
+            .iter()
+            .find(|phase| phase.phase == "checksum_scrub")
+            .expect("checksum_scrub phase should be present");
+        assert_eq!(scrub_phase.status, "skipped");
+        assert!(scrub_phase.detail.contains("pass --force for full scrub"));
+        assert!(
+            output
+                .limitations
+                .iter()
+                .any(|limitation| limitation.contains("skipped block-level scrub"))
+        );
+    }
+
+    #[test]
+    fn fsck_force_runs_full_scrub_for_clean_ext4() {
+        const EXT4_VALID_FS: u16 = 0x0001;
+        let image = build_test_ext4_image_with_state(EXT4_VALID_FS);
+        let output = with_temp_image_path(&image, |path| {
+            build_fsck_output(
+                &path,
+                FsckCommandOptions {
+                    flags: FsckFlags::empty().with_force(true),
+                    block_group: None,
+                },
+            )
+            .expect("build fsck output for forced clean ext4 image")
+        });
+
+        assert!(output.scrub.scanned > 0);
+        let scrub_phase = output
+            .phases
+            .iter()
+            .find(|phase| phase.phase == "checksum_scrub")
+            .expect("checksum_scrub phase should be present");
+        assert_eq!(scrub_phase.status, "ok");
+        assert!(
+            !output
+                .limitations
+                .iter()
+                .any(|limitation| limitation.contains("skipped block-level scrub"))
+        );
     }
 }
