@@ -24,7 +24,7 @@
 | 14 | `ffs-repair` | RaptorQ self-healing: generate/store repair symbols per block group, detect corruption via checksum, recover blocks, background scrub | `ffs-types`, `ffs-error`, `ffs-block`, `asupersync`, `blake3`, `crc32c` | 8 |
 | 15 | `ffs-core` | Engine integration: format detection (FsFlavor), FrankenFsEngine (MVCC wrapper), DurabilityAutopilot (Bayesian redundancy), mount orchestration | `ffs-types`, `ffs-error`, `ffs-ondisk`, `ffs-block`, `ffs-mvcc`, `ffs-btrfs`, `asupersync`, `serde`, `thiserror` | 7 |
 | 16 | `ffs` | Public API facade: re-exports core functionality, stable external interface | `ffs-core` | 9 |
-| 17 | `ffs-cli` | CLI binary: `ffs inspect`, `ffs mount`, `ffs scrub`, `ffs parity` | `ffs-core`, `ffs-block`, `ffs-fuse`, `ffs-repair`, `ffs-harness`, `anyhow`, `asupersync`, `clap`, `serde`, `serde_json` | 9 |
+| 17 | `ffs-cli` | CLI binary: `ffs inspect`, `ffs info`, `ffs dump`, `ffs fsck`, `ffs repair`, `ffs mount`, `ffs scrub`, `ffs parity` | `ffs-core`, `ffs-block`, `ffs-fuse`, `ffs-harness`, `ffs-ondisk`, `ffs-repair`, `ffs-types`, `anyhow`, `asupersync`, `clap`, `serde`, `serde_json` | 9 |
 | 18 | `ffs-tui` | TUI monitoring: live cache stats, MVCC version counts, repair status, I/O throughput | `ffs`, `ftui` | 9 |
 | 19 | `ffs-harness` | Conformance testing harness: parity reports, sparse JSON fixtures, compare FrankenFS behavior against real ext4/btrfs images | `ffs-core`, `ffs-ondisk`, `ffs-types`, `anyhow`, `hex`, `serde`, `serde_json`; dev: `criterion` | 9 |
 | 20 | `ffs-ext4` | Legacy/reference wrapper for ext4 parsing APIs (re-exports `ffs-ondisk::ext4::*`) | `ffs-ondisk` | 1 |

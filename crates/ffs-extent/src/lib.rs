@@ -1351,6 +1351,298 @@ mod tests {
         );
     }
 
+    // ── Error-path tests ───────────────────────────────────────────────
+
+    #[test]
+    fn allocate_unwritten_zero_count_fails() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let mut root = empty_root();
+
+        let result = allocate_unwritten_extent(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            0,
+            &AllocHint::default(),
+        );
+        assert!(
+            matches!(result, Err(FfsError::Format(_))),
+            "allocate_unwritten_extent with count=0 should return Format error"
+        );
+    }
+
+    #[test]
+    fn allocate_unwritten_over_max_count_fails() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let mut root = empty_root();
+
+        let result = allocate_unwritten_extent(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            32768,
+            &AllocHint::default(),
+        );
+        assert!(
+            matches!(result, Err(FfsError::Format(_))),
+            "allocate_unwritten_extent with count=32768 should return Format error"
+        );
+    }
+
+    #[test]
+    fn allocate_extent_no_space_fails() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let mut root = empty_root();
+
+        // Mark all groups as having 0 free blocks.
+        for g in &mut groups {
+            g.free_blocks = 0;
+        }
+
+        let result = allocate_extent(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            10,
+            &AllocHint::default(),
+        );
+        assert!(
+            matches!(result, Err(FfsError::NoSpace)),
+            "allocate_extent with no free blocks should return NoSpace"
+        );
+    }
+
+    #[test]
+    fn allocate_unwritten_no_space_fails() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let mut root = empty_root();
+
+        // Mark all groups as having 0 free blocks.
+        for g in &mut groups {
+            g.free_blocks = 0;
+        }
+
+        let result = allocate_unwritten_extent(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            10,
+            &AllocHint::default(),
+        );
+        assert!(
+            matches!(result, Err(FfsError::NoSpace)),
+            "allocate_unwritten_extent with no free blocks should return NoSpace"
+        );
+    }
+
+    // ── Multiple overlapping unwritten extents ──────────────────────────
+
+    #[test]
+    fn mark_written_across_two_unwritten_extents() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let mut root = empty_root();
+
+        // Allocate two adjacent unwritten extents: [0-4] and [5-9].
+        allocate_unwritten_extent(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            5,
+            &AllocHint::default(),
+        )
+        .unwrap();
+        allocate_unwritten_extent(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            5,
+            5,
+            &AllocHint::default(),
+        )
+        .unwrap();
+
+        // Both should be unwritten.
+        match ffs_btree::search(&cx, &dev, &root, 2).unwrap() {
+            SearchResult::Found { extent, .. } => assert!(extent.is_unwritten()),
+            _ => panic!("expected unwritten extent at block 2"),
+        }
+        match ffs_btree::search(&cx, &dev, &root, 7).unwrap() {
+            SearchResult::Found { extent, .. } => assert!(extent.is_unwritten()),
+            _ => panic!("expected unwritten extent at block 7"),
+        }
+
+        // Mark blocks 3-7 as written, spanning both extents.
+        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 3, 5).unwrap();
+
+        // Block 1 should still be unwritten (left residual of first extent).
+        match ffs_btree::search(&cx, &dev, &root, 1).unwrap() {
+            SearchResult::Found { extent, .. } => {
+                assert!(extent.is_unwritten(), "block 1 should remain unwritten");
+            }
+            _ => panic!("expected extent at block 1"),
+        }
+
+        // Block 4 should now be written (was in first extent, within mark range).
+        match ffs_btree::search(&cx, &dev, &root, 4).unwrap() {
+            SearchResult::Found { extent, .. } => assert!(
+                !extent.is_unwritten(),
+                "block 4 should be written after mark_written"
+            ),
+            _ => panic!("expected extent at block 4"),
+        }
+
+        // Block 6 should now be written (was in second extent, within mark range).
+        match ffs_btree::search(&cx, &dev, &root, 6).unwrap() {
+            SearchResult::Found { extent, .. } => assert!(
+                !extent.is_unwritten(),
+                "block 6 should be written after mark_written"
+            ),
+            _ => panic!("expected extent at block 6"),
+        }
+
+        // Block 9 should still be unwritten (right residual of second extent).
+        match ffs_btree::search(&cx, &dev, &root, 9).unwrap() {
+            SearchResult::Found { extent, .. } => {
+                assert!(extent.is_unwritten(), "block 9 should remain unwritten");
+            }
+            _ => panic!("expected extent at block 9"),
+        }
+    }
+
+    #[test]
+    fn mark_written_across_three_unwritten_extents() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let mut root = empty_root();
+
+        // Allocate three adjacent unwritten extents: [0-3], [4-7], [8-11].
+        for i in 0..3 {
+            allocate_unwritten_extent(
+                &cx,
+                &dev,
+                &mut root,
+                &geo,
+                &mut groups,
+                i * 4,
+                4,
+                &AllocHint::default(),
+            )
+            .unwrap();
+        }
+
+        // Mark the entire range as written.
+        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 0, 12).unwrap();
+
+        // All blocks should now be written.
+        for block in [0, 3, 4, 7, 8, 11] {
+            match ffs_btree::search(&cx, &dev, &root, block).unwrap() {
+                SearchResult::Found { extent, .. } => assert!(
+                    !extent.is_unwritten(),
+                    "block {block} should be written after mark_written"
+                ),
+                _ => panic!("expected extent at block {block}"),
+            }
+        }
+    }
+
+    #[test]
+    fn mark_written_partial_across_two_unwritten_extents() {
+        // Mark a range that starts in the middle of one unwritten extent
+        // and ends in the middle of another.
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let mut root = empty_root();
+
+        // [0-9] unwritten, [10-19] unwritten.
+        allocate_unwritten_extent(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            10,
+            &AllocHint::default(),
+        )
+        .unwrap();
+        allocate_unwritten_extent(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            10,
+            10,
+            &AllocHint::default(),
+        )
+        .unwrap();
+
+        // Mark [7-13] as written — spans tail of first, head of second.
+        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 7, 7).unwrap();
+
+        // Blocks 0-6: unwritten (left residual of first extent).
+        match ffs_btree::search(&cx, &dev, &root, 3).unwrap() {
+            SearchResult::Found { extent, .. } => assert!(extent.is_unwritten()),
+            _ => panic!("expected unwritten at block 3"),
+        }
+
+        // Blocks 7-9: written (right part of first extent, within mark range).
+        match ffs_btree::search(&cx, &dev, &root, 8).unwrap() {
+            SearchResult::Found { extent, .. } => assert!(!extent.is_unwritten()),
+            _ => panic!("expected written at block 8"),
+        }
+
+        // Blocks 10-13: written (left part of second extent, within mark range).
+        match ffs_btree::search(&cx, &dev, &root, 11).unwrap() {
+            SearchResult::Found { extent, .. } => assert!(!extent.is_unwritten()),
+            _ => panic!("expected written at block 11"),
+        }
+
+        // Blocks 14-19: unwritten (right residual of second extent).
+        match ffs_btree::search(&cx, &dev, &root, 16).unwrap() {
+            SearchResult::Found { extent, .. } => assert!(extent.is_unwritten()),
+            _ => panic!("expected unwritten at block 16"),
+        }
+    }
+
+    // ── Lifecycle / integration tests ───────────────────────────────────
+
     #[test]
     fn unwritten_lifecycle_allocate_mark_truncate() {
         let cx = test_cx();

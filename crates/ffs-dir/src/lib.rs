@@ -695,6 +695,140 @@ mod tests {
     }
 
     #[test]
+    fn dx_hash_distribution_across_buckets() {
+        // Hash 1000 sequential filenames and verify the distribution across
+        // 16 buckets is roughly uniform (no bucket has more than 3x the
+        // expected count, which would indicate severe clustering).
+        let seed = [0xDEAD_BEEF, 0xCAFE_BABE, 0x1234_5678, 0xABCD_EF01];
+        let num_buckets = 16u32;
+        let num_names = 1000usize;
+        let mut buckets = vec![0u32; num_buckets as usize];
+
+        for i in 0..num_names {
+            let name = format!("file_{i:04}.txt");
+            let h = compute_dx_hash(1, name.as_bytes(), &seed);
+            // Use top 4 bits for bucket assignment (hash has bit 0 cleared by ext4 convention).
+            let bucket = (h >> 28) as usize;
+            buckets[bucket] += 1;
+        }
+
+        #[expect(clippy::cast_possible_truncation)]
+        let expected = num_names as u32 / num_buckets;
+        let max_allowed = expected * 3; // 3x expected = very loose bound
+        for (i, &count) in buckets.iter().enumerate() {
+            assert!(
+                count <= max_allowed,
+                "bucket {i} has {count} entries (expected ~{expected}, max {max_allowed}) — \
+                 hash distribution is severely skewed"
+            );
+        }
+
+        // Also verify no bucket is completely empty (with 1000 names / 16 buckets,
+        // every bucket should have at least one entry).
+        let empty_buckets = buckets.iter().filter(|&&c| c == 0).count();
+        assert!(
+            empty_buckets <= 2,
+            "too many empty buckets ({empty_buckets}/16) — hash is poorly distributed"
+        );
+    }
+
+    #[test]
+    fn dx_hash_collision_rate_within_bounds() {
+        // Hash 500 distinct filenames and verify the collision rate is below 10%.
+        // A good 32-bit hash should have very few collisions for 500 names
+        // (birthday paradox: ~0.003% expected for truly random 32-bit values).
+        let seed = [0x1111_2222, 0x3333_4444, 0x5555_6666, 0x7777_8888];
+        let num_names = 500usize;
+        let mut hashes = std::collections::HashSet::new();
+
+        for i in 0..num_names {
+            let name = format!("document_{i:05}.dat");
+            let h = compute_dx_hash(1, name.as_bytes(), &seed);
+            hashes.insert(h);
+        }
+
+        let distinct = hashes.len();
+        let collisions = num_names - distinct;
+        let collision_pct = (collisions as f64 / num_names as f64) * 100.0;
+        assert!(
+            collision_pct < 10.0,
+            "collision rate {collision_pct:.1}% ({collisions}/{num_names}) exceeds 10% threshold"
+        );
+    }
+
+    #[test]
+    fn dx_hash_all_algorithms_produce_distinct_outputs() {
+        // All supported hash algorithm variants should produce different hashes
+        // for the same input (since they use fundamentally different transforms).
+        let seed = [0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD];
+        let name = b"test_file.txt";
+
+        let versions = [0u8, 1, 2, 3, 4, 5]; // legacy, half-md4, tea, legacy-unsigned, half-md4-unsigned, tea-unsigned
+        let hashes: Vec<u32> = versions
+            .iter()
+            .map(|&v| compute_dx_hash(v, name, &seed))
+            .collect();
+
+        // At least 3 distinct values (legacy signed/unsigned might collide for ASCII,
+        // but half-md4 and tea should differ from each other and from legacy).
+        let mut unique = hashes.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert!(
+            unique.len() >= 3,
+            "expected at least 3 distinct hashes from 6 algorithm variants, got {}: {hashes:?}",
+            unique.len(),
+        );
+    }
+
+    #[test]
+    fn dx_hash_low_bit_always_cleared() {
+        // ext4 convention: the major hash always has bit 0 cleared (reserved).
+        let seed = [0x1234, 0x5678, 0x9ABC, 0xDEF0];
+        for version in [0u8, 1, 2, 3, 5] {
+            for i in 0..100 {
+                let name = format!("entry_{version}_{i}");
+                let h = compute_dx_hash(version, name.as_bytes(), &seed);
+                assert_eq!(
+                    h & 1,
+                    0,
+                    "hash version {version}, name '{name}': bit 0 should be cleared, got {h:#010x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dx_hash_bit_utilization() {
+        // Verify that all 32 bits of the hash output are actually used
+        // (no stuck-at-zero or stuck-at-one bits) across many inputs.
+        let seed = [0xFEED_FACE, 0xDEAD_C0DE, 0xBAAD_F00D, 0xC0FF_EE42];
+        let mut or_all = 0u32;
+        let mut and_all = 0xFFFF_FFFFu32;
+
+        for i in 0..200 {
+            let name = format!("bit_test_{i:03}");
+            let h = compute_dx_hash(1, name.as_bytes(), &seed);
+            or_all |= h;
+            and_all &= h;
+        }
+
+        // All bits (except bit 0) should have been set in at least one hash.
+        // Bit 0 is always cleared by ext4 convention.
+        let or_mask = or_all & !1u32; // ignore bit 0
+        assert_eq!(
+            or_mask, 0xFFFF_FFFEu32,
+            "some hash bits are never set (stuck at 0): or_all = {or_all:#010x}"
+        );
+
+        // All bits should have been cleared in at least one hash.
+        assert_eq!(
+            and_all, 0,
+            "some hash bits are never cleared (stuck at 1): and_all = {and_all:#010x}"
+        );
+    }
+
+    #[test]
     fn dx_hash_long_name_does_not_panic() {
         let seed = [1, 2, 3, 4];
         // 255-byte name (maximum valid ext4 name length) should not panic.

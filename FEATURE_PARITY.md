@@ -63,6 +63,10 @@
 | FUSE readlink | FrankenFS spec §9 | ✅ | `FsOps::readlink` via `OpenFs` |
 | FUSE mount runtime | FrankenFS spec §9 | ✅ | Production runtime lifecycle, signal handling, dispatch coverage, and CI-safe skip behavior are implemented. |
 | CLI inspect command | FrankenFS spec §6 | ✅ | Implemented in `ffs-cli` |
+| CLI info command | FrankenFS spec §14.2 | ✅ | `ffs info` implemented in `ffs-cli` with optional `--groups`, `--mvcc`, `--repair`, and `--journal` sections plus `--json` output |
+| CLI dump command | FrankenFS spec §14.4 | ✅ | `ffs dump` implemented in `ffs-cli` with subcommands `superblock`, `group`, `inode`, `extents`, and `dir`, each supporting `--json` and `--hex` |
+| CLI fsck command | FrankenFS spec §14.1 | ✅ | `ffs fsck` implemented in `ffs-cli` with `--repair`, `--force`, `--verbose`, `--block-group`, and `--json`; checks include superblock/group-descriptor validation + scoped scrub reporting, and `--repair` now executes ext4 mount-time journal/orphan recovery with structured recovery output (btrfs write-side repair remains explicitly unsupported). |
+| CLI repair command | FrankenFS spec §14.3 | ✅ | `ffs repair` implemented in `ffs-cli` with `--full-scrub`, `--block-group`, `--rebuild-symbols`, `--verify-only`, `--max-threads`, and `--json`; non-verify mode performs ext4 mount-time journal/orphan recovery plus scrub verification, with explicit limitations for not-yet-wired symbol re-encoding/block-symbol reconstruction paths. |
 | fixture conformance harness | FrankenFS spec §7 | ✅ | Implemented in `ffs-harness` |
 | benchmark harness | FrankenFS spec §8 | ✅ | Criterion benchmark added |
 | xfstests generic/ext4 subset infrastructure | xfstests (`check`, generic/, ext4/) | ✅ | Curated subset manifests, planner/runner automation, CI planning gate, and regression guard workflow are implemented. |

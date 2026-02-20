@@ -1169,7 +1169,7 @@ mod tests {
         let secs: u64 = 1 << 33;
         let extra = encode_extra_timestamp(secs, 123_456_788);
         assert_eq!(extra & 0x3, 2);
-        assert_eq!(extra & 0x3FFF_FFFC, 123_456_788 & 0x3FFF_FFFC);
+        assert_eq!(extra & 0x3FFF_FFFC, 0x075B_CD14 & 0x3FFF_FFFC);
 
         // Timestamp at 3 * 2^32 (epoch 3).
         let secs: u64 = 3 << 32;

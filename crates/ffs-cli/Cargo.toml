@@ -14,7 +14,9 @@ ffs-block = { workspace = true }
 ffs-core = { workspace = true }
 ffs-fuse = { workspace = true }
 ffs-harness = { workspace = true }
+ffs-ondisk = { workspace = true }
 ffs-repair = { workspace = true }
+ffs-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

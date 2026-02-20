@@ -31,7 +31,7 @@ Implementation is phased for sequencing, not scope reduction. A feature in Phase
 This section records *current* (not historical) drift between this spec and the codebase. It exists to prevent agents from "implementing to the wrong contract."
 
 - **ParseError -> FfsError context drift:** The crate boundary is now explicit: `ffs-ondisk` returns `ParseError` (pure parsing + checksum verification), while user-facing layers return `FfsError` and convert at the orchestration boundary (`ffs-core`). However, the conversion still lacks a structured context object (structure + offsets + inode/group) for actionable diagnostics. Track: `bd-2fy`.
-- **Missing normative traits (integration points):** Spec §8/§9/§14 define normative traits (repair manager, scrub progress, semantics ops) that are not yet present in code (`crates/ffs-repair` is currently stub-only, `crates/ffs-fuse` is scaffolding). Resolution: introduce the traits in the owning crates without creating dependency cycles, then migrate scaffolding to those contracts. Tracks: `bd-2l4`, `bd-3bf`, `bd-hv6`.
+- **Missing normative traits (integration points):** Spec §8/§9/§14 define normative traits (repair manager, scrub progress, semantics ops) that are not yet fully present as explicit contracts in code (`crates/ffs-repair` now ships scrub/recovery pipelines and evidence wiring, and `crates/ffs-fuse` ships production mount scaffolding). Resolution: promote the remaining behavior to explicit trait contracts in the owning crates without creating dependency cycles, then migrate call sites to those contracts. Tracks: `bd-2l4`, `bd-3bf`, `bd-hv6`.
 
 ### 0.1.2 Audit Checklist (Mechanical)
 
@@ -2410,7 +2410,7 @@ pedantic+nursery at deny, common versions via `[workspace.dependencies]`.
 | 14 | `ffs-repair` | Scrub pipeline + repair symbol format (RaptorQ encode/decode phased) | `ffs-types`, `ffs-error`, `ffs-block`, `asupersync`, `blake3`, `crc32c` |
 | 15 | `ffs-core` | Engine integration: detect/inspect, MVCC wrapper, autopilot, RepairPolicy | `asupersync`, `ffs-block`, `ffs-btrfs`, `ffs-error`, `ffs-mvcc`, `ffs-ondisk`, `ffs-types`, `libc`, `serde`, `serde_json`, `thiserror` |
 | 16 | `ffs` | Public facade; re-exports `ffs-core` | `ffs-core` |
-| 17 | `ffs-cli` | CLI: `inspect`, `mount`, `scrub`, `parity`; clap-based structured subcommands | `anyhow`, `asupersync`, `clap`, `ffs-block`, `ffs-core`, `ffs-fuse`, `ffs-harness`, `ffs-repair`, `serde`, `serde_json` |
+| 17 | `ffs-cli` | CLI: `inspect`, `info`, `dump`, `fsck`, `repair`, `mount`, `scrub`, `parity`; clap-based structured subcommands | `anyhow`, `asupersync`, `clap`, `ffs-block`, `ffs-core`, `ffs-fuse`, `ffs-harness`, `ffs-ondisk`, `ffs-repair`, `ffs-types`, `serde`, `serde_json` |
 | 18 | `ffs-tui` | TUI monitoring | `ffs`, `ftui` |
 | 19 | `ffs-harness` | Fixture conformance + benches | `anyhow`, `ffs-core`, `ffs-ondisk`, `ffs-types`, `hex`, `serde`, `serde_json` (+dev: `criterion`) |
 

@@ -48,6 +48,9 @@ cargo build --workspace
 # Inspect an ext4 image
 cargo run -p ffs-cli -- inspect /path/to/ext4.img --json
 
+# Show filesystem superblock + optional detailed sections
+cargo run -p ffs-cli -- info /path/to/ext4.img --groups --mvcc --journal --json
+
 # Inspect a btrfs image
 cargo run -p ffs-cli -- inspect /path/to/btrfs.img --json
 
@@ -178,7 +181,7 @@ FrankenFS is a 21-crate Cargo workspace (19 core crates + 2 legacy/reference wra
 | **Namespace** | `ffs-inode`, `ffs-dir`, `ffs-xattr` | Inode lifecycle, directory ops (linear scan + htree), extended attributes (user/system/security/trusted) |
 | **Interface** | `ffs-fuse`, `ffs-core`, `ffs` | FUSE protocol adapter, engine integration (format detection, mount orchestration, Bayesian durability autopilot), public API facade |
 | **Repair** | `ffs-repair` | RaptorQ symbol generation/recovery per block group, background scrub |
-| **Tooling** | `ffs-cli`, `ffs-tui`, `ffs-harness` | CLI (`inspect`, planned: `mount`/`fsck`/`repair`), live TUI monitoring, conformance test harness + benchmarks |
+| **Tooling** | `ffs-cli`, `ffs-tui`, `ffs-harness` | CLI (`inspect`, `info`, `dump`, `fsck`, `repair`, `mount`, `scrub`, `parity`), live TUI monitoring, conformance test harness + benchmarks |
 
 ### Layering Rules
 
@@ -294,19 +297,29 @@ cargo run -p ffs-harness -- parity
 # Inspect ext4 or btrfs image metadata (JSON output)
 cargo run -p ffs-cli -- inspect <image-path> --json
 
+# Show filesystem information (superblock + optional sections)
+cargo run -p ffs-cli -- info <image-path> --groups --mvcc --repair --journal --json
+
+# Dump low-level metadata structures
+cargo run -p ffs-cli -- dump superblock <image-path> --json --hex
+cargo run -p ffs-cli -- dump inode 2 <image-path> --json
+cargo run -p ffs-cli -- dump extents 12 <image-path> --json
+cargo run -p ffs-cli -- dump dir 2 <image-path> --json
+
 # Mount an ext4 image via FUSE (read-only)
 cargo run -p ffs-cli -- mount <image-path> <mountpoint>
 
 # Run a read-only scrub over image blocks
 cargo run -p ffs-cli -- scrub <image-path> --json
 
+# Run offline filesystem checks (supports ext4 mount-time recovery with --repair)
+cargo run -p ffs-cli -- fsck <image-path> --repair --json
+
+# Run manual repair workflow (ext4 mount-time recovery + scrub verification)
+cargo run -p ffs-cli -- repair <image-path> --json
+
 # Show current feature parity report
 cargo run -p ffs-cli -- parity --json
-
-# Planned (not yet implemented):
-# ffs fsck <image>
-# ffs info <image>
-# ffs repair <image>
 ```
 
 ### `ffs-harness`
@@ -375,7 +388,7 @@ FrankenFS is in **early development**. The tracked V1 parity matrix is complete 
 - btrfs superblock, B-tree header, leaf item metadata decoding, and geometry validation
 - MVCC snapshot visibility, commit sequencing, first-committer-wins conflict detection
 - Bayesian durability policy model and RaptorQ config mapping
-- CLI `inspect`, `mount` (ext4 read-only), `scrub`, and `parity` commands
+- CLI `inspect`, `info`, `dump`, `fsck` (with ext4 mount-time recovery via `--repair`), `repair` (ext4 mount-time recovery + scrub verification), `mount` (ext4 read-only), `scrub`, and `parity` commands
 - Conformance fixture harness and Criterion benchmark scaffolding
 
 ### What's Next
