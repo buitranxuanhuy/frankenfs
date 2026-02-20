@@ -1875,9 +1875,10 @@ impl OpenFs {
                 data: item.data.clone(),
             };
             // Allow replace in case of duplicate keys from multiple walks.
-            let _ = fs_tree
+            fs_tree
                 .update(&tree_item.key, &tree_item.data)
-                .or_else(|_| fs_tree.insert(tree_item.key, &tree_item.data));
+                .or_else(|_| fs_tree.insert(tree_item.key, &tree_item.data))
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
         }
 
         // Build a minimal extent allocator with a synthetic data block group.
@@ -5524,7 +5525,9 @@ impl OpenFs {
                 let dot_dot_block = BlockNumber(first_ext.physical_start);
                 let mut data = self.read_block_vec(cx, dot_dot_block)?;
                 // Remove old .. and add new one.
-                let _ = ffs_dir::remove_entry(&mut data, b"..");
+                if let Err(e) = ffs_dir::remove_entry(&mut data, b"..") {
+                    warn!("rename: failed to remove '..' entry: {e}");
+                }
                 #[allow(clippy::cast_possible_truncation)]
                 ffs_dir::add_entry(&mut data, new_parent.0 as u32, b"..", Ext4FileType::Dir)?;
                 block_dev.write_block(cx, dot_dot_block, &data)?;
@@ -5971,31 +5974,37 @@ impl OpenFs {
                         data: prev_data, ..
                     }) = parse_extent_data(edata)
                     {
-                        let _ = alloc.fs_tree.delete(&inline_key);
+                        alloc
+                            .fs_tree
+                            .delete(&inline_key)
+                            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
                         // Persist the old inline data as a regular extent at
                         // offset 0 so reads in [0, prev_data.len()) still work.
                         if !prev_data.is_empty() && offset > 0 {
                             let prev_alloc_size = (prev_data.len() as u64)
                                 .saturating_add(sectorsize - 1)
                                 & !(sectorsize - 1);
-                            if let Ok(prev_allocation) =
-                                alloc.extent_alloc.alloc_data(prev_alloc_size)
-                            {
-                                let _ = self.dev.write_all_at(
-                                    cx,
-                                    ByteOffset(prev_allocation.bytenr),
-                                    &prev_data,
-                                );
-                                let prev_extent = BtrfsExtentData::Regular {
-                                    extent_type: BTRFS_FILE_EXTENT_REG,
-                                    compression: 0,
-                                    disk_bytenr: prev_allocation.bytenr,
-                                    disk_num_bytes: prev_alloc_size,
-                                    extent_offset: 0,
-                                    num_bytes: prev_data.len() as u64,
-                                };
-                                let _ = alloc.fs_tree.insert(inline_key, &prev_extent.to_bytes());
-                            }
+                            let prev_allocation = alloc
+                                .extent_alloc
+                                .alloc_data(prev_alloc_size)
+                                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                            self.dev.write_all_at(
+                                cx,
+                                ByteOffset(prev_allocation.bytenr),
+                                &prev_data,
+                            )?;
+                            let prev_extent = BtrfsExtentData::Regular {
+                                extent_type: BTRFS_FILE_EXTENT_REG,
+                                compression: 0,
+                                disk_bytenr: prev_allocation.bytenr,
+                                disk_num_bytes: prev_alloc_size,
+                                extent_offset: 0,
+                                num_bytes: prev_data.len() as u64,
+                            };
+                            alloc
+                                .fs_tree
+                                .insert(inline_key, &prev_extent.to_bytes())
+                                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
                         }
                     }
                 }
@@ -6486,7 +6495,9 @@ impl OpenFs {
                         .map(|(k, _)| k)
                         .collect();
                     for key in to_delete {
-                        let _ = alloc.fs_tree.delete(&key);
+                        if let Err(e) = alloc.fs_tree.delete(&key) {
+                            warn!("truncate: failed to delete extent key {key:?}: {e:?}");
+                        }
                     }
                 }
 
@@ -6497,7 +6508,9 @@ impl OpenFs {
                         item_type: BTRFS_ITEM_EXTENT_DATA,
                         offset: 0,
                     };
-                    let _ = alloc.fs_tree.delete(&inline_key);
+                    if let Err(e) = alloc.fs_tree.delete(&inline_key) {
+                        warn!("truncate: failed to delete inline extent: {e:?}");
+                    }
                 }
             }
         }
@@ -6945,17 +6958,23 @@ impl OpenFs {
                 if let Ok(entries) = parse_dir_items(edata) {
                     let remaining: Vec<_> = entries.iter().filter(|e| e.name != name).collect();
                     if remaining.is_empty() {
-                        let _ = alloc.fs_tree.delete(&dir_item_key);
+                        if let Err(e) = alloc.fs_tree.delete(&dir_item_key) {
+                            warn!("unlink: failed to delete dir_item {dir_item_key:?}: {e:?}");
+                        }
                     } else {
                         let mut payload = Vec::new();
                         for entry in &remaining {
                             payload.extend_from_slice(&entry.to_bytes());
                         }
-                        let _ = alloc.fs_tree.update(&dir_item_key, &payload);
+                        if let Err(e) = alloc.fs_tree.update(&dir_item_key, &payload) {
+                            warn!("unlink: failed to update dir_item {dir_item_key:?}: {e:?}");
+                        }
                     }
                 } else {
                     // Can't parse existing entries; delete the whole key.
-                    let _ = alloc.fs_tree.delete(&dir_item_key);
+                    if let Err(e) = alloc.fs_tree.delete(&dir_item_key) {
+                        warn!("unlink: failed to delete unparseable dir_item: {e:?}");
+                    }
                 }
             }
         }
@@ -6975,7 +6994,9 @@ impl OpenFs {
             for (key, data) in &indices {
                 if let Ok(entries) = parse_dir_items(data) {
                     if entries.iter().any(|e| e.name == name) {
-                        let _ = alloc.fs_tree.delete(key);
+                        if let Err(e) = alloc.fs_tree.delete(key) {
+                            warn!("unlink: failed to delete dir_index {key:?}: {e:?}");
+                        }
                         break;
                     }
                 }
@@ -7061,7 +7082,9 @@ impl OpenFs {
             .map_err(|e| btrfs_mutation_to_ffs(&e))?;
 
         for (key, _) in items {
-            let _ = alloc.fs_tree.delete(&key);
+            if let Err(e) = alloc.fs_tree.delete(&key) {
+                warn!("cleanup: failed to delete inode item {key:?}: {e:?}");
+            }
         }
         Ok(())
     }
@@ -7107,7 +7130,9 @@ impl OpenFs {
             item_type: BTRFS_ITEM_INODE_REF,
             offset: parent_oid,
         };
-        let _ = alloc.fs_tree.delete(&ref_key);
+        if let Err(e) = alloc.fs_tree.delete(&ref_key) {
+            warn!("unlink: failed to delete inode_ref {ref_key:?}: {e:?}");
+        }
     }
 
     /// Look up the parent objectid for a btrfs inode via its INODE_REF.
