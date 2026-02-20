@@ -625,4 +625,79 @@ mod tests {
         assert!(entries.iter().any(|e| e.inode == 200 && e.name == b"repl"));
         assert!(!entries.iter().any(|e| e.name == b"temp"));
     }
+
+    // ── dx_hash edge-case and distribution tests ────────────────────
+
+    #[test]
+    fn dx_hash_different_names_produce_different_hashes() {
+        let seed = [0xDEAD_BEEF, 0xCAFE_BABE, 0x1234_5678, 0xABCD_EF01];
+        let names: Vec<&[u8]> = vec![
+            b"a", b"b", b"ab", b"ba", b"file.txt", b"FILE.TXT",
+            b"index.html", b"readme.md", b"Cargo.toml", b"lib.rs",
+        ];
+
+        let hashes: Vec<u32> = names
+            .iter()
+            .map(|n| compute_dx_hash(1, n, &seed))
+            .collect();
+
+        // Check for uniqueness — with 10 distinct names, we expect at least
+        // 8 distinct hashes (allowing some collision, but not total collision).
+        let mut unique = hashes.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert!(
+            unique.len() >= 8,
+            "expected at least 8 distinct hashes from 10 names, got {}: {hashes:?}",
+            unique.len(),
+        );
+    }
+
+    #[test]
+    fn dx_hash_seed_variation_changes_output() {
+        let name = b"test_file.txt";
+        let seed_a = [1, 2, 3, 4];
+        let seed_b = [5, 6, 7, 8];
+        let seed_zero = [0, 0, 0, 0];
+
+        let hash_a = compute_dx_hash(1, name, &seed_a);
+        let hash_b = compute_dx_hash(1, name, &seed_b);
+        let hash_zero = compute_dx_hash(1, name, &seed_zero);
+
+        // Different seeds should (almost certainly) produce different hashes.
+        assert_ne!(hash_a, hash_b, "different seeds should produce different hashes");
+        assert_ne!(hash_a, hash_zero, "non-zero vs zero seed should differ");
+    }
+
+    #[test]
+    fn dx_hash_single_byte_names() {
+        let seed = [0x1111, 0x2222, 0x3333, 0x4444];
+        // Every single printable ASCII byte should produce a valid (non-zero-for-most) hash.
+        let mut hashes = std::collections::HashSet::new();
+        for byte in b'!'..=b'~' {
+            let h = compute_dx_hash(1, &[byte], &seed);
+            hashes.insert(h);
+        }
+        // 94 printable ASCII chars should produce many distinct hashes.
+        assert!(
+            hashes.len() >= 80,
+            "expected at least 80 distinct hashes from 94 single-byte names, got {}",
+            hashes.len(),
+        );
+    }
+
+    #[test]
+    fn dx_hash_long_name_does_not_panic() {
+        let seed = [1, 2, 3, 4];
+        // 255-byte name (maximum valid ext4 name length) should not panic.
+        let long_name = vec![b'A'; 255];
+        let h = compute_dx_hash(1, &long_name, &seed);
+        // Should produce a valid hash.
+        let _ = h;
+
+        // A name with very different content should hash differently.
+        let different: Vec<u8> = (0..255).map(|i| b'a' + (i % 26)).collect();
+        let h2 = compute_dx_hash(1, &different, &seed);
+        assert_ne!(h, h2, "structurally different long names should hash differently");
+    }
 }

@@ -1240,4 +1240,174 @@ mod tests {
         };
         assert_ne!(a, c);
     }
+
+    // ── Additional edge-case tests ──────────────────────────────────
+
+    #[test]
+    fn mark_written_on_already_written_is_noop() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let mut root = empty_root();
+
+        // Allocate a regular (already-written) extent.
+        allocate_extent(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            10,
+            &AllocHint::default(),
+        )
+        .unwrap();
+
+        // mark_written should be a no-op since the extent is already written.
+        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 0, 10).unwrap();
+
+        // Verify the extent is still there and still written.
+        match ffs_btree::search(&cx, &dev, &root, 0).unwrap() {
+            SearchResult::Found { extent, .. } => {
+                assert!(!extent.is_unwritten());
+                assert_eq!(extent.actual_len(), 10);
+            }
+            _ => panic!("expected found"),
+        }
+
+        // Should still be exactly 1 extent.
+        let mut count = 0;
+        ffs_btree::walk(&cx, &dev, &root, &mut |_: &Ext4Extent| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn mark_written_on_empty_tree_is_noop() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let mut root = empty_root();
+
+        // mark_written on empty tree should succeed with no changes.
+        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 0, 10).unwrap();
+
+        // Tree should still be empty.
+        let mut count = 0;
+        ffs_btree::walk(&cx, &dev, &root, &mut |_: &Ext4Extent| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn punch_hole_in_unwritten_extent() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let mut root = empty_root();
+
+        // Allocate unwritten extent at blocks 0-9.
+        allocate_unwritten_extent(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            10,
+            &AllocHint::default(),
+        )
+        .unwrap();
+
+        let initial_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
+
+        // Punch hole in blocks 3-6 within the unwritten extent.
+        let freed = punch_hole(&cx, &dev, &mut root, &geo, &mut groups, 3, 4).unwrap();
+        assert!(freed > 0);
+
+        let after_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
+        assert!(after_free > initial_free);
+
+        // Blocks 0-2 should still be mapped (unwritten).
+        match ffs_btree::search(&cx, &dev, &root, 0).unwrap() {
+            SearchResult::Found { extent, .. } => assert!(extent.is_unwritten()),
+            _ => panic!("expected unwritten extent at block 0"),
+        }
+
+        // Blocks 3-6 should be a hole.
+        let mappings = map_logical_to_physical(&cx, &dev, &root, 3, 1).unwrap();
+        assert_eq!(
+            mappings[0].physical_start, 0,
+            "punched region in unwritten extent should be a hole"
+        );
+    }
+
+    #[test]
+    fn unwritten_lifecycle_allocate_mark_truncate() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let mut root = empty_root();
+
+        let initial_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
+
+        // Step 1: allocate unwritten extent at blocks 0-9.
+        let mapping = allocate_unwritten_extent(
+            &cx,
+            &dev,
+            &mut root,
+            &geo,
+            &mut groups,
+            0,
+            10,
+            &AllocHint::default(),
+        )
+        .unwrap();
+        assert!(mapping.unwritten);
+
+        // Step 2: mark blocks 0-4 as written.
+        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 0, 5).unwrap();
+
+        // Verify: blocks 0-4 written, blocks 5-9 still unwritten.
+        match ffs_btree::search(&cx, &dev, &root, 2).unwrap() {
+            SearchResult::Found { extent, .. } => assert!(!extent.is_unwritten()),
+            _ => panic!("expected written extent at block 2"),
+        }
+        match ffs_btree::search(&cx, &dev, &root, 7).unwrap() {
+            SearchResult::Found { extent, .. } => assert!(extent.is_unwritten()),
+            _ => panic!("expected unwritten extent at block 7"),
+        }
+
+        // Step 3: truncate at block 5 — should remove the unwritten tail.
+        let freed = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 5).unwrap();
+        assert_eq!(freed, 5);
+
+        // Only the written extent [0-4] should remain.
+        let mut count = 0;
+        ffs_btree::walk(&cx, &dev, &root, &mut |ext: &Ext4Extent| {
+            assert!(!ext.is_unwritten());
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 1);
+
+        // Step 4: truncate everything.
+        let freed = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 0).unwrap();
+        assert_eq!(freed, 5);
+
+        // All blocks should be freed.
+        let final_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
+        assert_eq!(final_free, initial_free);
+    }
 }
