@@ -1798,6 +1798,16 @@ fn ext4_state_flag_names(state: u16) -> Vec<String> {
     names
 }
 
+fn ext4_appears_clean_state(state: u16) -> bool {
+    const EXT4_VALID_FS: u16 = 0x0001;
+    const EXT4_ERROR_FS: u16 = 0x0002;
+    const EXT4_ORPHAN_FS: u16 = 0x0004;
+
+    (state & EXT4_VALID_FS) != 0
+        && (state & EXT4_ERROR_FS) == 0
+        && (state & EXT4_ORPHAN_FS) == 0
+}
+
 fn ext4_group_flag_names(flags: u16) -> Vec<String> {
     const EXT4_BG_INODE_UNINIT: u16 = 0x0001;
     const EXT4_BG_BLOCK_UNINIT: u16 = 0x0002;
@@ -3031,7 +3041,7 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     let image_len = byte_dev.len_bytes();
 
-    let (scope, scrub_report, block_size) = match &flavor {
+    let (scope, scrub_report, block_size, scrub_skipped_detail) = match &flavor {
         FsFlavor::Ext4(sb) => {
             let reader = Ext4ImageReader::new(&image).context("failed to parse ext4 superblock")?;
             let desc_status = validate_ext4_group_descriptors(&reader, &image, options.block_group);
@@ -3043,7 +3053,11 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
             })?;
             let validator = scrub_validator(&flavor, block_size);
 
-            let (scope, report) = if let Some(group) = options.block_group {
+            let skip_full_scrub = options.block_group.is_none()
+                && !flags.force()
+                && ext4_appears_clean_state(sb.state);
+
+            let (scope, report, skipped_detail) = if let Some(group) = options.block_group {
                 let (start, count) = ext4_group_scrub_scope(sb, group)?;
                 if flags.verbose() && !flags.json() {
                     eprintln!(
@@ -3062,7 +3076,30 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
                         start_block: start.0,
                         block_count: count,
                     },
-                    report,
+                    scrub_report_to_phase(&report),
+                    None,
+                )
+            } else if skip_full_scrub {
+                let detail = format!(
+                    "filesystem appears clean (state_flags={}); skipped block-level scrub; pass --force for full scrub",
+                    ext4_state_flag_names(sb.state).join("|")
+                );
+                if flags.verbose() && !flags.json() {
+                    eprintln!("fsck: {detail}");
+                }
+                limitations.push(
+                    "filesystem appears clean; skipped block-level scrub (use --force for full scrub)"
+                        .to_owned(),
+                );
+                (
+                    FsckScopeOutput::Full,
+                    FsckScrubOutput {
+                        scanned: 0,
+                        corrupt: 0,
+                        error_or_higher: 0,
+                        io_error: 0,
+                    },
+                    Some(detail),
                 )
             } else {
                 if flags.verbose() && !flags.json() {
@@ -3074,9 +3111,9 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
                 let report = Scrubber::new(&block_dev, &*validator)
                     .scrub_all(&cx)
                     .context("failed to scrub ext4 image")?;
-                (FsckScopeOutput::Full, report)
+                (FsckScopeOutput::Full, scrub_report_to_phase(&report), None)
             };
-            (scope, scrub_report_to_phase(&report), block_size)
+            (scope, report, block_size, skipped_detail)
         }
         FsFlavor::Btrfs(sb) => {
             if options.block_group.is_some() {
@@ -3115,22 +3152,29 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
                 FsckScopeOutput::Full,
                 scrub_report_to_phase(&report),
                 block_size,
+                None,
             )
         }
     };
 
     let report = scrub_report;
-    phases.push(FsckPhaseOutput {
-        phase: "checksum_scrub".to_owned(),
-        status: if report.error_or_higher == 0 {
-            "ok".to_owned()
-        } else {
-            "error".to_owned()
-        },
-        detail: format!(
+    let scrub_phase_status = if scrub_skipped_detail.is_some() {
+        "skipped"
+    } else if report.error_or_higher == 0 {
+        "ok"
+    } else {
+        "error"
+    };
+    let scrub_phase_detail = scrub_skipped_detail.unwrap_or_else(|| {
+        format!(
             "scanned={} corrupt={} error_or_higher={} io_errors={}",
             report.scanned, report.corrupt, report.error_or_higher, report.io_error
-        ),
+        )
+    });
+    phases.push(FsckPhaseOutput {
+        phase: "checksum_scrub".to_owned(),
+        status: scrub_phase_status.to_owned(),
+        detail: scrub_phase_detail,
     });
 
     let repair_status = if flags.repair() {
@@ -3155,12 +3199,6 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
         FsckRepairStatus::NotRequested
     };
 
-    if !flags.force() {
-        limitations.push(
-            "--force is currently a no-op because fsck always executes configured checks"
-                .to_owned(),
-        );
-    }
     limitations.push(format!(
         "fsck currently covers superblock/group-descriptor validation plus block-level scrub checks (block_size={block_size})"
     ));
@@ -4183,7 +4221,8 @@ fn mkfs_cmd(
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, DumpCommand, Ext4JournalReplayMode, LogFormat, ext4_mount_replay_mode,
+        Cli, Command, DumpCommand, Ext4JournalReplayMode, LogFormat, ext4_appears_clean_state,
+        ext4_mount_replay_mode,
         merge_scrub_reports, partition_scrub_range, repair_worker_limit,
     };
     use clap::Parser;
@@ -4589,5 +4628,13 @@ mod tests {
         assert_eq!(merged.blocks_scanned, 17);
         assert_eq!(merged.blocks_corrupt, 2);
         assert_eq!(merged.blocks_io_error, 4);
+    }
+
+    #[test]
+    fn ext4_clean_state_detection_matches_expected_flags() {
+        assert!(ext4_appears_clean_state(0x0001));
+        assert!(!ext4_appears_clean_state(0x0000));
+        assert!(!ext4_appears_clean_state(0x0001 | 0x0002));
+        assert!(!ext4_appears_clean_state(0x0001 | 0x0004));
     }
 }
