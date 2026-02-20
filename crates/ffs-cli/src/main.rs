@@ -3408,9 +3408,7 @@ fn repair_cmd(path: &PathBuf, options: RepairCommandOptions) -> Result<()> {
 }
 
 fn repair_worker_limit(requested: Option<u32>) -> (usize, Option<u32>) {
-    let available = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1);
+    let available = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let requested_raw = requested.unwrap_or(1).max(1);
     let requested_threads = usize::try_from(requested_raw).unwrap_or(usize::MAX);
     let effective = requested_threads.min(available).max(1);
@@ -3433,7 +3431,7 @@ fn partition_scrub_range(
     let mut cursor = start.0;
     let mut ranges = Vec::with_capacity(usize::try_from(workers_u64).unwrap_or(usize::MAX));
     for worker_idx in 0..workers_u64 {
-        let width = base + if worker_idx < remainder { 1 } else { 0 };
+        let width = base + u64::from(worker_idx < remainder);
         ranges.push((BlockNumber(cursor), width));
         cursor = cursor.saturating_add(width);
     }
