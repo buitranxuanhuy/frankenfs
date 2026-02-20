@@ -2530,6 +2530,24 @@ impl BtrfsExtentAllocator {
             .map(|bg| bg.item.free_bytes())
             .sum()
     }
+
+    /// Total used bytes across all block groups.
+    #[must_use]
+    pub fn total_used(&self) -> u64 {
+        self.block_groups
+            .values()
+            .map(|bg| bg.item.used_bytes)
+            .sum()
+    }
+
+    /// Total capacity across all block groups.
+    #[must_use]
+    pub fn total_capacity(&self) -> u64 {
+        self.block_groups
+            .values()
+            .map(|bg| bg.item.total_bytes)
+            .sum()
+    }
 }
 
 #[cfg(test)]

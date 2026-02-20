@@ -7277,9 +7277,18 @@ impl FsOps for OpenFs {
             FsFlavor::Btrfs(sb) => {
                 let unit = sb.sectorsize.max(1);
                 let unit_u64 = u64::from(unit);
-                let free_bytes = sb.total_bytes.saturating_sub(sb.bytes_used);
+                // Use live allocator stats when writes are enabled,
+                // otherwise fall back to the on-disk superblock.
+                let used_bytes = self
+                    .btrfs_alloc_state
+                    .as_ref()
+                    .map_or(sb.bytes_used, |alloc_mutex| {
+                        alloc_mutex.lock().extent_alloc.total_used()
+                    });
+                let total_bytes = sb.total_bytes;
+                let free_bytes = total_bytes.saturating_sub(used_bytes);
                 Ok(FsStat {
-                    blocks: sb.total_bytes / unit_u64,
+                    blocks: total_bytes / unit_u64,
                     blocks_free: free_bytes / unit_u64,
                     blocks_available: free_bytes / unit_u64,
                     files: 0,
@@ -15015,5 +15024,30 @@ mod tests {
         let data = ops.read(&cx, attr.ino, 4096, 4096).unwrap();
         assert_eq!(data.len(), 4096);
         assert!(data.iter().all(|&b| b == 0x42));
+    }
+
+    #[test]
+    fn btrfs_write_statfs_reflects_allocations() {
+        let (fs, cx) = open_writable_btrfs();
+        let ops: &dyn FsOps = &fs;
+
+        let stat_before = ops.statfs(&cx, InodeNumber(1)).unwrap();
+        let free_before = stat_before.blocks_free;
+
+        // Create a file and write enough data to trigger a regular extent allocation.
+        let attr = ops
+            .create(&cx, InodeNumber(1), OsStr::new("big.bin"), 0o644, 0, 0)
+            .unwrap();
+        let big = vec![0xAA_u8; 8192];
+        ops.write(&cx, attr.ino, 0, &big).unwrap();
+
+        let stat_after = ops.statfs(&cx, InodeNumber(1)).unwrap();
+        let free_after = stat_after.blocks_free;
+
+        // Free space should have decreased after the allocation.
+        assert!(
+            free_after < free_before,
+            "statfs should reflect decreased free space: before={free_before}, after={free_after}"
+        );
     }
 }
