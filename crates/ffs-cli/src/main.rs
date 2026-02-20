@@ -11,21 +11,25 @@ use ffs_core::{
 use ffs_fuse::MountOptions;
 use ffs_harness::ParityReport;
 use ffs_ondisk::{
-    Ext4DirEntry, Ext4Extent, Ext4ExtentHeader, Ext4ExtentIndex, Ext4GroupDesc, Ext4ImageReader,
-    Ext4Inode, Ext4Superblock, ExtentTree, parse_dx_root, parse_extent_tree,
-    parse_inode_extent_tree,
+    BtrfsChunkEntry, Ext4DirEntry, Ext4Extent, Ext4ExtentHeader, Ext4ExtentIndex, Ext4GroupDesc,
+    Ext4ImageReader, Ext4Inode, Ext4Superblock, ExtentTree, map_logical_to_physical, parse_dx_root,
+    parse_extent_tree, parse_inode_extent_tree,
 };
+use ffs_repair::codec::encode_group;
 use ffs_repair::evidence::{self, EvidenceEventType, EvidenceRecord};
+use ffs_repair::recovery::{GroupRecoveryOrchestrator, RecoveryOutcome};
 use ffs_repair::scrub::{
     BlockValidator, BtrfsSuperblockValidator, BtrfsTreeBlockValidator, CompositeValidator,
     Ext4SuperblockValidator, ScrubReport, Scrubber, Severity, ZeroCheckValidator,
 };
+use ffs_repair::storage::{REPAIR_DESC_SLOT_COUNT, RepairGroupLayout, RepairGroupStorage};
+use ffs_repair::symbol::RepairGroupDescExt;
 use ffs_types::{
     BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE, BlockNumber, EXT4_SUPERBLOCK_OFFSET,
     EXT4_SUPERBLOCK_SIZE, GroupNumber, InodeNumber,
 };
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env::VarError;
 use std::fmt::Write;
 use std::path::PathBuf;
@@ -207,7 +211,7 @@ enum Command {
         /// Emit detailed phase progress.
         #[arg(long, short = 'v')]
         verbose: bool,
-        /// Restrict checks to one ext4 block group.
+        /// Restrict checks to one ext4 group or btrfs block-group index.
         #[arg(long)]
         block_group: Option<u32>,
         /// Output in JSON format.
@@ -221,7 +225,7 @@ enum Command {
         /// Scrub all groups (default behavior is stale-only intent).
         #[arg(long)]
         full_scrub: bool,
-        /// Restrict to one ext4 block group.
+        /// Restrict to one ext4 group or btrfs block-group index.
         #[arg(long)]
         block_group: Option<u32>,
         /// Force re-encoding of repair symbols.
@@ -822,6 +826,13 @@ enum FsckScopeOutput {
         start_block: u64,
         block_count: u64,
     },
+    BtrfsBlockGroup {
+        group: u32,
+        logical_start: u64,
+        logical_bytes: u64,
+        start_block: u64,
+        block_count: u64,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -945,6 +956,13 @@ enum RepairScopeOutput {
     Full,
     Ext4BlockGroup {
         group: u32,
+        start_block: u64,
+        block_count: u64,
+    },
+    BtrfsBlockGroup {
+        group: u32,
+        logical_start: u64,
+        logical_bytes: u64,
         start_block: u64,
         block_count: u64,
     },
@@ -3114,12 +3132,6 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
             (scope, report, block_size, skipped_detail)
         }
         FsFlavor::Btrfs(sb) => {
-            if options.block_group.is_some() {
-                limitations.push(
-                    "--block-group currently applies only to ext4 images; running full btrfs check"
-                        .to_owned(),
-                );
-            }
             phases.push(FsckPhaseOutput {
                 phase: "group_descriptor_validation".to_owned(),
                 status: "skipped".to_owned(),
@@ -3133,25 +3145,76 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
                         sb.nodesize, sb.sectorsize
                     )
                 })?;
-            let block_dev = ByteBlockDevice::new(byte_dev, block_size).with_context(|| {
-                format!("failed to create block device (block_size={block_size})")
-            })?;
-            let validator = scrub_validator(&flavor, block_size);
-            if flags.verbose() && !flags.json() {
-                eprintln!(
-                    "fsck: btrfs full scrub across {} blocks (block_size={block_size})",
-                    block_dev.block_count()
-                );
+            if let Some(group) = options.block_group {
+                let specs = discover_btrfs_repair_group_specs(path, block_size)
+                    .context("failed to discover btrfs block groups for scoped fsck")?;
+                let spec = specs
+                    .iter()
+                    .find(|spec| spec.group == group)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "btrfs block group {group} is unavailable (valid range: 0..{})",
+                            specs.len().saturating_sub(1)
+                        )
+                    })?;
+                if flags.verbose() && !flags.json() {
+                    eprintln!(
+                        "fsck: btrfs group {} -> logical {}..{}, physical blocks {}..{}",
+                        group,
+                        spec.logical_start,
+                        spec.logical_start
+                            .saturating_add(spec.logical_bytes)
+                            .saturating_sub(1),
+                        spec.physical_start_block.0,
+                        spec.physical_start_block
+                            .0
+                            .saturating_add(spec.physical_block_count)
+                            .saturating_sub(1)
+                    );
+                }
+                let report = scrub_range_for_repair(
+                    path,
+                    &flavor,
+                    block_size,
+                    spec.physical_start_block,
+                    spec.physical_block_count,
+                    None,
+                    &mut limitations,
+                )
+                .with_context(|| format!("failed to scrub btrfs group {group}"))?;
+                (
+                    FsckScopeOutput::BtrfsBlockGroup {
+                        group,
+                        logical_start: spec.logical_start,
+                        logical_bytes: spec.logical_bytes,
+                        start_block: spec.physical_start_block.0,
+                        block_count: spec.physical_block_count,
+                    },
+                    scrub_report_to_phase(&report),
+                    block_size,
+                    None,
+                )
+            } else {
+                let block_dev = ByteBlockDevice::new(byte_dev, block_size).with_context(|| {
+                    format!("failed to create block device (block_size={block_size})")
+                })?;
+                let validator = scrub_validator(&flavor, block_size);
+                if flags.verbose() && !flags.json() {
+                    eprintln!(
+                        "fsck: btrfs full scrub across {} blocks (block_size={block_size})",
+                        block_dev.block_count()
+                    );
+                }
+                let report = Scrubber::new(&block_dev, &*validator)
+                    .scrub_all(&cx)
+                    .context("failed to scrub btrfs image")?;
+                (
+                    FsckScopeOutput::Full,
+                    scrub_report_to_phase(&report),
+                    block_size,
+                    None,
+                )
             }
-            let report = Scrubber::new(&block_dev, &*validator)
-                .scrub_all(&cx)
-                .context("failed to scrub btrfs image")?;
-            (
-                FsckScopeOutput::Full,
-                scrub_report_to_phase(&report),
-                block_size,
-                None,
-            )
         }
     };
 
@@ -3350,6 +3413,24 @@ fn print_fsck_output(json: bool, output: &FsckOutput) -> Result<()> {
                 start_block.saturating_add(*block_count).saturating_sub(1)
             );
         }
+        FsckScopeOutput::BtrfsBlockGroup {
+            group,
+            logical_start,
+            logical_bytes,
+            start_block,
+            block_count,
+        } => {
+            println!(
+                "scope: btrfs group {} (logical {}..{}, physical blocks {}..{})",
+                group,
+                logical_start,
+                logical_start
+                    .saturating_add(*logical_bytes)
+                    .saturating_sub(1),
+                start_block,
+                start_block.saturating_add(*block_count).saturating_sub(1)
+            );
+        }
     }
     println!("phases:");
     for phase in &output.phases {
@@ -3492,6 +3573,596 @@ fn merge_scrub_reports(reports: Vec<ScrubReport>) -> ScrubReport {
     merged
 }
 
+const DEFAULT_REPAIR_OVERHEAD_RATIO: f64 = 1.05;
+const DEFAULT_REPAIR_VALIDATION_BLOCK_COUNT: u32 = 0;
+const BTRFS_EXTENT_TREE_OBJECTID: u64 = 2;
+const BTRFS_ROOT_ITEM_TYPE: u8 = 132;
+const BTRFS_BLOCK_GROUP_ITEM_TYPE: u8 = 192;
+
+#[derive(Debug, Clone, Copy)]
+struct BtrfsRepairGroupSpec {
+    group: u32,
+    logical_start: u64,
+    logical_bytes: u64,
+    physical_start_block: BlockNumber,
+    physical_block_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ext4RepairStaleness {
+    Fresh,
+    Stale,
+    Untracked,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Ext4RepairGroupSpec {
+    group: u32,
+    scrub_start_block: BlockNumber,
+    scrub_block_count: u64,
+    source_first_block: BlockNumber,
+    source_block_count: u32,
+    layout: RepairGroupLayout,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RepairExecutionStats {
+    recovery_attempted: bool,
+    recovery_unrecovered_blocks: u64,
+    symbol_rebuild_attempted: bool,
+    symbol_rebuild_groups: u64,
+    symbol_rebuild_failed_groups: u64,
+}
+
+fn parse_btrfs_root_item_bytenr(data: &[u8]) -> Result<u64> {
+    if data.len() < 184 {
+        bail!(
+            "btrfs root item payload too short: expected at least 184 bytes, got {}",
+            data.len()
+        );
+    }
+    let mut bytenr_raw = [0_u8; 8];
+    bytenr_raw.copy_from_slice(&data[176..184]);
+    let bytenr = u64::from_le_bytes(bytenr_raw);
+    if bytenr == 0 {
+        bail!("btrfs root item bytenr must be non-zero");
+    }
+    Ok(bytenr)
+}
+
+fn parse_btrfs_block_group_total_bytes(data: &[u8]) -> Result<u64> {
+    if data.len() < 16 {
+        bail!(
+            "btrfs block-group payload too short: expected at least 16 bytes, got {}",
+            data.len()
+        );
+    }
+    let mut total_raw = [0_u8; 8];
+    total_raw.copy_from_slice(&data[8..16]);
+    let total_bytes = u64::from_le_bytes(total_raw);
+    if total_bytes == 0 {
+        bail!("btrfs block-group total_bytes must be non-zero");
+    }
+    Ok(total_bytes)
+}
+
+fn build_btrfs_repair_group_spec(
+    group: u32,
+    logical_start: u64,
+    logical_bytes: u64,
+    block_size: u32,
+    chunks: &[BtrfsChunkEntry],
+) -> Result<BtrfsRepairGroupSpec> {
+    if logical_bytes == 0 {
+        bail!("btrfs block group {group} has zero logical span");
+    }
+    let logical_end = logical_start
+        .checked_add(logical_bytes.saturating_sub(1))
+        .ok_or_else(|| anyhow::anyhow!("btrfs block group {group} logical range overflow"))?;
+    let start_mapping = map_logical_to_physical(chunks, logical_start)
+        .with_context(|| format!("failed to map btrfs group {group} logical start"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "btrfs block group {group} logical start {logical_start} is not covered by any chunk"
+            )
+        })?;
+    let end_mapping = map_logical_to_physical(chunks, logical_end)
+        .with_context(|| format!("failed to map btrfs group {group} logical end"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "btrfs block group {group} logical end {logical_end} is not covered by any chunk"
+            )
+        })?;
+    if start_mapping.devid != end_mapping.devid {
+        bail!(
+            "btrfs block group {group} spans multiple devices (start devid={}, end devid={})",
+            start_mapping.devid,
+            end_mapping.devid
+        );
+    }
+    let expected_end_physical = start_mapping
+        .physical
+        .checked_add(logical_bytes.saturating_sub(1))
+        .ok_or_else(|| anyhow::anyhow!("btrfs block group {group} physical range overflow"))?;
+    if end_mapping.physical != expected_end_physical {
+        bail!(
+            "btrfs block group {group} spans non-contiguous chunk mapping (start_physical={}, end_physical={}, expected_end={expected_end_physical})",
+            start_mapping.physical,
+            end_mapping.physical
+        );
+    }
+    let block_size_u64 = u64::from(block_size);
+    let start_block = start_mapping.physical / block_size_u64;
+    let end_exclusive = expected_end_physical
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("btrfs block group {group} end overflow"))?;
+    let end_block = end_exclusive.div_ceil(block_size_u64);
+    let block_count = end_block.saturating_sub(start_block);
+    if block_count == 0 {
+        bail!("btrfs block group {group} maps to zero scrub blocks");
+    }
+
+    Ok(BtrfsRepairGroupSpec {
+        group,
+        logical_start,
+        logical_bytes,
+        physical_start_block: BlockNumber(start_block),
+        physical_block_count: block_count,
+    })
+}
+
+fn discover_btrfs_repair_group_specs(
+    path: &PathBuf,
+    block_size: u32,
+) -> Result<Vec<BtrfsRepairGroupSpec>> {
+    let cx = cli_cx();
+    let byte_dev = FileByteDevice::open(path)
+        .with_context(|| format!("failed to open image: {}", path.display()))?;
+    let fs = OpenFs::from_device(&cx, Box::new(byte_dev), &OpenOptions::default())
+        .with_context(|| format!("failed to open btrfs image at {}", path.display()))?;
+    if !fs.is_btrfs() {
+        bail!("image is not btrfs");
+    }
+    let chunks = fs
+        .btrfs_context()
+        .ok_or_else(|| anyhow::anyhow!("btrfs context is unavailable"))?
+        .chunks
+        .clone();
+
+    let root_entries = fs
+        .walk_btrfs_root_tree(&cx)
+        .context("failed to walk btrfs root tree")?;
+    let extent_root_entry = root_entries
+        .iter()
+        .find(|entry| {
+            entry.key.objectid == BTRFS_EXTENT_TREE_OBJECTID
+                && entry.key.item_type == BTRFS_ROOT_ITEM_TYPE
+        })
+        .ok_or_else(|| anyhow::anyhow!("failed to locate btrfs extent tree root item"))?;
+    let extent_root_bytenr = parse_btrfs_root_item_bytenr(&extent_root_entry.data)
+        .context("failed to parse btrfs extent tree root item")?;
+
+    let extent_entries = fs
+        .walk_btrfs_tree(&cx, extent_root_bytenr)
+        .with_context(|| format!("failed to walk btrfs extent tree at {extent_root_bytenr}"))?;
+
+    let mut specs = Vec::new();
+    let mut group_index = 0_u32;
+    for entry in extent_entries
+        .iter()
+        .filter(|entry| entry.key.item_type == BTRFS_BLOCK_GROUP_ITEM_TYPE)
+    {
+        let payload_total =
+            parse_btrfs_block_group_total_bytes(&entry.data).with_context(|| {
+                format!(
+                    "failed to parse btrfs block-group payload for key objectid={} offset={}",
+                    entry.key.objectid, entry.key.offset
+                )
+            })?;
+        let logical_bytes = if entry.key.offset == 0 {
+            payload_total
+        } else {
+            entry.key.offset
+        };
+        let spec = build_btrfs_repair_group_spec(
+            group_index,
+            entry.key.objectid,
+            logical_bytes,
+            block_size,
+            &chunks,
+        )?;
+        specs.push(spec);
+        group_index = group_index.saturating_add(1);
+    }
+
+    if specs.is_empty() {
+        bail!("no btrfs block groups discovered from extent tree");
+    }
+
+    Ok(specs)
+}
+
+fn build_ext4_repair_group_spec(sb: &Ext4Superblock, group: u32) -> Result<Ext4RepairGroupSpec> {
+    let (scrub_start, scrub_count) = ext4_group_scrub_scope(sb, group)?;
+    let blocks_per_group = u32::try_from(scrub_count).with_context(|| {
+        format!("ext4 group {group} scrub span does not fit u32 blocks ({scrub_count})")
+    })?;
+    if blocks_per_group <= REPAIR_DESC_SLOT_COUNT + 1 {
+        bail!(
+            "ext4 group {group} is too small for repair tail layout (blocks_per_group={blocks_per_group})"
+        );
+    }
+
+    let source_and_repair_budget = blocks_per_group.saturating_sub(REPAIR_DESC_SLOT_COUNT);
+    let desired_repair = RepairGroupDescExt::compute_repair_block_count(
+        source_and_repair_budget,
+        DEFAULT_REPAIR_OVERHEAD_RATIO,
+    )
+    .max(1);
+    let repair_block_count = desired_repair
+        .min(source_and_repair_budget.saturating_sub(1))
+        .max(1);
+    let source_block_count = source_and_repair_budget.saturating_sub(repair_block_count);
+    if source_block_count == 0 {
+        bail!(
+            "ext4 group {group} has no source payload blocks after reserving repair metadata \
+             (blocks_per_group={blocks_per_group}, repair_blocks={repair_block_count})"
+        );
+    }
+
+    let layout = RepairGroupLayout::new(
+        GroupNumber(group),
+        scrub_start,
+        blocks_per_group,
+        DEFAULT_REPAIR_VALIDATION_BLOCK_COUNT,
+        repair_block_count,
+    )?;
+
+    Ok(Ext4RepairGroupSpec {
+        group,
+        scrub_start_block: scrub_start,
+        scrub_block_count: scrub_count,
+        source_first_block: scrub_start,
+        source_block_count,
+        layout,
+    })
+}
+
+fn build_ext4_repair_group_specs(sb: &Ext4Superblock) -> Result<Vec<Ext4RepairGroupSpec>> {
+    let mut specs = Vec::with_capacity(usize::try_from(sb.groups_count()).unwrap_or(usize::MAX));
+    for group in 0..sb.groups_count() {
+        specs.push(build_ext4_repair_group_spec(sb, group)?);
+    }
+    Ok(specs)
+}
+
+fn probe_ext4_repair_staleness(
+    path: &PathBuf,
+    block_size: u32,
+    specs: &[Ext4RepairGroupSpec],
+) -> Result<Vec<(u32, Ext4RepairStaleness)>> {
+    let cx = cli_cx();
+    let byte_dev = FileByteDevice::open(path)
+        .with_context(|| format!("failed to open image: {}", path.display()))?;
+    let block_dev = ByteBlockDevice::new(byte_dev, block_size)
+        .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
+
+    let mut states = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let storage = RepairGroupStorage::new(&block_dev, spec.layout);
+        let state =
+            storage
+                .read_group_desc_ext(&cx)
+                .map_or(Ext4RepairStaleness::Untracked, |desc| {
+                    if desc.repair_generation == 0 {
+                        Ext4RepairStaleness::Stale
+                    } else {
+                        match storage.read_repair_symbols(&cx) {
+                            Ok(symbols) if symbols.is_empty() => Ext4RepairStaleness::Stale,
+                            Ok(_) => Ext4RepairStaleness::Fresh,
+                            Err(_) => Ext4RepairStaleness::Stale,
+                        }
+                    }
+                });
+        states.push((spec.group, state));
+    }
+
+    Ok(states)
+}
+
+fn select_ext4_repair_groups(
+    flags: RepairFlags,
+    ext4_clean: bool,
+    all_groups: &[u32],
+    staleness: &[(u32, Ext4RepairStaleness)],
+) -> Vec<u32> {
+    if flags.full_scrub() || flags.rebuild_symbols() {
+        return all_groups.to_vec();
+    }
+
+    let stale: Vec<u32> = staleness
+        .iter()
+        .filter_map(|(group, state)| (*state == Ext4RepairStaleness::Stale).then_some(*group))
+        .collect();
+    if !stale.is_empty() {
+        return stale;
+    }
+
+    let has_fresh = staleness
+        .iter()
+        .any(|(_, state)| *state == Ext4RepairStaleness::Fresh);
+    if has_fresh || ext4_clean {
+        return Vec::new();
+    }
+
+    all_groups.to_vec()
+}
+
+fn scrub_ext4_groups_for_repair(
+    path: &PathBuf,
+    flavor: &FsFlavor,
+    specs: &[Ext4RepairGroupSpec],
+    groups: &[u32],
+    max_threads: Option<u32>,
+    limitations: &mut Vec<String>,
+) -> Result<ScrubReport> {
+    if groups.is_empty() {
+        return Ok(ScrubReport {
+            findings: Vec::new(),
+            blocks_scanned: 0,
+            blocks_corrupt: 0,
+            blocks_io_error: 0,
+        });
+    }
+
+    let mut reports = Vec::with_capacity(groups.len());
+    for group in groups {
+        let spec = specs
+            .iter()
+            .find(|spec| spec.group == *group)
+            .ok_or_else(|| {
+                anyhow::anyhow!("ext4 repair group {group} is not available in the computed layout")
+            })?;
+        let report = scrub_range_for_repair(
+            path,
+            flavor,
+            match flavor {
+                FsFlavor::Ext4(sb) => sb.block_size,
+                FsFlavor::Btrfs(_) => unreachable!("ext4 helper called for non-ext4 flavor"),
+            },
+            spec.scrub_start_block,
+            spec.scrub_block_count,
+            max_threads,
+            limitations,
+        )
+        .with_context(|| format!("failed to scrub ext4 group {group}"))?;
+        reports.push(report);
+    }
+
+    Ok(merge_scrub_reports(reports))
+}
+
+fn corrupt_blocks_at_error_or_higher(report: &ScrubReport) -> Vec<BlockNumber> {
+    let mut blocks: Vec<BlockNumber> = report
+        .findings
+        .iter()
+        .filter(|finding| finding.severity >= Severity::Error)
+        .map(|finding| finding.block)
+        .collect();
+    blocks.sort_unstable_by_key(|block| block.0);
+    blocks.dedup_by_key(|block| block.0);
+    blocks
+}
+
+fn group_ext4_corrupt_blocks(
+    report: &ScrubReport,
+    specs: &[Ext4RepairGroupSpec],
+) -> (BTreeMap<u32, Vec<BlockNumber>>, u64) {
+    let mut grouped: BTreeMap<u32, Vec<BlockNumber>> = BTreeMap::new();
+    let mut outside_source_ranges = 0_u64;
+
+    for block in corrupt_blocks_at_error_or_higher(report) {
+        if let Some(spec) = specs.iter().find(|spec| {
+            let start = spec.source_first_block.0;
+            let end = start.saturating_add(u64::from(spec.source_block_count));
+            block.0 >= start && block.0 < end
+        }) {
+            grouped.entry(spec.group).or_default().push(block);
+        } else {
+            outside_source_ranges = outside_source_ranges.saturating_add(1);
+        }
+    }
+
+    (grouped, outside_source_ranges)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover_ext4_corrupt_blocks(
+    path: &PathBuf,
+    block_size: u32,
+    fs_uuid: [u8; 16],
+    specs: &[Ext4RepairGroupSpec],
+    report: &ScrubReport,
+    limitations: &mut Vec<String>,
+) -> Result<(u64, u64, Vec<u32>)> {
+    let cx = cli_cx();
+    let byte_dev = FileByteDevice::open(path)
+        .with_context(|| format!("failed to open image: {}", path.display()))?;
+    let block_dev = ByteBlockDevice::new(byte_dev, block_size)
+        .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
+
+    let (grouped, outside_source_ranges) = group_ext4_corrupt_blocks(report, specs);
+    if outside_source_ranges > 0 {
+        limitations.push(format!(
+            "{outside_source_ranges} corrupt block(s) were outside ext4 source repair ranges and \
+             could not be reconstructed with block symbols"
+        ));
+    }
+
+    let mut recovered_blocks = 0_u64;
+    let mut unrecovered_blocks = 0_u64;
+    let mut repaired_groups = Vec::new();
+
+    for (group, corrupt_blocks) in grouped {
+        let spec = specs
+            .iter()
+            .find(|spec| spec.group == group)
+            .ok_or_else(|| {
+                anyhow::anyhow!("ext4 recovery group {group} missing from computed repair layout")
+            })?;
+        let orchestrator = GroupRecoveryOrchestrator::new(
+            &block_dev,
+            fs_uuid,
+            spec.layout,
+            spec.source_first_block,
+            spec.source_block_count,
+        )
+        .with_context(|| format!("failed to create recovery orchestrator for group {group}"))?;
+
+        let outcome = orchestrator.recover_from_corrupt_blocks(&cx, &corrupt_blocks);
+        let repaired = u64::try_from(outcome.repaired_blocks.len()).unwrap_or(u64::MAX);
+        let corrupt = u64::try_from(corrupt_blocks.len()).unwrap_or(u64::MAX);
+        let unrecovered = corrupt.saturating_sub(repaired);
+        recovered_blocks = recovered_blocks.saturating_add(repaired);
+        unrecovered_blocks = unrecovered_blocks.saturating_add(unrecovered);
+        if repaired > 0 {
+            repaired_groups.push(group);
+        }
+
+        if outcome.evidence.outcome != RecoveryOutcome::Recovered || unrecovered > 0 {
+            let reason = outcome.evidence.reason.as_deref().unwrap_or("unspecified");
+            limitations.push(format!(
+                "ext4 group {group} recovery outcome={:?} recovered={repaired} unrecovered={unrecovered} reason={reason}",
+                outcome.evidence.outcome
+            ));
+        }
+    }
+
+    Ok((recovered_blocks, unrecovered_blocks, repaired_groups))
+}
+
+#[allow(clippy::too_many_lines)]
+fn rebuild_ext4_repair_symbols(
+    path: &PathBuf,
+    block_size: u32,
+    fs_uuid: [u8; 16],
+    specs: &[Ext4RepairGroupSpec],
+    groups: &[u32],
+    limitations: &mut Vec<String>,
+) -> Result<(u64, u64)> {
+    if groups.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let cx = cli_cx();
+    let byte_dev = FileByteDevice::open(path)
+        .with_context(|| format!("failed to open image: {}", path.display()))?;
+    let block_dev = ByteBlockDevice::new(byte_dev, block_size)
+        .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
+    let spec_by_group: BTreeMap<u32, Ext4RepairGroupSpec> = specs
+        .iter()
+        .copied()
+        .map(|spec| (spec.group, spec))
+        .collect();
+
+    let mut unique_groups = BTreeSet::new();
+    unique_groups.extend(groups.iter().copied());
+
+    let mut rebuilt_groups = 0_u64;
+    let mut failed_groups = 0_u64;
+    for group in unique_groups {
+        let Some(spec) = spec_by_group.get(&group).copied() else {
+            failed_groups = failed_groups.saturating_add(1);
+            limitations.push(format!(
+                "cannot rebuild symbols for ext4 group {group}: group layout is unavailable"
+            ));
+            continue;
+        };
+
+        let encoded = match encode_group(
+            &cx,
+            &block_dev,
+            &fs_uuid,
+            GroupNumber(group),
+            spec.source_first_block,
+            spec.source_block_count,
+            spec.layout.repair_block_count,
+        ) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                failed_groups = failed_groups.saturating_add(1);
+                limitations.push(format!(
+                    "failed to encode repair symbols for ext4 group {group}: {error}"
+                ));
+                continue;
+            }
+        };
+
+        let Ok(symbol_size) = u16::try_from(encoded.symbol_size) else {
+            failed_groups = failed_groups.saturating_add(1);
+            limitations.push(format!(
+                "cannot rebuild symbols for ext4 group {group}: symbol_size {} exceeds u16",
+                encoded.symbol_size
+            ));
+            continue;
+        };
+        let Ok(source_block_count_u16) = u16::try_from(encoded.source_block_count) else {
+            failed_groups = failed_groups.saturating_add(1);
+            limitations.push(format!(
+                "cannot rebuild symbols for ext4 group {group}: source_block_count {} exceeds u16",
+                encoded.source_block_count
+            ));
+            continue;
+        };
+
+        let storage = RepairGroupStorage::new(&block_dev, spec.layout);
+        let current_generation = if let Ok(desc) = storage.read_group_desc_ext(&cx) {
+            desc.repair_generation
+        } else {
+            let bootstrap = RepairGroupDescExt {
+                transfer_length: u64::from(encoded.source_block_count)
+                    .saturating_mul(u64::from(encoded.symbol_size)),
+                symbol_size,
+                source_block_count: source_block_count_u16,
+                sub_blocks: 1,
+                symbol_alignment: 4,
+                repair_start_block: spec.layout.repair_start_block(),
+                repair_block_count: spec.layout.repair_block_count,
+                repair_generation: 0,
+                checksum: 0,
+            };
+            if let Err(error) = storage.write_group_desc_ext(&cx, &bootstrap) {
+                failed_groups = failed_groups.saturating_add(1);
+                limitations.push(format!(
+                    "failed to bootstrap repair descriptor for ext4 group {group}: {error}"
+                ));
+                continue;
+            }
+            0
+        };
+
+        let symbols: Vec<(u32, Vec<u8>)> = encoded
+            .repair_symbols
+            .into_iter()
+            .map(|symbol| (symbol.esi, symbol.data))
+            .collect();
+        let new_generation = current_generation.saturating_add(1).max(1);
+        match storage.write_repair_symbols(&cx, &symbols, new_generation) {
+            Ok(()) => {
+                rebuilt_groups = rebuilt_groups.saturating_add(1);
+            }
+            Err(error) => {
+                failed_groups = failed_groups.saturating_add(1);
+                limitations.push(format!(
+                    "failed to publish rebuilt symbols for ext4 group {group}: {error}"
+                ));
+            }
+        }
+    }
+
+    Ok((rebuilt_groups, failed_groups))
+}
+
 fn scrub_range_for_repair(
     path: &PathBuf,
     flavor: &FsFlavor,
@@ -3588,6 +4259,11 @@ fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Result<
         .with_context(|| format!("failed to detect ext4/btrfs metadata in {}", path.display()))?;
 
     let mut limitations = Vec::new();
+    let rebuild_symbols_requested = flags.rebuild_symbols() && !flags.verify_only();
+    if flags.rebuild_symbols() && flags.verify_only() {
+        limitations.push("--rebuild-symbols is ignored when --verify-only is set".to_owned());
+    }
+
     let ext4_recovery = if flags.verify_only() {
         None
     } else {
@@ -3606,59 +4282,196 @@ fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Result<
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     let image_len = byte_dev.len_bytes();
 
-    let (scope, report) = match &flavor {
+    let (scope, report, execution_stats) = match &flavor {
         FsFlavor::Ext4(sb) => {
-            let block_size = sb.block_size;
-            if let Some(group) = options.block_group {
-                let (start, count) = ext4_group_scrub_scope(sb, group)?;
-                let report = scrub_range_for_repair(
-                    path,
-                    &flavor,
-                    block_size,
-                    start,
-                    count,
-                    options.max_threads,
-                    &mut limitations,
-                )
-                .with_context(|| format!("failed to scrub ext4 group {group}"))?;
-                (
-                    RepairScopeOutput::Ext4BlockGroup {
-                        group,
-                        start_block: start.0,
-                        block_count: count,
-                    },
-                    report,
-                )
+            let specs = build_ext4_repair_group_specs(sb)
+                .context("failed to compute ext4 repair group layout")?;
+            let all_groups: Vec<u32> = specs.iter().map(|spec| spec.group).collect();
+            let selected_groups = if let Some(group) = options.block_group {
+                vec![group]
             } else {
-                if !flags.full_scrub() {
+                let staleness = probe_ext4_repair_staleness(path, sb.block_size, &specs)
+                    .context("failed to inspect ext4 repair symbol staleness")?;
+                let selection_flags = RepairFlags::empty()
+                    .with_full_scrub(flags.full_scrub())
+                    .with_rebuild_symbols(rebuild_symbols_requested);
+                let selected = select_ext4_repair_groups(
+                    selection_flags,
+                    ext4_appears_clean_state(sb.state),
+                    &all_groups,
+                    &staleness,
+                );
+
+                if !selection_flags.full_scrub() && !selection_flags.rebuild_symbols() {
+                    let stale_count = staleness
+                        .iter()
+                        .filter(|(_, state)| *state == Ext4RepairStaleness::Stale)
+                        .count();
+                    let fresh_count = staleness
+                        .iter()
+                        .filter(|(_, state)| *state == Ext4RepairStaleness::Fresh)
+                        .count();
+                    let untracked_count = staleness
+                        .iter()
+                        .filter(|(_, state)| *state == Ext4RepairStaleness::Untracked)
+                        .count();
+
+                    if selected.is_empty() {
+                        if stale_count == 0 && fresh_count > 0 {
+                            limitations.push(
+                                "stale-only scope found no stale ext4 groups; scrub skipped (use --full-scrub to force)"
+                                    .to_owned(),
+                            );
+                        } else if stale_count == 0
+                            && fresh_count == 0
+                            && ext4_appears_clean_state(sb.state)
+                        {
+                            limitations.push(
+                                "stale-only scope found no tracked repair metadata and filesystem is clean; scrub skipped (use --full-scrub to force)"
+                                    .to_owned(),
+                            );
+                        } else if stale_count == 0 && fresh_count == 0 && untracked_count > 0 {
+                            limitations.push(
+                                "stale-only scope could not infer group staleness from on-image repair metadata; running full scrub because filesystem is not clean"
+                                    .to_owned(),
+                            );
+                        }
+                    } else if selected.len() < all_groups.len() {
+                        limitations.push(format!(
+                            "stale-only scope selected {}/{} ext4 groups (stale={}, fresh={}, untracked={})",
+                            selected.len(),
+                            all_groups.len(),
+                            stale_count,
+                            fresh_count,
+                            untracked_count
+                        ));
+                    }
+                }
+
+                if selected.is_empty() && !ext4_appears_clean_state(sb.state) {
                     limitations.push(
-                        "stale-only group filtering is not yet implemented; running full scrub"
+                        "stale-only scope yielded no explicit candidates on a non-clean filesystem; running full scrub"
                             .to_owned(),
                     );
+                    all_groups
+                } else {
+                    selected
                 }
-                let report = scrub_range_for_repair(
+            };
+
+            let scope = if let Some(group) = options.block_group {
+                let spec = specs
+                    .iter()
+                    .find(|spec| spec.group == group)
+                    .ok_or_else(|| anyhow::anyhow!("ext4 block group {group} is unavailable"))?;
+                RepairScopeOutput::Ext4BlockGroup {
+                    group,
+                    start_block: spec.scrub_start_block.0,
+                    block_count: spec.scrub_block_count,
+                }
+            } else {
+                RepairScopeOutput::Full
+            };
+
+            let selected_set: BTreeSet<u32> = selected_groups.iter().copied().collect();
+            let selected_specs: Vec<Ext4RepairGroupSpec> = specs
+                .iter()
+                .copied()
+                .filter(|spec| selected_set.contains(&spec.group))
+                .collect();
+            let mut report = scrub_ext4_groups_for_repair(
+                path,
+                &flavor,
+                &specs,
+                &selected_groups,
+                options.max_threads,
+                &mut limitations,
+            )
+            .context("failed to scrub ext4 image")?;
+
+            let mut stats = RepairExecutionStats::default();
+            if !flags.verify_only()
+                && !selected_specs.is_empty()
+                && count_blocks_at_severity_or_higher(&report, Severity::Error) > 0
+            {
+                let (_recovered, unrecovered, repaired_groups) = recover_ext4_corrupt_blocks(
+                    path,
+                    sb.block_size,
+                    sb.uuid,
+                    &selected_specs,
+                    &report,
+                    &mut limitations,
+                )
+                .context("failed to run ext4 block-symbol recovery")?;
+                stats.recovery_attempted = true;
+                stats.recovery_unrecovered_blocks = unrecovered;
+
+                if !repaired_groups.is_empty() {
+                    let (rebuilt, failed) = rebuild_ext4_repair_symbols(
+                        path,
+                        sb.block_size,
+                        sb.uuid,
+                        &selected_specs,
+                        &repaired_groups,
+                        &mut limitations,
+                    )
+                    .context("failed to refresh ext4 repair symbols after recovery")?;
+                    stats.symbol_rebuild_attempted = true;
+                    stats.symbol_rebuild_groups =
+                        stats.symbol_rebuild_groups.saturating_add(rebuilt);
+                    stats.symbol_rebuild_failed_groups =
+                        stats.symbol_rebuild_failed_groups.saturating_add(failed);
+                }
+            }
+
+            if rebuild_symbols_requested && !selected_specs.is_empty() {
+                let (rebuilt, failed) = rebuild_ext4_repair_symbols(
+                    path,
+                    sb.block_size,
+                    sb.uuid,
+                    &selected_specs,
+                    &selected_groups,
+                    &mut limitations,
+                )
+                .context("failed to rebuild ext4 repair symbols")?;
+                stats.symbol_rebuild_attempted = true;
+                stats.symbol_rebuild_groups = stats.symbol_rebuild_groups.saturating_add(rebuilt);
+                stats.symbol_rebuild_failed_groups =
+                    stats.symbol_rebuild_failed_groups.saturating_add(failed);
+            }
+
+            if !flags.verify_only() && (stats.recovery_attempted || stats.symbol_rebuild_attempted)
+            {
+                report = scrub_ext4_groups_for_repair(
                     path,
                     &flavor,
-                    block_size,
-                    BlockNumber(0),
-                    u64::MAX,
+                    &specs,
+                    &selected_groups,
                     options.max_threads,
                     &mut limitations,
                 )
-                .context("failed to scrub ext4 image")?;
-                (RepairScopeOutput::Full, report)
+                .context("failed to verify ext4 image after repair writes")?;
             }
+
+            if stats.symbol_rebuild_failed_groups > 0 {
+                limitations.push(format!(
+                    "symbol re-encoding failed for {} ext4 group(s)",
+                    stats.symbol_rebuild_failed_groups
+                ));
+            }
+
+            (scope, report, stats)
         }
         FsFlavor::Btrfs(sb) => {
-            if options.block_group.is_some() {
+            if !flags.full_scrub() && !rebuild_symbols_requested && options.block_group.is_none() {
                 limitations.push(
-                    "--block-group currently applies only to ext4 images; running full btrfs scrub"
+                    "stale-only mode currently maps to full btrfs scrub because btrfs group-level staleness tracking is not exposed"
                         .to_owned(),
                 );
             }
-            if !flags.full_scrub() {
+            if rebuild_symbols_requested {
                 limitations.push(
-                    "stale-only group filtering is not yet implemented; running full scrub"
+                    "--rebuild-symbols currently applies to ext4 images only; skipping btrfs symbol rebuild"
                         .to_owned(),
                 );
             }
@@ -3670,36 +4483,65 @@ fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Result<
                         sb.nodesize, sb.sectorsize
                     )
                 })?;
-            let report = scrub_range_for_repair(
-                path,
-                &flavor,
-                block_size,
-                BlockNumber(0),
-                u64::MAX,
-                options.max_threads,
-                &mut limitations,
-            )
-            .context("failed to scrub btrfs image")?;
-            (RepairScopeOutput::Full, report)
+            if let Some(group) = options.block_group {
+                let specs = discover_btrfs_repair_group_specs(path, block_size)
+                    .context("failed to discover btrfs block groups for scoped repair")?;
+                let spec = specs
+                    .iter()
+                    .find(|spec| spec.group == group)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "btrfs block group {group} is unavailable (valid range: 0..{})",
+                            specs.len().saturating_sub(1)
+                        )
+                    })?;
+                let report = scrub_range_for_repair(
+                    path,
+                    &flavor,
+                    block_size,
+                    spec.physical_start_block,
+                    spec.physical_block_count,
+                    options.max_threads,
+                    &mut limitations,
+                )
+                .with_context(|| format!("failed to scrub btrfs group {group}"))?;
+                (
+                    RepairScopeOutput::BtrfsBlockGroup {
+                        group,
+                        logical_start: spec.logical_start,
+                        logical_bytes: spec.logical_bytes,
+                        start_block: spec.physical_start_block.0,
+                        block_count: spec.physical_block_count,
+                    },
+                    report,
+                    RepairExecutionStats::default(),
+                )
+            } else {
+                let report = scrub_range_for_repair(
+                    path,
+                    &flavor,
+                    block_size,
+                    BlockNumber(0),
+                    u64::MAX,
+                    options.max_threads,
+                    &mut limitations,
+                )
+                .context("failed to scrub btrfs image")?;
+                (
+                    RepairScopeOutput::Full,
+                    report,
+                    RepairExecutionStats::default(),
+                )
+            }
         }
     };
-
-    if flags.rebuild_symbols() {
-        limitations.push(
-            "--rebuild-symbols is accepted but symbol re-encoding is not yet wired into this command"
-                .to_owned(),
-        );
-    }
     let scrub = repair_scrub_from_report(&report);
     let action = if flags.verify_only() {
         RepairActionOutput::VerifyOnly
-    } else if ext4_recovery.is_some() {
-        if scrub.error_or_higher > 0 {
-            limitations.push(
-                "ext4 mount-time recovery ran, but scrub still reports corruption; block-symbol reconstruction is not yet wired in this command"
-                    .to_owned(),
-            );
-        }
+    } else if ext4_recovery.is_some()
+        || execution_stats.recovery_attempted
+        || execution_stats.symbol_rebuild_attempted
+    {
         RepairActionOutput::RepairRequested
     } else if scrub.error_or_higher > 0 {
         limitations.push(
@@ -3711,7 +4553,18 @@ fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Result<
         RepairActionOutput::NoCorruptionDetected
     };
 
-    let exit_code = i32::from(scrub.error_or_higher > 0);
+    if execution_stats.recovery_unrecovered_blocks > 0 {
+        limitations.push(format!(
+            "{} corrupt block(s) remained unrecovered after block-symbol reconstruction attempts",
+            execution_stats.recovery_unrecovered_blocks
+        ));
+    }
+
+    let exit_code = i32::from(
+        scrub.error_or_higher > 0
+            || execution_stats.recovery_unrecovered_blocks > 0
+            || execution_stats.symbol_rebuild_failed_groups > 0,
+    );
 
     Ok(RepairOutput {
         filesystem: filesystem_name(&flavor).to_owned(),
@@ -3754,6 +4607,24 @@ fn print_repair_output(json: bool, output: &RepairOutput) -> Result<()> {
             println!(
                 "scope: ext4 group {} (blocks {}..{})",
                 group,
+                start_block,
+                start_block.saturating_add(*block_count).saturating_sub(1)
+            );
+        }
+        RepairScopeOutput::BtrfsBlockGroup {
+            group,
+            logical_start,
+            logical_bytes,
+            start_block,
+            block_count,
+        } => {
+            println!(
+                "scope: btrfs group {} (logical {}..{}, physical blocks {}..{})",
+                group,
+                logical_start,
+                logical_start
+                    .saturating_add(*logical_bytes)
+                    .saturating_sub(1),
                 start_block,
                 start_block.saturating_add(*block_count).saturating_sub(1)
             );
@@ -4219,9 +5090,10 @@ fn mkfs_cmd(
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, DumpCommand, Ext4JournalReplayMode, FsckCommandOptions, FsckFlags, LogFormat,
-        build_fsck_output, ext4_appears_clean_state, ext4_mount_replay_mode, merge_scrub_reports,
-        partition_scrub_range, repair_worker_limit,
+        Cli, Command, DumpCommand, Ext4JournalReplayMode, Ext4RepairStaleness, FsckCommandOptions,
+        FsckFlags, LogFormat, RepairCommandOptions, RepairFlags, build_btrfs_repair_group_spec,
+        build_fsck_output, build_repair_output, ext4_appears_clean_state, ext4_mount_replay_mode,
+        merge_scrub_reports, partition_scrub_range, repair_worker_limit, select_ext4_repair_groups,
     };
     use clap::Parser;
     use serde_json::Value;
@@ -4313,6 +5185,34 @@ mod tests {
         image[gdt_off + 0x08..gdt_off + 0x0C].copy_from_slice(&5_u32.to_le_bytes()); // inode table block
 
         image
+    }
+
+    fn test_btrfs_chunk_entry(
+        logical_start: u64,
+        length: u64,
+        physical_start: u64,
+    ) -> ffs_ondisk::BtrfsChunkEntry {
+        ffs_ondisk::BtrfsChunkEntry {
+            key: ffs_ondisk::BtrfsKey {
+                objectid: 0,
+                item_type: 0,
+                offset: logical_start,
+            },
+            length,
+            owner: 0,
+            stripe_len: 0,
+            chunk_type: 0,
+            io_align: 0,
+            io_width: 0,
+            sector_size: 4096,
+            num_stripes: 1,
+            sub_stripes: 1,
+            stripes: vec![ffs_ondisk::BtrfsStripe {
+                devid: 1,
+                offset: physical_start,
+                dev_uuid: [0_u8; 16],
+            }],
+        }
     }
 
     fn with_temp_image_path<T>(image: &[u8], f: impl FnOnce(PathBuf) -> T) -> T {
@@ -4748,5 +5648,121 @@ mod tests {
                 .iter()
                 .any(|limitation| limitation.contains("skipped block-level scrub"))
         );
+    }
+
+    #[test]
+    fn repair_selection_prefers_explicit_stale_groups() {
+        let all = vec![0, 1, 2, 3];
+        let staleness = vec![
+            (0, Ext4RepairStaleness::Fresh),
+            (1, Ext4RepairStaleness::Stale),
+            (2, Ext4RepairStaleness::Untracked),
+            (3, Ext4RepairStaleness::Stale),
+        ];
+        let selected = select_ext4_repair_groups(RepairFlags::empty(), true, &all, &staleness);
+        assert_eq!(selected, vec![1, 3]);
+    }
+
+    #[test]
+    fn repair_selection_skips_when_clean_and_untracked() {
+        let all = vec![0, 1];
+        let staleness = vec![
+            (0, Ext4RepairStaleness::Untracked),
+            (1, Ext4RepairStaleness::Untracked),
+        ];
+        let selected = select_ext4_repair_groups(RepairFlags::empty(), true, &all, &staleness);
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn repair_selection_runs_full_when_dirty_and_untracked() {
+        let all = vec![0, 1, 2];
+        let staleness = vec![
+            (0, Ext4RepairStaleness::Untracked),
+            (1, Ext4RepairStaleness::Untracked),
+            (2, Ext4RepairStaleness::Untracked),
+        ];
+        let selected = select_ext4_repair_groups(RepairFlags::empty(), false, &all, &staleness);
+        assert_eq!(selected, all);
+    }
+
+    #[test]
+    fn repair_selection_rebuild_symbols_forces_full_scope() {
+        let all = vec![0, 1, 2];
+        let staleness = vec![
+            (0, Ext4RepairStaleness::Fresh),
+            (1, Ext4RepairStaleness::Stale),
+            (2, Ext4RepairStaleness::Untracked),
+        ];
+        let selected = select_ext4_repair_groups(
+            RepairFlags::empty().with_rebuild_symbols(true),
+            true,
+            &all,
+            &staleness,
+        );
+        assert_eq!(selected, all);
+    }
+
+    #[test]
+    fn repair_verify_only_ignores_rebuild_symbols_write_path() {
+        const EXT4_VALID_FS: u16 = 0x0001;
+        let image = build_test_ext4_image_with_state(EXT4_VALID_FS);
+        let output = with_temp_image_path(&image, |path| {
+            build_repair_output(
+                &path,
+                RepairCommandOptions {
+                    flags: RepairFlags::empty()
+                        .with_verify_only(true)
+                        .with_rebuild_symbols(true),
+                    block_group: None,
+                    max_threads: None,
+                },
+            )
+            .expect("build repair output for verify-only rebuild request")
+        });
+
+        assert!(
+            output
+                .limitations
+                .iter()
+                .any(|limitation| limitation.contains("ignored when --verify-only"))
+        );
+        assert!(matches!(
+            output.action,
+            super::RepairActionOutput::VerifyOnly
+        ));
+    }
+
+    #[test]
+    fn btrfs_repair_group_spec_maps_contiguous_single_chunk() {
+        let chunks = vec![test_btrfs_chunk_entry(0x1000, 0x4000, 0x8000)];
+        let spec = build_btrfs_repair_group_spec(2, 0x2000, 0x1000, 4096, &chunks)
+            .expect("map contiguous btrfs group");
+        assert_eq!(spec.group, 2);
+        assert_eq!(spec.logical_start, 0x2000);
+        assert_eq!(spec.logical_bytes, 0x1000);
+        assert_eq!(spec.physical_start_block.0, 9);
+        assert_eq!(spec.physical_block_count, 1);
+    }
+
+    #[test]
+    fn btrfs_repair_group_spec_rejects_unmapped_range() {
+        let chunks = vec![test_btrfs_chunk_entry(0x1000, 0x1000, 0x8000)];
+        let err = build_btrfs_repair_group_spec(0, 0x4000, 0x1000, 4096, &chunks)
+            .expect_err("unmapped logical range should fail");
+        let detail = format!("{err:#}");
+        assert!(detail.contains("not covered by any chunk"));
+    }
+
+    #[test]
+    fn btrfs_repair_group_spec_rejects_non_contiguous_chunk_mapping() {
+        let chunks = vec![
+            test_btrfs_chunk_entry(0x0, 0x1000, 0x10000),
+            test_btrfs_chunk_entry(0x1000, 0x1000, 0x30000),
+        ];
+        let err = build_btrfs_repair_group_spec(1, 0x0, 0x2000, 4096, &chunks)
+            .expect_err("discontiguous mapping should fail");
+        let detail = format!("{err:#}");
+        assert!(detail.contains("non-contiguous chunk mapping"));
     }
 }
