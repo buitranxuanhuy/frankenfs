@@ -266,7 +266,7 @@ pub fn create_inode(
     gid: u32,
     parent_group: GroupNumber,
     csum_seed: u32,
-    now_secs: u32,
+    now_secs: u64,
     now_nsec: u32,
 ) -> Result<(InodeNumber, Ext4Inode)> {
     cx_checkpoint(cx)?;
@@ -313,6 +313,8 @@ pub fn create_inode(
 
     let extra_time = encode_extra_timestamp(now_secs, now_nsec);
 
+    #[allow(clippy::cast_possible_truncation)]
+    let now_lo = now_secs as u32;
     let inode = Ext4Inode {
         mode,
         uid,
@@ -323,14 +325,14 @@ pub fn create_inode(
         flags: EXT4_EXTENTS_FL,
         generation: old_generation.wrapping_add(1),
         file_acl: 0,
-        atime: now_secs,
-        ctime: now_secs,
-        mtime: now_secs,
+        atime: now_lo,
+        ctime: now_lo,
+        mtime: now_lo,
         dtime: 0,
         atime_extra: extra_time,
         ctime_extra: extra_time,
         mtime_extra: extra_time,
-        crtime: now_secs,
+        crtime: now_lo,
         crtime_extra: extra_time,
         extra_isize: 32,
         checksum: 0,
@@ -356,7 +358,7 @@ pub fn delete_inode(
     ino: InodeNumber,
     inode: &mut Ext4Inode,
     csum_seed: u32,
-    now_secs: u32,
+    now_secs: u64,
 ) -> Result<()> {
     cx_checkpoint(cx)?;
 
@@ -369,7 +371,10 @@ pub fn delete_inode(
     }
 
     // Set deletion time.
-    inode.dtime = now_secs;
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        inode.dtime = now_secs as u32;
+    }
     inode.links_count = 0;
     inode.size = 0;
     inode.blocks = 0;
@@ -389,28 +394,32 @@ pub fn delete_inode(
 ///
 /// Layout: bits 0-1 = epoch extension (seconds >> 32), bits 2-31 = nanoseconds.
 #[must_use]
-pub fn encode_extra_timestamp(_secs: u32, nsec: u32) -> u32 {
-    // For 32-bit base seconds, epoch is 0.
-    nsec & 0x3FFF_FFFC // mask to 30-bit nanoseconds, shifted to bits 2-31
+pub fn encode_extra_timestamp(secs: u64, nsec: u32) -> u32 {
+    let epoch = ((secs >> 32) & 0x3) as u32; // upper 2 bits of seconds
+    let nsec_bits = nsec & 0x3FFF_FFFC; // mask to 30-bit nanoseconds, in bits 2-31
+    epoch | nsec_bits
 }
 
 /// Touch atime on an inode.
-pub fn touch_atime(inode: &mut Ext4Inode, secs: u32, nsec: u32) {
-    inode.atime = secs;
+#[allow(clippy::cast_possible_truncation)]
+pub fn touch_atime(inode: &mut Ext4Inode, secs: u64, nsec: u32) {
+    inode.atime = secs as u32; // lower 32 bits per ext4 spec
     inode.atime_extra = encode_extra_timestamp(secs, nsec);
 }
 
 /// Touch mtime and ctime on an inode.
-pub fn touch_mtime_ctime(inode: &mut Ext4Inode, secs: u32, nsec: u32) {
-    inode.mtime = secs;
+#[allow(clippy::cast_possible_truncation)]
+pub fn touch_mtime_ctime(inode: &mut Ext4Inode, secs: u64, nsec: u32) {
+    inode.mtime = secs as u32;
     inode.mtime_extra = encode_extra_timestamp(secs, nsec);
-    inode.ctime = secs;
+    inode.ctime = secs as u32;
     inode.ctime_extra = encode_extra_timestamp(secs, nsec);
 }
 
 /// Touch ctime only on an inode (e.g., for chmod, chown).
-pub fn touch_ctime(inode: &mut Ext4Inode, secs: u32, nsec: u32) {
-    inode.ctime = secs;
+#[allow(clippy::cast_possible_truncation)]
+pub fn touch_ctime(inode: &mut Ext4Inode, secs: u64, nsec: u32) {
+    inode.ctime = secs as u32;
     inode.ctime_extra = encode_extra_timestamp(secs, nsec);
 }
 
@@ -1145,6 +1154,27 @@ mod tests {
         // mtime should remain unchanged
         assert_eq!(inode.mtime, 100);
         assert_eq!(inode.mtime_extra, encode_extra_timestamp(100, 500_000_000));
+    }
+
+    #[test]
+    fn encode_extra_timestamp_epoch_extension() {
+        // Timestamp at 2^32 (epoch 1): after Feb 2106.
+        let secs: u64 = 1 << 32; // 4_294_967_296
+        let extra = encode_extra_timestamp(secs, 0);
+        // Epoch bits (bits 0-1) should be 1, nsec bits should be 0.
+        assert_eq!(extra & 0x3, 1);
+        assert_eq!(extra & 0x3FFF_FFFC, 0);
+
+        // Timestamp at 2^33 (epoch 2).
+        let secs: u64 = 1 << 33;
+        let extra = encode_extra_timestamp(secs, 123_456_788);
+        assert_eq!(extra & 0x3, 2);
+        assert_eq!(extra & 0x3FFF_FFFC, 123_456_788 & 0x3FFF_FFFC);
+
+        // Timestamp at 3 * 2^32 (epoch 3).
+        let secs: u64 = 3 << 32;
+        let extra = encode_extra_timestamp(secs, 0);
+        assert_eq!(extra & 0x3, 3);
     }
 
     #[test]

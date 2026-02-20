@@ -4414,14 +4414,13 @@ impl OpenFs {
     }
 
     /// Get current wall-clock timestamp as (seconds-since-epoch, nanoseconds).
-    fn now_timestamp() -> (u32, u32) {
+    ///
+    /// Returns full 64-bit seconds to support ext4 34-bit timestamps (epoch
+    /// extension bits in the `_extra` fields) through year ~2446.
+    fn now_timestamp() -> (u64, u32) {
         let now = SystemTime::now();
         let dur = now.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
-        #[allow(clippy::cast_possible_truncation)]
-        let secs = dur.as_secs() as u32;
-        #[allow(clippy::cast_possible_truncation)]
-        let nsec = dur.subsec_nanos();
-        (secs, nsec)
+        (dur.as_secs(), dur.subsec_nanos())
     }
 
     /// Require the ext4 alloc state to be present (i.e., writes enabled).
@@ -4664,7 +4663,7 @@ impl OpenFs {
         child_ino: InodeNumber,
         file_type: Ext4FileType,
         csum_seed: u32,
-        tstamp_secs: u32,
+        tstamp_secs: u64,
         tstamp_nanos: u32,
     ) -> ffs_error::Result<()> {
         // Collect existing directory extents.
@@ -5620,17 +5619,11 @@ impl OpenFs {
         }
         if let Some(atime) = attrs.atime {
             let dur = atime.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
-            #[allow(clippy::cast_possible_truncation)]
-            ffs_inode::touch_atime(&mut inode, dur.as_secs() as u32, dur.subsec_nanos());
+            ffs_inode::touch_atime(&mut inode, dur.as_secs(), dur.subsec_nanos());
         }
         if let Some(mtime) = attrs.mtime {
             let dur = mtime.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                inode.mtime = dur.as_secs() as u32;
-                inode.mtime_extra =
-                    ffs_inode::encode_extra_timestamp(dur.as_secs() as u32, dur.subsec_nanos());
-            }
+            ffs_inode::touch_mtime_ctime(&mut inode, dur.as_secs(), dur.subsec_nanos());
         }
 
         // Handle truncation.
