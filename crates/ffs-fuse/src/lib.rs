@@ -311,7 +311,10 @@ impl AccessPredictor {
     fn fetch_size(&self, ino: InodeNumber, offset: u64, requested: u32) -> u32 {
         let guard = match self.state.lock() {
             Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
+            Err(poisoned) => {
+                warn!("AccessPredictor state lock poisoned in fetch_size, recovering");
+                poisoned.into_inner()
+            }
         };
         let pattern = guard.history.get(&ino.0).copied();
         drop(guard);
@@ -342,7 +345,10 @@ impl AccessPredictor {
         {
             let mut guard = match self.state.lock() {
                 Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
+                Err(poisoned) => {
+                    warn!("AccessPredictor state lock poisoned in record_read, recovering");
+                    poisoned.into_inner()
+                }
             };
 
             guard.next_touch = guard.next_touch.saturating_add(1);
@@ -410,7 +416,10 @@ impl ReadaheadManager {
         }
         let mut guard = match self.pending.lock() {
             Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
+            Err(poisoned) => {
+                warn!("ReadaheadCache pending lock poisoned in insert, recovering");
+                poisoned.into_inner()
+            }
         };
         guard.insert((ino.0, offset), data);
         while guard.len() > self.max_pending {
@@ -426,7 +435,10 @@ impl ReadaheadManager {
     fn take(&self, ino: InodeNumber, offset: u64, requested_len: usize) -> Option<Vec<u8>> {
         let mut guard = match self.pending.lock() {
             Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
+            Err(poisoned) => {
+                warn!("ReadaheadCache pending lock poisoned in take, recovering");
+                poisoned.into_inner()
+            }
         };
         let mut cached = guard.remove(&(ino.0, offset))?;
         if cached.len() <= requested_len {

@@ -195,9 +195,12 @@ impl ChallengeSet {
     /// Uses BLAKE3 in XOF mode to derive pseudo-random challenge indices.
     /// `total_blocks` is the number of blocks in the group/file.
     /// `challenge_count` is how many blocks to challenge.
+    /// Maximum challenges per set to prevent unbounded allocation.
+    const MAX_CHALLENGES: u32 = 1_000_000;
+
     #[must_use]
     pub fn generate(seed: &[u8; 32], total_blocks: u32, challenge_count: u32) -> Self {
-        let count = challenge_count.min(total_blocks);
+        let count = challenge_count.min(total_blocks).min(Self::MAX_CHALLENGES);
 
         // Derive nonce from seed.
         let nonce = *blake3::hash(seed).as_bytes();

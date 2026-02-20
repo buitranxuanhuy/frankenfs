@@ -298,7 +298,7 @@ impl E2eTestContext {
 
         // Check if mkfs tool is available.
         let tool_check = Command::new("which").arg(mkfs_cmd).output();
-        if tool_check.is_err() || !tool_check.unwrap().status.success() {
+        if !tool_check.is_ok_and(|o| o.status.success()) {
             self.log_skip("create_fixture", &format!("{mkfs_cmd} not found"));
             return Ok(false);
         }
