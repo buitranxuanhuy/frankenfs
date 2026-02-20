@@ -5224,7 +5224,7 @@ mod tests {
                     }
                 })
                 .expect("create reader task");
-            runtime.scheduler.lock().expect("scheduler lock not poisoned").schedule(task_id, 0);
+            runtime.scheduler.lock().schedule(task_id, 0);
         }
 
         for writer in 0..WRITERS {
@@ -5245,7 +5245,7 @@ mod tests {
                     }
                 })
                 .expect("create writer task");
-            runtime.scheduler.lock().expect("scheduler lock not poisoned").schedule(task_id, 0);
+            runtime.scheduler.lock().schedule(task_id, 0);
         }
 
         runtime.run_until_quiescent();
