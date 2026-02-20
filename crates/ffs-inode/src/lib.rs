@@ -50,7 +50,7 @@ pub fn locate_inode(
     let byte_in_table = u64::from(index) * u64::from(geo.inode_size);
     let block_offset = byte_in_table / u64::from(geo.block_size);
     let byte_offset = (byte_in_table % u64::from(geo.block_size)) as usize;
-    let block = BlockNumber(groups[gidx].inode_table_block.0 + block_offset);
+    let block = BlockNumber(groups[gidx].inode_table_block.0.checked_add(block_offset)?);
     Some(InodeLocation { block, byte_offset })
 }
 
@@ -277,7 +277,7 @@ pub fn create_inode(
     if is_dir {
         let gidx = alloc.group.0 as usize;
         if gidx < groups.len() {
-            groups[gidx].used_dirs += 1;
+            groups[gidx].used_dirs = groups[gidx].used_dirs.saturating_add(1);
         }
     }
 

@@ -378,7 +378,12 @@ fn persist_group_desc(
     let gdt_block_idx = group.0 as usize / descs_per_block;
     let offset_in_block = (group.0 as usize % descs_per_block) * ds;
 
-    let block_num = BlockNumber(pctx.gdt_block.0 + gdt_block_idx as u64);
+    let block_num = BlockNumber(
+        pctx.gdt_block
+            .0
+            .checked_add(gdt_block_idx as u64)
+            .ok_or_else(|| FfsError::InvalidGeometry("GDT block number overflow".into()))?,
+    );
     let raw = dev.read_block(cx, block_num)?;
     let mut buf = raw.as_slice().to_vec();
 
@@ -521,7 +526,7 @@ fn try_alloc_in_group(
         dev.write_block(cx, gs.block_bitmap_block, &bitmap)?;
 
         // Update group stats.
-        groups[gidx].free_blocks -= alloc_count;
+        groups[gidx].free_blocks = groups[gidx].free_blocks.saturating_sub(alloc_count);
 
         let abs_start = geo.group_block_to_absolute(group, rel_start);
         Ok(Some(BlockAlloc {
@@ -562,7 +567,7 @@ pub fn free_blocks(
     }
 
     dev.write_block(cx, gs.block_bitmap_block, &bitmap)?;
-    groups[gidx].free_blocks += count;
+    groups[gidx].free_blocks = groups[gidx].free_blocks.saturating_add(count);
     Ok(())
 }
 
@@ -692,7 +697,7 @@ fn try_alloc_safe(
         }
 
         dev.write_block(cx, groups[gidx].block_bitmap_block, &bitmap)?;
-        groups[gidx].free_blocks -= alloc_count;
+        groups[gidx].free_blocks = groups[gidx].free_blocks.saturating_sub(alloc_count);
 
         // Persist group descriptor.
         persist_group_desc(cx, dev, pctx, group, &groups[gidx])?;
@@ -763,7 +768,7 @@ pub fn free_blocks_persist(
     }
 
     dev.write_block(cx, groups[gidx].block_bitmap_block, &bitmap)?;
-    groups[gidx].free_blocks += count;
+    groups[gidx].free_blocks = groups[gidx].free_blocks.saturating_add(count);
 
     // Persist group descriptor.
     persist_group_desc(cx, dev, pctx, group, &groups[gidx])?;
@@ -886,7 +891,7 @@ fn try_alloc_inode_in_group(
         bitmap_set(&mut bitmap, idx);
         dev.write_block(cx, gs.inode_bitmap_block, &bitmap)?;
 
-        groups[gidx].free_inodes -= 1;
+        groups[gidx].free_inodes = groups[gidx].free_inodes.saturating_sub(1);
 
         // Compute absolute inode number: group * inodes_per_group + idx + 1.
         let ino = u64::from(group.0) * u64::from(geo.inodes_per_group) + u64::from(idx) + 1;
@@ -933,7 +938,7 @@ pub fn free_inode(
 
     bitmap_clear(&mut bitmap, bit_idx);
     dev.write_block(cx, gs.inode_bitmap_block, &bitmap)?;
-    groups[gidx].free_inodes += 1;
+    groups[gidx].free_inodes = groups[gidx].free_inodes.saturating_add(1);
     Ok(())
 }
 
