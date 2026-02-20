@@ -14827,8 +14827,7 @@ mod tests {
         let data = ops.read(&cx, attr.ino, 0, 4096).unwrap();
         assert!(
             data.is_empty(),
-            "expected empty after truncate, got {:?}",
-            data
+            "expected empty after truncate, got {data:?}",
         );
     }
 

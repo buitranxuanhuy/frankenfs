@@ -141,7 +141,7 @@ fn stress_concurrent_rw() {
                     }
                 })
                 .expect("create writer task");
-            runtime.scheduler.lock().schedule(task_id, 0);
+            runtime.scheduler.lock().expect("scheduler lock not poisoned").schedule(task_id, 0);
         }
 
         for reader_id in 0_u64..READER_COUNT {
@@ -177,7 +177,7 @@ fn stress_concurrent_rw() {
                     }
                 })
                 .expect("create reader task");
-            runtime.scheduler.lock().schedule(task_id, 0);
+            runtime.scheduler.lock().expect("scheduler lock not poisoned").schedule(task_id, 0);
         }
 
         runtime.run_until_quiescent();
@@ -327,7 +327,7 @@ fn stress_ssi_write_skew() {
                     outcomes.lock().expect("outcomes lock").0 = Some(result);
                 })
                 .expect("create txn_one task");
-            runtime.scheduler.lock().schedule(task_id, 0);
+            runtime.scheduler.lock().expect("scheduler lock not poisoned").schedule(task_id, 0);
         }
 
         {
@@ -349,7 +349,7 @@ fn stress_ssi_write_skew() {
                     outcomes.lock().expect("outcomes lock").1 = Some(result);
                 })
                 .expect("create txn_two task");
-            runtime.scheduler.lock().schedule(task_id, 0);
+            runtime.scheduler.lock().expect("scheduler lock not poisoned").schedule(task_id, 0);
         }
 
         runtime.run_until_quiescent();
@@ -465,7 +465,7 @@ fn stress_gc_under_load() {
                     }
                 })
                 .expect("create writer task");
-            runtime.scheduler.lock().schedule(task_id, 0);
+            runtime.scheduler.lock().expect("scheduler lock not poisoned").schedule(task_id, 0);
         }
 
         {
@@ -486,7 +486,7 @@ fn stress_gc_under_load() {
                     }
                 })
                 .expect("create gc task");
-            runtime.scheduler.lock().schedule(task_id, 0);
+            runtime.scheduler.lock().expect("scheduler lock not poisoned").schedule(task_id, 0);
         }
 
         runtime.run_until_quiescent();
@@ -578,7 +578,7 @@ fn stress_version_chain_growth() {
                     }
                 })
                 .expect("create writer task");
-            runtime.scheduler.lock().schedule(task_id, 0);
+            runtime.scheduler.lock().expect("scheduler lock not poisoned").schedule(task_id, 0);
         }
 
         runtime.run_until_quiescent();
