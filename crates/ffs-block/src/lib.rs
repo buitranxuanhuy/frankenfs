@@ -1137,21 +1137,41 @@ impl ArcState {
         }
 
         let t1_len = self.t1.len();
-        if t1_len >= 1
+        let target_t1 = t1_len >= 1
             && (t1_len > self.p
-                || (matches!(self.loc.get(&incoming), Some(ArcList::B2)) && t1_len == self.p))
-        {
-            if let Some(victim) = self.t1.pop_front() {
+                || (matches!(self.loc.get(&incoming), Some(ArcList::B2)) && t1_len == self.p));
+
+        let mut victim = None;
+        let mut from_t1 = target_t1;
+
+        if from_t1 {
+            if let Some(pos) = self.t1.iter().position(|b| !self.is_dirty(*b)) {
+                victim = self.t1.remove(pos);
+            } else if let Some(pos) = self.t2.iter().position(|b| !self.is_dirty(*b)) {
+                victim = self.t2.remove(pos);
+                from_t1 = false;
+            }
+        } else {
+            if let Some(pos) = self.t2.iter().position(|b| !self.is_dirty(*b)) {
+                victim = self.t2.remove(pos);
+            } else if let Some(pos) = self.t1.iter().position(|b| !self.is_dirty(*b)) {
+                victim = self.t1.remove(pos);
+                from_t1 = true;
+            }
+        }
+
+        if let Some(victim) = victim {
+            if from_t1 {
                 self.loc.insert(victim, ArcList::B1);
                 self.evict_resident(victim);
                 self.b1.push_back(victim);
                 self.evictions += 1;
+            } else {
+                self.loc.insert(victim, ArcList::B2);
+                self.evict_resident(victim);
+                self.b2.push_back(victim);
+                self.evictions += 1;
             }
-        } else if let Some(victim) = self.t2.pop_front() {
-            self.loc.insert(victim, ArcList::B2);
-            self.evict_resident(victim);
-            self.b2.push_back(victim);
-            self.evictions += 1;
         }
 
         while self.b1.len() > self.capacity {
@@ -1364,10 +1384,16 @@ impl ArcState {
 
     #[cfg(feature = "s3fifo")]
     fn s3_rebalance_queues(&mut self, block_hint: Option<BlockNumber>) {
-        while self.t1.len() > self.small_capacity {
+        let mut t1_attempts = self.t1.len();
+        while self.t1.len() > self.small_capacity && t1_attempts > 0 {
+            t1_attempts -= 1;
             let Some(victim) = self.t1.pop_front() else {
                 break;
             };
+            if self.is_dirty(victim) {
+                self.t1.push_back(victim);
+                continue;
+            }
             let access_count = self.access_count.get(&victim).copied().unwrap_or(0);
             if access_count > 0 {
                 self.loc.insert(victim, ArcList::T2);
@@ -1402,10 +1428,16 @@ impl ArcState {
             }
         }
 
-        while self.t2.len() > self.main_capacity {
+        let mut t2_attempts = self.t2.len();
+        while self.t2.len() > self.main_capacity && t2_attempts > 0 {
+            t2_attempts -= 1;
             let Some(victim) = self.t2.pop_front() else {
                 break;
             };
+            if self.is_dirty(victim) {
+                self.t2.push_back(victim);
+                continue;
+            }
             let access_count = self.access_count.get(&victim).copied().unwrap_or(0);
             if access_count > 0 {
                 let next_count = access_count.saturating_sub(1);

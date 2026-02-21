@@ -285,6 +285,7 @@ struct AccessPattern {
 #[derive(Debug, Default)]
 struct AccessPredictorState {
     history: BTreeMap<u64, AccessPattern>,
+    lru: BTreeMap<u64, u64>,
     next_touch: u64,
 }
 
@@ -332,7 +333,7 @@ impl AccessPredictor {
         if should_batch {
             requested
                 .saturating_mul(COALESCED_FETCH_MULTIPLIER)
-                .min(MAX_COALESCED_READ_SIZE)
+                .clamp(requested, MAX_COALESCED_READ_SIZE.max(requested))
         } else {
             requested
         }
@@ -353,6 +354,11 @@ impl AccessPredictor {
 
             guard.next_touch = guard.next_touch.saturating_add(1);
             let touch = guard.next_touch;
+            if let Some(old) = guard.history.get(&ino.0) {
+                guard.lru.remove(&old.last_touch);
+            }
+            guard.lru.insert(touch, ino.0);
+
             let entry = guard.history.entry(ino.0).or_insert(AccessPattern {
                 last_offset: offset,
                 last_size: size,
@@ -379,12 +385,7 @@ impl AccessPredictor {
             entry.last_touch = touch;
 
             while guard.history.len() > self.max_entries {
-                let oldest_inode = guard
-                    .history
-                    .iter()
-                    .min_by_key(|(inode, pattern)| (pattern.last_touch, *inode))
-                    .map(|(inode, _)| *inode);
-                if let Some(oldest_inode) = oldest_inode {
+                if let Some((_, oldest_inode)) = guard.lru.pop_first() {
                     let _ = guard.history.remove(&oldest_inode);
                 } else {
                     break;
@@ -396,16 +397,22 @@ impl AccessPredictor {
     }
 }
 
+#[derive(Debug, Default)]
+struct ReadaheadState {
+    map: BTreeMap<(u64, u64), Vec<u8>>,
+    fifo: std::collections::VecDeque<(u64, u64)>,
+}
+
 #[derive(Debug)]
 struct ReadaheadManager {
-    pending: Mutex<BTreeMap<(u64, u64), Vec<u8>>>,
+    pending: Mutex<ReadaheadState>,
     max_pending: usize,
 }
 
 impl ReadaheadManager {
     fn new(max_pending: usize) -> Self {
         Self {
-            pending: Mutex::new(BTreeMap::new()),
+            pending: Mutex::new(ReadaheadState::default()),
             max_pending: max_pending.max(1),
         }
     }
@@ -421,10 +428,12 @@ impl ReadaheadManager {
                 poisoned.into_inner()
             }
         };
-        guard.insert((ino.0, offset), data);
-        while guard.len() > self.max_pending {
-            if let Some(key) = guard.keys().next().copied() {
-                let _ = guard.remove(&key);
+        if guard.map.insert((ino.0, offset), data).is_none() {
+            guard.fifo.push_back((ino.0, offset));
+        }
+        while guard.fifo.len() > self.max_pending {
+            if let Some(key) = guard.fifo.pop_front() {
+                let _ = guard.map.remove(&key);
             } else {
                 break;
             }
@@ -440,7 +449,7 @@ impl ReadaheadManager {
                 poisoned.into_inner()
             }
         };
-        let mut cached = guard.remove(&(ino.0, offset))?;
+        let mut cached = guard.map.remove(&(ino.0, offset))?;
         if cached.len() <= requested_len {
             drop(guard);
             return Some(cached);
@@ -449,7 +458,16 @@ impl ReadaheadManager {
         let tail = cached.split_off(requested_len);
         let consumed = u64::try_from(cached.len()).unwrap_or(u64::MAX);
         let next_offset = offset.saturating_add(consumed);
-        guard.insert((ino.0, next_offset), tail);
+        if guard.map.insert((ino.0, next_offset), tail).is_none() {
+            guard.fifo.push_back((ino.0, next_offset));
+        }
+        while guard.fifo.len() > self.max_pending {
+            if let Some(key) = guard.fifo.pop_front() {
+                let _ = guard.map.remove(&key);
+            } else {
+                break;
+            }
+        }
         drop(guard);
         Some(cached)
     }

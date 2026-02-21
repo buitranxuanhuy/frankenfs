@@ -2515,20 +2515,27 @@ impl OpenFs {
         // Resolve parent via INODE_REF when COW tree is available.
         // Reverse-map root objectid back to FUSE inode 1.
         let root_oid = self.btrfs_superblock().map(|sb| sb.root_dir_objectid);
-        let parent_ino = self
-            .btrfs_alloc_state
-            .as_ref()
-            .and_then(|alloc_mutex| {
-                let alloc = alloc_mutex.lock();
-                self.btrfs_lookup_parent(&alloc, canonical_dir).map(|oid| {
-                    if Some(oid) == root_oid {
-                        InodeNumber(1) // FUSE root
-                    } else {
-                        InodeNumber(oid)
-                    }
+        let parent_ino = if let Some(alloc_mutex) = self.btrfs_alloc_state.as_ref() {
+            let alloc = alloc_mutex.lock();
+            self.btrfs_lookup_parent(&alloc, canonical_dir)
+        } else {
+            self.walk_btrfs_fs_tree(cx)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|item| {
+                    item.key.objectid == canonical_dir
+                        && item.key.item_type == BTRFS_ITEM_INODE_REF
                 })
-            })
-            .unwrap_or(ino); // root or read-only: ".." points to self
+                .map(|item| item.key.offset)
+        }
+        .map(|oid| {
+            if Some(oid) == root_oid {
+                InodeNumber(1) // FUSE root
+            } else {
+                InodeNumber(oid)
+            }
+        })
+        .unwrap_or(ino); // fallback to self if no parent found
         let dot = DirEntry {
             ino,
             offset: 0,
@@ -5468,6 +5475,23 @@ impl OpenFs {
         if let Some(existing) = self.lookup_name(cx, &new_parent_inode, new_name)? {
             let existing_ino = InodeNumber(u64::from(existing.inode));
             let existing_inode = self.read_inode(cx, existing_ino)?;
+
+            if existing_inode.is_dir() {
+                if !child_inode.is_dir() {
+                    return Err(FfsError::IsDirectory);
+                }
+                let entries = self.read_dir(cx, &existing_inode)?;
+                let real_entries = entries
+                    .iter()
+                    .filter(|e| e.name != b"." && e.name != b"..")
+                    .count();
+                if real_entries > 0 {
+                    return Err(FfsError::NotEmpty);
+                }
+            } else if child_inode.is_dir() {
+                return Err(FfsError::NotDirectory);
+            }
+
             // Remove the existing target.
             let extents = self.collect_extents(cx, &new_parent_inode)?;
             'rm_existing: for ext in &extents {
