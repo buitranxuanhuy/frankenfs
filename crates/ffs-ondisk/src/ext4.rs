@@ -1622,7 +1622,7 @@ impl Ext4Inode {
             crtime,
             crtime_extra,
             projid,
-        ) = if bytes.len() > 0x82 {
+        ) = if bytes.len() >= 0x82 {
             let extra_isize = read_le_u16(bytes, 0x80)?;
             let extra_end = 128_usize + usize::from(extra_isize);
 
