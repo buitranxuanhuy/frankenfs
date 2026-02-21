@@ -99,18 +99,19 @@ pub struct GroupBlockAllocator<'a> {
     pub geo: &'a FsGeometry,
     pub groups: &'a mut [GroupStats],
     pub hint: AllocHint,
+    pub pctx: &'a ffs_alloc::PersistCtx,
 }
 
 impl BlockAllocator for GroupBlockAllocator<'_> {
     fn alloc_block(&mut self, cx: &Cx) -> Result<BlockNumber> {
-        let alloc = ffs_alloc::alloc_blocks(cx, self.dev, self.geo, self.groups, 1, &self.hint)?;
+        let alloc = ffs_alloc::alloc_blocks_persist(cx, self.dev, self.geo, self.groups, 1, &self.hint, self.pctx)?;
         // Update hint to prefer contiguous allocation.
         self.hint.goal_block = Some(BlockNumber(alloc.start.0 + 1));
         Ok(alloc.start)
     }
 
     fn free_block(&mut self, cx: &Cx, block: BlockNumber) -> Result<()> {
-        ffs_alloc::free_blocks(cx, self.dev, self.geo, self.groups, block, 1)
+        ffs_alloc::free_blocks_persist(cx, self.dev, self.geo, self.groups, block, 1, self.pctx)
     }
 }
 
@@ -131,6 +132,7 @@ pub fn allocate_extent(
     logical_start: u32,
     count: u32,
     hint: &AllocHint,
+    pctx: &ffs_alloc::PersistCtx,
 ) -> Result<ExtentMapping> {
     cx_checkpoint(cx)?;
 
@@ -142,7 +144,7 @@ pub fn allocate_extent(
     let BlockAlloc {
         start,
         count: allocated,
-    } = ffs_alloc::alloc_blocks(cx, dev, geo, groups, count, hint)?;
+    } = ffs_alloc::alloc_blocks_persist(cx, dev, geo, groups, count, hint, pctx)?;
 
     // Build the extent.
     #[expect(clippy::cast_possible_truncation)]
@@ -163,6 +165,7 @@ pub fn allocate_extent(
         geo,
         groups,
         hint: tree_hint,
+        pctx,
     };
     ffs_btree::insert(cx, dev, root_bytes, extent, &mut tree_alloc)?;
 
@@ -188,6 +191,7 @@ pub fn allocate_unwritten_extent(
     logical_start: u32,
     count: u32,
     hint: &AllocHint,
+    pctx: &ffs_alloc::PersistCtx,
 ) -> Result<ExtentMapping> {
     cx_checkpoint(cx)?;
 
@@ -198,7 +202,7 @@ pub fn allocate_unwritten_extent(
     let BlockAlloc {
         start,
         count: allocated,
-    } = ffs_alloc::alloc_blocks(cx, dev, geo, groups, count, hint)?;
+    } = ffs_alloc::alloc_blocks_persist(cx, dev, geo, groups, count, hint, pctx)?;
 
     #[expect(clippy::cast_possible_truncation)]
     let extent = Ext4Extent {
@@ -217,6 +221,7 @@ pub fn allocate_unwritten_extent(
         geo,
         groups,
         hint: tree_hint,
+        pctx,
     };
     ffs_btree::insert(cx, dev, root_bytes, extent, &mut tree_alloc)?;
 
@@ -240,81 +245,42 @@ pub fn truncate_extents(
     geo: &FsGeometry,
     groups: &mut [GroupStats],
     new_logical_end: u32,
+    pctx: &ffs_alloc::PersistCtx,
 ) -> Result<u64> {
     cx_checkpoint(cx)?;
 
-    // Collect all extents first via walk.
-    let mut extents = Vec::new();
-    ffs_btree::walk(cx, dev, root_bytes, &mut |ext: &Ext4Extent| {
-        extents.push(*ext);
-        Ok(())
-    })?;
-
     let mut total_freed = 0u64;
 
-    for ext in &extents {
-        let ext_start = ext.logical_block;
-        let ext_len = u32::from(ext.actual_len());
-        let ext_end = ext_start.saturating_add(ext_len);
+    let freed_ranges = {
+        let mut tree_alloc = GroupBlockAllocator {
+            cx,
+            dev,
+            geo,
+            groups,
+            hint: AllocHint::default(),
+            pctx,
+        };
+        ffs_btree::delete_range(
+            cx,
+            dev,
+            root_bytes,
+            new_logical_end,
+            u32::MAX - new_logical_end,
+            &mut tree_alloc,
+        )?
+    };
 
-        if ext_start >= new_logical_end {
-            // Fully beyond truncation point: remove and free all blocks.
-            let freed = {
-                let mut tree_alloc = GroupBlockAllocator {
-                    cx,
-                    dev,
-                    geo,
-                    groups,
-                    hint: AllocHint::default(),
-                };
-                ffs_btree::delete_range(cx, dev, root_bytes, ext_start, ext_len, &mut tree_alloc)?
-            };
-            for f in &freed {
-                ffs_alloc::free_blocks(
-                    cx,
-                    dev,
-                    geo,
-                    groups,
-                    BlockNumber(f.physical_start),
-                    u32::from(f.count),
-                )?;
-                total_freed += u64::from(f.count);
-            }
-        } else if ext_end > new_logical_end {
-            // Partially beyond: remove tail portion.
-            let keep_len = new_logical_end - ext_start;
-            let remove_start = ext_start + keep_len;
-            let remove_count = ext_end - new_logical_end;
-            let freed = {
-                let mut tree_alloc = GroupBlockAllocator {
-                    cx,
-                    dev,
-                    geo,
-                    groups,
-                    hint: AllocHint::default(),
-                };
-                ffs_btree::delete_range(
-                    cx,
-                    dev,
-                    root_bytes,
-                    remove_start,
-                    remove_count,
-                    &mut tree_alloc,
-                )?
-            };
-            for f in &freed {
-                ffs_alloc::free_blocks(
-                    cx,
-                    dev,
-                    geo,
-                    groups,
-                    BlockNumber(f.physical_start),
-                    u32::from(f.count),
-                )?;
-                total_freed += u64::from(f.count);
-            }
-        }
-        // Fully before truncation point: keep.
+    for f in &freed_ranges {
+        ffs_alloc::free_blocks_persist(
+            cx,
+            dev,
+            geo,
+            groups,
+            BlockNumber(f.physical_start),
+            u32::from(f.count),
+            pctx,
+        )?;
+        total_freed += u64::from(f.count);
     }
 
     Ok(total_freed)
@@ -334,6 +300,7 @@ pub fn punch_hole(
     groups: &mut [GroupStats],
     logical_start: u32,
     count: u32,
+    pctx: &ffs_alloc::PersistCtx,
 ) -> Result<u64> {
     cx_checkpoint(cx)?;
 
@@ -344,19 +311,21 @@ pub fn punch_hole(
             geo,
             groups,
             hint: AllocHint::default(),
+            pctx,
         };
         ffs_btree::delete_range(cx, dev, root_bytes, logical_start, count, &mut tree_alloc)?
     };
     let mut total_freed = 0u64;
 
     for f in &freed_ranges {
-        ffs_alloc::free_blocks(
+        ffs_alloc::free_blocks_persist(
             cx,
             dev,
             geo,
             groups,
             BlockNumber(f.physical_start),
             u32::from(f.count),
+            pctx,
         )?;
         total_freed += u64::from(f.count);
     }
@@ -380,6 +349,7 @@ pub fn mark_written(
     groups: &mut [GroupStats],
     logical_start: u32,
     count: u32,
+    pctx: &ffs_alloc::PersistCtx,
 ) -> Result<()> {
     cx_checkpoint(cx)?;
 
@@ -409,6 +379,7 @@ pub fn mark_written(
             geo,
             groups,
             hint: AllocHint::default(),
+            pctx,
         };
 
         // All branches start by removing the old extent.
@@ -608,6 +579,15 @@ mod tests {
         root[6] = 0;
         root[7] = 0;
         root
+    }
+
+    fn mock_pctx() -> ffs_alloc::PersistCtx {
+        ffs_alloc::PersistCtx {
+            gdt_block: BlockNumber(1),
+            desc_size: 32,
+            has_metadata_csum: false,
+            csum_seed: 0,
+        }
     }
 
     // ── Map tests ────────────────────────────────────────────────────────

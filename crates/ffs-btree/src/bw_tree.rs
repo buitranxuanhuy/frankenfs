@@ -163,7 +163,7 @@ impl MappingTable {
         let mut head_guard = write_lock(&entry.head);
         match entry.epoch.compare_exchange(
             expected_epoch,
-            expected_epoch.saturating_add(1),
+            expected_epoch.wrapping_add(1),
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
@@ -175,7 +175,7 @@ impl MappingTable {
                     target: "ffs::bwtree",
                     event = "bw_cas_commit",
                     page_id = page_id.0,
-                    new_epoch = expected_epoch.saturating_add(1)
+                    new_epoch = expected_epoch.wrapping_add(1)
                 );
                 Ok(true)
             }

@@ -1570,11 +1570,13 @@ impl Ext4Inode {
         }
 
         // ── Base 128-byte area ───────────────────────────────────────────
+        let mode = read_le_u16(bytes, 0x00)?;
         let uid_lo = u32::from(read_le_u16(bytes, 0x02)?);
         let gid_lo = u32::from(read_le_u16(bytes, 0x18)?);
 
+        let is_reg = (mode & ffs_types::S_IFMT) == ffs_types::S_IFREG;
         let size_lo = u64::from(read_le_u32(bytes, 0x04)?);
-        let size_hi = if bytes.len() > 0x6E {
+        let size_hi = if is_reg && bytes.len() > 0x6E {
             u64::from(read_le_u32(bytes, 0x6C)?)
         } else {
             0
@@ -1674,7 +1676,7 @@ impl Ext4Inode {
         };
 
         Ok(Self {
-            mode: read_le_u16(bytes, 0x00)?,
+            mode,
             uid: uid_lo | (uid_hi << 16),
             gid: gid_lo | (gid_hi << 16),
             size: size_lo | (size_hi << 32),
@@ -3406,17 +3408,8 @@ pub fn parse_dx_root(block: &[u8]) -> Result<Ext4DxRoot, ParseError> {
         });
     }
 
-    // Count/limit at 0x20
-    let count = read_le_u16(block, 0x20)?;
-    let _limit = read_le_u16(block, 0x22)?;
-
-    // Entries start at 0x24 (first is the zero-hash sentinel entry)
-    let entries = parse_dx_entries(block, 0x24)?;
-
-    // Sanity: should have `count` entries total (including sentinel)
-    if entries.len() != usize::from(count) {
-        // Parse what we can, but if count is wildly off, report as many as fit
-    }
+    // Entries start at 0x20, with the first 8 bytes being dx_countlimit
+    let entries = parse_dx_entries(block, 0x20)?;
 
     Ok(Ext4DxRoot {
         hash_version,
@@ -3425,23 +3418,32 @@ pub fn parse_dx_root(block: &[u8]) -> Result<Ext4DxRoot, ParseError> {
     })
 }
 
-/// Parse DX entries starting at `offset` in a block.
+/// Parse DX entries starting at `count_limit_offset` in a block.
 ///
-/// Each entry is 8 bytes: hash(4) + block(4). The list continues
-/// until we run out of space in the block.
-fn parse_dx_entries(data: &[u8], start: usize) -> Result<Vec<Ext4DxEntry>, ParseError> {
-    let mut entries = Vec::new();
-    let mut off = start;
+/// The `count_limit_offset` points to a `dx_countlimit` structure (8 bytes),
+/// followed by an array of 8-byte `Ext4DxEntry` structures.
+fn parse_dx_entries(data: &[u8], count_limit_offset: usize) -> Result<Vec<Ext4DxEntry>, ParseError> {
+    if count_limit_offset + 8 > data.len() {
+        return Err(ParseError::InsufficientData {
+            needed: count_limit_offset + 8,
+            offset: 0,
+            actual: data.len(),
+        });
+    }
 
-    // First, read count at start - 4 (the count/limit pair is 4 bytes before entries)
-    let count = if start >= 4 {
-        usize::from(read_le_u16(data, start - 4)?)
-    } else {
-        // Estimate: fill remaining space
-        (data.len() - start) / 8
-    };
+    // dx_countlimit is 8 bytes:
+    // limit is at count_limit_offset
+    // count is at count_limit_offset + 2
+    let count = usize::from(read_le_u16(data, count_limit_offset + 2)?);
 
-    for _ in 0..count {
+    // The count includes the dx_countlimit itself (which is the first "entry" in the kernel struct)
+    let actual_entries = count.saturating_sub(1);
+    let mut entries = Vec::with_capacity(actual_entries);
+    
+    // Real entries start after the 8-byte dx_countlimit
+    let mut off = count_limit_offset + 8;
+
+    for _ in 0..actual_entries {
         if off + 8 > data.len() {
             break;
         }

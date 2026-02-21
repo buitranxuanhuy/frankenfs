@@ -268,11 +268,12 @@ pub fn create_inode(
     csum_seed: u32,
     now_secs: u64,
     now_nsec: u32,
+    pctx: &ffs_alloc::PersistCtx,
 ) -> Result<(InodeNumber, Ext4Inode)> {
     cx_checkpoint(cx)?;
 
     let is_dir = (mode & 0xF000) == file_type::S_IFDIR;
-    let alloc = ffs_alloc::alloc_inode(cx, dev, geo, groups, parent_group, is_dir)?;
+    let alloc = ffs_alloc::alloc_inode_persist(cx, dev, geo, groups, parent_group, is_dir, pctx)?;
 
     if is_dir {
         let gidx = alloc.group.0 as usize;
@@ -359,6 +360,7 @@ pub fn delete_inode(
     inode: &mut Ext4Inode,
     csum_seed: u32,
     now_secs: u64,
+    pctx: &ffs_alloc::PersistCtx,
 ) -> Result<()> {
     cx_checkpoint(cx)?;
 
@@ -366,7 +368,7 @@ pub fn delete_inode(
     if inode.flags & EXT4_EXTENTS_FL != 0 && inode.extent_bytes.len() >= 60 {
         let mut root_buf = [0u8; 60];
         root_buf.copy_from_slice(&inode.extent_bytes[..60]);
-        ffs_extent::truncate_extents(cx, dev, &mut root_buf, geo, groups, 0)?;
+        ffs_extent::truncate_extents(cx, dev, &mut root_buf, geo, groups, 0, pctx)?;
         inode.extent_bytes[..60].copy_from_slice(&root_buf);
     }
 
@@ -383,7 +385,7 @@ pub fn delete_inode(
     write_inode(cx, dev, geo, groups, ino, inode, csum_seed)?;
 
     // Free the inode in the bitmap.
-    ffs_alloc::free_inode(cx, dev, geo, groups, ino)?;
+    ffs_alloc::free_inode_persist(cx, dev, geo, groups, ino, pctx)?;
 
     Ok(())
 }
@@ -396,7 +398,7 @@ pub fn delete_inode(
 #[must_use]
 pub fn encode_extra_timestamp(secs: u64, nsec: u32) -> u32 {
     let epoch = ((secs >> 32) & 0x3) as u32; // upper 2 bits of seconds
-    let nsec_bits = nsec & 0x3FFF_FFFC; // mask to 30-bit nanoseconds, in bits 2-31
+    let nsec_bits = nsec << 2; // nanoseconds shifted to bits 2-31
     epoch | nsec_bits
 }
 
@@ -482,6 +484,15 @@ mod tests {
 
     fn test_cx() -> Cx {
         Cx::for_testing()
+    }
+
+    fn mock_pctx() -> ffs_alloc::PersistCtx {
+        ffs_alloc::PersistCtx {
+            gdt_block: BlockNumber(1),
+            desc_size: 32,
+            has_metadata_csum: false,
+            csum_seed: 0,
+        }
     }
 
     fn make_geometry() -> FsGeometry {
@@ -633,6 +644,7 @@ mod tests {
             0,
             1_700_000_000,
             0,
+            &mock_pctx(),
         )
         .unwrap();
 
@@ -666,6 +678,7 @@ mod tests {
             0,
             1_700_000_000,
             0,
+            &mock_pctx(),
         )
         .unwrap();
 
@@ -692,6 +705,7 @@ mod tests {
             0,
             1_700_000_000,
             0,
+            &mock_pctx(),
         )
         .unwrap();
 
@@ -793,9 +807,9 @@ mod tests {
     fn encode_extra_timestamp_nsec() {
         let extra = encode_extra_timestamp(0, 999_999_999);
         // Nanoseconds stored in bits 2-31.
-        let nsec = extra & 0x3FFF_FFFC;
-        // Should preserve the nanosecond value (masked).
-        assert_eq!(nsec, 0x3B9A_C9FF & 0x3FFF_FFFC);
+        let nsec = extra >> 2;
+        // Should preserve the nanosecond value.
+        assert_eq!(nsec, 999_999_999);
     }
 
     #[test]
@@ -1008,6 +1022,7 @@ mod tests {
             0,
             1_700_000_000,
             0,
+            &mock_pctx(),
         )
         .unwrap();
 
@@ -1044,6 +1059,7 @@ mod tests {
             0,
             1_700_000_000,
             0,
+            &mock_pctx(),
         )
         .unwrap();
 
@@ -1078,9 +1094,8 @@ mod tests {
     fn encode_extra_timestamp_max_nsec() {
         // 999_999_999 ns is the maximum valid nanosecond value.
         let extra = encode_extra_timestamp(0, 999_999_999);
-        let nsec_back = extra & 0x3FFF_FFFC;
-        // The encoded value should be the nsec masked to bits 2-31.
-        assert_eq!(nsec_back, 0x3B9A_C9FC); // 999_999_999 & 0x3FFF_FFFC
+        let nsec_back = extra >> 2;
+        assert_eq!(nsec_back, 999_999_999);
         // Verify the epoch bits (0-1) are zero for 32-bit timestamps.
         assert_eq!(extra & 0x3, 0);
     }
@@ -1106,6 +1121,7 @@ mod tests {
             0,
             0,
             0,
+            &mock_pctx(),
         )
         .expect("create inode");
 
@@ -1143,6 +1159,7 @@ mod tests {
             0,
             0,
             0,
+            &mock_pctx(),
         )
         .expect("create");
 
@@ -1163,13 +1180,13 @@ mod tests {
         let extra = encode_extra_timestamp(secs, 0);
         // Epoch bits (bits 0-1) should be 1, nsec bits should be 0.
         assert_eq!(extra & 0x3, 1);
-        assert_eq!(extra & 0x3FFF_FFFC, 0);
+        assert_eq!(extra >> 2, 0);
 
         // Timestamp at 2^33 (epoch 2).
         let secs: u64 = 1 << 33;
         let extra = encode_extra_timestamp(secs, 123_456_788);
         assert_eq!(extra & 0x3, 2);
-        assert_eq!(extra & 0x3FFF_FFFC, 0x075B_CD14 & 0x3FFF_FFFC);
+        assert_eq!(extra >> 2, 123_456_788);
 
         // Timestamp at 3 * 2^32 (epoch 3).
         let secs: u64 = 3 << 32;
@@ -1233,6 +1250,7 @@ mod tests {
             0,
             1_700_000_000,
             0,
+            &mock_pctx(),
         )
         .unwrap();
         assert_eq!(inode1.generation, 1, "first alloc: 0 → 1");
@@ -1248,6 +1266,7 @@ mod tests {
             &mut del,
             0,
             1_700_000_001,
+            &mock_pctx(),
         )
         .unwrap();
         let (ino2, inode2) = create_inode(
@@ -1262,6 +1281,7 @@ mod tests {
             0,
             1_700_000_002,
             0,
+            &mock_pctx(),
         )
         .unwrap();
         assert_eq!(ino2, ino1, "should reuse the freed inode number");

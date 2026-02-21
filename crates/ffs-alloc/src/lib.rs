@@ -99,16 +99,18 @@ pub fn bitmap_find_free(bitmap: &[u8], count: u32, start: u32) -> Option<u32> {
     (0..start).find(|&idx| !bitmap_get(bitmap, idx))
 }
 
-/// Find `n` contiguous free bits in the first `count` bits of `bitmap`.
+/// Find `n` contiguous free bits in the first `count` bits of `bitmap`,
+/// starting from `start`.
 #[must_use]
-pub fn bitmap_find_contiguous(bitmap: &[u8], count: u32, n: u32) -> Option<u32> {
+pub fn bitmap_find_contiguous(bitmap: &[u8], count: u32, n: u32, start: u32) -> Option<u32> {
     if n == 0 {
         return Some(0);
     }
-    let mut run_start = 0u32;
-    let mut run_len = 0u32;
 
-    for idx in 0..count {
+    // Pass 1: from `start` to `count`
+    let mut run_start = start;
+    let mut run_len = 0u32;
+    for idx in start..count {
         if bitmap_get(bitmap, idx) {
             run_start = idx + 1;
             run_len = 0;
@@ -119,6 +121,23 @@ pub fn bitmap_find_contiguous(bitmap: &[u8], count: u32, n: u32) -> Option<u32> 
             }
         }
     }
+
+    // Pass 2: wrap around from 0 to `start + n - 1` (to allow runs overlapping `start`)
+    run_start = 0;
+    run_len = 0;
+    let pass2_end = start.saturating_add(n).saturating_sub(1).min(count);
+    for idx in 0..pass2_end {
+        if bitmap_get(bitmap, idx) {
+            run_start = idx + 1;
+            run_len = 0;
+        } else {
+            run_len += 1;
+            if run_len >= n {
+                return Some(run_start);
+            }
+        }
+    }
+
     None
 }
 
@@ -513,7 +532,7 @@ fn try_alloc_in_group(
     let found = if count == 1 {
         bitmap_find_free(&bitmap, blocks_in_group, start).map(|idx| (idx, 1))
     } else {
-        bitmap_find_contiguous(&bitmap, blocks_in_group, count).map(|idx| (idx, count))
+        bitmap_find_contiguous(&bitmap, blocks_in_group, count, start).map(|idx| (idx, count))
     };
 
     if let Some((rel_start, alloc_count)) = found {
@@ -677,7 +696,7 @@ fn try_alloc_safe(
     let found = if count == 1 {
         bitmap_find_free(&bitmap, blocks_in_group, start).map(|idx| (idx, 1))
     } else {
-        bitmap_find_contiguous(&bitmap, blocks_in_group, count).map(|idx| (idx, count))
+        bitmap_find_contiguous(&bitmap, blocks_in_group, count, start).map(|idx| (idx, count))
     };
 
     if let Some((rel_start, alloc_count)) = found {
@@ -904,6 +923,59 @@ fn try_alloc_inode_in_group(
     }
 }
 
+/// Allocate an inode using the Orlov strategy with full on-disk accounting.
+pub fn alloc_inode_persist(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    geo: &FsGeometry,
+    groups: &mut [GroupStats],
+    parent_group: GroupNumber,
+    is_directory: bool,
+    pctx: &PersistCtx,
+) -> Result<InodeAlloc> {
+    cx_checkpoint(cx)?;
+
+    let target_group = if is_directory {
+        orlov_choose_group_for_dir(geo, groups)?
+    } else {
+        parent_group
+    };
+
+    if let Some(alloc) = try_alloc_inode_in_group_persist(cx, dev, geo, groups, target_group, pctx)? {
+        return Ok(alloc);
+    }
+
+    for g in 0..geo.group_count {
+        let group = GroupNumber(g);
+        if group == target_group {
+            continue;
+        }
+        if let Some(alloc) = try_alloc_inode_in_group_persist(cx, dev, geo, groups, group, pctx)? {
+            return Ok(alloc);
+        }
+    }
+
+    Err(FfsError::NoSpace)
+}
+
+/// Try to allocate an inode in a specific group with full on-disk accounting.
+fn try_alloc_inode_in_group_persist(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    geo: &FsGeometry,
+    groups: &mut [GroupStats],
+    group: GroupNumber,
+    pctx: &PersistCtx,
+) -> Result<Option<InodeAlloc>> {
+    let alloc = try_alloc_inode_in_group(cx, dev, geo, groups, group)?;
+    if let Some(a) = alloc {
+        persist_group_desc(cx, dev, pctx, group, &groups[group.0 as usize])?;
+        Ok(Some(a))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Free an inode.
 pub fn free_inode(
     cx: &Cx,
@@ -939,6 +1011,23 @@ pub fn free_inode(
     bitmap_clear(&mut bitmap, bit_idx);
     dev.write_block(cx, gs.inode_bitmap_block, &bitmap)?;
     groups[gidx].free_inodes = groups[gidx].free_inodes.saturating_add(1);
+    Ok(())
+}
+
+/// Free an inode with full on-disk accounting.
+pub fn free_inode_persist(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    geo: &FsGeometry,
+    groups: &mut [GroupStats],
+    ino: InodeNumber,
+    pctx: &PersistCtx,
+) -> Result<()> {
+    free_inode(cx, dev, geo, groups, ino)?;
+    let ino_zero = ino.0.saturating_sub(1);
+    #[expect(clippy::cast_possible_truncation)]
+    let group_idx = (ino_zero / u64::from(geo.inodes_per_group)) as u32;
+    persist_group_desc(cx, dev, pctx, GroupNumber(group_idx), &groups[group_idx as usize])?;
     Ok(())
 }
 
@@ -1088,7 +1177,7 @@ mod tests {
         bitmap_set(&mut bm, 0);
         bitmap_set(&mut bm, 1);
         // Free: 2,3,4,5,... contiguous from 2
-        assert_eq!(bitmap_find_contiguous(&bm, 32, 4), Some(2));
+        assert_eq!(bitmap_find_contiguous(&bm, 32, 4, 0), Some(2));
     }
 
     #[test]
@@ -1099,7 +1188,7 @@ mod tests {
             bitmap_set(&mut bm, i);
         }
         // No 2-contiguous free bits.
-        assert_eq!(bitmap_find_contiguous(&bm, 16, 2), None);
+        assert_eq!(bitmap_find_contiguous(&bm, 16, 2, 0), None);
     }
 
     // ── Geometry tests ──────────────────────────────────────────────────
