@@ -1934,13 +1934,13 @@ impl OpenFs {
     ///
     /// The write path is:
     /// 1. Extract the transaction's write set.
-    /// 2. Write a JBD2 transaction (descriptor + data + commit blocks)
+    /// 2. Commit the MVCC transaction (in-memory) to perform conflict detection.
+    /// 3. If MVCC commit succeeds, write a JBD2 transaction (descriptor + data + commit blocks)
     ///    to the journal region via the attached [`Jbd2Writer`].
-    /// 3. Commit the MVCC transaction (in-memory).
     ///
-    /// If the journal write succeeds but the MVCC commit fails (conflict),
-    /// the journal transaction is harmless — replay will apply data that
-    /// has no semantic effect since it was never made visible.
+    /// MVCC commit must happen first because if an FCW conflict aborts the transaction,
+    /// we must not write it to the JBD2 journal. Otherwise, crash recovery would
+    /// replay the aborted writes and corrupt the filesystem state.
     ///
     /// # Errors
     ///
@@ -1974,20 +1974,10 @@ impl OpenFs {
             block_size,
         };
 
-        // Phase 1: write all pending blocks to the JBD2 journal.
-        let jbd2_stats = {
-            let mut writer = jbd2_mutex.lock();
-            let mut jbd2_txn = writer.begin_transaction();
+        let writes: Vec<_> = txn.write_set().iter().map(|(b, d)| (*b, d.clone())).collect();
 
-            for (block, payload) in txn.write_set() {
-                jbd2_txn.add_write(*block, payload.clone());
-            }
-
-            let (_seq, stats) = writer.commit_transaction(cx, &block_dev, &jbd2_txn)?;
-            stats
-        };
-
-        // Phase 2: commit to MVCC store.
+        // Phase 1: commit to MVCC store. This performs conflict detection.
+        // If it fails, the transaction is cleanly aborted without touching the disk.
         let commit_seq = self.mvcc_store.write().commit(txn).map_err(|e| {
             warn!(
                 target: "ffs::journal",
@@ -1995,8 +1985,30 @@ impl OpenFs {
                 error = %e,
                 "journaled_commit_mvcc_conflict"
             );
-            FfsError::Format(format!("MVCC commit failed after journal write: {e}"))
+            FfsError::Format(format!("MVCC commit failed before journal write: {e}"))
         })?;
+
+        // Phase 2: write all pending blocks to the JBD2 journal.
+        let jbd2_stats = {
+            let mut writer = jbd2_mutex.lock();
+            let mut jbd2_txn = writer.begin_transaction();
+
+            for (block, payload) in writes {
+                jbd2_txn.add_write(block, payload);
+            }
+
+            match writer.commit_transaction(cx, &block_dev, &jbd2_txn) {
+                Ok((_seq, stats)) => stats,
+                Err(e) => {
+                    panic!(
+                        "FATAL: JBD2 journal write failed after MVCC commit. \
+                         Memory state and disk state have diverged. \
+                         Aborting to prevent filesystem corruption. Error: {}",
+                        e
+                    );
+                }
+            }
+        };
 
         info!(
             target: "ffs::journal",
@@ -4455,7 +4467,7 @@ impl OpenFs {
         }
 
         let mut alloc = alloc_mutex.lock();
-        let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+        let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
 
         // Allocate a new inode.
         let parent_group = GroupNumber(
@@ -4476,6 +4488,7 @@ impl OpenFs {
             csum_seed,
             tstamp_secs,
             tstamp_nanos,
+            persist_ctx,
         )?;
 
         // Add directory entry to parent.
@@ -4542,7 +4555,7 @@ impl OpenFs {
             },
         );
         let (ino, mut new_inode) = {
-            let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+            let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
             ffs_inode::create_inode(
                 cx,
                 &block_dev,
@@ -4555,6 +4568,7 @@ impl OpenFs {
                 csum_seed,
                 tstamp_secs,
                 tstamp_nanos,
+                persist_ctx,
             )?
         };
 
@@ -4564,8 +4578,8 @@ impl OpenFs {
             goal_block: None,
         };
         let dir_alloc = {
-            let Ext4AllocState { geo, groups, .. } = &mut *alloc;
-            ffs_alloc::alloc_blocks(cx, &block_dev, geo, groups, 1, &hint)?
+            let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
+            ffs_alloc::alloc_blocks_persist(cx, &block_dev, geo, groups, 1, &hint, persist_ctx)?
         };
 
         let block_size_usize = alloc.geo.block_size as usize;
@@ -4582,13 +4596,14 @@ impl OpenFs {
         };
         let mut root_bytes = Self::extent_root(&new_inode);
         {
-            let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+            let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
             let mut tree_alloc = ffs_extent::GroupBlockAllocator {
                 cx,
                 dev: &block_dev,
                 geo,
                 groups,
                 hint,
+                pctx: persist_ctx,
             };
             ffs_btree::insert(cx, &block_dev, &mut root_bytes, extent, &mut tree_alloc)?;
         }
@@ -4701,7 +4716,7 @@ impl OpenFs {
             goal_block: extents.last().map(Self::extent_end_hint),
         };
         let new_alloc =
-            ffs_alloc::alloc_blocks(cx, block_dev, &alloc.geo, &mut alloc.groups, 1, &hint)?;
+            ffs_alloc::alloc_blocks_persist(cx, block_dev, &alloc.geo, &mut alloc.groups, 1, &hint, &alloc.persist_ctx)?;
 
         let block_size = alloc.geo.block_size as usize;
         let mut new_block = vec![0u8; block_size];
@@ -4740,6 +4755,7 @@ impl OpenFs {
             geo: &alloc.geo,
             groups: &mut alloc.groups,
             hint: tree_hint,
+            pctx: &alloc.persist_ctx,
         };
         ffs_btree::insert(cx, block_dev, &mut root_bytes, extent, &mut tree_alloc)?;
         Self::set_extent_root(&mut parent_upd, &root_bytes);
@@ -4837,7 +4853,7 @@ impl OpenFs {
         ffs_inode::touch_ctime(&mut child_upd, tstamp_secs, tstamp_nanos);
 
         {
-            let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+            let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
             if child_upd.links_count == 0 {
                 ffs_inode::delete_inode(
                     cx,
@@ -4848,6 +4864,7 @@ impl OpenFs {
                     &mut child_upd,
                     csum_seed,
                     tstamp_secs,
+                    persist_ctx,
                 )?;
             } else {
                 ffs_inode::write_inode(
@@ -5000,7 +5017,7 @@ impl OpenFs {
                 },
             );
             let (ino, mut inode) = {
-                let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+                let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
                 ffs_inode::create_inode(
                     cx,
                     &block_dev,
@@ -5013,6 +5030,7 @@ impl OpenFs {
                     csum_seed,
                     tstamp_secs,
                     tstamp_nanos,
+                    persist_ctx,
                 )?
             };
 
@@ -5138,7 +5156,7 @@ impl OpenFs {
                 u32::try_from(length / block_size).map_err(|_| FfsError::NoSpace)?;
             if logical_count > 0 {
                 let freed_blocks = {
-                    let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+                    let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
                     ffs_extent::punch_hole(
                         cx,
                         &block_dev,
@@ -5147,6 +5165,7 @@ impl OpenFs {
                         groups,
                         logical_start,
                         logical_count,
+                        persist_ctx,
                     )?
                 };
                 inode.blocks = inode
@@ -5193,7 +5212,7 @@ impl OpenFs {
                         goal_block,
                     };
                     let alloc_mapping = {
-                        let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+                        let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
                         ffs_extent::allocate_extent(
                             cx,
                             &block_dev,
@@ -5203,6 +5222,7 @@ impl OpenFs {
                             logical,
                             chunk,
                             &hint,
+                            persist_ctx,
                         )?
                     };
 
@@ -5331,7 +5351,7 @@ impl OpenFs {
                     };
                     let mut root_bytes = Self::extent_root(&inode);
                     let mapping = {
-                        let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+                        let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
                         ffs_extent::allocate_extent(
                             cx,
                             &block_dev,
@@ -5341,6 +5361,7 @@ impl OpenFs {
                             logical_block,
                             1,
                             &hint,
+                            persist_ctx,
                         )?
                     };
                     Self::set_extent_root(&mut inode, &root_bytes);
@@ -5462,7 +5483,7 @@ impl OpenFs {
             let mut ex_upd = existing_inode;
             ex_upd.links_count = ex_upd.links_count.saturating_sub(1);
             {
-                let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+                let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
                 if ex_upd.links_count == 0 {
                     ffs_inode::delete_inode(
                         cx,
@@ -5473,6 +5494,7 @@ impl OpenFs {
                         &mut ex_upd,
                         csum_seed,
                         tstamp_secs,
+                        persist_ctx,
                     )?;
                 } else {
                     ffs_inode::write_inode(
@@ -5638,7 +5660,7 @@ impl OpenFs {
                     let new_logical_end = new_size.div_ceil(u64::from(block_size)) as u32;
                     let mut root_bytes = Self::extent_root(&inode);
                     let freed = {
-                        let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+                        let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
                         ffs_extent::truncate_extents(
                             cx,
                             &block_dev,
@@ -5646,6 +5668,7 @@ impl OpenFs {
                             geo,
                             groups,
                             new_logical_end,
+                            persist_ctx,
                         )?
                     };
                     Self::set_extent_root(&mut inode, &root_bytes);
@@ -5747,8 +5770,8 @@ impl OpenFs {
                     goal_group: Some(ino_group),
                     goal_block: None,
                 };
-                let Ext4AllocState { geo, groups, .. } = &mut *alloc;
-                let block_alloc = ffs_alloc::alloc_blocks(cx, &block_dev, geo, groups, 1, &hint)?;
+                let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
+                let block_alloc = ffs_alloc::alloc_blocks_persist(cx, &block_dev, geo, groups, 1, &hint, persist_ctx)?;
                 let block_size = geo.block_size as usize;
                 drop(alloc);
 

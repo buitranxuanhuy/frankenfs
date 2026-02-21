@@ -556,6 +556,7 @@ dependencies = [
  "anyhow",
  "asupersync",
  "clap",
+ "crc32c",
  "ffs-block",
  "ffs-core",
  "ffs-fuse",

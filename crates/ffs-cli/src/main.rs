@@ -11,9 +11,9 @@ use ffs_core::{
 use ffs_fuse::MountOptions;
 use ffs_harness::ParityReport;
 use ffs_ondisk::{
-    BtrfsChunkEntry, Ext4DirEntry, Ext4Extent, Ext4ExtentHeader, Ext4ExtentIndex, Ext4GroupDesc,
-    Ext4ImageReader, Ext4Inode, Ext4Superblock, ExtentTree, map_logical_to_physical, parse_dx_root,
-    parse_extent_tree, parse_inode_extent_tree,
+    BtrfsChunkEntry, BtrfsSuperblock, Ext4DirEntry, Ext4Extent, Ext4ExtentHeader, Ext4ExtentIndex,
+    Ext4GroupDesc, Ext4ImageReader, Ext4Inode, Ext4Superblock, ExtentTree, map_logical_to_physical,
+    parse_dx_root, parse_extent_tree, parse_inode_extent_tree, verify_btrfs_superblock_checksum,
 };
 use ffs_repair::codec::encode_group;
 use ffs_repair::evidence::{self, EvidenceEventType, EvidenceRecord};
@@ -25,8 +25,8 @@ use ffs_repair::scrub::{
 use ffs_repair::storage::{REPAIR_DESC_SLOT_COUNT, RepairGroupLayout, RepairGroupStorage};
 use ffs_repair::symbol::RepairGroupDescExt;
 use ffs_types::{
-    BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE, BlockNumber, EXT4_SUPERBLOCK_OFFSET,
-    EXT4_SUPERBLOCK_SIZE, GroupNumber, InodeNumber,
+    BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE, BlockNumber, ByteOffset,
+    EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, GroupNumber, InodeNumber,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -3016,25 +3016,25 @@ fn fsck_cmd(path: &PathBuf, options: FsckCommandOptions) -> Result<()> {
 fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<FsckOutput> {
     let flags = options.flags;
     let cx = cli_cx();
-    let flavor = detect_filesystem_at_path(&cx, path)
-        .with_context(|| format!("failed to detect ext4/btrfs metadata in {}", path.display()))?;
-
     let mut phases = Vec::new();
     let mut limitations = Vec::new();
-    let ext4_recovery = if flags.repair() {
-        match &flavor {
-            FsFlavor::Ext4(_) => Some(run_ext4_mount_recovery(path)?),
-            FsFlavor::Btrfs(_) => {
-                limitations.push(
-                    "fsck --repair currently supports ext4 only (mount-time journal/orphan recovery)"
-                        .to_owned(),
-                );
-                None
-            }
+    let (flavor, bootstrap_recovery_source) =
+        detect_flavor_with_optional_btrfs_bootstrap(&cx, path, flags.repair(), &mut limitations)?;
+    let mut ext4_recovery = None;
+    let mut btrfs_repair_attempted = bootstrap_recovery_source.is_some();
+    let mut btrfs_repair_performed = bootstrap_recovery_source.is_some();
+    let mut btrfs_repair_detail = bootstrap_recovery_source.map(|source| {
+        format!(
+            "bootstrap restored primary btrfs superblock from backup mirror at byte offset {} \
+             (generation={})",
+            source.offset, source.generation
+        )
+    });
+    if flags.repair() {
+        if let FsFlavor::Ext4(_) = &flavor {
+            ext4_recovery = Some(run_ext4_mount_recovery(path)?);
         }
-    } else {
-        None
-    };
+    }
 
     phases.push(FsckPhaseOutput {
         phase: "superblock_validation".to_owned(),
@@ -3057,7 +3057,7 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     let image_len = byte_dev.len_bytes();
 
-    let (scope, scrub_report, block_size, scrub_skipped_detail) = match &flavor {
+    let (scope, report, block_size, scrub_skipped_detail) = match &flavor {
         FsFlavor::Ext4(sb) => {
             let reader = Ext4ImageReader::new(&image).context("failed to parse ext4 superblock")?;
             let desc_status = validate_ext4_group_descriptors(&reader, &image, options.block_group);
@@ -3092,7 +3092,7 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
                         start_block: start.0,
                         block_count: count,
                     },
-                    scrub_report_to_phase(&report),
+                    report,
                     None,
                 )
             } else if skip_full_scrub {
@@ -3109,11 +3109,11 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
                 );
                 (
                     FsckScopeOutput::Full,
-                    FsckScrubOutput {
-                        scanned: 0,
-                        corrupt: 0,
-                        error_or_higher: 0,
-                        io_error: 0,
+                    ScrubReport {
+                        findings: Vec::new(),
+                        blocks_scanned: 0,
+                        blocks_corrupt: 0,
+                        blocks_io_error: 0,
                     },
                     Some(detail),
                 )
@@ -3127,7 +3127,7 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
                 let report = Scrubber::new(&block_dev, &*validator)
                     .scrub_all(&cx)
                     .context("failed to scrub ext4 image")?;
-                (FsckScopeOutput::Full, scrub_report_to_phase(&report), None)
+                (FsckScopeOutput::Full, report, None)
             };
             (scope, report, block_size, skipped_detail)
         }
@@ -3145,7 +3145,9 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
                         sb.nodesize, sb.sectorsize
                     )
                 })?;
-            if let Some(group) = options.block_group {
+            let (scope, scrub_start, scrub_count, mut report) = if let Some(group) =
+                options.block_group
+            {
                 let specs = discover_btrfs_repair_group_specs(path, block_size)
                     .context("failed to discover btrfs block groups for scoped fsck")?;
                 let spec = specs
@@ -3190,9 +3192,9 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
                         start_block: spec.physical_start_block.0,
                         block_count: spec.physical_block_count,
                     },
-                    scrub_report_to_phase(&report),
-                    block_size,
-                    None,
+                    spec.physical_start_block,
+                    spec.physical_block_count,
+                    report,
                 )
             } else {
                 let block_dev = ByteBlockDevice::new(byte_dev, block_size).with_context(|| {
@@ -3208,20 +3210,74 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
                 let report = Scrubber::new(&block_dev, &*validator)
                     .scrub_all(&cx)
                     .context("failed to scrub btrfs image")?;
-                (
-                    FsckScopeOutput::Full,
-                    scrub_report_to_phase(&report),
-                    block_size,
-                    None,
-                )
+                (FsckScopeOutput::Full, BlockNumber(0), u64::MAX, report)
+            };
+
+            if flags.repair() {
+                let primary_superblock = primary_btrfs_superblock_block(block_size);
+                let superblock_in_scope =
+                    block_range_contains(scrub_start, scrub_count, primary_superblock);
+                if superblock_in_scope
+                    && report_has_error_or_higher_for_block(&report, primary_superblock)
+                {
+                    btrfs_repair_attempted = true;
+                    match recover_primary_btrfs_superblock_from_backup(path, &mut limitations) {
+                        Ok(Some(source)) => {
+                            btrfs_repair_performed = true;
+                            let detail = format!(
+                                "restored primary btrfs superblock from backup mirror at byte offset {} (generation={})",
+                                source.offset, source.generation
+                            );
+                            btrfs_repair_detail = Some(detail.clone());
+                            limitations.push(detail);
+                            report = scrub_range_for_repair(
+                                path,
+                                &flavor,
+                                block_size,
+                                scrub_start,
+                                scrub_count,
+                                None,
+                                &mut limitations,
+                            )
+                            .context(
+                                "failed to verify btrfs image after fsck superblock recovery",
+                            )?;
+                        }
+                        Ok(None) => {
+                            let detail =
+                                "btrfs superblock corruption detected, but no valid backup superblock mirror was available for restoration"
+                                    .to_owned();
+                            btrfs_repair_detail = Some(detail.clone());
+                            limitations.push(detail);
+                        }
+                        Err(error) => {
+                            let detail =
+                                format!("btrfs superblock recovery attempt failed: {error:#}");
+                            btrfs_repair_detail = Some(detail.clone());
+                            limitations.push(detail);
+                        }
+                    }
+                } else if !btrfs_repair_performed {
+                    if superblock_in_scope {
+                        btrfs_repair_detail = Some(
+                            "no primary btrfs superblock corruption detected in selected fsck scope"
+                                .to_owned(),
+                        );
+                    } else {
+                        btrfs_repair_detail = Some(
+                            "repair scope does not include the primary btrfs superblock".to_owned(),
+                        );
+                    }
+                }
             }
+
+            (scope, report, block_size, None)
         }
     };
-
-    let report = scrub_report;
+    let scrub = scrub_report_to_phase(&report);
     let scrub_phase_status = if scrub_skipped_detail.is_some() {
         "skipped"
-    } else if report.error_or_higher == 0 {
+    } else if scrub.error_or_higher == 0 {
         "ok"
     } else {
         "error"
@@ -3229,7 +3285,7 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
     let scrub_phase_detail = scrub_skipped_detail.unwrap_or_else(|| {
         format!(
             "scanned={} corrupt={} error_or_higher={} io_errors={}",
-            report.scanned, report.corrupt, report.error_or_higher, report.io_error
+            scrub.scanned, scrub.corrupt, scrub.error_or_higher, scrub.io_error
         )
     });
     phases.push(FsckPhaseOutput {
@@ -3246,6 +3302,44 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
                 detail: ext4_recovery_detail(recovery),
             });
             FsckRepairStatus::RequestedPerformed
+        } else if matches!(flavor, FsFlavor::Btrfs(_)) {
+            let (status, detail, performed) = if btrfs_repair_performed {
+                (
+                    "ok".to_owned(),
+                    btrfs_repair_detail.unwrap_or_else(|| {
+                        "restored primary btrfs superblock from backup mirror".to_owned()
+                    }),
+                    true,
+                )
+            } else if btrfs_repair_attempted {
+                (
+                    "error".to_owned(),
+                    btrfs_repair_detail.unwrap_or_else(|| {
+                        "btrfs superblock corruption detected but recovery did not complete"
+                            .to_owned()
+                    }),
+                    false,
+                )
+            } else {
+                (
+                    "skipped".to_owned(),
+                    btrfs_repair_detail.unwrap_or_else(|| {
+                        "repair requested but no primary btrfs superblock corruption was detected in scope"
+                            .to_owned()
+                    }),
+                    false,
+                )
+            };
+            phases.push(FsckPhaseOutput {
+                phase: "repair".to_owned(),
+                status,
+                detail,
+            });
+            if performed {
+                FsckRepairStatus::RequestedPerformed
+            } else {
+                FsckRepairStatus::RequestedNotPerformed
+            }
         } else {
             phases.push(FsckPhaseOutput {
                 phase: "repair".to_owned(),
@@ -3264,7 +3358,7 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
         "fsck currently covers superblock/group-descriptor validation plus block-level scrub checks (block_size={block_size})"
     ));
 
-    let outcome = if report.error_or_higher > 0 {
+    let outcome = if scrub.error_or_higher > 0 {
         FsckOutcome::ErrorsFound
     } else {
         FsckOutcome::Clean
@@ -3278,7 +3372,7 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
         filesystem: filesystem_name(&flavor).to_owned(),
         scope,
         phases,
-        scrub: report,
+        scrub,
         repair_status,
         ext4_recovery,
         outcome,
@@ -3578,6 +3672,13 @@ const DEFAULT_REPAIR_VALIDATION_BLOCK_COUNT: u32 = 0;
 const BTRFS_EXTENT_TREE_OBJECTID: u64 = 2;
 const BTRFS_ROOT_ITEM_TYPE: u8 = 132;
 const BTRFS_BLOCK_GROUP_ITEM_TYPE: u8 = 192;
+const BTRFS_SUPER_MIRROR_MAX: u32 = 3;
+const BTRFS_SUPER_MIRROR_SHIFT: u32 = 12;
+const BTRFS_SUPER_MIRROR_BASE: u64 = 16 * 1024;
+const BTRFS_SUPER_BYTENR_OFFSET: usize = 0x30;
+const BTRFS_SUPER_CSUM_OFFSET: usize = 0;
+const BTRFS_SUPER_CSUM_LEN: usize = 4;
+const BTRFS_SUPER_CSUM_DATA_OFFSET: usize = 0x20;
 
 #[derive(Debug, Clone, Copy)]
 struct BtrfsRepairGroupSpec {
@@ -3612,6 +3713,205 @@ struct RepairExecutionStats {
     symbol_rebuild_attempted: bool,
     symbol_rebuild_groups: u64,
     symbol_rebuild_failed_groups: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BtrfsSuperblockRecoverySource {
+    offset: u64,
+    generation: u64,
+}
+
+fn btrfs_super_mirror_offsets(image_len: u64) -> Vec<u64> {
+    let mut offsets = Vec::new();
+    for mirror in 0..BTRFS_SUPER_MIRROR_MAX {
+        let offset = if mirror == 0 {
+            BTRFS_SUPER_INFO_OFFSET as u64
+        } else {
+            let shift = BTRFS_SUPER_MIRROR_SHIFT.saturating_mul(mirror);
+            let Some(candidate) = BTRFS_SUPER_MIRROR_BASE.checked_shl(shift) else {
+                continue;
+            };
+            candidate
+        };
+        let Some(end) =
+            offset.checked_add(u64::try_from(BTRFS_SUPER_INFO_SIZE).unwrap_or(u64::MAX))
+        else {
+            continue;
+        };
+        if end <= image_len {
+            offsets.push(offset);
+        }
+    }
+    offsets
+}
+
+fn block_range_contains(start: BlockNumber, count: u64, target: BlockNumber) -> bool {
+    if count == 0 || target.0 < start.0 {
+        return false;
+    }
+    if count == u64::MAX {
+        return true;
+    }
+    start.0.checked_add(count).is_none_or(|end| target.0 < end)
+}
+
+fn primary_btrfs_superblock_block(block_size: u32) -> BlockNumber {
+    BlockNumber((BTRFS_SUPER_INFO_OFFSET as u64) / u64::from(block_size))
+}
+
+fn report_has_error_or_higher_for_block(report: &ScrubReport, block: BlockNumber) -> bool {
+    report
+        .findings
+        .iter()
+        .any(|finding| finding.block == block && finding.severity >= Severity::Error)
+}
+
+fn normalize_btrfs_superblock_as_primary(region: &mut [u8]) -> Result<()> {
+    if region.len() < BTRFS_SUPER_INFO_SIZE {
+        bail!(
+            "btrfs superblock region too short: expected {} bytes, got {}",
+            BTRFS_SUPER_INFO_SIZE,
+            region.len()
+        );
+    }
+    region[BTRFS_SUPER_BYTENR_OFFSET..BTRFS_SUPER_BYTENR_OFFSET + 8]
+        .copy_from_slice(&(BTRFS_SUPER_INFO_OFFSET as u64).to_le_bytes());
+    let checksum = crc32c::crc32c(&region[BTRFS_SUPER_CSUM_DATA_OFFSET..BTRFS_SUPER_INFO_SIZE]);
+    region[BTRFS_SUPER_CSUM_OFFSET..BTRFS_SUPER_CSUM_OFFSET + BTRFS_SUPER_CSUM_LEN]
+        .copy_from_slice(&checksum.to_le_bytes());
+    Ok(())
+}
+
+fn recover_primary_btrfs_superblock_from_backup(
+    path: &PathBuf,
+    limitations: &mut Vec<String>,
+) -> Result<Option<BtrfsSuperblockRecoverySource>> {
+    let cx = cli_cx();
+    let byte_dev = FileByteDevice::open(path)
+        .with_context(|| format!("failed to open image: {}", path.display()))?;
+    let image_len = byte_dev.len_bytes();
+    let primary_offset = BTRFS_SUPER_INFO_OFFSET as u64;
+
+    let mut selected: Option<(Vec<u8>, BtrfsSuperblockRecoverySource)> = None;
+    for offset in btrfs_super_mirror_offsets(image_len)
+        .into_iter()
+        .filter(|offset| *offset != primary_offset)
+    {
+        let mut region = vec![0_u8; BTRFS_SUPER_INFO_SIZE];
+        if let Err(error) = byte_dev.read_exact_at(&cx, ByteOffset(offset), &mut region) {
+            limitations.push(format!(
+                "failed to read btrfs superblock mirror at byte offset {offset}: {error}"
+            ));
+            continue;
+        }
+
+        let parsed = match BtrfsSuperblock::parse_superblock_region(&region) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                limitations.push(format!(
+                    "btrfs superblock mirror at byte offset {offset} is structurally invalid: {error}"
+                ));
+                continue;
+            }
+        };
+        if parsed.bytenr != offset {
+            limitations.push(format!(
+                "btrfs superblock mirror at byte offset {offset} reports bytenr={} and was skipped",
+                parsed.bytenr
+            ));
+            continue;
+        }
+        if let Err(error) = verify_btrfs_superblock_checksum(&region) {
+            limitations.push(format!(
+                "btrfs superblock mirror at byte offset {offset} failed checksum validation: {error}"
+            ));
+            continue;
+        }
+
+        let source = BtrfsSuperblockRecoverySource {
+            offset,
+            generation: parsed.generation,
+        };
+        let keep_candidate = selected.as_ref().is_none_or(|(_, current)| {
+            source.generation > current.generation
+                || (source.generation == current.generation && source.offset < current.offset)
+        });
+        if keep_candidate {
+            selected = Some((region, source));
+        }
+    }
+
+    let Some((mut recovered_region, source)) = selected else {
+        return Ok(None);
+    };
+    normalize_btrfs_superblock_as_primary(&mut recovered_region)?;
+    BtrfsSuperblock::parse_superblock_region(&recovered_region)
+        .context("recovered primary btrfs superblock failed structural validation")?;
+    verify_btrfs_superblock_checksum(&recovered_region)
+        .context("recovered primary btrfs superblock failed checksum validation")?;
+
+    byte_dev
+        .write_all_at(&cx, ByteOffset(primary_offset), &recovered_region)
+        .context("failed to write recovered primary btrfs superblock")?;
+    byte_dev
+        .sync(&cx)
+        .context("failed to sync image after primary btrfs superblock recovery")?;
+
+    Ok(Some(source))
+}
+
+fn detect_flavor_with_optional_btrfs_bootstrap(
+    cx: &Cx,
+    path: &PathBuf,
+    allow_bootstrap: bool,
+    limitations: &mut Vec<String>,
+) -> Result<(FsFlavor, Option<BtrfsSuperblockRecoverySource>)> {
+    match detect_filesystem_at_path(cx, path) {
+        Ok(flavor) => Ok((flavor, None)),
+        Err(detect_error) => {
+            if !allow_bootstrap {
+                return Err(detect_error).with_context(|| {
+                    format!("failed to detect ext4/btrfs metadata in {}", path.display())
+                });
+            }
+
+            let source = match recover_primary_btrfs_superblock_from_backup(path, limitations) {
+                Ok(Some(source)) => source,
+                Ok(None) => {
+                    return Err(detect_error).with_context(|| {
+                        format!(
+                            "failed to detect ext4/btrfs metadata in {}; bootstrap btrfs superblock \
+                             recovery found no valid backup mirrors",
+                            path.display()
+                        )
+                    });
+                }
+                Err(recover_error) => {
+                    return Err(detect_error).with_context(|| {
+                        format!(
+                            "failed to detect ext4/btrfs metadata in {}; bootstrap btrfs superblock \
+                             recovery failed: {recover_error:#}",
+                            path.display()
+                        )
+                    });
+                }
+            };
+            limitations.push(format!(
+                "bootstrap restored primary btrfs superblock from backup mirror at byte offset {} \
+                 (generation={})",
+                source.offset, source.generation
+            ));
+
+            let flavor = detect_filesystem_at_path(cx, path).with_context(|| {
+                format!(
+                    "failed to detect ext4/btrfs metadata in {} after bootstrap btrfs superblock \
+                     recovery",
+                    path.display()
+                )
+            })?;
+            Ok((flavor, Some(source)))
+        }
+    }
 }
 
 fn parse_btrfs_root_item_bytenr(data: &[u8]) -> Result<u64> {
@@ -4255,10 +4555,13 @@ fn scrub_range_for_repair(
 fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Result<RepairOutput> {
     let flags = options.flags;
     let cx = cli_cx();
-    let flavor = detect_filesystem_at_path(&cx, path)
-        .with_context(|| format!("failed to detect ext4/btrfs metadata in {}", path.display()))?;
-
     let mut limitations = Vec::new();
+    let (flavor, bootstrap_recovery_source) = detect_flavor_with_optional_btrfs_bootstrap(
+        &cx,
+        path,
+        !flags.verify_only(),
+        &mut limitations,
+    )?;
     let rebuild_symbols_requested = flags.rebuild_symbols() && !flags.verify_only();
     if flags.rebuild_symbols() && flags.verify_only() {
         limitations.push("--rebuild-symbols is ignored when --verify-only is set".to_owned());
@@ -4269,13 +4572,7 @@ fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Result<
     } else {
         match &flavor {
             FsFlavor::Ext4(_) => Some(run_ext4_mount_recovery(path)?),
-            FsFlavor::Btrfs(_) => {
-                limitations.push(
-                    "write-side repair actions are currently implemented for ext4 only (mount-time journal/orphan recovery)"
-                        .to_owned(),
-                );
-                None
-            }
+            FsFlavor::Btrfs(_) => None,
         }
     };
     let byte_dev = FileByteDevice::open(path)
@@ -4483,7 +4780,7 @@ fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Result<
                         sb.nodesize, sb.sectorsize
                     )
                 })?;
-            if let Some(group) = options.block_group {
+            let (scope, scrub_start, scrub_count) = if let Some(group) = options.block_group {
                 let specs = discover_btrfs_repair_group_specs(path, block_size)
                     .context("failed to discover btrfs block groups for scoped repair")?;
                 let spec = specs
@@ -4495,16 +4792,6 @@ fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Result<
                             specs.len().saturating_sub(1)
                         )
                     })?;
-                let report = scrub_range_for_repair(
-                    path,
-                    &flavor,
-                    block_size,
-                    spec.physical_start_block,
-                    spec.physical_block_count,
-                    options.max_threads,
-                    &mut limitations,
-                )
-                .with_context(|| format!("failed to scrub btrfs group {group}"))?;
                 (
                     RepairScopeOutput::BtrfsBlockGroup {
                         group,
@@ -4513,26 +4800,73 @@ fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Result<
                         start_block: spec.physical_start_block.0,
                         block_count: spec.physical_block_count,
                     },
-                    report,
-                    RepairExecutionStats::default(),
+                    spec.physical_start_block,
+                    spec.physical_block_count,
                 )
             } else {
-                let report = scrub_range_for_repair(
+                (RepairScopeOutput::Full, BlockNumber(0), u64::MAX)
+            };
+
+            let mut report = scrub_range_for_repair(
+                path,
+                &flavor,
+                block_size,
+                scrub_start,
+                scrub_count,
+                options.max_threads,
+                &mut limitations,
+            )
+            .context("failed to scrub btrfs image")?;
+
+            let mut stats = RepairExecutionStats {
+                recovery_attempted: bootstrap_recovery_source.is_some(),
+                ..RepairExecutionStats::default()
+            };
+            let mut verify_after_recovery = false;
+            let primary_superblock = primary_btrfs_superblock_block(block_size);
+            let superblock_in_scope =
+                block_range_contains(scrub_start, scrub_count, primary_superblock);
+            if !flags.verify_only()
+                && superblock_in_scope
+                && report_has_error_or_higher_for_block(&report, primary_superblock)
+            {
+                stats.recovery_attempted = true;
+                verify_after_recovery = true;
+                match recover_primary_btrfs_superblock_from_backup(path, &mut limitations) {
+                    Ok(Some(source)) => {
+                        limitations.push(format!(
+                            "restored primary btrfs superblock from backup mirror at byte offset {} (generation={})",
+                            source.offset, source.generation
+                        ));
+                    }
+                    Ok(None) => {
+                        limitations.push(
+                            "btrfs superblock corruption detected, but no valid backup superblock mirror was available for restoration"
+                                .to_owned(),
+                        );
+                    }
+                    Err(error) => {
+                        limitations.push(format!(
+                            "btrfs superblock recovery attempt failed: {error:#}"
+                        ));
+                    }
+                }
+            }
+
+            if !flags.verify_only() && verify_after_recovery {
+                report = scrub_range_for_repair(
                     path,
                     &flavor,
                     block_size,
-                    BlockNumber(0),
-                    u64::MAX,
+                    scrub_start,
+                    scrub_count,
                     options.max_threads,
                     &mut limitations,
                 )
-                .context("failed to scrub btrfs image")?;
-                (
-                    RepairScopeOutput::Full,
-                    report,
-                    RepairExecutionStats::default(),
-                )
+                .context("failed to verify btrfs image after superblock recovery")?;
             }
+
+            (scope, report, stats)
         }
     };
     let scrub = repair_scrub_from_report(&report);
@@ -4545,7 +4879,7 @@ fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Result<
         RepairActionOutput::RepairRequested
     } else if scrub.error_or_higher > 0 {
         limitations.push(
-            "repair found actionable corruption, but no write-side workflow is available for this filesystem flavor"
+            "repair found actionable corruption, but no write-side workflow is available for the detected corruption class"
                 .to_owned(),
         );
         RepairActionOutput::RepairRequested
@@ -5091,9 +5425,11 @@ fn mkfs_cmd(
 mod tests {
     use super::{
         Cli, Command, DumpCommand, Ext4JournalReplayMode, Ext4RepairStaleness, FsckCommandOptions,
-        FsckFlags, LogFormat, RepairCommandOptions, RepairFlags, build_btrfs_repair_group_spec,
-        build_fsck_output, build_repair_output, ext4_appears_clean_state, ext4_mount_replay_mode,
-        merge_scrub_reports, partition_scrub_range, repair_worker_limit, select_ext4_repair_groups,
+        FsckFlags, LogFormat, RepairCommandOptions, RepairFlags, btrfs_super_mirror_offsets,
+        build_btrfs_repair_group_spec, build_fsck_output, build_repair_output,
+        ext4_appears_clean_state, ext4_mount_replay_mode, merge_scrub_reports,
+        normalize_btrfs_superblock_as_primary, partition_scrub_range, repair_worker_limit,
+        select_ext4_repair_groups,
     };
     use clap::Parser;
     use serde_json::Value;
@@ -5185,6 +5521,20 @@ mod tests {
         image[gdt_off + 0x08..gdt_off + 0x0C].copy_from_slice(&5_u32.to_le_bytes()); // inode table block
 
         image
+    }
+
+    fn build_test_btrfs_superblock(bytenr: u64, generation: u64) -> Vec<u8> {
+        let mut sb = vec![0_u8; super::BTRFS_SUPER_INFO_SIZE];
+        sb[0x40..0x48].copy_from_slice(&ffs_types::BTRFS_MAGIC.to_le_bytes());
+        sb[0x30..0x38].copy_from_slice(&bytenr.to_le_bytes());
+        sb[0x48..0x50].copy_from_slice(&generation.to_le_bytes());
+        sb[0x90..0x94].copy_from_slice(&4096_u32.to_le_bytes()); // sectorsize
+        sb[0x94..0x98].copy_from_slice(&16384_u32.to_le_bytes()); // nodesize
+        sb[0x9C..0xA0].copy_from_slice(&4096_u32.to_le_bytes()); // stripesize
+        sb[0xC4..0xC6].copy_from_slice(&ffs_types::BTRFS_CSUM_TYPE_CRC32C.to_le_bytes());
+        let checksum = crc32c::crc32c(&sb[0x20..super::BTRFS_SUPER_INFO_SIZE]);
+        sb[0..4].copy_from_slice(&checksum.to_le_bytes());
+        sb
     }
 
     fn test_btrfs_chunk_entry(
@@ -5731,6 +6081,238 @@ mod tests {
             output.action,
             super::RepairActionOutput::VerifyOnly
         ));
+    }
+
+    #[test]
+    fn btrfs_super_mirror_offsets_follow_kernel_layout() {
+        let image_len =
+            ((16 * 1024_u64) << 24) + u64::try_from(super::BTRFS_SUPER_INFO_SIZE).unwrap_or(0);
+        let offsets = btrfs_super_mirror_offsets(image_len);
+        assert_eq!(
+            offsets,
+            vec![64 * 1024, 64 * 1024 * 1024, 256 * 1024 * 1024 * 1024]
+        );
+    }
+
+    #[test]
+    fn btrfs_superblock_normalization_retargets_primary_offset() {
+        let mut region = build_test_btrfs_superblock(64 * 1024 * 1024, 3);
+        normalize_btrfs_superblock_as_primary(&mut region)
+            .expect("normalize mirror superblock for primary slot");
+        let parsed = ffs_ondisk::BtrfsSuperblock::parse_superblock_region(&region)
+            .expect("normalized superblock should parse");
+        assert_eq!(parsed.bytenr, super::BTRFS_SUPER_INFO_OFFSET as u64);
+        ffs_ondisk::verify_btrfs_superblock_checksum(&region)
+            .expect("normalized superblock checksum should be valid");
+    }
+
+    #[test]
+    fn repair_restores_primary_btrfs_superblock_from_backup_mirror() {
+        let primary_offset = super::BTRFS_SUPER_INFO_OFFSET;
+        let backup_offset = 64 * 1024 * 1024_usize;
+        let image_len = backup_offset + super::BTRFS_SUPER_INFO_SIZE + 4096;
+        let mut image = vec![0_u8; image_len];
+
+        let mut primary = build_test_btrfs_superblock(primary_offset as u64, 5);
+        primary[0] ^= 0xA5; // Corrupt checksum but keep structure parseable.
+        image[primary_offset..primary_offset + super::BTRFS_SUPER_INFO_SIZE]
+            .copy_from_slice(&primary);
+
+        let backup = build_test_btrfs_superblock(backup_offset as u64, 9);
+        image[backup_offset..backup_offset + super::BTRFS_SUPER_INFO_SIZE].copy_from_slice(&backup);
+
+        let (output, parsed_primary) = with_temp_image_path(&image, |path| {
+            build_repair_output(
+                &path,
+                RepairCommandOptions {
+                    flags: RepairFlags::empty(),
+                    block_group: None,
+                    max_threads: Some(1),
+                },
+            )
+            .map(|output| {
+                let repaired = std::fs::read(&path).expect("read repaired image");
+                let sb_region =
+                    &repaired[primary_offset..primary_offset + super::BTRFS_SUPER_INFO_SIZE];
+                ffs_ondisk::verify_btrfs_superblock_checksum(sb_region)
+                    .expect("repaired primary checksum should be valid");
+                let parsed = ffs_ondisk::BtrfsSuperblock::parse_superblock_region(sb_region)
+                    .expect("repaired primary should parse");
+                (output, parsed)
+            })
+            .expect("repair output for btrfs mirror recovery")
+        });
+
+        assert!(matches!(
+            output.action,
+            super::RepairActionOutput::RepairRequested
+        ));
+        assert_eq!(parsed_primary.bytenr, primary_offset as u64);
+        assert!(
+            output
+                .limitations
+                .iter()
+                .any(|limitation| limitation.contains("restored primary btrfs superblock"))
+        );
+    }
+
+    #[test]
+    fn fsck_repair_restores_primary_btrfs_superblock_from_backup_mirror() {
+        let primary_offset = super::BTRFS_SUPER_INFO_OFFSET;
+        let backup_offset = 64 * 1024 * 1024_usize;
+        let image_len = backup_offset + super::BTRFS_SUPER_INFO_SIZE + 4096;
+        let mut image = vec![0_u8; image_len];
+
+        let mut primary = build_test_btrfs_superblock(primary_offset as u64, 11);
+        primary[0] ^= 0x3C; // Corrupt checksum but keep structure parseable.
+        image[primary_offset..primary_offset + super::BTRFS_SUPER_INFO_SIZE]
+            .copy_from_slice(&primary);
+
+        let backup = build_test_btrfs_superblock(backup_offset as u64, 13);
+        image[backup_offset..backup_offset + super::BTRFS_SUPER_INFO_SIZE].copy_from_slice(&backup);
+
+        let (output, parsed_primary) = with_temp_image_path(&image, |path| {
+            build_fsck_output(
+                &path,
+                FsckCommandOptions {
+                    flags: FsckFlags::empty().with_repair(true),
+                    block_group: None,
+                },
+            )
+            .map(|output| {
+                let repaired = std::fs::read(&path).expect("read repaired image");
+                let sb_region =
+                    &repaired[primary_offset..primary_offset + super::BTRFS_SUPER_INFO_SIZE];
+                ffs_ondisk::verify_btrfs_superblock_checksum(sb_region)
+                    .expect("repaired primary checksum should be valid");
+                let parsed = ffs_ondisk::BtrfsSuperblock::parse_superblock_region(sb_region)
+                    .expect("repaired primary should parse");
+                (output, parsed)
+            })
+            .expect("fsck output for btrfs mirror recovery")
+        });
+
+        assert!(matches!(
+            output.repair_status,
+            super::FsckRepairStatus::RequestedPerformed
+        ));
+        let repair_phase = output
+            .phases
+            .iter()
+            .find(|phase| phase.phase == "repair")
+            .expect("repair phase should be present");
+        assert_eq!(repair_phase.status, "ok");
+        assert!(
+            repair_phase
+                .detail
+                .contains("restored primary btrfs superblock")
+        );
+        assert_eq!(parsed_primary.bytenr, primary_offset as u64);
+        assert!(output.scrub.scanned > 0);
+    }
+
+    #[test]
+    fn repair_bootstraps_btrfs_detection_from_backup_superblock() {
+        let primary_offset = super::BTRFS_SUPER_INFO_OFFSET;
+        let backup_offset = 64 * 1024 * 1024_usize;
+        let image_len = backup_offset + super::BTRFS_SUPER_INFO_SIZE + 4096;
+        let mut image = vec![0_u8; image_len];
+
+        let mut primary = build_test_btrfs_superblock(primary_offset as u64, 31);
+        primary[0x40..0x48].fill(0); // Break magic so initial filesystem detection fails.
+        image[primary_offset..primary_offset + super::BTRFS_SUPER_INFO_SIZE]
+            .copy_from_slice(&primary);
+
+        let backup = build_test_btrfs_superblock(backup_offset as u64, 33);
+        image[backup_offset..backup_offset + super::BTRFS_SUPER_INFO_SIZE].copy_from_slice(&backup);
+
+        let (output, parsed_primary) = with_temp_image_path(&image, |path| {
+            build_repair_output(
+                &path,
+                RepairCommandOptions {
+                    flags: RepairFlags::empty(),
+                    block_group: None,
+                    max_threads: Some(1),
+                },
+            )
+            .map(|output| {
+                let repaired = std::fs::read(&path).expect("read repaired image");
+                let sb_region =
+                    &repaired[primary_offset..primary_offset + super::BTRFS_SUPER_INFO_SIZE];
+                ffs_ondisk::verify_btrfs_superblock_checksum(sb_region)
+                    .expect("repaired primary checksum should be valid");
+                let parsed = ffs_ondisk::BtrfsSuperblock::parse_superblock_region(sb_region)
+                    .expect("repaired primary should parse");
+                (output, parsed)
+            })
+            .expect("repair output for btrfs bootstrap recovery")
+        });
+
+        assert!(matches!(
+            output.action,
+            super::RepairActionOutput::RepairRequested
+        ));
+        assert_eq!(parsed_primary.bytenr, primary_offset as u64);
+        assert!(
+            output.limitations.iter().any(
+                |limitation| limitation.contains("bootstrap restored primary btrfs superblock")
+            )
+        );
+    }
+
+    #[test]
+    fn fsck_repair_bootstraps_btrfs_detection_from_backup_superblock() {
+        let primary_offset = super::BTRFS_SUPER_INFO_OFFSET;
+        let backup_offset = 64 * 1024 * 1024_usize;
+        let image_len = backup_offset + super::BTRFS_SUPER_INFO_SIZE + 4096;
+        let mut image = vec![0_u8; image_len];
+
+        let mut primary = build_test_btrfs_superblock(primary_offset as u64, 41);
+        primary[0x40..0x48].fill(0); // Break magic so initial filesystem detection fails.
+        image[primary_offset..primary_offset + super::BTRFS_SUPER_INFO_SIZE]
+            .copy_from_slice(&primary);
+
+        let backup = build_test_btrfs_superblock(backup_offset as u64, 44);
+        image[backup_offset..backup_offset + super::BTRFS_SUPER_INFO_SIZE].copy_from_slice(&backup);
+
+        let (output, parsed_primary) = with_temp_image_path(&image, |path| {
+            build_fsck_output(
+                &path,
+                FsckCommandOptions {
+                    flags: FsckFlags::empty().with_repair(true),
+                    block_group: None,
+                },
+            )
+            .map(|output| {
+                let repaired = std::fs::read(&path).expect("read repaired image");
+                let sb_region =
+                    &repaired[primary_offset..primary_offset + super::BTRFS_SUPER_INFO_SIZE];
+                ffs_ondisk::verify_btrfs_superblock_checksum(sb_region)
+                    .expect("repaired primary checksum should be valid");
+                let parsed = ffs_ondisk::BtrfsSuperblock::parse_superblock_region(sb_region)
+                    .expect("repaired primary should parse");
+                (output, parsed)
+            })
+            .expect("fsck output for btrfs bootstrap recovery")
+        });
+
+        assert!(matches!(
+            output.repair_status,
+            super::FsckRepairStatus::RequestedPerformed
+        ));
+        let repair_phase = output
+            .phases
+            .iter()
+            .find(|phase| phase.phase == "repair")
+            .expect("repair phase should be present");
+        assert_eq!(repair_phase.status, "ok");
+        assert!(
+            repair_phase
+                .detail
+                .contains("bootstrap restored primary btrfs superblock")
+        );
+        assert_eq!(parsed_primary.bytenr, primary_offset as u64);
+        assert!(output.scrub.scanned > 0);
     }
 
     #[test]
