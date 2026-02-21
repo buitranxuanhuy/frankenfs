@@ -312,10 +312,10 @@ cargo run -p ffs-cli -- mount <image-path> <mountpoint>
 # Run a read-only scrub over image blocks
 cargo run -p ffs-cli -- scrub <image-path> --json
 
-# Run offline filesystem checks (supports ext4 mount-time recovery with --repair)
+# Run offline filesystem checks (ext4 mount-time recovery + btrfs primary-superblock restore, including bootstrap from backup mirrors when primary is unreadable)
 cargo run -p ffs-cli -- fsck <image-path> --repair --json
 
-# Run manual repair workflow (ext4 mount-time recovery + scrub verification)
+# Run manual repair workflow (ext4 mount-time recovery + btrfs superblock mirror restore + scrub verification)
 cargo run -p ffs-cli -- repair <image-path> --json
 
 # Show current feature parity report
@@ -388,7 +388,7 @@ FrankenFS is in **early development**. The tracked V1 parity matrix is complete 
 - btrfs superblock, B-tree header, leaf item metadata decoding, and geometry validation
 - MVCC snapshot visibility, commit sequencing, first-committer-wins conflict detection
 - Bayesian durability policy model and RaptorQ config mapping
-- CLI `inspect`, `info`, `dump`, `fsck` (with ext4 mount-time recovery via `--repair`), `repair` (ext4 mount-time recovery + scrub verification), `mount` (ext4 read-only), `scrub`, and `parity` commands
+- CLI `inspect`, `info`, `dump`, `fsck` (ext4 mount-time recovery + btrfs primary-superblock restoration via `--repair`, including bootstrap from backup mirrors when primary is unreadable), `repair` (ext4 mount-time recovery + btrfs primary-superblock restoration from validated backup mirrors + scrub verification), `mount` (ext4 read-only), `scrub`, and `parity` commands
 - Conformance fixture harness and Criterion benchmark scaffolding
 
 ### What's Next
