@@ -753,8 +753,7 @@ fn load_checkpoint(path: &Path, store: &mut MvccStore) -> Result<()> {
     ]);
     let num_blocks = u32::from_le_bytes([header[24], header[25], header[26], header[27]]);
 
-    store.next_txn = next_txn;
-    store.next_commit = next_commit;
+    store.advance_counters(next_commit.saturating_sub(1), next_txn.saturating_sub(1));
 
     // Read blocks
     for _ in 0..num_blocks {
@@ -819,7 +818,7 @@ fn load_checkpoint(path: &Path, store: &mut MvccStore) -> Result<()> {
             });
         }
 
-        store.versions.insert(block, versions);
+        store.insert_versions(block, versions);
     }
 
     // Verify CRC

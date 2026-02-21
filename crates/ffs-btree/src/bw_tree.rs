@@ -473,6 +473,7 @@ fn write_lock<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 enum MaterializeOp {
     Insert { key: BwKey, value: BwValue },
     Delete { key: BwKey },
+    Split { separator: BwKey },
 }
 
 fn materialize_from_head(head: &Arc<PageDelta>) -> Result<(BTreeMap<BwKey, BwValue>, usize)> {
@@ -510,7 +511,11 @@ fn materialize_from_head(head: &Arc<PageDelta>) -> Result<(BTreeMap<BwKey, BwVal
                 ops.push(MaterializeOp::Delete { key: *key });
                 cursor = Arc::clone(next);
             }
-            PageDelta::Split { next, .. } | PageDelta::Merge { next, .. } => {
+            PageDelta::Split { separator, next, .. } => {
+                ops.push(MaterializeOp::Split { separator: *separator });
+                cursor = Arc::clone(next);
+            }
+            PageDelta::Merge { next, .. } => {
                 cursor = Arc::clone(next);
             }
         }
@@ -524,6 +529,12 @@ fn apply_op(state: &mut BTreeMap<BwKey, BwValue>, op: MaterializeOp) {
         }
         MaterializeOp::Delete { key } => {
             state.remove(&key);
+        }
+        MaterializeOp::Split { separator } => {
+            let keys_to_remove: Vec<_> = state.range(separator..).map(|(k, _)| *k).collect();
+            for k in keys_to_remove {
+                state.remove(&k);
+            }
         }
     }
 }

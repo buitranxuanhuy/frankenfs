@@ -247,8 +247,7 @@ pub enum DecodeResult {
 /// Returns the decoded commit and the number of bytes consumed, or an error.
 #[must_use]
 pub fn decode_commit(bytes: &[u8]) -> DecodeResult {
-    // Check for end of data (all zeros)
-    if bytes.is_empty() || is_all_zero(bytes) {
+    if bytes.is_empty() {
         return DecodeResult::EndOfData;
     }
 
@@ -435,10 +434,6 @@ fn read_le_u64(bytes: &[u8], offset: usize) -> Result<u64> {
         .try_into()
         .map_err(|_| FfsError::Format("read_le_u64 slice conversion failed".to_owned()))?;
     Ok(u64::from_le_bytes(arr))
-}
-
-fn is_all_zero(bytes: &[u8]) -> bool {
-    bytes.iter().all(|&b| b == 0)
 }
 
 #[cfg(test)]
