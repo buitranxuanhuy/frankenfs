@@ -514,7 +514,7 @@ impl EpochManager {
     pub fn record_commit(&self) -> Option<u64> {
         let prev = self.commits_in_epoch.fetch_add(1, Ordering::AcqRel);
         if prev.saturating_add(1) >= self.config.commit_threshold {
-            Some(self.advance())
+            self.try_advance(false)
         } else {
             None
         }
@@ -525,32 +525,44 @@ impl EpochManager {
     /// Returns `Some(new_epoch)` if the interval has elapsed and the epoch
     /// was advanced, or `None` if not yet time.
     pub fn maybe_advance_by_time(&self) -> Option<u64> {
-        let guard = self
-            .last_advance
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if guard.elapsed() >= self.config.epoch_interval {
-            drop(guard);
-            Some(self.advance())
-        } else {
-            None
-        }
+        self.try_advance(false)
     }
 
     /// Check if the current epoch should advance (either trigger).
     ///
     /// Returns `Some(new_epoch)` if advanced, `None` otherwise.
     pub fn maybe_advance(&self) -> Option<u64> {
-        // Check count-based first (cheaper — no lock).
-        if self.commits_in_epoch.load(Ordering::Acquire) >= self.config.commit_threshold {
-            return Some(self.advance());
-        }
-        self.maybe_advance_by_time()
+        self.try_advance(false)
     }
 
     /// Force an epoch advance regardless of triggers.
     pub fn force_advance(&self) -> u64 {
-        self.advance()
+        self.try_advance(true).expect("force advance must return epoch")
+    }
+
+    fn try_advance(&self, force: bool) -> Option<u64> {
+        let mut guard = self
+            .last_advance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let needs_advance = force
+            || guard.elapsed() >= self.config.epoch_interval
+            || self.commits_in_epoch.load(Ordering::Acquire) >= self.config.commit_threshold;
+
+        if needs_advance {
+            let new_epoch = self.epoch.advance();
+            *guard = std::time::Instant::now();
+            self.commits_in_epoch.store(0, Ordering::Release);
+            tracing::debug!(
+                target: "ffs::wal_buffer",
+                new_epoch,
+                "epoch_advanced"
+            );
+            Some(new_epoch)
+        } else {
+            None
+        }
     }
 
     /// Mark an epoch as durably flushed.

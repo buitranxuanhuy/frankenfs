@@ -371,6 +371,12 @@ impl PersistentMvccStore {
         use_ssi: bool,
     ) -> std::result::Result<CommitSeq, CommitError> {
         let txn_id = txn.id();
+        let write_blocks: Vec<BlockNumber> = txn.write_set().keys().copied().collect();
+        let cow_blocks: Vec<BlockNumber> = write_blocks
+            .iter()
+            .copied()
+            .filter(|block| txn.staged_physical(*block).is_some())
+            .collect();
         let writes: Vec<wal::WalWrite> = txn
             .write_set()
             .iter()
@@ -380,9 +386,13 @@ impl PersistentMvccStore {
             })
             .collect();
 
-        // Write to WAL first before making changes visible in memory
         let mut store_guard = self.store.write();
-        let commit_seq = CommitSeq(store_guard.next_commit);
+        let commit_seq = if use_ssi {
+            store_guard.commit_ssi(txn)?
+        } else {
+            store_guard.commit(txn)?
+        };
+
         let wal_commit = wal::WalCommit {
             commit_seq,
             txn_id,
@@ -397,6 +407,14 @@ impl PersistentMvccStore {
 
         let mut wal_guard = self.wal.write();
         if wal_guard.append(&encoded).is_err() {
+            rollback_in_memory_commit(
+                &mut store_guard,
+                txn_id.0,
+                commit_seq,
+                &write_blocks,
+                &cow_blocks,
+                use_ssi,
+            );
             return Err(CommitError::Conflict {
                 block: BlockNumber(0),
                 snapshot: CommitSeq(0),
@@ -404,18 +422,20 @@ impl PersistentMvccStore {
             });
         }
         if self.options.sync_on_commit && wal_guard.sync().is_err() {
+            rollback_in_memory_commit(
+                &mut store_guard,
+                txn_id.0,
+                commit_seq,
+                &write_blocks,
+                &cow_blocks,
+                use_ssi,
+            );
             return Err(CommitError::Conflict {
                 block: BlockNumber(0),
                 snapshot: CommitSeq(0),
                 observed: CommitSeq(0),
             });
         }
-
-        let commit_seq = if use_ssi {
-            store_guard.commit_ssi(txn)?
-        } else {
-            store_guard.commit(txn)?
-        };
 
         let mut stats = self.stats.write();
         stats.commits_written += 1;
@@ -934,8 +954,17 @@ fn replay_wal_from_seq(
 /// This directly inserts versions into the store without going through the
 /// normal transaction commit path, since we're replaying already-committed data.
 fn apply_wal_commit(store: &mut MvccStore, commit: &WalCommit) {
-    store.advance_counters(commit.commit_seq.0, commit.txn_id.0);
+    // Ensure the store's sequence counters are advanced appropriately
+    // We need to update next_commit to be at least commit_seq + 1
+    // and next_txn to be at least txn_id + 1
+    if store.next_commit <= commit.commit_seq.0 {
+        store.next_commit = commit.commit_seq.0.saturating_add(1);
+    }
+    if store.next_txn <= commit.txn_id.0 {
+        store.next_txn = commit.txn_id.0.saturating_add(1);
+    }
 
+    // Insert each version
     let dedup_enabled = store.compression_policy().dedup_identical;
     for write in &commit.writes {
         let version_data = if dedup_enabled {
@@ -950,19 +979,6 @@ fn apply_wal_commit(store: &mut MvccStore, commit: &WalCommit) {
             data: version_data,
         };
         store.versions.entry(write.block).or_default().push(version);
-    }
-}
-
-// We need access to MvccStore internals for replay, so we extend it here
-impl MvccStore {
-    #[doc(hidden)]
-    pub(crate) fn advance_counters(&mut self, commit_seq: u64, txn_id: u64) {
-        if self.next_commit <= commit_seq {
-            self.next_commit = commit_seq.saturating_add(1);
-        }
-        if self.next_txn <= txn_id {
-            self.next_txn = txn_id.saturating_add(1);
-        }
     }
 }
 

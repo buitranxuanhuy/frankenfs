@@ -421,16 +421,33 @@ impl MvccEvidenceSink {
 
 #[derive(Debug, Clone)]
 pub struct MvccStore {
-    pub(crate) next_txn: u64,
-    pub(crate) next_commit: u64,
-    pub(crate) versions: BTreeMap<BlockNumber, Vec<BlockVersion>>,
-    pub(crate) physical_versions: BTreeMap<BlockNumber, Vec<PhysicalBlockVersion>>,
-    pub(crate) active_snapshots: BTreeMap<CommitSeq, u32>,
-    pub(crate) ssi_log: Vec<CommittedTxnRecord>,
-    pub(crate) compression_policy: CompressionPolicy,
-    pub(crate) ebr_reclaimer: EbrVersionReclaimer,
-    pub(crate) evidence_sink: Option<MvccEvidenceSink>,
-    pub(crate) gc_throttled: bool,
+    next_txn: u64,
+    next_commit: u64,
+    versions: BTreeMap<BlockNumber, Vec<BlockVersion>>,
+    physical_versions: BTreeMap<BlockNumber, Vec<PhysicalBlockVersion>>,
+    /// Active snapshots: each entry is a `CommitSeq` from which a reader is
+    /// still potentially reading.  The set uses a `BTreeMap` so that the
+    /// minimum (oldest active snapshot) can be obtained in O(log n).
+    ///
+    /// Callers **must** pair every `register_snapshot` with a corresponding
+    /// `release_snapshot` to avoid preventing GC indefinitely.
+    ///
+    /// NOTE: For new code, prefer using [`SnapshotRegistry`] + [`SnapshotHandle`]
+    /// which provide thread-safe RAII lifecycle management decoupled from the
+    /// version store lock.  These inline methods are retained for backward
+    /// compatibility and for use in single-threaded / test contexts.
+    active_snapshots: BTreeMap<CommitSeq, u32>,
+    /// Recent committed transactions retained for SSI antidependency
+    /// checking.  Pruned by `prune_ssi_log`.
+    ssi_log: Vec<CommittedTxnRecord>,
+    /// Version chain compression policy.
+    compression_policy: CompressionPolicy,
+    /// Epoch-based reclaimer for retired logical block versions.
+    ebr_reclaimer: EbrVersionReclaimer,
+    /// Optional append-only evidence sink for transaction decisions.
+    evidence_sink: Option<MvccEvidenceSink>,
+    /// Whether the most recent GC batch was throttled by budget pressure.
+    gc_throttled: bool,
 }
 
 impl Default for MvccStore {
