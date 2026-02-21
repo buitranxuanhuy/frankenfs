@@ -712,6 +712,7 @@ fn write_checkpoint(
 /// Load a checkpoint from a file into an MvccStore.
 fn load_checkpoint(path: &Path, store: &mut MvccStore) -> Result<()> {
     let file = File::open(path)?;
+    let file_len = file.metadata()?.len();
     let mut reader = BufReader::new(file);
     let mut hasher = Crc32cHasher::new();
 
@@ -759,7 +760,7 @@ fn load_checkpoint(path: &Path, store: &mut MvccStore) -> Result<()> {
         hasher.update(&num_versions_bytes);
         let num_versions = u32::from_le_bytes(num_versions_bytes);
 
-        let mut versions = Vec::with_capacity(num_versions as usize);
+        let mut versions = Vec::with_capacity((num_versions as usize).min(1024));
         for _ in 0..num_versions {
             let mut commit_seq_bytes = [0_u8; 8];
             reader.read_exact(&mut commit_seq_bytes)?;
@@ -776,15 +777,37 @@ fn load_checkpoint(path: &Path, store: &mut MvccStore) -> Result<()> {
             hasher.update(&data_len_bytes);
             let data_len = u32::from_le_bytes(data_len_bytes) as usize;
 
+            if data_len as u64 > file_len {
+                return Err(FfsError::Corruption {
+                    block: 0,
+                    detail: format!("checkpoint data_len {} exceeds file size", data_len),
+                });
+            }
+
             let mut data = vec![0_u8; data_len];
             reader.read_exact(&mut data)?;
             hasher.update(&data);
+
+            let version_data = if store.compression_policy().dedup_identical {
+                let is_identical = !versions.is_empty() && {
+                    let last_idx = versions.len() - 1;
+                    crate::compression::resolve_data_with(&versions, last_idx, |v| &v.data)
+                        == Some(data.as_slice())
+                };
+                if is_identical {
+                    crate::compression::VersionData::Identical
+                } else {
+                    crate::compression::VersionData::Full(data)
+                }
+            } else {
+                crate::compression::VersionData::Full(data)
+            };
 
             versions.push(BlockVersion {
                 block,
                 commit_seq,
                 writer: txn_id,
-                data: crate::compression::VersionData::Full(data),
+                data: version_data,
             });
         }
 
@@ -934,12 +957,18 @@ fn apply_wal_commit(store: &mut MvccStore, commit: &WalCommit) {
     }
 
     // Insert each version
+    let dedup_enabled = store.compression_policy().dedup_identical;
     for write in &commit.writes {
+        let version_data = if dedup_enabled {
+            store.maybe_dedup(write.block, &write.data)
+        } else {
+            crate::compression::VersionData::Full(write.data.clone())
+        };
         let version = BlockVersion {
             block: write.block,
             commit_seq: commit.commit_seq,
             writer: commit.txn_id,
-            data: crate::compression::VersionData::Full(write.data.clone()),
+            data: version_data,
         };
         store.versions.entry(write.block).or_default().push(version);
     }

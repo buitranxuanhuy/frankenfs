@@ -122,6 +122,17 @@ impl ShardedMvccStore {
         }
     }
 
+    fn make_chain_head_full(versions: &mut [BlockVersion], keep_from: usize) {
+        if keep_from < versions.len() && versions[keep_from].data.is_identical() {
+            if let Some(full_data) =
+                compression::resolve_data_with(versions, keep_from, |v| &v.data)
+            {
+                let full_data = full_data.to_vec();
+                versions[keep_from].data = VersionData::Full(full_data);
+            }
+        }
+    }
+
     /// The current snapshot (latest committed version).
     #[must_use]
     pub fn current_snapshot(&self) -> Snapshot {
@@ -166,7 +177,7 @@ impl ShardedMvccStore {
     /// Commit a transaction with first-committer-wins (FCW) conflict detection.
     ///
     /// Shard locks are acquired in sorted order to prevent deadlocks.
-    pub fn commit(&self, txn: Transaction) -> Result<CommitSeq, CommitError> {
+    pub fn commit(&self, txn: Transaction) -> Result<CommitSeq, (CommitError, Transaction)> {
         if txn.write_set().is_empty() {
             // Read-only transaction: nothing to commit.
             return Ok(self.current_snapshot().high);
@@ -192,11 +203,11 @@ impl ShardedMvccStore {
                 .and_then(|v| v.last())
                 .map_or(CommitSeq(0), |v| v.commit_seq);
             if latest > txn.snapshot().high {
-                return Err(CommitError::Conflict {
+                return Err((CommitError::Conflict {
                     block,
                     snapshot: txn.snapshot().high,
                     observed: latest,
-                });
+                }, txn));
             }
         }
 
@@ -236,7 +247,7 @@ impl ShardedMvccStore {
     }
 
     /// Commit with Serializable Snapshot Isolation (SSI) enforcement.
-    pub fn commit_ssi(&self, txn: Transaction) -> Result<CommitSeq, CommitError> {
+    pub fn commit_ssi(&self, txn: Transaction) -> Result<CommitSeq, (CommitError, Transaction)> {
         if txn.write_set().is_empty() {
             return Ok(self.current_snapshot().high);
         }
@@ -267,11 +278,11 @@ impl ShardedMvccStore {
                 .and_then(|v| v.last())
                 .map_or(CommitSeq(0), |v| v.commit_seq);
             if latest > txn.snapshot().high {
-                return Err(CommitError::Conflict {
+                return Err((CommitError::Conflict {
                     block,
                     snapshot: txn.snapshot().high,
                     observed: latest,
-                });
+                }, txn));
             }
         }
 
@@ -288,12 +299,12 @@ impl ShardedMvccStore {
                     break;
                 }
                 if record.write_set.contains(&block) {
-                    return Err(CommitError::SsiConflict {
+                    return Err((CommitError::SsiConflict {
                         pivot_block: block,
                         read_version,
                         write_version: record.commit_seq,
                         concurrent_txn: record.txn_id,
-                    });
+                    }, txn));
                 }
             }
         }
@@ -327,7 +338,7 @@ impl ShardedMvccStore {
             });
         }
 
-        // Add SSI log entry to all write-set shards.
+        // Add SSI log entry to all involved shards (read + write sets).
         let ssi_record = CommittedTxnRecord {
             txn_id,
             commit_seq,
@@ -398,6 +409,7 @@ impl ShardedMvccStore {
                     }
                 }
                 if keep_from > 0 {
+                    Self::make_chain_head_full(versions, keep_from);
                     versions.drain(0..keep_from);
                 }
             }
@@ -488,7 +500,7 @@ mod tests {
 
         store.commit(t1).expect("t1");
         let err = store.commit(t2).expect_err("t2 should conflict");
-        assert!(matches!(err, CommitError::Conflict { .. }));
+        assert!(matches!(err, (CommitError::Conflict { .. }, _)));
     }
 
     #[test]
@@ -570,7 +582,7 @@ mod tests {
         store.commit_ssi(t1).expect("T1 succeeds");
         let result = store.commit_ssi(t2);
         assert!(
-            matches!(result, Err(CommitError::SsiConflict { .. })),
+            matches!(result, Err((CommitError::SsiConflict { .. }, _))),
             "SSI should reject T2"
         );
     }
@@ -722,10 +734,10 @@ mod tests {
                         txn.stage_write(block, vec![value; 8]);
                         match store.commit(txn) {
                             Ok(_) => committed += 1,
-                            Err(CommitError::Conflict { .. }) => {
+                            Err((CommitError::Conflict { .. }, _)) => {
                                 // Expected under contention.
                             }
-                            Err(e) => panic!("unexpected error: {e}"),
+                            Err((e, _)) => panic!("unexpected error: {e}"),
                         }
                     }
                     committed

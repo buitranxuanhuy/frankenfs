@@ -335,7 +335,7 @@ pub fn decode_commit(bytes: &[u8]) -> DecodeResult {
     offset += 4;
 
     // Parse writes
-    let mut writes = Vec::with_capacity(num_writes);
+    let mut writes = Vec::with_capacity(num_writes.min(1024));
     for i in 0..num_writes {
         // Block number
         let block = match read_le_u64(body_bytes, offset) {

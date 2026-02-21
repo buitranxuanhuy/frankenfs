@@ -668,6 +668,25 @@ impl MvccStore {
         });
     }
 
+    /// Explicitly abort a transaction and free any physical blocks allocated for it.
+    pub fn abort_with_cow_allocator(
+        &mut self,
+        txn: Transaction,
+        reason: TxnAbortReason,
+        detail: Option<String>,
+        allocator: &dyn CowAllocator,
+        cx: &Cx,
+    ) {
+        for intent in txn.cow_writes.values() {
+            allocator.defer_free(intent.new_physical, CommitSeq(0));
+        }
+        for orphan in &txn.cow_orphans {
+            allocator.defer_free(*orphan, CommitSeq(0));
+        }
+        let _ = self.gc_cow_blocks(allocator, cx);
+        self.abort(txn, reason, detail);
+    }
+
     pub fn commit(&mut self, txn: Transaction) -> Result<CommitSeq, CommitError> {
         let started = Instant::now();
         let txn_id = txn.id().0;
@@ -678,7 +697,7 @@ impl MvccStore {
                 self.emit_transaction_commit(txn_id, commit_seq, write_set_size, started);
                 Ok(commit_seq)
             }
-            Err(error) => {
+            Err((error, _txn)) => {
                 self.record_commit_abort(txn_id, read_set_size, write_set_size, &error);
                 Err(error)
             }
@@ -705,7 +724,14 @@ impl MvccStore {
                 self.emit_transaction_commit(txn_id, commit_seq, write_set_size, started);
                 Ok(commit_seq)
             }
-            Err(error) => {
+            Err((error, txn)) => {
+                for intent in txn.cow_writes.values() {
+                    allocator.defer_free(intent.new_physical, CommitSeq(0));
+                }
+                for orphan in txn.cow_orphans {
+                    allocator.defer_free(orphan, CommitSeq(0));
+                }
+                let _ = self.gc_cow_blocks(allocator, cx);
                 self.record_commit_abort(txn_id, read_set_size, write_set_size, &error);
                 Err(error)
             }
@@ -736,7 +762,7 @@ impl MvccStore {
                 self.emit_transaction_commit(txn_id, commit_seq, write_set_size, started);
                 Ok(commit_seq)
             }
-            Err(error) => {
+            Err((error, _txn)) => {
                 self.record_commit_abort(txn_id, read_set_size, write_set_size, &error);
                 Err(error)
             }
@@ -763,7 +789,14 @@ impl MvccStore {
                 self.emit_transaction_commit(txn_id, commit_seq, write_set_size, started);
                 Ok(commit_seq)
             }
-            Err(error) => {
+            Err((error, txn)) => {
+                for intent in txn.cow_writes.values() {
+                    allocator.defer_free(intent.new_physical, CommitSeq(0));
+                }
+                for orphan in txn.cow_orphans {
+                    allocator.defer_free(orphan, CommitSeq(0));
+                }
+                let _ = self.gc_cow_blocks(allocator, cx);
                 self.record_commit_abort(txn_id, read_set_size, write_set_size, &error);
                 Err(error)
             }
@@ -861,7 +894,7 @@ impl MvccStore {
     fn commit_fcw_internal(
         &mut self,
         txn: Transaction,
-    ) -> Result<(CommitSeq, Vec<BlockNumber>), CommitError> {
+    ) -> Result<(CommitSeq, Vec<BlockNumber>), (CommitError, Transaction)> {
         let chain_cap = self.compression_policy.max_chain_length;
         for block in txn.writes.keys() {
             let latest = self.latest_commit_seq(*block);
@@ -875,14 +908,16 @@ impl MvccStore {
                     snapshot_commit_seq = txn.snapshot.high.0,
                     observed_commit_seq = latest.0
                 );
-                return Err(CommitError::Conflict {
+                return Err((CommitError::Conflict {
                     block: *block,
                     snapshot: txn.snapshot.high,
                     observed: latest,
-                });
+                }, txn));
             }
             if let Some(cap) = chain_cap {
-                self.enforce_chain_pressure(txn.id, *block, cap)?;
+                if let Err(e) = self.enforce_chain_pressure(txn.id, *block, cap) {
+                    return Err((e, txn));
+                }
             }
         }
 
@@ -938,7 +973,7 @@ impl MvccStore {
     fn commit_ssi_internal(
         &mut self,
         txn: Transaction,
-    ) -> Result<(CommitSeq, Vec<BlockNumber>), CommitError> {
+    ) -> Result<(CommitSeq, Vec<BlockNumber>), (CommitError, Transaction)> {
         let chain_cap = self.compression_policy.max_chain_length;
         // Step 1: FCW check (write-write conflicts).
         for block in txn.writes.keys() {
@@ -953,19 +988,24 @@ impl MvccStore {
                     snapshot_commit_seq = txn.snapshot.high.0,
                     observed_commit_seq = latest.0
                 );
-                return Err(CommitError::Conflict {
+                return Err((CommitError::Conflict {
                     block: *block,
                     snapshot: txn.snapshot.high,
                     observed: latest,
-                });
+                }, txn));
             }
             if let Some(cap) = chain_cap {
-                self.enforce_chain_pressure(txn.id, *block, cap)?;
+                if let Err(e) = self.enforce_chain_pressure(txn.id, *block, cap) {
+                    return Err((e, txn));
+                }
             }
         }
 
         // Step 2: SSI rw-antidependency check (phantom detection).
-        let checks_performed = self.validate_ssi_read_set(&txn)?;
+        let checks_performed = match self.validate_ssi_read_set(&txn) {
+            Ok(count) => count,
+            Err(e) => return Err((e, txn)),
+        };
 
         let Transaction {
             id: txn_id,
@@ -1039,7 +1079,7 @@ impl MvccStore {
 
     /// Check if `new_bytes` are identical to the latest version for `block`.
     /// If so, return `VersionData::Identical` (dedup); otherwise `VersionData::Full`.
-    fn maybe_dedup(&self, block: BlockNumber, new_bytes: &[u8]) -> VersionData {
+    pub(crate) fn maybe_dedup(&self, block: BlockNumber, new_bytes: &[u8]) -> VersionData {
         if let Some(versions) = self.versions.get(&block) {
             if !versions.is_empty() {
                 // Resolve the latest version's data (might itself be Identical).
@@ -1257,7 +1297,6 @@ impl MvccStore {
                 let (trimmed, retired_versions) =
                     Self::trim_block_chain_to_cap(versions, max_len, watermark);
                 if trimmed > 0 {
-                    Self::ensure_chain_head_full(versions);
                     trace!(
                         block = block.0,
                         watermark = watermark.0,
@@ -1317,6 +1356,7 @@ impl MvccStore {
             trim += 1;
         }
         let retired = if trim > 0 {
+            Self::make_chain_head_full(versions, trim);
             versions.drain(0..trim).collect()
         } else {
             Vec::new()
@@ -1343,15 +1383,14 @@ impl MvccStore {
         trim
     }
 
-    fn ensure_chain_head_full(versions: &mut [BlockVersion]) {
-        if versions.first().is_none_or(|v| !v.data.is_identical()) {
-            return;
-        }
-        if let Some(full_data) = versions
-            .iter()
-            .find_map(|v| v.data.as_bytes().map(ToOwned::to_owned))
-        {
-            versions[0].data = VersionData::Full(full_data);
+    fn make_chain_head_full(versions: &mut [BlockVersion], keep_from: usize) {
+        if keep_from < versions.len() && versions[keep_from].data.is_identical() {
+            if let Some(full_data) =
+                compression::resolve_data_with(versions, keep_from, |v| &v.data)
+            {
+                let full_data = full_data.to_vec();
+                versions[keep_from].data = VersionData::Full(full_data);
+            }
         }
     }
 
@@ -1491,8 +1530,8 @@ impl MvccStore {
             }
 
             if keep_from > 0 {
+                Self::make_chain_head_full(versions, keep_from);
                 retired_versions.extend(versions.drain(0..keep_from));
-                Self::ensure_chain_head_full(versions);
                 let oldest_retained_commit_seq =
                     versions.first().map_or(watermark.0, |v| v.commit_seq.0);
                 info!(
@@ -1784,6 +1823,7 @@ impl SnapshotRegistry {
             return false;
         };
 
+        let was_oldest = active.keys().next().copied() == Some(snapshot.high);
         let mut clear_oldest = false;
         let mut reset_oldest = false;
         count_after = count_after.saturating_sub(1);
@@ -1795,7 +1835,7 @@ impl SnapshotRegistry {
             );
             if active.is_empty() {
                 clear_oldest = true;
-            } else {
+            } else if was_oldest {
                 reset_oldest = true;
             }
         } else {
