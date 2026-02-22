@@ -936,18 +936,16 @@ fn parse_descriptor_tags(block: &[u8]) -> Vec<DescriptorTag> {
 #[must_use]
 fn parse_revoke_entries(block: &[u8]) -> Vec<BlockNumber> {
     let mut out = Vec::new();
-    // Revoke header: journal_header (12 bytes) + r_count (4 bytes) = 16 bytes.
-    // The r_count field at offset 12 specifies total bytes in the revoke record
-    // including the header. Revoke entries start at offset 16.
+    let Some(r_count) = read_be_u32(block, 12) else {
+        return out;
+    };
+    let limit = (r_count as usize).min(block.len());
     let mut offset = JBD2_REVOKE_HEADER_SIZE;
 
-    while offset.saturating_add(4) <= block.len() {
+    while offset.saturating_add(4) <= limit {
         let Some(raw) = read_be_u32(block, offset) else {
             break;
         };
-        if raw == 0 {
-            break;
-        }
         out.push(BlockNumber(u64::from(raw)));
         offset = offset.saturating_add(4);
     }
