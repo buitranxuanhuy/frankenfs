@@ -6226,6 +6226,25 @@ impl OpenFs {
                 item_type: BTRFS_ITEM_EXTENT_DATA,
                 offset,
             };
+
+            // Free the old physical extent if we are overwriting an existing regular extent
+            if let Ok(existing) = alloc.fs_tree.range(&extent_key, &extent_key) {
+                if let Some((_, edata)) = existing.first() {
+                    if let Ok(BtrfsExtentData::Regular {
+                        disk_bytenr: old_bytenr,
+                        disk_num_bytes: old_num_bytes,
+                        ..
+                    }) = parse_extent_data(edata)
+                    {
+                        if old_bytenr > 0 {
+                            if let Err(e) = alloc.extent_alloc.free_extent(old_bytenr, old_num_bytes, false) {
+                                warn!("btrfs_write: failed to free overwritten extent at {old_bytenr}: {e:?}");
+                            }
+                        }
+                    }
+                }
+            }
+
             let extent_bytes = extent.to_bytes();
             alloc
                 .fs_tree
