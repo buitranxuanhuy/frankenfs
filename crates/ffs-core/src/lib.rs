@@ -4923,7 +4923,11 @@ impl OpenFs {
 
         // Decrement child link count.
         let mut child_upd = child_inode;
-        child_upd.links_count = child_upd.links_count.saturating_sub(1);
+        if expect_dir {
+            child_upd.links_count = 0; // Removing a directory drops both the parent link and the `.` link
+        } else {
+            child_upd.links_count = child_upd.links_count.saturating_sub(1);
+        }
         ffs_inode::touch_ctime(&mut child_upd, tstamp_secs, tstamp_nanos);
 
         {
@@ -5592,7 +5596,11 @@ impl OpenFs {
             }
             // Decrement link count / delete.
             let mut ex_upd = existing_inode;
-            ex_upd.links_count = ex_upd.links_count.saturating_sub(1);
+            if ex_upd.is_dir() {
+                ex_upd.links_count = 0;
+            } else {
+                ex_upd.links_count = ex_upd.links_count.saturating_sub(1);
+            }
             {
                 let Ext4AllocState {
                     geo,
@@ -6452,7 +6460,11 @@ impl OpenFs {
         self.btrfs_remove_inode_ref(&mut alloc, child_oid, parent_oid);
 
         // Decrement child nlink.
-        self.btrfs_adjust_nlink(&mut alloc, child_oid, -1)?;
+        if expect_dir {
+            self.btrfs_adjust_nlink(&mut alloc, child_oid, -2)?;
+        } else {
+            self.btrfs_adjust_nlink(&mut alloc, child_oid, -1)?;
+        }
 
         // If nlink reached 0, purge the orphaned inode and all its data.
         let child_inode = self.btrfs_read_inode_from_tree(&alloc, child_oid)?;
@@ -6497,10 +6509,11 @@ impl OpenFs {
             let target_oid = target.child_objectid;
             self.btrfs_remove_dir_entry(&mut alloc, new_parent_oid, new_name)?;
             self.btrfs_remove_inode_ref(&mut alloc, target_oid, new_parent_oid);
-            self.btrfs_adjust_nlink(&mut alloc, target_oid, -1)?;
-            // If overwriting a directory, the new parent loses a ".." backref.
             if target.file_type == BTRFS_FT_DIR {
+                self.btrfs_adjust_nlink(&mut alloc, target_oid, -2)?;
                 self.btrfs_adjust_nlink(&mut alloc, new_parent_oid, -1)?;
+            } else {
+                self.btrfs_adjust_nlink(&mut alloc, target_oid, -1)?;
             }
             let target_inode = self.btrfs_read_inode_from_tree(&alloc, target_oid)?;
             if target_inode.nlink == 0 {

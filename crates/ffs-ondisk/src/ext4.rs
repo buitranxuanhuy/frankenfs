@@ -3578,11 +3578,8 @@ fn dx_hash_tea(name: &[u8], seed: &[u32; 4], signed: bool) -> (u32, u32) {
     let mut offset = 0;
     while offset < name.len() {
         let chunk_len = (name.len() - offset).min(16);
-        let (buf, num_words) = str2hashbuf_len(&name[offset..offset + chunk_len], 4, signed);
-        for i in 0..num_words {
-            // tea_transform consumes 4 words of key
-            tea_transform(&mut a, &mut b, &buf[i * 4..]);
-        }
+        let buf = str2hashbuf(&name[offset..offset + chunk_len], 4, signed);
+        tea_transform(&mut a, &mut b, &buf);
         offset += chunk_len;
     }
 
@@ -3595,20 +3592,15 @@ fn dx_hash_tea(name: &[u8], seed: &[u32; 4], signed: bool) -> (u32, u32) {
 /// with optional signed character semantics.
 #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 fn str2hashbuf(name: &[u8], buf_size: usize, signed: bool) -> Vec<u32> {
-    str2hashbuf_len(name, buf_size, signed).0
-}
-
-#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
-fn str2hashbuf_len(name: &[u8], buf_size: usize, signed: bool) -> (Vec<u32>, usize) {
     let mut buf = vec![0_u32; buf_size];
     let mut idx = 0_usize;
     let mut shift = 0_u32;
 
-    for &b in name {
+    for &byte_val in name {
         let val = if signed {
-            (b as i8) as u32
+            (byte_val as i8) as u32
         } else {
-            u32::from(b)
+            u32::from(byte_val)
         };
         // Clear the target byte before ORing, matching the Linux kernel's
         // behavior which truncates sign extensions from previous bytes in the target slot.
@@ -3628,8 +3620,7 @@ fn str2hashbuf_len(name: &[u8], buf_size: usize, signed: bool) -> (Vec<u32>, usi
         buf[idx] = (buf[idx] & !(0xFF << shift)) | (0x80 << shift);
     }
     
-    let words = (name.len() + 3) / 4;
-    (buf, words)
+    buf
 }
 
 /// Half-MD4 transform — the core of the half-MD4 hash.

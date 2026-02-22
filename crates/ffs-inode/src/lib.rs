@@ -372,6 +372,30 @@ pub fn delete_inode(
         inode.extent_bytes[..60].copy_from_slice(&root_buf);
     }
 
+    // Free the external xattr block if present.
+    if inode.file_acl != 0 {
+        let acl_block = BlockNumber(inode.file_acl);
+        let mut buf = dev.read_block(cx, acl_block)?;
+        let data = buf.as_mut_slice();
+        if data.len() >= 32 {
+            let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            if magic == 0xEA02_0000 {
+                let refcount = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                if refcount > 1 {
+                    let new_refcount = refcount - 1;
+                    data[4..8].copy_from_slice(&new_refcount.to_le_bytes());
+                    dev.write_block(cx, acl_block, data)?;
+                } else {
+                    ffs_alloc::free_blocks_persist(cx, dev, geo, groups, acl_block, 1, pctx)?;
+                }
+            } else {
+                // Not a valid xattr block, but we still free it to prevent leaks.
+                ffs_alloc::free_blocks_persist(cx, dev, geo, groups, acl_block, 1, pctx)?;
+            }
+        }
+        inode.file_acl = 0;
+    }
+
     // Set deletion time.
     #[allow(clippy::cast_possible_truncation)]
     {
