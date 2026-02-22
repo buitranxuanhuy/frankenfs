@@ -104,7 +104,15 @@ pub struct GroupBlockAllocator<'a> {
 
 impl BlockAllocator for GroupBlockAllocator<'_> {
     fn alloc_block(&mut self, cx: &Cx) -> Result<BlockNumber> {
-        let alloc = ffs_alloc::alloc_blocks_persist(cx, self.dev, self.geo, self.groups, 1, &self.hint, self.pctx)?;
+        let alloc = ffs_alloc::alloc_blocks_persist(
+            cx,
+            self.dev,
+            self.geo,
+            self.groups,
+            1,
+            &self.hint,
+            self.pctx,
+        )?;
         // Update hint to prefer contiguous allocation.
         self.hint.goal_block = Some(BlockNumber(alloc.start.0 + 1));
         Ok(alloc.start)
@@ -292,6 +300,7 @@ pub fn truncate_extents(
 /// `[logical_start, logical_start + count)` without changing file size.
 ///
 /// Returns the total number of physical blocks freed.
+#[allow(clippy::too_many_arguments)]
 pub fn punch_hole(
     cx: &Cx,
     dev: &dyn BlockDevice,
@@ -341,6 +350,7 @@ pub fn punch_hole(
 /// range. May split extents at range boundaries if they only partially overlap.
 ///
 /// This is used when data is first written to a preallocated (unwritten) region.
+#[allow(clippy::too_many_arguments)]
 pub fn mark_written(
     cx: &Cx,
     dev: &dyn BlockDevice,
@@ -583,7 +593,8 @@ mod tests {
 
     fn mock_pctx() -> ffs_alloc::PersistCtx {
         ffs_alloc::PersistCtx {
-            gdt_block: BlockNumber(1),
+            // Keep GDT writes off the group-0 block bitmap block (1) used by this fixture.
+            gdt_block: BlockNumber(50),
             desc_size: 32,
             has_metadata_csum: false,
             csum_seed: 0,
@@ -612,8 +623,9 @@ mod tests {
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
 
+        let pctx = mock_pctx();
         let hint = AllocHint::default();
-        allocate_extent(&cx, &dev, &mut root, &geo, &mut groups, 0, 5, &hint).unwrap();
+        allocate_extent(&cx, &dev, &mut root, &geo, &mut groups, 0, 5, &hint, &pctx).unwrap();
 
         let mappings = map_logical_to_physical(&cx, &dev, &root, 0, 10).unwrap();
         assert_eq!(mappings.len(), 2);
@@ -636,6 +648,7 @@ mod tests {
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
 
+        let pctx = mock_pctx();
         let mapping = allocate_extent(
             &cx,
             &dev,
@@ -645,6 +658,7 @@ mod tests {
             0,
             10,
             &AllocHint::default(),
+            &pctx,
         )
         .unwrap();
         assert_eq!(mapping.logical_start, 0);
@@ -659,6 +673,7 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
         let m1 = allocate_extent(
             &cx,
@@ -669,6 +684,7 @@ mod tests {
             0,
             5,
             &AllocHint::default(),
+            &pctx,
         )
         .unwrap();
         let m2 = allocate_extent(
@@ -683,6 +699,7 @@ mod tests {
                 goal_block: Some(BlockNumber(m1.physical_start + 5)),
                 ..Default::default()
             },
+            &pctx,
         )
         .unwrap();
         assert_eq!(m2.logical_start, 5);
@@ -705,6 +722,7 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
         let mapping = allocate_unwritten_extent(
             &cx,
@@ -715,6 +733,7 @@ mod tests {
             0,
             10,
             &AllocHint::default(),
+            &pctx,
         )
         .unwrap();
         assert!(mapping.unwritten);
@@ -736,6 +755,7 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
         // Allocate blocks 0-9 and 10-19.
         allocate_extent(
@@ -747,6 +767,7 @@ mod tests {
             0,
             10,
             &AllocHint::default(),
+            &pctx,
         )
         .unwrap();
         allocate_extent(
@@ -758,13 +779,14 @@ mod tests {
             10,
             10,
             &AllocHint::default(),
+            &pctx,
         )
         .unwrap();
 
         let initial_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
 
         // Truncate at logical block 10 — should remove second extent.
-        let freed = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 10).unwrap();
+        let freed = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 10, &pctx).unwrap();
         assert_eq!(freed, 10);
 
         let after_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
@@ -787,6 +809,7 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
         allocate_extent(
             &cx,
@@ -797,10 +820,11 @@ mod tests {
             0,
             10,
             &AllocHint::default(),
+            &pctx,
         )
         .unwrap();
 
-        let freed = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 0).unwrap();
+        let freed = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 0, &pctx).unwrap();
         assert_eq!(freed, 10);
 
         // Tree should be empty.
@@ -822,6 +846,7 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
         allocate_extent(
             &cx,
@@ -832,13 +857,14 @@ mod tests {
             0,
             10,
             &AllocHint::default(),
+            &pctx,
         )
         .unwrap();
 
         let initial_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
 
         // Punch hole in blocks 3-6 (4 blocks).
-        let freed = punch_hole(&cx, &dev, &mut root, &geo, &mut groups, 3, 4).unwrap();
+        let freed = punch_hole(&cx, &dev, &mut root, &geo, &mut groups, 3, 4, &pctx).unwrap();
         assert!(freed > 0);
 
         let after_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
@@ -852,8 +878,9 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
-        let freed = punch_hole(&cx, &dev, &mut root, &geo, &mut groups, 0, 10).unwrap();
+        let freed = punch_hole(&cx, &dev, &mut root, &geo, &mut groups, 0, 10, &pctx).unwrap();
         assert_eq!(freed, 0);
     }
 
@@ -866,6 +893,7 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
         allocate_extent(
             &cx,
@@ -876,6 +904,7 @@ mod tests {
             0,
             10,
             &AllocHint::default(),
+            &pctx,
         )
         .unwrap();
         allocate_extent(
@@ -887,10 +916,11 @@ mod tests {
             20,
             10,
             &AllocHint::default(),
+            &pctx,
         )
         .unwrap();
 
-        let freed = punch_hole(&cx, &dev, &mut root, &geo, &mut groups, 2, 3).unwrap();
+        let freed = punch_hole(&cx, &dev, &mut root, &geo, &mut groups, 2, 3, &pctx).unwrap();
         assert_eq!(freed, 3);
 
         let mappings = map_logical_to_physical(&cx, &dev, &root, 0, 30).unwrap();
@@ -923,6 +953,7 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
         // Allocate unwritten extent at blocks 0-9.
         allocate_unwritten_extent(
@@ -934,6 +965,7 @@ mod tests {
             0,
             10,
             &AllocHint::default(),
+            &pctx,
         )
         .unwrap();
 
@@ -944,7 +976,7 @@ mod tests {
         }
 
         // Mark entire range as written.
-        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 0, 10).unwrap();
+        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 0, 10, &pctx).unwrap();
 
         // Verify now written.
         match ffs_btree::search(&cx, &dev, &root, 0).unwrap() {
@@ -960,6 +992,7 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
         // Allocate unwritten extent at blocks 0-9.
         allocate_unwritten_extent(
@@ -971,11 +1004,12 @@ mod tests {
             0,
             10,
             &AllocHint::default(),
+            &pctx,
         )
         .unwrap();
 
         // Mark blocks 3-6 as written (partial range).
-        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 3, 4).unwrap();
+        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 3, 4, &pctx).unwrap();
 
         // Block 0 should still be unwritten.
         match ffs_btree::search(&cx, &dev, &root, 0).unwrap() {
@@ -1012,6 +1046,7 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
         let result = allocate_extent(
             &cx,
@@ -1022,6 +1057,7 @@ mod tests {
             0,
             0,
             &AllocHint::default(),
+            &pctx,
         );
         assert!(result.is_err());
     }
@@ -1033,6 +1069,7 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
         // Max valid extent count is 32767 (15 bits minus unwritten flag).
         let result = allocate_extent(
@@ -1044,6 +1081,7 @@ mod tests {
             0,
             32768,
             &AllocHint::default(),
+            &pctx,
         );
         assert!(result.is_err());
     }
@@ -1055,6 +1093,7 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
         // Allocate blocks 0-4 and 10-14 (gap at 5-9).
         let m1 = allocate_extent(
@@ -1066,6 +1105,7 @@ mod tests {
             0,
             5,
             &AllocHint::default(),
+            &pctx,
         )
         .unwrap();
         let m2 = allocate_extent(
@@ -1077,6 +1117,7 @@ mod tests {
             10,
             5,
             &AllocHint::default(),
+            &pctx,
         )
         .unwrap();
 
@@ -1098,8 +1139,9 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
-        let freed = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 0).unwrap();
+        let freed = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 0, &pctx).unwrap();
         assert_eq!(freed, 0);
     }
 
@@ -1110,6 +1152,7 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
         // Allocate blocks 0-9.
         let m = allocate_extent(
@@ -1121,6 +1164,7 @@ mod tests {
             0,
             10,
             &AllocHint::default(),
+            &pctx,
         )
         .unwrap();
 
@@ -1230,6 +1274,7 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
         // Allocate a regular (already-written) extent.
         allocate_extent(
@@ -1241,11 +1286,12 @@ mod tests {
             0,
             10,
             &AllocHint::default(),
+            &pctx,
         )
         .unwrap();
 
         // mark_written should be a no-op since the extent is already written.
-        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 0, 10).unwrap();
+        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 0, 10, &pctx).unwrap();
 
         // Verify the extent is still there and still written.
         match ffs_btree::search(&cx, &dev, &root, 0).unwrap() {
@@ -1273,9 +1319,10 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
         // mark_written on empty tree should succeed with no changes.
-        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 0, 10).unwrap();
+        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 0, 10, &pctx).unwrap();
 
         // Tree should still be empty.
         let mut count = 0;
@@ -1294,6 +1341,7 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
         // Allocate unwritten extent at blocks 0-9.
         allocate_unwritten_extent(
@@ -1305,13 +1353,14 @@ mod tests {
             0,
             10,
             &AllocHint::default(),
+            &pctx,
         )
         .unwrap();
 
         let initial_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
 
         // Punch hole in blocks 3-6 within the unwritten extent.
-        let freed = punch_hole(&cx, &dev, &mut root, &geo, &mut groups, 3, 4).unwrap();
+        let freed = punch_hole(&cx, &dev, &mut root, &geo, &mut groups, 3, 4, &pctx).unwrap();
         assert!(freed > 0);
 
         let after_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
@@ -1340,6 +1389,7 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
         let result = allocate_unwritten_extent(
             &cx,
@@ -1350,6 +1400,7 @@ mod tests {
             0,
             0,
             &AllocHint::default(),
+            &pctx,
         );
         assert!(
             matches!(result, Err(FfsError::Format(_))),
@@ -1364,6 +1415,7 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
         let result = allocate_unwritten_extent(
             &cx,
@@ -1374,6 +1426,7 @@ mod tests {
             0,
             32768,
             &AllocHint::default(),
+            &pctx,
         );
         assert!(
             matches!(result, Err(FfsError::Format(_))),
@@ -1388,6 +1441,7 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
         // Mark all groups as having 0 free blocks.
         for g in &mut groups {
@@ -1403,6 +1457,7 @@ mod tests {
             0,
             10,
             &AllocHint::default(),
+            &pctx,
         );
         assert!(
             matches!(result, Err(FfsError::NoSpace)),
@@ -1417,6 +1472,7 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
         // Mark all groups as having 0 free blocks.
         for g in &mut groups {
@@ -1432,6 +1488,7 @@ mod tests {
             0,
             10,
             &AllocHint::default(),
+            &pctx,
         );
         assert!(
             matches!(result, Err(FfsError::NoSpace)),
@@ -1448,6 +1505,7 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
         // Allocate two adjacent unwritten extents: [0-4] and [5-9].
         allocate_unwritten_extent(
@@ -1459,6 +1517,7 @@ mod tests {
             0,
             5,
             &AllocHint::default(),
+            &pctx,
         )
         .unwrap();
         allocate_unwritten_extent(
@@ -1470,6 +1529,7 @@ mod tests {
             5,
             5,
             &AllocHint::default(),
+            &pctx,
         )
         .unwrap();
 
@@ -1484,7 +1544,7 @@ mod tests {
         }
 
         // Mark blocks 3-7 as written, spanning both extents.
-        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 3, 5).unwrap();
+        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 3, 5, &pctx).unwrap();
 
         // Block 1 should still be unwritten (left residual of first extent).
         match ffs_btree::search(&cx, &dev, &root, 1).unwrap() {
@@ -1528,6 +1588,7 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
         // Allocate three adjacent unwritten extents: [0-3], [4-7], [8-11].
         for i in 0..3 {
@@ -1540,12 +1601,13 @@ mod tests {
                 i * 4,
                 4,
                 &AllocHint::default(),
+                &pctx,
             )
             .unwrap();
         }
 
         // Mark the entire range as written.
-        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 0, 12).unwrap();
+        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 0, 12, &pctx).unwrap();
 
         // All blocks should now be written.
         for block in [0, 3, 4, 7, 8, 11] {
@@ -1568,6 +1630,7 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
         // [0-9] unwritten, [10-19] unwritten.
         allocate_unwritten_extent(
@@ -1579,6 +1642,7 @@ mod tests {
             0,
             10,
             &AllocHint::default(),
+            &pctx,
         )
         .unwrap();
         allocate_unwritten_extent(
@@ -1590,11 +1654,12 @@ mod tests {
             10,
             10,
             &AllocHint::default(),
+            &pctx,
         )
         .unwrap();
 
         // Mark [7-13] as written — spans tail of first, head of second.
-        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 7, 7).unwrap();
+        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 7, 7, &pctx).unwrap();
 
         // Blocks 0-6: unwritten (left residual of first extent).
         match ffs_btree::search(&cx, &dev, &root, 3).unwrap() {
@@ -1630,6 +1695,7 @@ mod tests {
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
         let mut root = empty_root();
+        let pctx = mock_pctx();
 
         let initial_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
 
@@ -1643,12 +1709,13 @@ mod tests {
             0,
             10,
             &AllocHint::default(),
+            &pctx,
         )
         .unwrap();
         assert!(mapping.unwritten);
 
         // Step 2: mark blocks 0-4 as written.
-        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 0, 5).unwrap();
+        mark_written(&cx, &dev, &mut root, &geo, &mut groups, 0, 5, &pctx).unwrap();
 
         // Verify: blocks 0-4 written, blocks 5-9 still unwritten.
         match ffs_btree::search(&cx, &dev, &root, 2).unwrap() {
@@ -1661,7 +1728,7 @@ mod tests {
         }
 
         // Step 3: truncate at block 5 — should remove the unwritten tail.
-        let freed = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 5).unwrap();
+        let freed = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 5, &pctx).unwrap();
         assert_eq!(freed, 5);
 
         // Only the written extent [0-4] should remain.
@@ -1675,7 +1742,7 @@ mod tests {
         assert_eq!(count, 1);
 
         // Step 4: truncate everything.
-        let freed = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 0).unwrap();
+        let freed = truncate_extents(&cx, &dev, &mut root, &geo, &mut groups, 0, &pctx).unwrap();
         assert_eq!(freed, 5);
 
         // All blocks should be freed.

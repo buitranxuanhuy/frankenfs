@@ -3422,28 +3422,34 @@ pub fn parse_dx_root(block: &[u8]) -> Result<Ext4DxRoot, ParseError> {
 ///
 /// The `count_limit_offset` points to a `dx_countlimit` structure (8 bytes),
 /// followed by an array of 8-byte `Ext4DxEntry` structures.
-fn parse_dx_entries(data: &[u8], count_limit_offset: usize) -> Result<Vec<Ext4DxEntry>, ParseError> {
-    if count_limit_offset + 8 > data.len() {
+fn parse_dx_entries(
+    data: &[u8],
+    count_limit_offset: usize,
+) -> Result<Vec<Ext4DxEntry>, ParseError> {
+    if count_limit_offset + 4 > data.len() {
         return Err(ParseError::InsufficientData {
-            needed: count_limit_offset + 8,
+            needed: count_limit_offset + 4,
             offset: 0,
             actual: data.len(),
         });
     }
 
-    // dx_countlimit is 8 bytes:
-    // limit is at count_limit_offset
-    // count is at count_limit_offset + 2
+    // dx_countlimit is 4 bytes: limit(u16), count(u16).
+    let limit = usize::from(read_le_u16(data, count_limit_offset)?);
     let count = usize::from(read_le_u16(data, count_limit_offset + 2)?);
+    if count > limit {
+        return Err(ParseError::InvalidField {
+            field: "dx_count",
+            reason: "count exceeds limit",
+        });
+    }
 
-    // The count includes the dx_countlimit itself (which is the first "entry" in the kernel struct)
-    let actual_entries = count.saturating_sub(1);
-    let mut entries = Vec::with_capacity(actual_entries);
-    
-    // Real entries start after the 8-byte dx_countlimit
-    let mut off = count_limit_offset + 8;
+    // Entries start immediately after dx_countlimit.
+    let mut off = count_limit_offset + 4;
+    let max_entries_in_block = data.len().saturating_sub(off) / 8;
+    let mut entries = Vec::with_capacity(count.min(max_entries_in_block));
 
-    for _ in 0..actual_entries {
+    for _ in 0..count {
         if off + 8 > data.len() {
             break;
         }
@@ -6216,9 +6222,9 @@ mod tests {
         block[0x1E] = 0; // indirect_levels = 0
         block[0x1F] = 0; // unused_flags
 
-        // count/limit at 0x20
-        block[0x20..0x22].copy_from_slice(&3_u16.to_le_bytes()); // count=3
-        block[0x22..0x24].copy_from_slice(&100_u16.to_le_bytes()); // limit=100
+        // count/limit at 0x20 (limit first, then count)
+        block[0x20..0x22].copy_from_slice(&100_u16.to_le_bytes()); // limit=100
+        block[0x22..0x24].copy_from_slice(&3_u16.to_le_bytes()); // count=3
 
         // Entry 0 (sentinel): hash=0, block=1
         block[0x24..0x28].copy_from_slice(&0_u32.to_le_bytes());

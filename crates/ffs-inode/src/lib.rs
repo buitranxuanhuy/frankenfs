@@ -720,6 +720,7 @@ mod tests {
             &mut inode,
             0,
             1_700_000_001,
+            &mock_pctx(),
         )
         .unwrap();
 
@@ -747,6 +748,7 @@ mod tests {
             0x1234_5678,
             1_700_000_000,
             0,
+            &mock_pctx(),
         )
         .unwrap();
 
@@ -958,6 +960,7 @@ mod tests {
         let dev = MemBlockDevice::new(4096);
         let geo = make_geometry();
         let mut groups = make_groups(&geo);
+        let pctx = mock_pctx();
 
         let mut inos = Vec::new();
         for _ in 0..5 {
@@ -973,6 +976,7 @@ mod tests {
                 0,
                 1_700_000_000,
                 0,
+                &pctx,
             )
             .unwrap();
             inos.push(ino);
@@ -1076,6 +1080,7 @@ mod tests {
             &mut inode,
             0,
             1_700_000_001,
+            &mock_pctx(),
         )
         .unwrap();
 
