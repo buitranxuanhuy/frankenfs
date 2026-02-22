@@ -372,11 +372,7 @@ fn insert_descend(
         let right_extents = extents.split_off(mid);
         let left_extents = extents;
 
-        // Write left half back to original block.
-        let left_data = serialize_leaf_block(block_size, &left_extents);
-        dev.write_block(cx, BlockNumber(block), &left_data)?;
-
-        // Allocate new block for right half.
+        // Allocate new block for right half first to prevent data loss on allocation failure.
         let new_block = alloc.alloc_block(cx)?;
         trace!(
             new_block_num = new_block.0,
@@ -385,6 +381,10 @@ fn insert_descend(
         );
         let right_data = serialize_leaf_block(block_size, &right_extents);
         dev.write_block(cx, new_block, &right_data)?;
+
+        // Write left half back to original block.
+        let left_data = serialize_leaf_block(block_size, &left_extents);
+        dev.write_block(cx, BlockNumber(block), &left_data)?;
         debug!(
             old_node = block,
             new_node = new_block.0,
@@ -423,9 +423,6 @@ fn insert_descend(
                 let right_indexes = indexes.split_off(mid);
                 let left_indexes = indexes;
 
-                let left_data = serialize_index_block(block_size, depth, &left_indexes);
-                dev.write_block(cx, BlockNumber(block), &left_data)?;
-
                 let new_block = alloc.alloc_block(cx)?;
                 trace!(
                     new_block_num = new_block.0,
@@ -434,6 +431,9 @@ fn insert_descend(
                 );
                 let right_data = serialize_index_block(block_size, depth, &right_indexes);
                 dev.write_block(cx, new_block, &right_data)?;
+
+                let left_data = serialize_index_block(block_size, depth, &left_indexes);
+                dev.write_block(cx, BlockNumber(block), &left_data)?;
                 debug!(
                     old_node = block,
                     new_node = new_block.0,
@@ -615,6 +615,7 @@ pub fn delete_range(
     // Multi-level tree: descend, collapse empty children, and refresh separators.
     let mut indexes = parse_index_entries(root_bytes, &header)?;
     let mut all_freed = Vec::new();
+    let mut empty_children = Vec::new();
 
     let mut idx_pos = 0;
     while idx_pos < indexes.len() {
@@ -631,12 +632,7 @@ pub fn delete_range(
         all_freed.extend(child_result.freed_ranges);
 
         if child_result.empty {
-            trace!(
-                freed_block_num = child_block,
-                reason = "empty_subtree",
-                "extent_block_free"
-            );
-            alloc.free_block(cx, BlockNumber(child_block))?;
+            empty_children.push(child_block);
             debug!(
                 merged_nodes = 1_u8,
                 resulting_node = "root",
@@ -661,24 +657,27 @@ pub fn delete_range(
             generation: header.generation,
         };
         write_leaf_root(root_bytes, &empty_header, &[]);
-        trace!(
-            logical_start,
-            count,
-            freed_blocks_count = all_freed.len(),
-            "extent_delete_done"
-        );
-        return Ok(all_freed);
+    } else {
+        let new_header = Ext4ExtentHeader {
+            magic: EXT4_EXTENT_MAGIC,
+            entries: indexes.len() as u16,
+            max_entries: ROOT_MAX_ENTRIES,
+            depth: header.depth,
+            generation: header.generation,
+        };
+        write_index_root(root_bytes, &new_header, &indexes);
+        maybe_shrink_root(cx, dev, root_bytes, alloc)?;
     }
 
-    let new_header = Ext4ExtentHeader {
-        magic: EXT4_EXTENT_MAGIC,
-        entries: indexes.len() as u16,
-        max_entries: ROOT_MAX_ENTRIES,
-        depth: header.depth,
-        generation: header.generation,
-    };
-    write_index_root(root_bytes, &new_header, &indexes);
-    maybe_shrink_root(cx, dev, root_bytes, alloc)?;
+    for child_block in empty_children {
+        trace!(
+            freed_block_num = child_block,
+            reason = "empty_subtree",
+            "extent_block_free"
+        );
+        alloc.free_block(cx, BlockNumber(child_block))?;
+    }
+
     trace!(
         logical_start,
         count,
@@ -736,6 +735,7 @@ fn delete_range_subtree(
     } else {
         let mut indexes = parse_index_entries(data, &header)?;
         let mut all_freed = Vec::new();
+        let mut empty_children = Vec::new();
         let mut idx_pos = 0;
         while idx_pos < indexes.len() {
             let child_block = indexes[idx_pos].leaf_block;
@@ -751,12 +751,7 @@ fn delete_range_subtree(
             all_freed.extend(child_result.freed_ranges);
 
             if child_result.empty {
-                trace!(
-                    freed_block_num = child_block,
-                    reason = "empty_subtree",
-                    "extent_block_free"
-                );
-                alloc.free_block(cx, BlockNumber(child_block))?;
+                empty_children.push(child_block);
                 debug!(
                     merged_nodes = 1_u8,
                     resulting_node = block,
@@ -775,6 +770,15 @@ fn delete_range_subtree(
         if !indexes.is_empty() {
             let new_data = serialize_index_block(block_size, depth, &indexes);
             dev.write_block(cx, BlockNumber(block), &new_data)?;
+        }
+
+        for child_block in empty_children {
+            trace!(
+                freed_block_num = child_block,
+                reason = "empty_subtree",
+                "extent_block_free"
+            );
+            alloc.free_block(cx, BlockNumber(child_block))?;
         }
 
         Ok(DeleteSubtreeResult {
