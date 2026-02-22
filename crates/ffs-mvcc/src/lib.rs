@@ -1100,6 +1100,20 @@ impl MvccStore {
         VersionData::Full(new_bytes.to_vec())
     }
 
+    /// Advance the internal transaction and commit counters so the next
+    /// allocated IDs are at least `last_commit + 1` and `last_txn + 1`.
+    ///
+    /// Used during checkpoint / WAL replay to restore counter state.
+    pub(crate) fn advance_counters(&mut self, last_commit: u64, last_txn: u64) {
+        self.next_commit = self.next_commit.max(last_commit.saturating_add(1));
+        self.next_txn = self.next_txn.max(last_txn.saturating_add(1));
+    }
+
+    /// Insert pre-built version chains for a block during checkpoint loading.
+    pub(crate) fn insert_versions(&mut self, block: BlockNumber, versions: Vec<BlockVersion>) {
+        self.versions.entry(block).or_default().extend(versions);
+    }
+
     fn validate_ssi_read_set(&self, txn: &Transaction) -> Result<u64, CommitError> {
         if txn.writes.is_empty() {
             return Ok(0);

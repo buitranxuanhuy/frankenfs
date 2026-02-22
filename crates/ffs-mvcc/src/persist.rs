@@ -21,7 +21,7 @@
 //! - WAL replay is idempotent and deterministic.
 //! - Partial/corrupted WAL tail records are safely ignored.
 
-use crate::wal::{self, DecodeResult, HEADER_SIZE, WalCommit, WalHeader, WalWrite};
+use crate::wal::{self, DecodeResult, HEADER_SIZE, WalCommit, WalHeader};
 use crate::{BlockVersion, CommitError, MvccStore, Transaction};
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
@@ -798,7 +798,7 @@ fn load_checkpoint(path: &Path, store: &mut MvccStore) -> Result<()> {
             let version_data = if store.compression_policy().dedup_identical {
                 let is_identical = !versions.is_empty() && {
                     let last_idx = versions.len() - 1;
-                    crate::compression::resolve_data_with(&versions, last_idx, |v| &v.data)
+                    crate::compression::resolve_data_with(&versions, last_idx, |v: &BlockVersion| &v.data)
                         == Some(data.as_slice())
                 };
                 if is_identical {
