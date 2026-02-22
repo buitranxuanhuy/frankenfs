@@ -3286,6 +3286,59 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
                     }
                 }
 
+                // Attempt RaptorQ block-symbol recovery for non-superblock
+                // corruption in the fsck --repair path.
+                if count_blocks_at_severity_or_higher(&report, Severity::Error) > 0 {
+                    match discover_btrfs_repair_group_specs(path, block_size) {
+                        Ok(btrfs_specs) if !btrfs_specs.is_empty() => {
+                            match recover_btrfs_corrupt_blocks(
+                                path,
+                                block_size,
+                                sb.fsid,
+                                &btrfs_specs,
+                                &report,
+                                &mut limitations,
+                            ) {
+                                Ok((recovered, _unrecovered, _repaired_groups)) => {
+                                    if recovered > 0 {
+                                        btrfs_repair_attempted = true;
+                                        btrfs_repair_performed = true;
+                                        verify_after_repair_writes = true;
+                                        append_btrfs_repair_detail(
+                                            &mut btrfs_repair_detail,
+                                            format!(
+                                                "recovered {recovered} btrfs block(s) via RaptorQ symbol reconstruction"
+                                            ),
+                                        );
+                                    }
+                                }
+                                Err(error) => {
+                                    btrfs_repair_attempted = true;
+                                    let detail = format!(
+                                        "btrfs block-symbol recovery attempt failed: {error:#}"
+                                    );
+                                    append_btrfs_repair_detail(
+                                        &mut btrfs_repair_detail,
+                                        detail.clone(),
+                                    );
+                                    limitations.push(detail);
+                                }
+                            }
+                        }
+                        Ok(_) => {
+                            limitations.push(
+                                "no btrfs block groups discovered; fsck block-symbol recovery skipped"
+                                    .to_owned(),
+                            );
+                        }
+                        Err(error) => {
+                            limitations.push(format!(
+                                "failed to discover btrfs repair group layout for fsck: {error:#}"
+                            ));
+                        }
+                    }
+                }
+
                 if !btrfs_repair_performed && btrfs_repair_detail.is_none() {
                     if superblock_in_scope {
                         btrfs_repair_detail = Some(
@@ -3309,7 +3362,7 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
                         None,
                         &mut limitations,
                     )
-                    .context("failed to verify btrfs image after fsck superblock repairs")?;
+                    .context("failed to verify btrfs image after fsck repairs")?;
                 }
             }
 
@@ -3729,6 +3782,10 @@ struct BtrfsRepairGroupSpec {
     logical_bytes: u64,
     physical_start_block: BlockNumber,
     physical_block_count: u64,
+    /// Source payload blocks (total minus repair metadata).
+    source_block_count: u32,
+    /// Repair tail layout for RaptorQ symbol storage/recovery.
+    layout: RepairGroupLayout,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3848,6 +3905,7 @@ fn append_btrfs_repair_detail(detail: &mut Option<String>, message: impl Into<St
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn repair_corrupt_btrfs_superblock_mirrors_from_primary(
     path: &PathBuf,
     block_size: u32,
@@ -3996,7 +4054,7 @@ fn repair_corrupt_btrfs_superblock_mirrors_from_primary(
     outcome.repaired = u32::try_from(repaired_offsets.len()).unwrap_or(u32::MAX);
     let offsets = repaired_offsets
         .iter()
-        .map(|offset| offset.to_string())
+        .map(u64::to_string)
         .collect::<Vec<_>>()
         .join(", ");
     limitations.push(format!(
@@ -4226,12 +4284,41 @@ fn build_btrfs_repair_group_spec(
         bail!("btrfs block group {group} maps to zero scrub blocks");
     }
 
+    let blocks_per_group = u32::try_from(block_count).with_context(|| {
+        format!("btrfs block group {group} block count does not fit u32 ({block_count})")
+    })?;
+    // Compute tail layout for RaptorQ repair symbols (same scheme as ext4).
+    let source_and_repair_budget = if blocks_per_group > REPAIR_DESC_SLOT_COUNT + 1 {
+        blocks_per_group.saturating_sub(REPAIR_DESC_SLOT_COUNT)
+    } else {
+        // Group too small for repair metadata — treat entire span as source.
+        blocks_per_group
+    };
+    let desired_repair = RepairGroupDescExt::compute_repair_block_count(
+        source_and_repair_budget,
+        DEFAULT_REPAIR_OVERHEAD_RATIO,
+    )
+    .max(1);
+    let repair_block_count = desired_repair
+        .min(source_and_repair_budget.saturating_sub(1))
+        .max(1);
+    let source_block_count = source_and_repair_budget.saturating_sub(repair_block_count);
+    let layout = RepairGroupLayout::new(
+        GroupNumber(group),
+        BlockNumber(start_block),
+        blocks_per_group,
+        DEFAULT_REPAIR_VALIDATION_BLOCK_COUNT,
+        repair_block_count,
+    )?;
+
     Ok(BtrfsRepairGroupSpec {
         group,
         logical_start,
         logical_bytes,
         physical_start_block: BlockNumber(start_block),
         physical_block_count: block_count,
+        source_block_count,
+        layout,
     })
 }
 
@@ -4563,6 +4650,217 @@ fn recover_ext4_corrupt_blocks(
     }
 
     Ok((recovered_blocks, unrecovered_blocks, repaired_groups))
+}
+
+/// Group corrupt blocks from a scrub report into btrfs block-group buckets.
+fn group_btrfs_corrupt_blocks(
+    report: &ScrubReport,
+    specs: &[BtrfsRepairGroupSpec],
+) -> (BTreeMap<u32, Vec<BlockNumber>>, u64) {
+    let mut grouped: BTreeMap<u32, Vec<BlockNumber>> = BTreeMap::new();
+    let mut outside_source_ranges = 0_u64;
+
+    for block in corrupt_blocks_at_error_or_higher(report) {
+        if let Some(spec) = specs.iter().find(|spec| {
+            let start = spec.physical_start_block.0;
+            let end = start.saturating_add(u64::from(spec.source_block_count));
+            block.0 >= start && block.0 < end
+        }) {
+            grouped.entry(spec.group).or_default().push(block);
+        } else {
+            outside_source_ranges = outside_source_ranges.saturating_add(1);
+        }
+    }
+
+    (grouped, outside_source_ranges)
+}
+
+/// Attempt RaptorQ symbol reconstruction for corrupt btrfs blocks.
+fn recover_btrfs_corrupt_blocks(
+    path: &PathBuf,
+    block_size: u32,
+    fs_uuid: [u8; 16],
+    specs: &[BtrfsRepairGroupSpec],
+    report: &ScrubReport,
+    limitations: &mut Vec<String>,
+) -> Result<(u64, u64, Vec<u32>)> {
+    let cx = cli_cx();
+    let byte_dev = FileByteDevice::open(path)
+        .with_context(|| format!("failed to open image: {}", path.display()))?;
+    let block_dev = ByteBlockDevice::new(byte_dev, block_size)
+        .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
+
+    let (grouped, outside_source_ranges) = group_btrfs_corrupt_blocks(report, specs);
+    if outside_source_ranges > 0 {
+        limitations.push(format!(
+            "{outside_source_ranges} corrupt block(s) were outside btrfs source repair ranges and \
+             could not be reconstructed with block symbols"
+        ));
+    }
+
+    let mut recovered_blocks = 0_u64;
+    let mut unrecovered_blocks = 0_u64;
+    let mut repaired_groups = Vec::new();
+
+    for (group, corrupt_blocks) in grouped {
+        let spec = specs
+            .iter()
+            .find(|spec| spec.group == group)
+            .ok_or_else(|| {
+                anyhow::anyhow!("btrfs recovery group {group} missing from computed repair layout")
+            })?;
+        let orchestrator = GroupRecoveryOrchestrator::new(
+            &block_dev,
+            fs_uuid,
+            spec.layout,
+            spec.physical_start_block,
+            spec.source_block_count,
+        )
+        .with_context(|| {
+            format!("failed to create recovery orchestrator for btrfs group {group}")
+        })?;
+
+        let outcome = orchestrator.recover_from_corrupt_blocks(&cx, &corrupt_blocks);
+        let repaired = u64::try_from(outcome.repaired_blocks.len()).unwrap_or(u64::MAX);
+        let corrupt = u64::try_from(corrupt_blocks.len()).unwrap_or(u64::MAX);
+        let unrecovered = corrupt.saturating_sub(repaired);
+        recovered_blocks = recovered_blocks.saturating_add(repaired);
+        unrecovered_blocks = unrecovered_blocks.saturating_add(unrecovered);
+        if repaired > 0 {
+            repaired_groups.push(group);
+        }
+
+        if outcome.evidence.outcome != RecoveryOutcome::Recovered || unrecovered > 0 {
+            let reason = outcome.evidence.reason.as_deref().unwrap_or("unspecified");
+            limitations.push(format!(
+                "btrfs group {group} recovery outcome={:?} recovered={repaired} unrecovered={unrecovered} reason={reason}",
+                outcome.evidence.outcome
+            ));
+        }
+    }
+
+    Ok((recovered_blocks, unrecovered_blocks, repaired_groups))
+}
+
+/// Re-encode RaptorQ repair symbols for the given btrfs block groups after
+/// recovery, mirroring the ext4 symbol-rebuild workflow.
+#[allow(clippy::too_many_lines)]
+fn rebuild_btrfs_repair_symbols(
+    path: &PathBuf,
+    block_size: u32,
+    fs_uuid: [u8; 16],
+    specs: &[BtrfsRepairGroupSpec],
+    groups: &[u32],
+    limitations: &mut Vec<String>,
+) -> Result<(u64, u64)> {
+    if groups.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let cx = cli_cx();
+    let byte_dev = FileByteDevice::open(path)
+        .with_context(|| format!("failed to open image: {}", path.display()))?;
+    let block_dev = ByteBlockDevice::new(byte_dev, block_size)
+        .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
+    let spec_by_group: BTreeMap<u32, &BtrfsRepairGroupSpec> =
+        specs.iter().map(|spec| (spec.group, spec)).collect();
+
+    let mut unique_groups = BTreeSet::new();
+    unique_groups.extend(groups.iter().copied());
+
+    let mut rebuilt_groups = 0_u64;
+    let mut failed_groups = 0_u64;
+    for group in unique_groups {
+        let Some(spec) = spec_by_group.get(&group).copied() else {
+            failed_groups = failed_groups.saturating_add(1);
+            limitations.push(format!(
+                "cannot rebuild symbols for btrfs group {group}: group layout is unavailable"
+            ));
+            continue;
+        };
+
+        let encoded = match encode_group(
+            &cx,
+            &block_dev,
+            &fs_uuid,
+            GroupNumber(group),
+            spec.physical_start_block,
+            spec.source_block_count,
+            spec.layout.repair_block_count,
+        ) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                failed_groups = failed_groups.saturating_add(1);
+                limitations.push(format!(
+                    "failed to encode repair symbols for btrfs group {group}: {error}"
+                ));
+                continue;
+            }
+        };
+
+        let Ok(symbol_size) = u16::try_from(encoded.symbol_size) else {
+            failed_groups = failed_groups.saturating_add(1);
+            limitations.push(format!(
+                "cannot rebuild symbols for btrfs group {group}: symbol_size {} exceeds u16",
+                encoded.symbol_size
+            ));
+            continue;
+        };
+        let Ok(source_block_count_u16) = u16::try_from(encoded.source_block_count) else {
+            failed_groups = failed_groups.saturating_add(1);
+            limitations.push(format!(
+                "cannot rebuild symbols for btrfs group {group}: source_block_count {} exceeds u16",
+                encoded.source_block_count
+            ));
+            continue;
+        };
+
+        let storage = RepairGroupStorage::new(&block_dev, spec.layout);
+        let current_generation = if let Ok(desc) = storage.read_group_desc_ext(&cx) {
+            desc.repair_generation
+        } else {
+            let bootstrap = RepairGroupDescExt {
+                transfer_length: u64::from(encoded.source_block_count)
+                    .saturating_mul(u64::from(encoded.symbol_size)),
+                symbol_size,
+                source_block_count: source_block_count_u16,
+                sub_blocks: 1,
+                symbol_alignment: 4,
+                repair_start_block: spec.layout.repair_start_block(),
+                repair_block_count: spec.layout.repair_block_count,
+                repair_generation: 0,
+                checksum: 0,
+            };
+            if let Err(error) = storage.write_group_desc_ext(&cx, &bootstrap) {
+                failed_groups = failed_groups.saturating_add(1);
+                limitations.push(format!(
+                    "failed to bootstrap repair descriptor for btrfs group {group}: {error}"
+                ));
+                continue;
+            }
+            0
+        };
+
+        let symbols: Vec<(u32, Vec<u8>)> = encoded
+            .repair_symbols
+            .into_iter()
+            .map(|symbol| (symbol.esi, symbol.data))
+            .collect();
+        let new_generation = current_generation.saturating_add(1).max(1);
+        match storage.write_repair_symbols(&cx, &symbols, new_generation) {
+            Ok(()) => {
+                rebuilt_groups = rebuilt_groups.saturating_add(1);
+            }
+            Err(error) => {
+                failed_groups = failed_groups.saturating_add(1);
+                limitations.push(format!(
+                    "failed to publish rebuilt symbols for btrfs group {group}: {error}"
+                ));
+            }
+        }
+    }
+
+    Ok((rebuilt_groups, failed_groups))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4990,12 +5288,6 @@ fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Result<
                         .to_owned(),
                 );
             }
-            if rebuild_symbols_requested {
-                limitations.push(
-                    "--rebuild-symbols currently applies to ext4 images only; skipping btrfs symbol rebuild"
-                        .to_owned(),
-                );
-            }
 
             let block_size = choose_btrfs_scrub_block_size(image_len, sb.nodesize, sb.sectorsize)
                 .with_context(|| {
@@ -5102,6 +5394,93 @@ fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Result<
                 }
             }
 
+            // Attempt RaptorQ block-symbol recovery for non-superblock corruption.
+            let mut btrfs_repaired_groups: Vec<u32> = Vec::new();
+            let mut btrfs_specs_for_rebuild: Vec<BtrfsRepairGroupSpec> = Vec::new();
+            if !flags.verify_only()
+                && count_blocks_at_severity_or_higher(&report, Severity::Error) > 0
+            {
+                match discover_btrfs_repair_group_specs(path, block_size) {
+                    Ok(btrfs_specs) if !btrfs_specs.is_empty() => {
+                        btrfs_specs_for_rebuild.clone_from(&btrfs_specs);
+                        match recover_btrfs_corrupt_blocks(
+                            path,
+                            block_size,
+                            sb.fsid,
+                            &btrfs_specs,
+                            &report,
+                            &mut limitations,
+                        ) {
+                            Ok((recovered, unrecovered, repaired_groups)) => {
+                                stats.recovery_attempted = true;
+                                stats.recovery_unrecovered_blocks = unrecovered;
+                                btrfs_repaired_groups = repaired_groups;
+                                if recovered > 0 {
+                                    verify_after_repair_writes = true;
+                                }
+                            }
+                            Err(error) => {
+                                stats.recovery_attempted = true;
+                                limitations.push(format!(
+                                    "btrfs block-symbol recovery attempt failed: {error:#}"
+                                ));
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        limitations.push(
+                            "no btrfs block groups discovered; block-symbol recovery skipped"
+                                .to_owned(),
+                        );
+                    }
+                    Err(error) => {
+                        limitations.push(format!(
+                            "failed to discover btrfs repair group layout: {error:#}"
+                        ));
+                    }
+                }
+            }
+
+            // Rebuild repair symbols for repaired groups or on explicit request.
+            if !flags.verify_only() {
+                let rebuild_groups = if rebuild_symbols_requested {
+                    // --rebuild-symbols: discover all groups and rebuild.
+                    if btrfs_specs_for_rebuild.is_empty() {
+                        btrfs_specs_for_rebuild =
+                            discover_btrfs_repair_group_specs(path, block_size).unwrap_or_default();
+                    }
+                    btrfs_specs_for_rebuild
+                        .iter()
+                        .map(|spec| spec.group)
+                        .collect::<Vec<_>>()
+                } else {
+                    btrfs_repaired_groups
+                };
+                if !rebuild_groups.is_empty() {
+                    stats.symbol_rebuild_attempted = true;
+                    match rebuild_btrfs_repair_symbols(
+                        path,
+                        block_size,
+                        sb.fsid,
+                        &btrfs_specs_for_rebuild,
+                        &rebuild_groups,
+                        &mut limitations,
+                    ) {
+                        Ok((rebuilt, failed)) => {
+                            stats.symbol_rebuild_groups = rebuilt;
+                            stats.symbol_rebuild_failed_groups = failed;
+                            if rebuilt > 0 {
+                                verify_after_repair_writes = true;
+                            }
+                        }
+                        Err(error) => {
+                            limitations
+                                .push(format!("btrfs symbol rebuild attempt failed: {error:#}"));
+                        }
+                    }
+                }
+            }
+
             if !flags.verify_only() && verify_after_repair_writes {
                 report = scrub_range_for_repair(
                     path,
@@ -5112,7 +5491,7 @@ fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Result<
                     options.max_threads,
                     &mut limitations,
                 )
-                .context("failed to verify btrfs image after superblock repairs")?;
+                .context("failed to verify btrfs image after repairs")?;
             }
 
             (scope, report, stats)
@@ -6752,14 +7131,20 @@ mod tests {
 
     #[test]
     fn btrfs_repair_group_spec_maps_contiguous_single_chunk() {
-        let chunks = vec![test_btrfs_chunk_entry(0x1000, 0x4000, 0x8000)];
-        let spec = build_btrfs_repair_group_spec(2, 0x2000, 0x1000, 4096, &chunks)
+        // Group must be large enough for the repair tail (>= 4 blocks):
+        // REPAIR_DESC_SLOT_COUNT (2) + at least 1 repair block + source blocks.
+        // Chunk covers [0x1000..0x20FFF], group occupies [0x2000..0x11FFF] (16 blocks).
+        let chunks = vec![test_btrfs_chunk_entry(0x1000, 0x20000, 0x8000)];
+        let spec = build_btrfs_repair_group_spec(2, 0x2000, 0x10000, 4096, &chunks)
             .expect("map contiguous btrfs group");
         assert_eq!(spec.group, 2);
         assert_eq!(spec.logical_start, 0x2000);
-        assert_eq!(spec.logical_bytes, 0x1000);
+        assert_eq!(spec.logical_bytes, 0x10000);
+        // physical_start = chunk_physical + (logical_start - chunk_logical) = 0x8000 + (0x2000 - 0x1000) = 0x9000
+        // start_block = 0x9000 / 4096 = 9
         assert_eq!(spec.physical_start_block.0, 9);
-        assert_eq!(spec.physical_block_count, 1);
+        // block_count = 0x10000 / 4096 = 16
+        assert_eq!(spec.physical_block_count, 16);
     }
 
     #[test]
