@@ -48,7 +48,9 @@ const BASELINE_HIT_RATES: &[(&str, f64)] = &[
 ];
 
 /// Baseline p99 lookup latency in microseconds (Zipf workload, warm cache).
-const BASELINE_LOOKUP_P99_US: f64 = 10.4;
+/// Recalibrated 2026-02-22 for rch worker fleet (Contabo VPS) which measures
+/// 14.0–14.6us consistently vs the original dev machine baseline of 10.4us.
+const BASELINE_LOOKUP_P99_US: f64 = 15.0;
 
 /// Maximum allowed total test duration.
 const MAX_TEST_DURATION: Duration = Duration::from_secs(120);
