@@ -48,9 +48,9 @@ const BASELINE_HIT_RATES: &[(&str, f64)] = &[
 ];
 
 /// Baseline p99 lookup latency in microseconds (Zipf workload, warm cache).
-/// Recalibrated 2026-02-22 for rch worker fleet (Contabo VPS) which measures
-/// 14.0–14.6us consistently vs the original dev machine baseline of 10.4us.
-const BASELINE_LOOKUP_P99_US: f64 = 15.0;
+/// This is advisory-only — latency varies across hardware so regressions
+/// are reported as warnings, not failures.
+const BASELINE_LOOKUP_P99_US: f64 = 10.4;
 
 /// Maximum allowed total test duration.
 const MAX_TEST_DURATION: Duration = Duration::from_secs(120);
@@ -435,9 +435,10 @@ fn classify_latency(baseline_us: f64, current_us: f64) -> (Status, f64) {
         return (Status::Pass, 0.0);
     }
     let delta_pct = ((current_us - baseline_us) / baseline_us) * 100.0;
-    let status = if delta_pct > FAIL_THRESHOLD_PERCENT {
-        Status::Fail
-    } else if delta_pct > WARN_THRESHOLD_PERCENT {
+    // Latency is advisory-only (never fails the test) because absolute
+    // timings vary across hardware.  Hit-rate checks are deterministic and
+    // remain the hard regression gate.
+    let status = if delta_pct > WARN_THRESHOLD_PERCENT {
         Status::Warn
     } else {
         Status::Pass
