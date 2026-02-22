@@ -29,7 +29,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
@@ -42,6 +42,7 @@ const COALESCED_FETCH_MULTIPLIER: u32 = 4;
 const MAX_COALESCED_READ_SIZE: u32 = 256 * 1024;
 const MAX_PENDING_READAHEAD_ENTRIES: usize = 64;
 const MAX_ACCESS_PREDICTOR_ENTRIES: usize = 4096;
+const BACKPRESSURE_THROTTLE_DELAY: Duration = Duration::from_millis(5);
 const XATTR_FLAG_CREATE: i32 = 0x1;
 const XATTR_FLAG_REPLACE: i32 = 0x2;
 
@@ -141,10 +142,9 @@ pub struct MountOptions {
     pub auto_unmount: bool,
     /// Number of worker threads for FUSE dispatch.
     ///
-    /// Currently fuser 0.16 processes requests sequentially; this field
-    /// is reserved for future multi-threaded dispatch (e.g. via
-    /// `Session::run()` clones or a fuser upgrade). A value of 0 means
-    /// "use default" (min(num_cpus, 8) when multi-threading is enabled).
+    /// For explicit non-zero values, FrankenFS maps this to kernel FUSE queue
+    /// tuning (`max_background` and `congestion_threshold`) so mount behavior
+    /// changes under load. A value of `0` means "auto" and uses defaults.
     pub worker_threads: usize,
 }
 
@@ -592,10 +592,23 @@ impl FrankenFuse {
     /// Check backpressure for an operation. Returns `true` if the operation
     /// should be rejected (shed).
     fn should_shed(&self, op: RequestOp) -> bool {
-        self.inner
-            .backpressure
-            .as_ref()
-            .is_some_and(|gate| gate.check(op) == BackpressureDecision::Shed)
+        let Some(gate) = self.inner.backpressure.as_ref() else {
+            return false;
+        };
+
+        match gate.check(op) {
+            BackpressureDecision::Proceed => false,
+            BackpressureDecision::Throttle => {
+                trace!(
+                    ?op,
+                    delay_ms = BACKPRESSURE_THROTTLE_DELAY.as_millis(),
+                    "backpressure: throttling request"
+                );
+                std::thread::sleep(BACKPRESSURE_THROTTLE_DELAY);
+                false
+            }
+            BackpressureDecision::Shed => true,
+        }
     }
 
     /// Create a `Cx` for a FUSE request.
@@ -1666,6 +1679,16 @@ fn build_mount_options(options: &MountOptions) -> Vec<MountOption> {
     if options.auto_unmount {
         opts.push(MountOption::AutoUnmount);
     }
+    if options.worker_threads > 0 {
+        let max_background = options.resolved_thread_count();
+        let congestion_threshold = max_background.saturating_mul(3).saturating_div(4).max(1);
+        opts.push(MountOption::CUSTOM(format!(
+            "max_background={max_background}"
+        )));
+        opts.push(MountOption::CUSTOM(format!(
+            "congestion_threshold={congestion_threshold}"
+        )));
+    }
 
     opts
 }
@@ -1778,10 +1801,24 @@ impl MountHandle {
     #[must_use]
     pub fn wait(mut self) -> MetricsSnapshot {
         info!(mountpoint = %self.mountpoint.display(), "waiting for shutdown signal");
+        let started = Instant::now();
+        let timeout = self.config.unmount_timeout;
         while !self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_millis(100));
+            let elapsed = started.elapsed();
+            if elapsed >= timeout {
+                warn!(
+                    mountpoint = %self.mountpoint.display(),
+                    timeout_ms = timeout.as_millis(),
+                    "shutdown wait timed out; forcing unmount"
+                );
+                break;
+            }
+            let remaining = timeout.saturating_sub(elapsed);
+            std::thread::sleep(std::cmp::min(Duration::from_millis(100), remaining));
         }
-        info!(mountpoint = %self.mountpoint.display(), "shutdown signal received");
+        if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            info!(mountpoint = %self.mountpoint.display(), "shutdown signal received");
+        }
         self.do_unmount()
     }
 
@@ -2858,13 +2895,39 @@ mod tests {
         };
 
         // Set the shutdown flag from another thread after a short delay.
-        std::thread::spawn(move || {
+        let shutdown_thread = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
             shutdown_trigger.store(true, Ordering::Relaxed);
         });
 
         let snap = handle.wait();
+        shutdown_thread
+            .join()
+            .expect("shutdown trigger thread should not panic");
         assert_eq!(snap.requests_ok, 1);
+    }
+
+    #[test]
+    fn mount_handle_wait_respects_unmount_timeout() {
+        let config = MountConfig {
+            options: MountOptions::default(),
+            unmount_timeout: Duration::from_millis(60),
+        };
+        let handle = MountHandle {
+            session: None,
+            mountpoint: PathBuf::from("/mnt/timeout"),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            metrics: Arc::new(AtomicMetrics::new()),
+            config: config.clone(),
+        };
+
+        let started = Instant::now();
+        let snap = handle.wait();
+        let elapsed = started.elapsed();
+
+        assert_eq!(snap.requests_total, 0);
+        assert!(elapsed >= config.unmount_timeout);
+        assert!(elapsed < Duration::from_millis(500));
     }
 
     // ── FuseErrorContext errno mapping for all 21 variants (bd-2s4.6) ──
@@ -3007,6 +3070,46 @@ mod tests {
         assert!(has_allow, "AllowOther should be present");
     }
 
+    #[test]
+    fn build_mount_options_includes_queue_tuning_when_worker_threads_explicit() {
+        let opts = MountOptions {
+            read_only: true,
+            allow_other: false,
+            auto_unmount: true,
+            worker_threads: 8,
+        };
+        let mount_opts = build_mount_options(&opts);
+        assert!(
+            mount_opts
+                .iter()
+                .any(|o| matches!(o, MountOption::CUSTOM(v) if v == "max_background=8"))
+        );
+        assert!(
+            mount_opts
+                .iter()
+                .any(|o| matches!(o, MountOption::CUSTOM(v) if v == "congestion_threshold=6"))
+        );
+    }
+
+    #[test]
+    fn build_mount_options_auto_worker_threads_omits_queue_tuning() {
+        let opts = MountOptions {
+            read_only: true,
+            allow_other: false,
+            auto_unmount: true,
+            worker_threads: 0,
+        };
+        let mount_opts = build_mount_options(&opts);
+        assert!(
+            !mount_opts
+                .iter()
+                .any(|o| matches!(o, MountOption::CUSTOM(v) if v.starts_with("max_background=")))
+        );
+        assert!(!mount_opts.iter().any(
+            |o| matches!(o, MountOption::CUSTOM(v) if v.starts_with("congestion_threshold="))
+        ));
+    }
+
     // ── should_shed backpressure tests ───────────────────────────────────
 
     #[test]
@@ -3072,6 +3175,25 @@ mod tests {
         assert!(!fuse.should_shed(RequestOp::Write));
         assert!(!fuse.should_shed(RequestOp::Create));
         assert!(!fuse.should_shed(RequestOp::Mkdir));
+    }
+
+    #[test]
+    fn should_shed_with_degraded_gate_throttles_without_shedding() {
+        use asupersync::SystemPressure;
+        use ffs_core::DegradationFsm;
+
+        // Degraded level: headroom 0.2 -> writes are throttled (not shed).
+        let pressure = Arc::new(SystemPressure::with_headroom(0.2));
+        let fsm = Arc::new(DegradationFsm::new(Arc::clone(&pressure), 1));
+        fsm.tick();
+        let gate = BackpressureGate::new(fsm);
+
+        let opts = MountOptions::default();
+        let fuse = FrankenFuse::with_backpressure(Box::new(StubFs), &opts, gate);
+
+        let start = std::time::Instant::now();
+        assert!(!fuse.should_shed(RequestOp::Write));
+        assert!(start.elapsed() >= BACKPRESSURE_THROTTLE_DELAY);
     }
 
     // ── AccessPredictor backward sequence detection ──────────────────────
