@@ -16,7 +16,7 @@ use ffs_ondisk::{
     parse_dx_root, parse_extent_tree, parse_inode_extent_tree, verify_btrfs_superblock_checksum,
 };
 use ffs_repair::codec::encode_group;
-use ffs_repair::evidence::{self, EvidenceEventType, EvidenceRecord};
+use ffs_repair::evidence::{EvidenceEventType, EvidenceRecord};
 use ffs_repair::recovery::{GroupRecoveryOrchestrator, RecoveryOutcome};
 use ffs_repair::scrub::{
     BlockValidator, BtrfsSuperblockValidator, BtrfsTreeBlockValidator, CompositeValidator,
@@ -29,9 +29,11 @@ use ffs_types::{
     EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, GroupNumber, InodeNumber,
 };
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env::VarError;
 use std::fmt::Write;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::Instant;
 use tracing::{error, info, info_span};
@@ -1476,17 +1478,12 @@ fn superblock_info_for(flavor: &FsFlavor) -> SuperblockInfoOutput {
 }
 
 fn build_ext4_group_info(path: &PathBuf, sb: &Ext4Superblock) -> Result<Vec<Ext4GroupInfoOutput>> {
-    let image = std::fs::read(path)
-        .with_context(|| format!("failed to read ext4 image: {}", path.display()))?;
-    let reader = Ext4ImageReader::new(&image).context("failed to parse ext4 superblock")?;
     let groups_count = sb.groups_count();
     let mut groups = Vec::with_capacity(usize::try_from(groups_count).unwrap_or(0));
     let inodes_total = u64::from(sb.inodes_count);
 
     for group in 0..groups_count {
-        let desc = reader
-            .read_group_desc(&image, GroupNumber(group))
-            .with_context(|| format!("failed to read ext4 group descriptor {group}"))?;
+        let (desc, _raw_desc) = read_ext4_group_desc_from_path(path, sb, group)?;
 
         let block_start = u64::from(sb.first_data_block)
             .saturating_add(u64::from(group).saturating_mul(u64::from(sb.blocks_per_group)));
@@ -1941,25 +1938,22 @@ fn dump_superblock_cmd(path: &PathBuf, json: bool, hex: bool) -> Result<()> {
     let cx = cli_cx();
     let flavor = detect_filesystem_at_path(&cx, path)
         .with_context(|| format!("failed to detect ext4/btrfs metadata in {}", path.display()))?;
-    let image = std::fs::read(path)
-        .with_context(|| format!("failed to read filesystem image: {}", path.display()))?;
 
     let raw_hex = if hex {
-        let bytes = match &flavor {
-            FsFlavor::Ext4(_) => checked_slice(
-                &image,
+        let (offset, len, label) = match &flavor {
+            FsFlavor::Ext4(_) => (
                 EXT4_SUPERBLOCK_OFFSET,
                 EXT4_SUPERBLOCK_SIZE,
                 "ext4 superblock",
-            )?,
-            FsFlavor::Btrfs(_) => checked_slice(
-                &image,
+            ),
+            FsFlavor::Btrfs(_) => (
                 BTRFS_SUPER_INFO_OFFSET,
                 BTRFS_SUPER_INFO_SIZE,
                 "btrfs superblock",
-            )?,
+            ),
         };
-        Some(bytes_to_hex_dump(bytes))
+        let bytes = read_file_region(path, offset, len, label)?;
+        Some(bytes_to_hex_dump(&bytes))
     } else {
         None
     };
@@ -2009,15 +2003,11 @@ fn dump_group_cmd(group: u32, path: &PathBuf, json: bool, hex: bool) -> Result<(
     let started = Instant::now();
     info!(target: "ffs::cli::dump::group", "dump_group_start");
 
-    let (image, reader) = load_ext4_reader(path, "dump group")?;
-    let desc = reader
-        .read_group_desc(&image, GroupNumber(group))
-        .with_context(|| format!("failed to read group descriptor {group}"))?;
+    let sb = ext4_superblock_for_action(path, "dump group")?;
+    let (desc, raw_desc) = read_ext4_group_desc_from_path(path, &sb, group)?;
 
     let raw_hex = if hex {
-        Some(bytes_to_hex_dump(&read_ext4_raw_group_desc(
-            &image, &reader, group,
-        )?))
+        Some(bytes_to_hex_dump(&raw_desc))
     } else {
         None
     };
@@ -2072,6 +2062,16 @@ fn dump_group_cmd(group: u32, path: &PathBuf, json: bool, hex: bool) -> Result<(
     Ok(())
 }
 
+fn ext4_superblock_for_action(path: &PathBuf, action: &str) -> Result<Ext4Superblock> {
+    let cx = cli_cx();
+    let flavor = detect_filesystem_at_path(&cx, path)
+        .with_context(|| format!("failed to detect ext4/btrfs metadata in {}", path.display()))?;
+    match flavor {
+        FsFlavor::Ext4(sb) => Ok(sb),
+        FsFlavor::Btrfs(_) => bail!("{action} currently supports ext4 images only"),
+    }
+}
+
 fn dump_inode_cmd(inode: u64, path: &PathBuf, json: bool, hex: bool) -> Result<()> {
     let command_span = info_span!(
         target: "ffs::cli::dump::inode",
@@ -2085,18 +2085,13 @@ fn dump_inode_cmd(inode: u64, path: &PathBuf, json: bool, hex: bool) -> Result<(
     let started = Instant::now();
     info!(target: "ffs::cli::dump::inode", "dump_inode_start");
 
-    let (image, reader) = load_ext4_reader(path, "dump inode")?;
+    let sb = ext4_superblock_for_action(path, "dump inode")?;
     let inode_number = InodeNumber(inode);
-    let parsed = reader
-        .read_inode(&image, inode_number)
+    let (parsed, raw_inode) = read_ext4_inode_from_path(path, &sb, inode_number)
         .with_context(|| format!("failed to read inode {inode}"))?;
 
     let raw_hex = if hex {
-        Some(bytes_to_hex_dump(&read_ext4_raw_inode(
-            &image,
-            &reader,
-            inode_number,
-        )?))
+        Some(bytes_to_hex_dump(&raw_inode))
     } else {
         None
     };
@@ -2420,50 +2415,77 @@ fn load_ext4_reader(path: &PathBuf, action: &str) -> Result<(Vec<u8>, Ext4ImageR
     Ok((image, reader))
 }
 
-fn read_ext4_raw_group_desc(image: &[u8], reader: &Ext4ImageReader, group: u32) -> Result<Vec<u8>> {
+fn read_ext4_group_desc_from_path(
+    path: &PathBuf,
+    sb: &Ext4Superblock,
+    group: u32,
+) -> Result<(Ext4GroupDesc, Vec<u8>)> {
     let group_number = GroupNumber(group);
-    let offset_u64 = reader
-        .sb
+    let offset_u64 = sb
         .group_desc_offset(group_number)
         .ok_or_else(|| anyhow::anyhow!("group descriptor offset overflow for group {group}"))?;
     let offset = usize::try_from(offset_u64)
         .with_context(|| format!("group descriptor offset does not fit usize for group {group}"))?;
-    let desc_size = usize::from(reader.sb.group_desc_size());
-    Ok(checked_slice(image, offset, desc_size, "group descriptor")?.to_vec())
+    let desc_size = sb.group_desc_size();
+    let raw_desc = read_file_region(
+        path,
+        offset,
+        usize::from(desc_size),
+        "ext4 group descriptor",
+    )
+    .with_context(|| format!("failed to read ext4 group descriptor {group}"))?;
+    let desc = Ext4GroupDesc::parse_from_bytes(&raw_desc, desc_size)
+        .with_context(|| format!("failed to parse ext4 group descriptor {group}"))?;
+    Ok((desc, raw_desc))
 }
 
-fn read_ext4_raw_inode(
-    image: &[u8],
-    reader: &Ext4ImageReader,
+fn read_ext4_inode_from_path(
+    path: &PathBuf,
+    sb: &Ext4Superblock,
     inode: InodeNumber,
-) -> Result<Vec<u8>> {
-    let location = reader
-        .sb
+) -> Result<(Ext4Inode, Vec<u8>)> {
+    let location = sb
         .locate_inode(inode)
         .with_context(|| format!("failed to locate inode {}", inode.0))?;
-    let group_desc = reader
-        .read_group_desc(image, location.group)
+    let (group_desc, _raw_group_desc) = read_ext4_group_desc_from_path(path, sb, location.group.0)
         .with_context(|| format!("failed to read group descriptor {}", location.group.0))?;
-    let inode_offset = reader
-        .sb
+    let inode_offset = sb
         .inode_device_offset(&location, group_desc.inode_table)
         .with_context(|| format!("failed to compute inode offset for inode {}", inode.0))?;
     let offset = usize::try_from(inode_offset)
         .with_context(|| format!("inode offset does not fit usize for inode {}", inode.0))?;
-    let inode_size = usize::from(reader.sb.inode_size);
-    Ok(checked_slice(image, offset, inode_size, "inode bytes")?.to_vec())
+    let inode_size = usize::from(sb.inode_size);
+    let raw_inode = read_file_region(path, offset, inode_size, "ext4 inode")
+        .with_context(|| format!("failed to read raw inode bytes for inode {}", inode.0))?;
+    let parsed = Ext4Inode::parse_from_bytes(&raw_inode)
+        .with_context(|| format!("failed to parse inode {}", inode.0))?;
+    Ok((parsed, raw_inode))
 }
 
-fn checked_slice<'a>(bytes: &'a [u8], offset: usize, len: usize, label: &str) -> Result<&'a [u8]> {
-    let end = offset
-        .checked_add(len)
+fn read_file_region(path: &PathBuf, offset: usize, len: usize, label: &str) -> Result<Vec<u8>> {
+    let mut file = File::open(path)
+        .with_context(|| format!("failed to open filesystem image: {}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .with_context(|| format!("failed to stat filesystem image: {}", path.display()))?
+        .len();
+    let offset_u64 = u64::try_from(offset)
+        .with_context(|| format!("{label} offset does not fit in u64 (offset={offset})"))?;
+    let len_u64 = u64::try_from(len)
+        .with_context(|| format!("{label} length does not fit in u64 (len={len})"))?;
+    let end = offset_u64
+        .checked_add(len_u64)
         .ok_or_else(|| anyhow::anyhow!("{label} region overflow (offset={offset}, len={len})"))?;
-    bytes.get(offset..end).ok_or_else(|| {
-        anyhow::anyhow!(
-            "{label} region out of bounds (offset={offset}, len={len}, image_len={})",
-            bytes.len()
-        )
-    })
+    if end > file_len {
+        bail!("{label} region out of bounds (offset={offset}, len={len}, image_len={file_len})");
+    }
+
+    file.seek(SeekFrom::Start(offset_u64))
+        .with_context(|| format!("failed to seek to {label} offset {offset}"))?;
+    let mut bytes = vec![0_u8; len];
+    file.read_exact(&mut bytes)
+        .with_context(|| format!("failed to read {label} bytes"))?;
+    Ok(bytes)
 }
 
 fn bytes_to_hex_dump(bytes: &[u8]) -> String {
@@ -5632,27 +5654,7 @@ fn evidence_cmd(
     let started = Instant::now();
     info!(target: "ffs::cli::evidence", "evidence_start");
 
-    let data = std::fs::read(path)
-        .with_context(|| format!("failed to read evidence ledger: {}", path.display()))?;
-
-    let mut records = evidence::parse_evidence_ledger(&data);
-
-    // Filter by event type if requested.
-    if let Some(filter) = event_type_filter {
-        records.retain(|r| {
-            let type_str = serde_json::to_value(r.event_type)
-                .ok()
-                .and_then(|v| v.as_str().map(String::from));
-            type_str.as_deref() == Some(filter)
-        });
-    }
-
-    // Tail: keep only the last N records.
-    if let Some(n) = tail {
-        if records.len() > n {
-            records.drain(..records.len() - n);
-        }
-    }
+    let records = load_evidence_records(path, event_type_filter, tail)?;
 
     if json {
         println!(
@@ -5681,13 +5683,80 @@ fn evidence_cmd(
     Ok(())
 }
 
+fn load_evidence_records(
+    path: &PathBuf,
+    event_type_filter: Option<&str>,
+    tail: Option<usize>,
+) -> Result<Vec<EvidenceRecord>> {
+    let file = File::open(path)
+        .with_context(|| format!("failed to open evidence ledger: {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut records: Vec<EvidenceRecord> = Vec::new();
+    let mut tail_records: VecDeque<EvidenceRecord> = VecDeque::new();
+
+    for line in reader.lines() {
+        let line = line
+            .with_context(|| format!("failed reading evidence ledger line: {}", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<EvidenceRecord>(&line) else {
+            // Preserve torn-write behavior: skip malformed lines.
+            continue;
+        };
+        if let Some(filter) = event_type_filter {
+            if evidence_event_type_name(record.event_type) != filter {
+                continue;
+            }
+        }
+
+        if let Some(limit) = tail {
+            if limit == 0 {
+                continue;
+            }
+            if tail_records.len() == limit {
+                tail_records.pop_front();
+            }
+            tail_records.push_back(record);
+        } else {
+            records.push(record);
+        }
+    }
+
+    if tail.is_some() {
+        Ok(tail_records.into_iter().collect())
+    } else {
+        Ok(records)
+    }
+}
+
+const fn evidence_event_type_name(event_type: EvidenceEventType) -> &'static str {
+    match event_type {
+        EvidenceEventType::CorruptionDetected => "corruption_detected",
+        EvidenceEventType::RepairAttempted => "repair_attempted",
+        EvidenceEventType::RepairSucceeded => "repair_succeeded",
+        EvidenceEventType::RepairFailed => "repair_failed",
+        EvidenceEventType::ScrubCycleComplete => "scrub_cycle_complete",
+        EvidenceEventType::PolicyDecision => "policy_decision",
+        EvidenceEventType::SymbolRefresh => "symbol_refresh",
+        EvidenceEventType::WalRecovery => "wal_recovery",
+        EvidenceEventType::TransactionCommit => "transaction_commit",
+        EvidenceEventType::TxnAborted => "txn_aborted",
+        EvidenceEventType::SerializationConflict => "serialization_conflict",
+        EvidenceEventType::VersionGc => "version_gc",
+        EvidenceEventType::SnapshotAdvanced => "snapshot_advanced",
+        EvidenceEventType::FlushBatch => "flush_batch",
+        EvidenceEventType::BackpressureActivated => "backpressure_activated",
+        EvidenceEventType::DirtyBlockDiscarded => "dirty_block_discarded",
+        EvidenceEventType::DurabilityPolicyChanged => "durability_policy_changed",
+        EvidenceEventType::RefreshPolicyChanged => "refresh_policy_changed",
+    }
+}
+
 fn print_evidence_record(record: &EvidenceRecord) {
     let ts_secs = record.timestamp_ns / 1_000_000_000;
     let ts_nanos = record.timestamp_ns % 1_000_000_000;
-    let event = serde_json::to_value(record.event_type)
-        .ok()
-        .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_else(|| format!("{:?}", record.event_type));
+    let event = evidence_event_type_name(record.event_type);
 
     print!(
         "  [{ts_secs}.{ts_nanos:09}] {event:<24} group={}",
@@ -6052,12 +6121,13 @@ fn mkfs_cmd(
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, DumpCommand, Ext4JournalReplayMode, Ext4RepairStaleness, FsckCommandOptions,
-        FsckFlags, LogFormat, RepairCommandOptions, RepairFlags, btrfs_super_mirror_offsets,
-        build_btrfs_repair_group_spec, build_fsck_output, build_repair_output,
-        ext4_appears_clean_state, ext4_mount_replay_mode, merge_scrub_reports,
-        normalize_btrfs_superblock_as_primary, partition_scrub_range, repair_worker_limit,
-        select_ext4_repair_groups,
+        Cli, Command, DumpCommand, EvidenceEventType, Ext4JournalReplayMode, Ext4RepairStaleness,
+        FsckCommandOptions, FsckFlags, LogFormat, RepairCommandOptions, RepairFlags,
+        btrfs_super_mirror_offsets, build_btrfs_repair_group_spec, build_ext4_group_info,
+        build_fsck_output, build_repair_output, ext4_appears_clean_state, ext4_mount_replay_mode,
+        load_evidence_records, merge_scrub_reports, normalize_btrfs_superblock_as_primary,
+        partition_scrub_range, read_ext4_group_desc_from_path, read_ext4_inode_from_path,
+        read_file_region, repair_worker_limit, select_ext4_repair_groups,
     };
     use clap::Parser;
     use serde_json::Value;
@@ -6207,6 +6277,117 @@ mod tests {
         let result = f(path.clone());
         let _ = std::fs::remove_file(path);
         result
+    }
+
+    #[test]
+    fn read_file_region_reads_exact_window() {
+        let image: Vec<u8> = (0_u8..64).collect();
+        with_temp_image_path(&image, |path| {
+            let region = read_file_region(&path, 16, 8, "test window")
+                .expect("region read should succeed for in-bounds window");
+            assert_eq!(region, image[16..24]);
+        });
+    }
+
+    #[test]
+    fn read_file_region_rejects_out_of_bounds_window() {
+        let image = vec![0_u8; 32];
+        with_temp_image_path(&image, |path| {
+            let err = read_file_region(&path, 24, 16, "test window")
+                .expect_err("region read should fail for out-of-bounds window");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("out of bounds"),
+                "expected out-of-bounds error, got: {message}"
+            );
+        });
+    }
+
+    #[test]
+    fn load_evidence_records_skips_invalid_lines_and_filters_by_event_type() {
+        let ledger = concat!(
+            "{\"timestamp_ns\":1,\"event_type\":\"corruption_detected\",\"block_group\":1}\n",
+            "{not-json\n",
+            "\n",
+            "{\"timestamp_ns\":2,\"event_type\":\"repair_failed\",\"block_group\":2}\n",
+            "{\"timestamp_ns\":3,\"event_type\":\"repair_failed\",\"block_group\":3}\n",
+        );
+        with_temp_image_path(ledger.as_bytes(), |path| {
+            let records = load_evidence_records(&path, Some("repair_failed"), None)
+                .expect("filtered evidence read should succeed");
+            assert_eq!(records.len(), 2);
+            assert!(
+                records
+                    .iter()
+                    .all(|record| record.event_type == EvidenceEventType::RepairFailed)
+            );
+            assert_eq!(records[0].block_group, 2);
+            assert_eq!(records[1].block_group, 3);
+        });
+    }
+
+    #[test]
+    fn load_evidence_records_tail_keeps_last_filtered_records() {
+        let ledger = concat!(
+            "{\"timestamp_ns\":1,\"event_type\":\"repair_failed\",\"block_group\":1}\n",
+            "{\"timestamp_ns\":2,\"event_type\":\"corruption_detected\",\"block_group\":2}\n",
+            "{\"timestamp_ns\":3,\"event_type\":\"repair_failed\",\"block_group\":3}\n",
+            "{\"timestamp_ns\":4,\"event_type\":\"repair_failed\",\"block_group\":4}\n",
+        );
+        with_temp_image_path(ledger.as_bytes(), |path| {
+            let records = load_evidence_records(&path, Some("repair_failed"), Some(2))
+                .expect("tailed evidence read should succeed");
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0].timestamp_ns, 3);
+            assert_eq!(records[1].timestamp_ns, 4);
+            assert_eq!(records[0].block_group, 3);
+            assert_eq!(records[1].block_group, 4);
+        });
+    }
+
+    #[test]
+    fn build_ext4_group_info_reads_descriptors_from_disk_regions() {
+        const EXT4_VALID_FS: u16 = 0x0001;
+        let image = build_test_ext4_image_with_state(EXT4_VALID_FS);
+        let sb =
+            super::Ext4Superblock::parse_from_image(&image).expect("parse test ext4 superblock");
+        let expected_groups = usize::try_from(sb.groups_count()).expect("groups_count fits usize");
+
+        with_temp_image_path(&image, |path| {
+            let groups = build_ext4_group_info(&path, &sb).expect("build ext4 group info");
+            assert_eq!(groups.len(), expected_groups);
+            assert_eq!(groups[0].group, 0);
+        });
+    }
+
+    #[test]
+    fn read_ext4_group_desc_from_path_reads_single_descriptor_window() {
+        const EXT4_VALID_FS: u16 = 0x0001;
+        let image = build_test_ext4_image_with_state(EXT4_VALID_FS);
+        let sb =
+            super::Ext4Superblock::parse_from_image(&image).expect("parse test ext4 superblock");
+
+        with_temp_image_path(&image, |path| {
+            let (desc, raw) = read_ext4_group_desc_from_path(&path, &sb, 0)
+                .expect("read ext4 group descriptor from path");
+            assert_eq!(desc.inode_table, 5);
+            assert_eq!(raw.len(), usize::from(sb.group_desc_size()));
+        });
+    }
+
+    #[test]
+    fn read_ext4_inode_from_path_reads_inode_window() {
+        const EXT4_VALID_FS: u16 = 0x0001;
+        let image = build_test_ext4_image_with_state(EXT4_VALID_FS);
+        let sb =
+            super::Ext4Superblock::parse_from_image(&image).expect("parse test ext4 superblock");
+
+        with_temp_image_path(&image, |path| {
+            let (inode, raw) = read_ext4_inode_from_path(&path, &sb, ffs_types::InodeNumber(2))
+                .expect("read ext4 inode from path");
+            assert_eq!(raw.len(), usize::from(sb.inode_size));
+            assert_eq!(inode.mode, 0);
+        });
     }
 
     #[test]
