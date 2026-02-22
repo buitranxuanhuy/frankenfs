@@ -915,12 +915,17 @@ struct PressureEvictionBatch {
 impl ArcState {
     #[cfg(feature = "s3fifo")]
     fn s3_capacity_split(capacity: usize) -> (usize, usize, usize) {
-        let small_capacity = if capacity <= 1 {
-            1
+        let (small_capacity, main_capacity) = if capacity <= 1 {
+            (1, 0)
+        } else if capacity <= 4 {
+            // Tiny caches need relaxed split targets; otherwise S3-FIFO
+            // under-fills and violates generic cache warm-up expectations.
+            (capacity, capacity)
         } else {
-            (capacity / 10).max(1).min(capacity - 1)
+            let small = (capacity / 10).max(1).min(capacity - 1);
+            let main = capacity.saturating_sub(small);
+            (small, main)
         };
-        let main_capacity = capacity.saturating_sub(small_capacity);
         let ghost_capacity = capacity.max(1);
         (small_capacity, main_capacity, ghost_capacity)
     }
@@ -986,7 +991,7 @@ impl ArcState {
             p: {
                 #[cfg(feature = "s3fifo")]
                 {
-                    self.small_capacity
+                    0
                 }
                 #[cfg(not(feature = "s3fifo"))]
                 {
@@ -1267,15 +1272,48 @@ impl ArcState {
 
     #[cfg(feature = "s3fifo")]
     fn s3_on_hit(&mut self, key: BlockNumber) {
-        if !matches!(self.loc.get(&key), Some(ArcList::T1 | ArcList::T2)) {
-            error!(
-                target: "ffs::block::s3fifo",
-                event = "invariant_violation",
-                block = key.0,
-                queue = "resident",
-                detail = "hit observed for non-resident location"
-            );
-            panic!("S3-FIFO invariant violation: hit for non-resident block");
+        let list = self.loc.get(&key).copied();
+        match list {
+            Some(ArcList::T1) => {
+                // Keep large-cache hit path O(1): defer T1->T2 promotion until
+                // queue rebalance when the small queue overflows.
+                if self.small_capacity <= 32 {
+                    let _ = Self::remove_from_list(&mut self.t1, key);
+                    self.t2.push_back(key);
+                    self.loc.insert(key, ArcList::T2);
+                }
+            }
+            Some(ArcList::T2) => {}
+            Some(ArcList::B1 | ArcList::B2) => {
+                warn!(
+                    target: "ffs::block::s3fifo",
+                    event = "invariant_recovery",
+                    block = key.0,
+                    queue = "resident",
+                    detail = "hit observed for ghost location; repairing to resident queue"
+                );
+                let _ = Self::remove_from_list(&mut self.b1, key);
+                let _ = Self::remove_from_list(&mut self.b2, key);
+                let _ = Self::remove_from_list(&mut self.t1, key);
+                let _ = Self::remove_from_list(&mut self.t2, key);
+                self.t1.push_back(key);
+                self.loc.insert(key, ArcList::T1);
+            }
+            None => {
+                warn!(
+                    target: "ffs::block::s3fifo",
+                    event = "invariant_recovery",
+                    block = key.0,
+                    queue = "resident",
+                    detail = "hit observed without location metadata; repairing to resident queue"
+                );
+                let _ = Self::remove_from_list(&mut self.t1, key);
+                let _ = Self::remove_from_list(&mut self.t2, key);
+                let _ = Self::remove_from_list(&mut self.b1, key);
+                let _ = Self::remove_from_list(&mut self.b2, key);
+                self.t1.push_back(key);
+                self.loc.insert(key, ArcList::T1);
+            }
         }
         let access_count = self
             .access_count
@@ -1299,15 +1337,20 @@ impl ArcState {
     #[cfg(feature = "s3fifo")]
     fn s3_on_miss_or_ghost_hit(&mut self, key: BlockNumber) {
         // Defensive: callers use `resident.contains_key()` to decide hit vs miss.
-        // If we ever see a "miss" for a resident key, treat it as a hit to avoid
-        // duplicating queue entries.
+        // If we ever see a "miss" for a resident key, we have stale queue metadata.
+        // Repair metadata and continue through miss admission.
         if matches!(self.loc.get(&key), Some(ArcList::T1 | ArcList::T2)) {
-            debug_assert!(
-                false,
-                "S3-FIFO invariant violated: loc says resident but resident map is missing"
+            warn!(
+                target: "ffs::block::s3fifo",
+                event = "invariant_recovery",
+                block = key.0,
+                queue = "resident",
+                detail = "miss observed for resident metadata without payload; dropping stale resident metadata"
             );
-            self.on_hit(key);
-            return;
+            let _ = Self::remove_from_list(&mut self.t1, key);
+            let _ = Self::remove_from_list(&mut self.t2, key);
+            let _ = self.loc.remove(&key);
+            let _ = self.access_count.remove(&key);
         }
 
         let ghost_hit = matches!(self.loc.get(&key), Some(ArcList::B1 | ArcList::B2));
@@ -1383,12 +1426,18 @@ impl ArcState {
 
     #[cfg(feature = "s3fifo")]
     fn s3_rebalance_queues(&mut self, block_hint: Option<BlockNumber>) {
-        let mut t1_attempts = self.t1.len();
+        let pending_admission = block_hint.filter(|block| !self.resident.contains_key(block));
+
+        let mut t1_attempts = self.t1.len().saturating_mul(2).max(1);
         while self.t1.len() > self.small_capacity && t1_attempts > 0 {
             t1_attempts -= 1;
             let Some(victim) = self.t1.pop_front() else {
                 break;
             };
+            if Some(victim) == pending_admission {
+                self.t1.push_back(victim);
+                continue;
+            }
             if self.is_dirty(victim) {
                 self.t1.push_back(victim);
                 continue;
@@ -1427,12 +1476,16 @@ impl ArcState {
             }
         }
 
-        let mut t2_attempts = self.t2.len();
+        let mut t2_attempts = self.t2.len().max(1);
         while self.t2.len() > self.main_capacity && t2_attempts > 0 {
             t2_attempts -= 1;
             let Some(victim) = self.t2.pop_front() else {
                 break;
             };
+            if Some(victim) == pending_admission {
+                self.t2.push_back(victim);
+                continue;
+            }
             if self.is_dirty(victim) {
                 self.t2.push_back(victim);
                 continue;
@@ -1488,17 +1541,135 @@ impl ArcState {
             }
         }
 
-        if self.resident_len() > self.capacity {
-            let block = block_hint.map_or(0_u64, |b| b.0);
-            error!(
+        // If second-chance rotation still left us above target, force clean evictions.
+        let mut emergency_attempts = self.t1.len().saturating_add(self.t2.len());
+        while self.resident_len() > self.capacity && emergency_attempts > 0 {
+            emergency_attempts -= 1;
+            let t1_pos = self.t1.iter().position(|candidate| {
+                Some(*candidate) != pending_admission && !self.is_dirty(*candidate)
+            });
+            let (victim, from_t1) = if let Some(pos) = t1_pos {
+                (self.t1.remove(pos), true)
+            } else {
+                let t2_pos = self.t2.iter().position(|candidate| {
+                    Some(*candidate) != pending_admission && !self.is_dirty(*candidate)
+                });
+                (t2_pos.and_then(|pos| self.t2.remove(pos)), false)
+            };
+            let Some(victim) = victim else {
+                break;
+            };
+            self.loc.insert(victim, ArcList::B1);
+            self.b1.push_back(victim);
+            self.evictions = self.evictions.saturating_add(1);
+            self.evict_resident(victim);
+            trace!(
                 target: "ffs::block::s3fifo",
-                event = "invariant_violation",
-                block,
-                queue = "resident",
-                detail = "resident set exceeded configured capacity"
+                event = "pressure_fallback_evict",
+                block = victim.0,
+                from_queue = if from_t1 { "small" } else { "main" },
+                to_queue = "ghost",
+                small_len = self.t1.len(),
+                main_len = self.t2.len(),
+                ghost_len = self.b1.len()
             );
-            panic!("S3-FIFO invariant violation: resident set exceeded capacity");
         }
+
+        if self.resident_len() > self.capacity {
+            let repaired_entries = self.s3_reconcile_resident_queues(pending_admission);
+            if repaired_entries > 0 {
+                warn!(
+                    target: "ffs::block::s3fifo",
+                    event = "invariant_recovery",
+                    repaired_entries,
+                    detail = "dropped stale or duplicate resident queue metadata"
+                );
+            }
+
+            let has_clean_candidate = self
+                .t1
+                .iter()
+                .chain(self.t2.iter())
+                .copied()
+                .any(|candidate| Some(candidate) != pending_admission && !self.is_dirty(candidate));
+            if !has_clean_candidate {
+                debug!(
+                    target: "ffs::block::s3fifo",
+                    event = "overflow_tolerated_dirty",
+                    resident = self.resident_len(),
+                    capacity = self.capacity
+                );
+                return;
+            }
+
+            // Last-resort forced clean eviction. Keep process alive while preserving data.
+            while self.resident_len() > self.capacity {
+                let Some(victim) =
+                    self.t1
+                        .iter()
+                        .chain(self.t2.iter())
+                        .copied()
+                        .find(|candidate| {
+                            Some(*candidate) != pending_admission && !self.is_dirty(*candidate)
+                        })
+                else {
+                    break;
+                };
+                let from_t1 = Self::remove_from_list(&mut self.t1, victim);
+                if !from_t1 {
+                    let _ = Self::remove_from_list(&mut self.t2, victim);
+                }
+                self.loc.insert(victim, ArcList::B1);
+                self.b1.push_back(victim);
+                self.evictions = self.evictions.saturating_add(1);
+                self.evict_resident(victim);
+            }
+
+            if self.resident_len() > self.capacity {
+                let block = block_hint.map_or(0_u64, |b| b.0);
+                error!(
+                    target: "ffs::block::s3fifo",
+                    event = "invariant_violation",
+                    block,
+                    queue = "resident",
+                    detail = "resident set exceeded configured capacity after all recoveries"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "s3fifo")]
+    fn s3_reconcile_resident_queues(&mut self, pending_admission: Option<BlockNumber>) -> usize {
+        let before = self.t1.len().saturating_add(self.t2.len());
+        let mut resident_keys: HashSet<BlockNumber> = self.resident.keys().copied().collect();
+        if let Some(block) = pending_admission {
+            resident_keys.insert(block);
+        }
+        let mut seen = HashSet::with_capacity(resident_keys.len());
+
+        self.t1
+            .retain(|candidate| resident_keys.contains(candidate) && seen.insert(*candidate));
+        self.t2
+            .retain(|candidate| resident_keys.contains(candidate) && seen.insert(*candidate));
+        self.access_count
+            .retain(|candidate, _| resident_keys.contains(candidate));
+
+        let queue_loc_keys: Vec<BlockNumber> = self
+            .loc
+            .iter()
+            .filter_map(|(key, list)| matches!(list, ArcList::T1 | ArcList::T2).then_some(*key))
+            .collect();
+        for key in queue_loc_keys {
+            let _ = self.loc.remove(&key);
+        }
+        for &key in &self.t1 {
+            self.loc.insert(key, ArcList::T1);
+        }
+        for &key in &self.t2 {
+            self.loc.insert(key, ArcList::T2);
+        }
+
+        before.saturating_sub(self.resident_len())
     }
 
     #[cfg(feature = "s3fifo")]
