@@ -131,10 +131,10 @@ fn stress_concurrent_rw() {
                             Ok(_) => {
                                 committed.fetch_add(1, Ordering::Relaxed);
                             }
-                            Err(CommitError::Conflict { .. }) => {
+                            Err((CommitError::Conflict { .. }, _)) => {
                                 conflicts.fetch_add(1, Ordering::Relaxed);
                             }
-                            Err(err) => {
+                            Err((err, _)) => {
                                 panic!("seed {seed}: writer {writer_id} op {op} unexpected {err:?}")
                             }
                         }
@@ -245,12 +245,14 @@ fn stress_fcw_conflicts() {
 
             match store.commit(first) {
                 Ok(_) => commit_count += 1,
-                Err(err) => panic!("seed {seed}: first commit in pair {pair} failed: {err:?}"),
+                Err((err, _)) => panic!("seed {seed}: first commit in pair {pair} failed: {err:?}"),
             }
             match store.commit(second) {
                 Ok(_) => panic!("seed {seed}: second commit in pair {pair} must conflict"),
-                Err(CommitError::Conflict { .. }) => conflict_count += 1,
-                Err(err) => panic!("seed {seed}: unexpected FCW error in pair {pair}: {err:?}"),
+                Err((CommitError::Conflict { .. }, _)) => conflict_count += 1,
+                Err((err, _)) => {
+                    panic!("seed {seed}: unexpected FCW error in pair {pair}: {err:?}")
+                }
             }
         }
 

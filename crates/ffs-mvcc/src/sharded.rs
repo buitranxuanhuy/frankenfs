@@ -177,6 +177,7 @@ impl ShardedMvccStore {
     /// Commit a transaction with first-committer-wins (FCW) conflict detection.
     ///
     /// Shard locks are acquired in sorted order to prevent deadlocks.
+    #[allow(clippy::result_large_err)]
     pub fn commit(&self, txn: Transaction) -> Result<CommitSeq, (CommitError, Transaction)> {
         if txn.write_set().is_empty() {
             // Read-only transaction: nothing to commit.
@@ -203,11 +204,14 @@ impl ShardedMvccStore {
                 .and_then(|v| v.last())
                 .map_or(CommitSeq(0), |v| v.commit_seq);
             if latest > txn.snapshot().high {
-                return Err((CommitError::Conflict {
-                    block,
-                    snapshot: txn.snapshot().high,
-                    observed: latest,
-                }, txn));
+                return Err((
+                    CommitError::Conflict {
+                        block,
+                        snapshot: txn.snapshot().high,
+                        observed: latest,
+                    },
+                    txn,
+                ));
             }
         }
 
@@ -247,6 +251,7 @@ impl ShardedMvccStore {
     }
 
     /// Commit with Serializable Snapshot Isolation (SSI) enforcement.
+    #[allow(clippy::result_large_err)]
     pub fn commit_ssi(&self, txn: Transaction) -> Result<CommitSeq, (CommitError, Transaction)> {
         if txn.write_set().is_empty() {
             return Ok(self.current_snapshot().high);
@@ -278,11 +283,14 @@ impl ShardedMvccStore {
                 .and_then(|v| v.last())
                 .map_or(CommitSeq(0), |v| v.commit_seq);
             if latest > txn.snapshot().high {
-                return Err((CommitError::Conflict {
-                    block,
-                    snapshot: txn.snapshot().high,
-                    observed: latest,
-                }, txn));
+                return Err((
+                    CommitError::Conflict {
+                        block,
+                        snapshot: txn.snapshot().high,
+                        observed: latest,
+                    },
+                    txn,
+                ));
             }
         }
 
@@ -299,12 +307,15 @@ impl ShardedMvccStore {
                     break;
                 }
                 if record.write_set.contains(&block) {
-                    return Err((CommitError::SsiConflict {
-                        pivot_block: block,
-                        read_version,
-                        write_version: record.commit_seq,
-                        concurrent_txn: record.txn_id,
-                    }, txn));
+                    return Err((
+                        CommitError::SsiConflict {
+                            pivot_block: block,
+                            read_version,
+                            write_version: record.commit_seq,
+                            concurrent_txn: record.txn_id,
+                        },
+                        txn,
+                    ));
                 }
             }
         }

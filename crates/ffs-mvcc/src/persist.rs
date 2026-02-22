@@ -787,7 +787,7 @@ fn load_checkpoint(path: &Path, store: &mut MvccStore) -> Result<()> {
             if data_len as u64 > file_len {
                 return Err(FfsError::Corruption {
                     block: 0,
-                    detail: format!("checkpoint data_len {} exceeds file size", data_len),
+                    detail: format!("checkpoint data_len {data_len} exceeds file size"),
                 });
             }
 
@@ -798,8 +798,11 @@ fn load_checkpoint(path: &Path, store: &mut MvccStore) -> Result<()> {
             let version_data = if store.compression_policy().dedup_identical {
                 let is_identical = !versions.is_empty() && {
                     let last_idx = versions.len() - 1;
-                    crate::compression::resolve_data_with(&versions, last_idx, |v: &BlockVersion| &v.data)
-                        == Some(data.as_slice())
+                    crate::compression::resolve_data_with(
+                        &versions,
+                        last_idx,
+                        |v: &BlockVersion| &v.data,
+                    ) == Some(data.as_slice())
                 };
                 if is_identical {
                     crate::compression::VersionData::Identical

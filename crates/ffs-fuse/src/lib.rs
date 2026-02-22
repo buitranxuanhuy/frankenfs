@@ -354,8 +354,8 @@ impl AccessPredictor {
 
             guard.next_touch = guard.next_touch.saturating_add(1);
             let touch = guard.next_touch;
-            if let Some(old) = guard.history.get(&ino.0) {
-                guard.lru.remove(&old.last_touch);
+            if let Some(old_touch) = guard.history.get(&ino.0).map(|old| old.last_touch) {
+                guard.lru.remove(&old_touch);
             }
             guard.lru.insert(touch, ino.0);
 

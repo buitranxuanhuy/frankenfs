@@ -537,9 +537,11 @@ impl EpochManager {
 
     /// Force an epoch advance regardless of triggers.
     pub fn force_advance(&self) -> u64 {
-        self.try_advance(true).expect("force advance must return epoch")
+        self.try_advance(true)
+            .expect("force advance must return epoch")
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     fn try_advance(&self, force: bool) -> Option<u64> {
         let mut guard = self
             .last_advance
@@ -615,6 +617,7 @@ impl EpochManager {
         self.epoch.current()
     }
 
+    #[allow(dead_code)]
     fn advance(&self) -> u64 {
         self.commits_in_epoch.store(0, Ordering::Release);
         let new_epoch = self.epoch.advance();

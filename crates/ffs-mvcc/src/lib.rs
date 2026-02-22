@@ -891,6 +891,7 @@ impl MvccStore {
         );
     }
 
+    #[allow(clippy::result_large_err)]
     fn commit_fcw_internal(
         &mut self,
         txn: Transaction,
@@ -908,11 +909,14 @@ impl MvccStore {
                     snapshot_commit_seq = txn.snapshot.high.0,
                     observed_commit_seq = latest.0
                 );
-                return Err((CommitError::Conflict {
-                    block: *block,
-                    snapshot: txn.snapshot.high,
-                    observed: latest,
-                }, txn));
+                return Err((
+                    CommitError::Conflict {
+                        block: *block,
+                        snapshot: txn.snapshot.high,
+                        observed: latest,
+                    },
+                    txn,
+                ));
             }
             if let Some(cap) = chain_cap {
                 if let Err(e) = self.enforce_chain_pressure(txn.id, *block, cap) {
@@ -970,6 +974,7 @@ impl MvccStore {
         Ok((commit_seq, deferred))
     }
 
+    #[allow(clippy::result_large_err)]
     fn commit_ssi_internal(
         &mut self,
         txn: Transaction,
@@ -988,11 +993,14 @@ impl MvccStore {
                     snapshot_commit_seq = txn.snapshot.high.0,
                     observed_commit_seq = latest.0
                 );
-                return Err((CommitError::Conflict {
-                    block: *block,
-                    snapshot: txn.snapshot.high,
-                    observed: latest,
-                }, txn));
+                return Err((
+                    CommitError::Conflict {
+                        block: *block,
+                        snapshot: txn.snapshot.high,
+                        observed: latest,
+                    },
+                    txn,
+                ));
             }
             if let Some(cap) = chain_cap {
                 if let Err(e) = self.enforce_chain_pressure(txn.id, *block, cap) {
@@ -1188,8 +1196,13 @@ impl MvccStore {
 
     fn force_advance_oldest_snapshot(&mut self) -> Option<(CommitSeq, u32)> {
         let oldest = self.active_snapshots.keys().next().copied()?;
-        let count = self.active_snapshots.remove(&oldest)?;
-        Some((oldest, count))
+        let refs = self.active_snapshots.get_mut(&oldest)?;
+        if *refs > 1 {
+            *refs -= 1;
+            return Some((oldest, *refs));
+        }
+        self.active_snapshots.remove(&oldest);
+        Some((oldest, 0))
     }
 
     fn chain_trim_blocked_by_snapshot(&self, block: BlockNumber, watermark: CommitSeq) -> bool {
