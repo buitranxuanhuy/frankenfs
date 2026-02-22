@@ -1575,8 +1575,9 @@ impl Ext4Inode {
         let gid_lo = u32::from(read_le_u16(bytes, 0x18)?);
 
         let is_reg = (mode & ffs_types::S_IFMT) == ffs_types::S_IFREG;
+        let is_dir = (mode & ffs_types::S_IFMT) == ffs_types::S_IFDIR;
         let size_lo = u64::from(read_le_u32(bytes, 0x04)?);
-        let size_hi = if is_reg && bytes.len() > 0x6E {
+        let size_hi = if (is_reg || is_dir) && bytes.len() >= 0x70 {
             u64::from(read_le_u32(bytes, 0x6C)?)
         } else {
             0
@@ -2949,6 +2950,16 @@ impl Ext4ImageReader {
         // Extent-mapped symlink: read via normal file data path
         let size = usize::try_from(inode.size)
             .map_err(|_| ParseError::IntegerConversion { field: "i_size" })?;
+            
+        // Protect against malicious symlink sizes causing OOM.
+        // Linux PATH_MAX is 4096.
+        if size > 4096 {
+            return Err(ParseError::InvalidField {
+                field: "i_size",
+                reason: "symlink size exceeds 4096 bytes",
+            });
+        }
+
         let mut buf = vec![0_u8; size];
         let n = self.read_inode_data(image, inode, 0, &mut buf)?;
         buf.truncate(n);
@@ -3527,8 +3538,8 @@ fn dx_hash_legacy(name: &[u8], signed: bool) -> (u32, u32) {
         } else {
             u32::from(b)
         };
-        h0 = h0.wrapping_mul(16).wrapping_add(val);
-        h1 = h1.wrapping_mul(16).wrapping_add(val);
+        h0 = h0.wrapping_add(h0.wrapping_shl(4)).wrapping_add(val);
+        h1 = h1.wrapping_add(h1.wrapping_shl(4)).wrapping_add(val);
     }
 
     // Fold to produce major/minor
@@ -3540,13 +3551,18 @@ fn dx_hash_legacy(name: &[u8], signed: bool) -> (u32, u32) {
 /// This implements the str2hashbuf + half-MD4 transform from the kernel.
 #[allow(clippy::cast_possible_wrap)] // intentional signed char semantics
 fn dx_hash_half_md4(name: &[u8], seed: &[u32; 4], signed: bool) -> (u32, u32) {
-    let buf = str2hashbuf(name, 8, signed);
     let mut a = seed[0];
     let mut b = seed[1];
     let mut c = seed[2];
     let mut d = seed[3];
 
-    half_md4_transform(&mut a, &mut b, &mut c, &mut d, &buf);
+    let mut offset = 0;
+    while offset < name.len() {
+        let chunk_len = (name.len() - offset).min(32);
+        let buf = str2hashbuf(&name[offset..offset + chunk_len], 8, signed);
+        half_md4_transform(&mut a, &mut b, &mut c, &mut d, &buf);
+        offset += chunk_len;
+    }
 
     (a & !1, b) // clear low bit of major
 }
@@ -3554,23 +3570,36 @@ fn dx_hash_half_md4(name: &[u8], seed: &[u32; 4], signed: bool) -> (u32, u32) {
 /// TEA (Tiny Encryption Algorithm) hash — an alternative ext4 hash.
 #[allow(clippy::cast_possible_wrap)]
 fn dx_hash_tea(name: &[u8], seed: &[u32; 4], signed: bool) -> (u32, u32) {
-    let buf = str2hashbuf(name, 4, signed);
     let mut a = seed[0];
     let mut b = seed[1];
     let mut c = seed[2];
     let mut d = seed[3];
 
-    tea_transform(&mut a, &mut b, &mut c, &mut d, &buf);
+    let mut offset = 0;
+    while offset < name.len() {
+        let chunk_len = (name.len() - offset).min(16);
+        let (buf, num_words) = str2hashbuf_len(&name[offset..offset + chunk_len], 4, signed);
+        for i in 0..num_words {
+            // tea_transform consumes 4 words of key
+            tea_transform(&mut a, &mut b, &buf[i * 4..]);
+        }
+        offset += chunk_len;
+    }
 
     (a & !1, b)
 }
 
-/// Convert a filename to a u32 buffer for hashing.
+/// Convert a filename chunk to a u32 buffer for hashing.
 ///
 /// The kernel's `str2hashbuf` packs characters into u32 words (little-endian),
 /// with optional signed character semantics.
 #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 fn str2hashbuf(name: &[u8], buf_size: usize, signed: bool) -> Vec<u32> {
+    str2hashbuf_len(name, buf_size, signed).0
+}
+
+#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+fn str2hashbuf_len(name: &[u8], buf_size: usize, signed: bool) -> (Vec<u32>, usize) {
     let mut buf = vec![0_u32; buf_size];
     let mut idx = 0_usize;
     let mut shift = 0_u32;
@@ -3581,7 +3610,9 @@ fn str2hashbuf(name: &[u8], buf_size: usize, signed: bool) -> Vec<u32> {
         } else {
             u32::from(b)
         };
-        buf[idx] |= val << shift;
+        // Clear the target byte before ORing, matching the Linux kernel's
+        // behavior which truncates sign extensions from previous bytes in the target slot.
+        buf[idx] = (buf[idx] & !(0xFF << shift)) | (val << shift);
         shift += 8;
         if shift >= 32 {
             shift = 0;
@@ -3594,10 +3625,11 @@ fn str2hashbuf(name: &[u8], buf_size: usize, signed: bool) -> Vec<u32> {
 
     // Pad with 0x80 terminator like the kernel does
     if idx < buf_size {
-        buf[idx] |= 0x80 << shift;
+        buf[idx] = (buf[idx] & !(0xFF << shift)) | (0x80 << shift);
     }
-
-    buf
+    
+    let words = (name.len() + 3) / 4;
+    (buf, words)
 }
 
 /// Half-MD4 transform — the core of the half-MD4 hash.
@@ -3673,49 +3705,38 @@ fn half_md4_transform(a: &mut u32, b: &mut u32, c: &mut u32, d: &mut u32, buf: &
 
 /// TEA (Tiny Encryption Algorithm) transform.
 ///
-/// Operates on 4 u32 words of input, modifying the state (a, b, c, d).
-fn tea_transform(a: &mut u32, b: &mut u32, c: &mut u32, d: &mut u32, buf: &[u32]) {
+/// Operates on 2 u32 words of state (a, b) using 4 words of input (buf).
+fn tea_transform(a: &mut u32, b: &mut u32, buf: &[u32]) {
     let get = |i: usize| -> u32 { buf.get(i).copied().unwrap_or(0) };
 
     let mut sum: u32 = 0;
     let delta: u32 = 0x9E37_79B9;
 
-    // TEA uses the buf as "key" and the state as "data"
     let k0 = get(0);
     let k1 = get(1);
     let k2 = get(2);
     let k3 = get(3);
 
+    let mut b0 = *a;
+    let mut b1 = *b;
+
     // 16 rounds of TEA on (a, b) pair
     for _ in 0..16 {
         sum = sum.wrapping_add(delta);
-        *a = a.wrapping_add(
-            (b.wrapping_shl(4).wrapping_add(k0))
-                ^ b.wrapping_add(sum)
-                ^ (b.wrapping_shr(5).wrapping_add(k1)),
+        b0 = b0.wrapping_add(
+            (b1.wrapping_shl(4).wrapping_add(k0))
+                ^ b1.wrapping_add(sum)
+                ^ (b1.wrapping_shr(5).wrapping_add(k1)),
         );
-        *b = b.wrapping_add(
-            (a.wrapping_shl(4).wrapping_add(k2))
-                ^ a.wrapping_add(sum)
-                ^ (a.wrapping_shr(5).wrapping_add(k3)),
+        b1 = b1.wrapping_add(
+            (b0.wrapping_shl(4).wrapping_add(k2))
+                ^ b0.wrapping_add(sum)
+                ^ (b0.wrapping_shr(5).wrapping_add(k3)),
         );
     }
 
-    // 16 rounds on (c, d) pair
-    sum = 0;
-    for _ in 0..16 {
-        sum = sum.wrapping_add(delta);
-        *c = c.wrapping_add(
-            (d.wrapping_shl(4).wrapping_add(k0))
-                ^ d.wrapping_add(sum)
-                ^ (d.wrapping_shr(5).wrapping_add(k1)),
-        );
-        *d = d.wrapping_add(
-            (c.wrapping_shl(4).wrapping_add(k2))
-                ^ c.wrapping_add(sum)
-                ^ (c.wrapping_shr(5).wrapping_add(k3)),
-        );
-    }
+    *a = a.wrapping_add(b0);
+    *b = b.wrapping_add(b1);
 }
 
 #[cfg(test)]
