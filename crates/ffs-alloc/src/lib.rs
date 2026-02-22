@@ -941,7 +941,8 @@ pub fn alloc_inode_persist(
         parent_group
     };
 
-    if let Some(alloc) = try_alloc_inode_in_group_persist(cx, dev, geo, groups, target_group, pctx)? {
+    if let Some(alloc) = try_alloc_inode_in_group_persist(cx, dev, geo, groups, target_group, pctx)?
+    {
         return Ok(alloc);
     }
 
@@ -1027,7 +1028,13 @@ pub fn free_inode_persist(
     let ino_zero = ino.0.saturating_sub(1);
     #[expect(clippy::cast_possible_truncation)]
     let group_idx = (ino_zero / u64::from(geo.inodes_per_group)) as u32;
-    persist_group_desc(cx, dev, pctx, GroupNumber(group_idx), &groups[group_idx as usize])?;
+    persist_group_desc(
+        cx,
+        dev,
+        pctx,
+        GroupNumber(group_idx),
+        &groups[group_idx as usize],
+    )?;
     Ok(())
 }
 

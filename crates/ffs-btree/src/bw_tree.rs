@@ -511,8 +511,12 @@ fn materialize_from_head(head: &Arc<PageDelta>) -> Result<(BTreeMap<BwKey, BwVal
                 ops.push(MaterializeOp::Delete { key: *key });
                 cursor = Arc::clone(next);
             }
-            PageDelta::Split { separator, next, .. } => {
-                ops.push(MaterializeOp::Split { separator: *separator });
+            PageDelta::Split {
+                separator, next, ..
+            } => {
+                ops.push(MaterializeOp::Split {
+                    separator: *separator,
+                });
                 cursor = Arc::clone(next);
             }
             PageDelta::Merge { next, .. } => {

@@ -1327,6 +1327,7 @@ impl OpenFs {
                     &mut inode,
                     csum_seed,
                     tstamp_secs,
+                    &alloc.persist_ctx,
                 )?;
                 stats.deleted = stats.deleted.saturating_add(1);
                 info!(
@@ -1353,6 +1354,7 @@ impl OpenFs {
                     &alloc.geo,
                     &mut alloc.groups,
                     logical_end,
+                    &alloc.persist_ctx,
                 )?;
                 Self::set_extent_root(&mut inode, &root_bytes);
                 inode.blocks = inode
@@ -1974,7 +1976,11 @@ impl OpenFs {
             block_size,
         };
 
-        let writes: Vec<_> = txn.write_set().iter().map(|(b, d)| (*b, d.clone())).collect();
+        let writes: Vec<_> = txn
+            .write_set()
+            .iter()
+            .map(|(b, d)| (*b, d.clone()))
+            .collect();
 
         // Phase 1: commit to MVCC store. This performs conflict detection.
         // If it fails, the transaction is cleanly aborted without touching the disk.
@@ -1990,21 +1996,20 @@ impl OpenFs {
 
         // Phase 2: write all pending blocks to the JBD2 journal.
         let jbd2_stats = {
-            let mut writer = jbd2_mutex.lock();
-            let mut jbd2_txn = writer.begin_transaction();
+            let mut jbd2_writer = jbd2_mutex.lock();
+            let mut jbd2_txn = jbd2_writer.begin_transaction();
 
             for (block, payload) in writes {
                 jbd2_txn.add_write(block, payload);
             }
 
-            match writer.commit_transaction(cx, &block_dev, &jbd2_txn) {
+            match jbd2_writer.commit_transaction(cx, &block_dev, &jbd2_txn) {
                 Ok((_seq, stats)) => stats,
                 Err(e) => {
                     panic!(
                         "FATAL: JBD2 journal write failed after MVCC commit. \
                          Memory state and disk state have diverged. \
-                         Aborting to prevent filesystem corruption. Error: {}",
-                        e
+                         Aborting to prevent filesystem corruption. Error: {e}"
                     );
                 }
             }
@@ -2515,6 +2520,7 @@ impl OpenFs {
         // Resolve parent via INODE_REF when COW tree is available.
         // Reverse-map root objectid back to FUSE inode 1.
         let root_oid = self.btrfs_superblock().map(|sb| sb.root_dir_objectid);
+        #[allow(clippy::option_if_let_else)]
         let parent_ino = if let Some(alloc_mutex) = self.btrfs_alloc_state.as_ref() {
             let alloc = alloc_mutex.lock();
             self.btrfs_lookup_parent(&alloc, canonical_dir)
@@ -2523,19 +2529,17 @@ impl OpenFs {
                 .unwrap_or_default()
                 .into_iter()
                 .find(|item| {
-                    item.key.objectid == canonical_dir
-                        && item.key.item_type == BTRFS_ITEM_INODE_REF
+                    item.key.objectid == canonical_dir && item.key.item_type == BTRFS_ITEM_INODE_REF
                 })
                 .map(|item| item.key.offset)
         }
-        .map(|oid| {
+        .map_or(ino, |oid| {
             if Some(oid) == root_oid {
                 InodeNumber(1) // FUSE root
             } else {
                 InodeNumber(oid)
             }
-        })
-        .unwrap_or(ino); // fallback to self if no parent found
+        });
         let dot = DirEntry {
             ino,
             offset: 0,
@@ -4474,7 +4478,11 @@ impl OpenFs {
         }
 
         let mut alloc = alloc_mutex.lock();
-        let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
+        let Ext4AllocState {
+            geo,
+            groups,
+            persist_ctx,
+        } = &mut *alloc;
 
         // Allocate a new inode.
         let parent_group = GroupNumber(
@@ -4562,7 +4570,11 @@ impl OpenFs {
             },
         );
         let (ino, mut new_inode) = {
-            let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
+            let Ext4AllocState {
+                geo,
+                groups,
+                persist_ctx,
+            } = &mut *alloc;
             ffs_inode::create_inode(
                 cx,
                 &block_dev,
@@ -4585,7 +4597,11 @@ impl OpenFs {
             goal_block: None,
         };
         let dir_alloc = {
-            let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
+            let Ext4AllocState {
+                geo,
+                groups,
+                persist_ctx,
+            } = &mut *alloc;
             ffs_alloc::alloc_blocks_persist(cx, &block_dev, geo, groups, 1, &hint, persist_ctx)?
         };
 
@@ -4603,7 +4619,11 @@ impl OpenFs {
         };
         let mut root_bytes = Self::extent_root(&new_inode);
         {
-            let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
+            let Ext4AllocState {
+                geo,
+                groups,
+                persist_ctx,
+            } = &mut *alloc;
             let mut tree_alloc = ffs_extent::GroupBlockAllocator {
                 cx,
                 dev: &block_dev,
@@ -4722,8 +4742,15 @@ impl OpenFs {
             goal_group: None,
             goal_block: extents.last().map(Self::extent_end_hint),
         };
-        let new_alloc =
-            ffs_alloc::alloc_blocks_persist(cx, block_dev, &alloc.geo, &mut alloc.groups, 1, &hint, &alloc.persist_ctx)?;
+        let new_alloc = ffs_alloc::alloc_blocks_persist(
+            cx,
+            block_dev,
+            &alloc.geo,
+            &mut alloc.groups,
+            1,
+            &hint,
+            &alloc.persist_ctx,
+        )?;
 
         let block_size = alloc.geo.block_size as usize;
         let mut new_block = vec![0u8; block_size];
@@ -4860,7 +4887,11 @@ impl OpenFs {
         ffs_inode::touch_ctime(&mut child_upd, tstamp_secs, tstamp_nanos);
 
         {
-            let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
+            let Ext4AllocState {
+                geo,
+                groups,
+                persist_ctx,
+            } = &mut *alloc;
             if child_upd.links_count == 0 {
                 ffs_inode::delete_inode(
                     cx,
@@ -5024,7 +5055,11 @@ impl OpenFs {
                 },
             );
             let (ino, mut inode) = {
-                let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
+                let Ext4AllocState {
+                    geo,
+                    groups,
+                    persist_ctx,
+                } = &mut *alloc;
                 ffs_inode::create_inode(
                     cx,
                     &block_dev,
@@ -5163,7 +5198,11 @@ impl OpenFs {
                 u32::try_from(length / block_size).map_err(|_| FfsError::NoSpace)?;
             if logical_count > 0 {
                 let freed_blocks = {
-                    let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
+                    let Ext4AllocState {
+                        geo,
+                        groups,
+                        persist_ctx,
+                    } = &mut *alloc;
                     ffs_extent::punch_hole(
                         cx,
                         &block_dev,
@@ -5219,7 +5258,11 @@ impl OpenFs {
                         goal_block,
                     };
                     let alloc_mapping = {
-                        let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
+                        let Ext4AllocState {
+                            geo,
+                            groups,
+                            persist_ctx,
+                        } = &mut *alloc;
                         ffs_extent::allocate_extent(
                             cx,
                             &block_dev,
@@ -5358,7 +5401,11 @@ impl OpenFs {
                     };
                     let mut root_bytes = Self::extent_root(&inode);
                     let mapping = {
-                        let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
+                        let Ext4AllocState {
+                            geo,
+                            groups,
+                            persist_ctx,
+                        } = &mut *alloc;
                         ffs_extent::allocate_extent(
                             cx,
                             &block_dev,
@@ -5507,7 +5554,11 @@ impl OpenFs {
             let mut ex_upd = existing_inode;
             ex_upd.links_count = ex_upd.links_count.saturating_sub(1);
             {
-                let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
+                let Ext4AllocState {
+                    geo,
+                    groups,
+                    persist_ctx,
+                } = &mut *alloc;
                 if ex_upd.links_count == 0 {
                     ffs_inode::delete_inode(
                         cx,
@@ -5684,7 +5735,11 @@ impl OpenFs {
                     let new_logical_end = new_size.div_ceil(u64::from(block_size)) as u32;
                     let mut root_bytes = Self::extent_root(&inode);
                     let freed = {
-                        let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
+                        let Ext4AllocState {
+                            geo,
+                            groups,
+                            persist_ctx,
+                        } = &mut *alloc;
                         ffs_extent::truncate_extents(
                             cx,
                             &block_dev,
@@ -5794,8 +5849,20 @@ impl OpenFs {
                     goal_group: Some(ino_group),
                     goal_block: None,
                 };
-                let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
-                let block_alloc = ffs_alloc::alloc_blocks_persist(cx, &block_dev, geo, groups, 1, &hint, persist_ctx)?;
+                let Ext4AllocState {
+                    geo,
+                    groups,
+                    persist_ctx,
+                } = &mut *alloc;
+                let block_alloc = ffs_alloc::alloc_blocks_persist(
+                    cx,
+                    &block_dev,
+                    geo,
+                    groups,
+                    1,
+                    &hint,
+                    persist_ctx,
+                )?;
                 let block_size = geo.block_size as usize;
                 drop(alloc);
 
@@ -9789,10 +9856,10 @@ mod tests {
     /// Layout (4K block size, 256K image = 64 blocks):
     /// - Block 0: superblock at offset 1024
     /// - Block 1: group descriptor table
-    /// - Block 4+: inode table
-    /// - Block 10: data for inode #11 (leaf extent)
-    /// - Block 11: extent leaf block for inode #12 (index extent)
-    /// - Block 12: data for inode #12
+    /// - Block 4–11: inode table (128 inodes × 256 bytes)
+    /// - Block 13: data for inode #11 (leaf extent)
+    /// - Block 14: extent leaf block for inode #12 (index extent)
+    /// - Block 15: data for inode #12
     #[allow(clippy::cast_possible_truncation)]
     fn build_ext4_image_with_extents() -> Vec<u8> {
         let block_size: u32 = 4096;
@@ -9829,7 +9896,7 @@ mod tests {
         image[ino11_off + 0x20..ino11_off + 0x24].copy_from_slice(&0x0008_0000_u32.to_le_bytes()); // EXT4_EXTENTS_FL
         image[ino11_off + 0x80..ino11_off + 0x82].copy_from_slice(&32_u16.to_le_bytes()); // extra
 
-        // Extent tree (depth=0, 1 leaf extent: logical 0 → physical 10)
+        // Extent tree (depth=0, 1 leaf extent: logical 0 → physical 13)
         let e = ino11_off + 0x28;
         image[e..e + 2].copy_from_slice(&0xF30A_u16.to_le_bytes()); // magic
         image[e + 2..e + 4].copy_from_slice(&1_u16.to_le_bytes()); // entries
@@ -9838,10 +9905,10 @@ mod tests {
         image[e + 12..e + 16].copy_from_slice(&0_u32.to_le_bytes()); // logical_block=0
         image[e + 16..e + 18].copy_from_slice(&1_u16.to_le_bytes()); // raw_len=1
         image[e + 18..e + 20].copy_from_slice(&0_u16.to_le_bytes()); // start_hi=0
-        image[e + 20..e + 24].copy_from_slice(&10_u32.to_le_bytes()); // start_lo=10
+        image[e + 20..e + 24].copy_from_slice(&13_u32.to_le_bytes()); // start_lo=13
 
-        // Data at block 10
-        let d = 10 * 4096;
+        // Data at block 13
+        let d = 13 * 4096;
         image[d..d + 14].copy_from_slice(b"Hello, extent!");
 
         // ── Inode #12 (index 11): regular file with index extent (depth=1) ──
@@ -9852,18 +9919,18 @@ mod tests {
         image[ino12_off + 0x20..ino12_off + 0x24].copy_from_slice(&0x0008_0000_u32.to_le_bytes()); // EXT4_EXTENTS_FL
         image[ino12_off + 0x80..ino12_off + 0x82].copy_from_slice(&32_u16.to_le_bytes());
 
-        // Extent tree (depth=1, 1 index entry pointing to block 11)
+        // Extent tree (depth=1, 1 index entry pointing to block 14)
         let e = ino12_off + 0x28;
         image[e..e + 2].copy_from_slice(&0xF30A_u16.to_le_bytes()); // magic
         image[e + 2..e + 4].copy_from_slice(&1_u16.to_le_bytes()); // entries
         image[e + 4..e + 6].copy_from_slice(&4_u16.to_le_bytes()); // max
         image[e + 6..e + 8].copy_from_slice(&1_u16.to_le_bytes()); // depth=1
         image[e + 12..e + 16].copy_from_slice(&0_u32.to_le_bytes()); // logical_block=0
-        image[e + 16..e + 20].copy_from_slice(&11_u32.to_le_bytes()); // leaf_lo=11
+        image[e + 16..e + 20].copy_from_slice(&14_u32.to_le_bytes()); // leaf_lo=14
         image[e + 20..e + 22].copy_from_slice(&0_u16.to_le_bytes()); // leaf_hi=0
 
-        // Block 11: leaf extent block (depth=0, 1 extent: logical 0 → physical 12)
-        let l = 11 * 4096;
+        // Block 14: leaf extent block (depth=0, 1 extent: logical 0 → physical 15)
+        let l = 14 * 4096;
         image[l..l + 2].copy_from_slice(&0xF30A_u16.to_le_bytes()); // magic
         image[l + 2..l + 4].copy_from_slice(&1_u16.to_le_bytes()); // entries
         image[l + 4..l + 6].copy_from_slice(&340_u16.to_le_bytes()); // max (4K block)
@@ -9871,11 +9938,16 @@ mod tests {
         image[l + 12..l + 16].copy_from_slice(&0_u32.to_le_bytes()); // logical_block=0
         image[l + 16..l + 18].copy_from_slice(&1_u16.to_le_bytes()); // raw_len=1
         image[l + 18..l + 20].copy_from_slice(&0_u16.to_le_bytes()); // start_hi=0
-        image[l + 20..l + 24].copy_from_slice(&12_u32.to_le_bytes()); // start_lo=12
+        image[l + 20..l + 24].copy_from_slice(&15_u32.to_le_bytes()); // start_lo=15
 
-        // Data at block 12
-        let d = 12 * 4096;
+        // Data at block 15
+        let d = 15 * 4096;
         image[d..d + 14].copy_from_slice(b"Index extent!\n");
+
+        // ── Block bitmap (block 2): mark blocks 13, 14, 15 as allocated ──
+        // This allows free_blocks_persist to succeed during orphan recovery.
+        let bm = 2 * 4096;
+        image[bm + 1] = 0xE0; // bits 13, 14, 15 set (byte 1, bits 5-7)
 
         image
     }
@@ -9889,7 +9961,7 @@ mod tests {
 
         let inode = fs.read_inode(&cx, InodeNumber(11)).unwrap();
         let phys = fs.resolve_extent(&cx, &inode, 0).unwrap();
-        assert_eq!(phys, Some(10));
+        assert_eq!(phys, Some(13));
     }
 
     #[test]
@@ -9914,13 +9986,13 @@ mod tests {
 
         let inode = fs.read_inode(&cx, InodeNumber(12)).unwrap();
         let phys = fs.resolve_extent(&cx, &inode, 0).unwrap();
-        assert_eq!(phys, Some(12));
+        assert_eq!(phys, Some(15));
     }
 
     #[test]
     fn resolve_extent_index_rejects_corrupted_child_depth() {
         let mut image = build_ext4_image_with_extents();
-        let child_block_off = 11 * 4096;
+        let child_block_off = 14 * 4096;
         image[child_block_off + 6..child_block_off + 8].copy_from_slice(&1_u16.to_le_bytes());
 
         let dev = TestDevice::from_vec(image);
@@ -9965,7 +10037,7 @@ mod tests {
         let extents = fs.collect_extents(&cx, &inode).unwrap();
         assert_eq!(extents.len(), 1);
         assert_eq!(extents[0].logical_block, 0);
-        assert_eq!(extents[0].physical_start, 10);
+        assert_eq!(extents[0].physical_start, 13);
         assert_eq!(extents[0].actual_len(), 1);
         assert!(!extents[0].is_unwritten());
     }
@@ -9981,7 +10053,7 @@ mod tests {
         let extents = fs.collect_extents(&cx, &inode).unwrap();
         assert_eq!(extents.len(), 1);
         assert_eq!(extents[0].logical_block, 0);
-        assert_eq!(extents[0].physical_start, 12);
+        assert_eq!(extents[0].physical_start, 15);
         assert_eq!(extents[0].actual_len(), 1);
     }
 

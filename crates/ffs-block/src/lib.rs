@@ -1165,13 +1165,12 @@ impl ArcState {
                 self.loc.insert(victim, ArcList::B1);
                 self.evict_resident(victim);
                 self.b1.push_back(victim);
-                self.evictions += 1;
             } else {
                 self.loc.insert(victim, ArcList::B2);
                 self.evict_resident(victim);
                 self.b2.push_back(victim);
-                self.evictions += 1;
             }
+            self.evictions += 1;
         }
 
         while self.b1.len() > self.capacity {
