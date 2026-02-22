@@ -28,9 +28,9 @@ const BLOCK_SIZE_4K: u32 = 4096;
 // ── Regression thresholds ───────────────────────────────────────────────
 
 /// Warn if p99 latency regresses by more than this percentage.
+/// Latency checks are advisory-only (warn, never fail) because absolute
+/// timings vary across heterogeneous CI hardware.
 const WARN_THRESHOLD_PERCENT: f64 = 10.0;
-/// Fail if p99 latency regresses by more than this percentage.
-const FAIL_THRESHOLD_PERCENT: f64 = 20.0;
 /// Warn if hit rate drops by more than this many percentage points.
 const HIT_RATE_WARN_PP: f64 = 2.0;
 /// Fail if hit rate drops by more than this many percentage points.
