@@ -4,6 +4,7 @@ use asupersync::Cx;
 use ffs_block::ByteDevice;
 use ffs_core::{Ext4JournalReplayMode, OpenFs, OpenOptions};
 use ffs_error::{FfsError, Result};
+use ffs_ondisk::{EXT4_ERROR_FS, EXT4_VALID_FS};
 use ffs_types::{BlockNumber, ByteOffset, EXT4_SUPER_MAGIC, EXT4_SUPERBLOCK_OFFSET};
 use std::sync::{Arc, Mutex};
 
@@ -426,6 +427,271 @@ fn write_jbd2_header(block: &mut [u8], block_type: u32, sequence: u32) {
     block[0..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
     block[4..8].copy_from_slice(&block_type.to_be_bytes());
     block[8..12].copy_from_slice(&sequence.to_be_bytes());
+}
+
+const TARGET_BLOCK2: usize = 16;
+const TARGET2_PREFIX_LEN: usize = 16;
+
+// ── Multi-transaction and crash recovery integration tests ──────────
+
+#[test]
+fn ext4_journal_recovery_replays_multiple_committed_transactions() {
+    let image = build_multi_txn_image(true);
+    let dev = MemByteDevice::new(image);
+    let inspector = dev.clone();
+    let cx = Cx::for_testing();
+
+    let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default())
+        .expect("open ext4 with multi-txn journal");
+    let replay = fs
+        .ext4_journal_replay()
+        .expect("replay outcome should be present");
+
+    assert_eq!(replay.committed_sequences, vec![1, 2]);
+    assert_eq!(replay.stats.replayed_blocks, 2);
+    assert_eq!(replay.stats.incomplete_transactions, 0);
+    assert_eq!(
+        inspector.read_block_prefix(TARGET_BLOCK, TARGET_PREFIX_LEN),
+        b"JBD2-REPLAY-TEST"
+    );
+    assert_eq!(
+        inspector.read_block_prefix(TARGET_BLOCK2, TARGET2_PREFIX_LEN),
+        b"JBD2-REPLAY-TXN2"
+    );
+}
+
+#[test]
+fn ext4_journal_recovery_crash_mid_second_transaction() {
+    let image = build_multi_txn_image(false);
+    let dev = MemByteDevice::new(image);
+    let inspector = dev.clone();
+    let cx = Cx::for_testing();
+
+    let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default())
+        .expect("open ext4 with crash-mid-second-txn journal");
+    let replay = fs
+        .ext4_journal_replay()
+        .expect("replay outcome should be present");
+
+    // Only the first transaction was committed.
+    assert_eq!(replay.committed_sequences, vec![1]);
+    assert_eq!(replay.stats.replayed_blocks, 1);
+    assert_eq!(replay.stats.incomplete_transactions, 1);
+
+    // First transaction's target was replayed.
+    assert_eq!(
+        inspector.read_block_prefix(TARGET_BLOCK, TARGET_PREFIX_LEN),
+        b"JBD2-REPLAY-TEST"
+    );
+    // Second transaction's target was NOT replayed (crash before commit).
+    assert_eq!(
+        inspector.read_block_prefix(TARGET_BLOCK2, TARGET2_PREFIX_LEN),
+        b"BLK16--ORIGINAL-"
+    );
+}
+
+#[test]
+fn ext4_journal_recovery_crash_outcome_includes_journal_stats() {
+    let image = build_ext4_image_with_journal(JournalScenario::Committed);
+    let dev = MemByteDevice::new(image);
+    let cx = Cx::for_testing();
+
+    let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default())
+        .expect("open ext4 with committed journal");
+
+    let recovery = fs
+        .crash_recovery()
+        .expect("crash recovery outcome should be present");
+    // Default state=0 → not clean (EXT4_VALID_FS not set).
+    assert!(!recovery.was_clean);
+    assert_eq!(recovery.journal_txns_replayed, 1);
+    assert_eq!(recovery.journal_blocks_replayed, 1);
+    assert!(recovery.mvcc_reset);
+}
+
+#[test]
+fn ext4_journal_recovery_dirty_state_with_error_flag() {
+    let mut image = build_ext4_image_with_journal(JournalScenario::Committed);
+    // Set EXT4_ERROR_FS in s_state at superblock offset 0x3A.
+    let sb_off = EXT4_SUPERBLOCK_OFFSET;
+    let state: u16 = EXT4_VALID_FS | EXT4_ERROR_FS;
+    image[sb_off + 0x3A..sb_off + 0x3C].copy_from_slice(&state.to_le_bytes());
+
+    let dev = MemByteDevice::new(image);
+    let inspector = dev.clone();
+    let cx = Cx::for_testing();
+
+    let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default())
+        .expect("open ext4 with error flag + journal");
+
+    // Journal still gets replayed even with error flag.
+    let replay = fs
+        .ext4_journal_replay()
+        .expect("replay outcome should be present");
+    assert_eq!(replay.committed_sequences, vec![1]);
+    assert_eq!(replay.stats.replayed_blocks, 1);
+    assert_eq!(
+        inspector.read_block_prefix(TARGET_BLOCK, TARGET_PREFIX_LEN),
+        b"JBD2-REPLAY-TEST"
+    );
+
+    // CrashRecoveryOutcome reflects both error state and journal replay.
+    let recovery = fs
+        .crash_recovery()
+        .expect("crash recovery outcome should be present");
+    assert!(!recovery.was_clean);
+    assert!(recovery.had_errors);
+    assert_eq!(recovery.journal_txns_replayed, 1);
+    assert_eq!(recovery.journal_blocks_replayed, 1);
+}
+
+#[test]
+fn ext4_journal_recovery_skip_mode_no_replay() {
+    let image = build_ext4_image_with_journal(JournalScenario::Committed);
+    let dev = MemByteDevice::new(image);
+    let inspector = dev.clone();
+    let cx = Cx::for_testing();
+    let options = OpenOptions {
+        ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+        ..OpenOptions::default()
+    };
+
+    let fs = OpenFs::from_device(&cx, Box::new(dev), &options).expect("open ext4 with skip mode");
+
+    // Skip mode returns a default (empty) replay outcome — no actual replay.
+    let replay = fs
+        .ext4_journal_replay()
+        .expect("skip mode still populates a default replay outcome");
+    assert!(replay.committed_sequences.is_empty());
+    assert_eq!(replay.stats.replayed_blocks, 0);
+
+    // Target block is untouched — no replay occurred.
+    assert_eq!(
+        inspector.read_block_prefix(TARGET_BLOCK, TARGET_PREFIX_LEN),
+        b"BLOCK15-ORIGINAL"
+    );
+
+    // CrashRecoveryOutcome still records 0 journal stats.
+    let recovery = fs
+        .crash_recovery()
+        .expect("crash recovery outcome should be present");
+    assert_eq!(recovery.journal_txns_replayed, 0);
+    assert_eq!(recovery.journal_blocks_replayed, 0);
+}
+
+#[test]
+fn ext4_journal_recovery_multi_txn_crash_outcome_stats() {
+    let image = build_multi_txn_image(true);
+    let dev = MemByteDevice::new(image);
+    let cx = Cx::for_testing();
+
+    let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default())
+        .expect("open ext4 with multi-txn journal");
+
+    let recovery = fs
+        .crash_recovery()
+        .expect("crash recovery outcome should be present");
+    assert_eq!(recovery.journal_txns_replayed, 2);
+    assert_eq!(recovery.journal_blocks_replayed, 2);
+}
+
+/// Build an ext4 image with two journal transactions.
+///
+/// When `commit_second` is true, both transactions are committed.
+/// When false, the second transaction has descriptor+data but no commit,
+/// simulating a crash during the second write.
+#[allow(clippy::cast_possible_truncation)]
+fn build_multi_txn_image(commit_second: bool) -> Vec<u8> {
+    let mut image = build_ext4_image_with_extents();
+    let sb_off = EXT4_SUPERBLOCK_OFFSET;
+
+    // Enable HAS_JOURNAL and point to internal journal inode #8.
+    let compat = u32::from_le_bytes([
+        image[sb_off + 0x5C],
+        image[sb_off + 0x5D],
+        image[sb_off + 0x5E],
+        image[sb_off + 0x5F],
+    ]);
+    image[sb_off + 0x5C..sb_off + 0x60].copy_from_slice(&(compat | 0x0004).to_le_bytes());
+    image[sb_off + 0xE0..sb_off + 0xE4].copy_from_slice(&JOURNAL_INODE.to_le_bytes());
+
+    // Journal needs 6 blocks for two full transactions (desc+data+commit × 2),
+    // or 5 blocks if second commit is omitted.
+    let journal_len_blocks: u16 = if commit_second { 6 } else { 5 };
+
+    // Write journal inode #8 with extent covering blocks 20..20+len.
+    let ino8_off = 4 * BLOCK_SIZE + 7 * 256;
+    image[ino8_off..ino8_off + 2].copy_from_slice(&0o100_600_u16.to_le_bytes());
+    image[ino8_off + 4..ino8_off + 8]
+        .copy_from_slice(&(u32::from(journal_len_blocks) * 4096).to_le_bytes());
+    image[ino8_off + 0x1A..ino8_off + 0x1C].copy_from_slice(&1_u16.to_le_bytes());
+    image[ino8_off + 0x20..ino8_off + 0x24].copy_from_slice(&0x0008_0000_u32.to_le_bytes());
+    image[ino8_off + 0x80..ino8_off + 0x82].copy_from_slice(&32_u16.to_le_bytes());
+
+    let e = ino8_off + 0x28;
+    image[e..e + 2].copy_from_slice(&0xF30A_u16.to_le_bytes()); // extent magic
+    image[e + 2..e + 4].copy_from_slice(&1_u16.to_le_bytes()); // entries
+    image[e + 4..e + 6].copy_from_slice(&4_u16.to_le_bytes()); // max
+    image[e + 6..e + 8].copy_from_slice(&0_u16.to_le_bytes()); // depth=0
+    image[e + 12..e + 16].copy_from_slice(&0_u32.to_le_bytes()); // logical 0
+    image[e + 16..e + 18].copy_from_slice(&journal_len_blocks.to_le_bytes()); // len
+    image[e + 18..e + 20].copy_from_slice(&0_u16.to_le_bytes()); // start_hi
+    image[e + 20..e + 24].copy_from_slice(
+        &u32::try_from(JOURNAL_START_BLOCK)
+            .expect("journal start should fit u32")
+            .to_le_bytes(),
+    );
+
+    // Baseline payload at target blocks so tests can verify whether replay wrote.
+    let t1 = TARGET_BLOCK * BLOCK_SIZE;
+    image[t1..t1 + TARGET_PREFIX_LEN].copy_from_slice(b"BLOCK15-ORIGINAL");
+    let t2 = TARGET_BLOCK2 * BLOCK_SIZE;
+    image[t2..t2 + TARGET2_PREFIX_LEN].copy_from_slice(b"BLK16--ORIGINAL-");
+
+    // Transaction 1 (seq=1): descriptor → data → commit, targeting block 15.
+    let j0 = JOURNAL_START_BLOCK * BLOCK_SIZE;
+    write_jbd2_header(
+        &mut image[j0..j0 + BLOCK_SIZE],
+        JBD2_BLOCKTYPE_DESCRIPTOR,
+        1,
+    );
+    image[j0 + 12..j0 + 16].copy_from_slice(
+        &u32::try_from(TARGET_BLOCK)
+            .expect("target block fits u32")
+            .to_be_bytes(),
+    );
+    image[j0 + 16..j0 + 20].copy_from_slice(&JBD2_LAST_TAG.to_be_bytes());
+
+    let j1 = (JOURNAL_START_BLOCK + 1) * BLOCK_SIZE;
+    image[j1..j1 + TARGET_PREFIX_LEN].copy_from_slice(b"JBD2-REPLAY-TEST");
+
+    let j2 = (JOURNAL_START_BLOCK + 2) * BLOCK_SIZE;
+    write_jbd2_header(&mut image[j2..j2 + BLOCK_SIZE], JBD2_BLOCKTYPE_COMMIT, 1);
+
+    // Transaction 2 (seq=2): descriptor → data, targeting block 16.
+    let j3 = (JOURNAL_START_BLOCK + 3) * BLOCK_SIZE;
+    write_jbd2_header(
+        &mut image[j3..j3 + BLOCK_SIZE],
+        JBD2_BLOCKTYPE_DESCRIPTOR,
+        2,
+    );
+    image[j3 + 12..j3 + 16].copy_from_slice(
+        &u32::try_from(TARGET_BLOCK2)
+            .expect("target block2 fits u32")
+            .to_be_bytes(),
+    );
+    image[j3 + 16..j3 + 20].copy_from_slice(&JBD2_LAST_TAG.to_be_bytes());
+
+    let j4 = (JOURNAL_START_BLOCK + 4) * BLOCK_SIZE;
+    image[j4..j4 + TARGET2_PREFIX_LEN].copy_from_slice(b"JBD2-REPLAY-TXN2");
+
+    if commit_second {
+        let j5 = (JOURNAL_START_BLOCK + 5) * BLOCK_SIZE;
+        write_jbd2_header(&mut image[j5..j5 + BLOCK_SIZE], JBD2_BLOCKTYPE_COMMIT, 2);
+    }
+    // When !commit_second, journal block 25 stays zeroed → incomplete transaction.
+
+    image
 }
 
 /// Build an ext4 image with file inodes that have extent trees.

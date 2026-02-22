@@ -16,6 +16,8 @@ use asupersync::Cx;
 use ffs_core::{Ext4JournalReplayMode, OpenFs, OpenOptions};
 use ffs_fuse::{MountOptions, mount_background};
 use std::fs;
+use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::Command;
 use std::thread;
@@ -301,4 +303,436 @@ fn fuse_readlink_and_symlink_detection() {
     // Following the symlink should give the same content.
     let content = fs::read_to_string(mnt.join("link.txt")).expect("read through symlink via FUSE");
     assert_eq!(content, "Hello from FrankenFS E2E!\n");
+}
+
+// ── Write-path E2E tests ────────────────────────────────────────────────────
+
+/// Try to mount an ext4 image via FrankenFS FUSE in **read-write** mode.
+///
+/// Returns `None` if FUSE mounting fails (e.g. permission denied in containers).
+fn try_mount_ffs_rw(image: &Path, mountpoint: &Path) -> Option<fuser::BackgroundSession> {
+    let cx = Cx::for_testing();
+    let opts = OpenOptions {
+        skip_validation: false,
+        ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
+    };
+    let fs = OpenFs::open_with_options(&cx, image, &opts).expect("open ext4 image");
+    let mount_opts = MountOptions {
+        read_only: false,
+        auto_unmount: false,
+        ..MountOptions::default()
+    };
+    match mount_background(Box::new(fs), mountpoint, &mount_opts) {
+        Ok(session) => {
+            thread::sleep(Duration::from_millis(300));
+            Some(session)
+        }
+        Err(e) => {
+            eprintln!("FUSE mount (rw) failed (skipping test): {e}");
+            None
+        }
+    }
+}
+
+/// Helper: create image, mount rw, run a closure, then drop the session.
+fn with_rw_mount(f: impl FnOnce(&Path)) {
+    if !fuse_available() {
+        eprintln!("FUSE prerequisites not met, skipping");
+        return;
+    }
+    let tmp = TempDir::new().expect("tmpdir");
+    let image = create_test_image(tmp.path());
+    let mnt = tmp.path().join("mnt");
+    fs::create_dir_all(&mnt).expect("create mountpoint");
+
+    let Some(_session) = try_mount_ffs_rw(&image, &mnt) else {
+        return;
+    };
+    f(&mnt);
+}
+
+#[test]
+#[ignore = "requires /dev/fuse"]
+fn fuse_create_and_read_file() {
+    with_rw_mount(|mnt| {
+        let path = mnt.join("newfile.txt");
+        fs::write(&path, b"Created via FUSE write path!\n").expect("create file via FUSE");
+
+        let content = fs::read_to_string(&path).expect("read back created file");
+        assert_eq!(content, "Created via FUSE write path!\n");
+
+        let meta = fs::metadata(&path).expect("stat created file");
+        assert!(meta.is_file());
+        assert_eq!(meta.len(), 29);
+    });
+}
+
+#[test]
+#[ignore = "requires /dev/fuse"]
+fn fuse_write_overwrite_and_append() {
+    with_rw_mount(|mnt| {
+        let path = mnt.join("overwrite.txt");
+
+        // Write initial content.
+        fs::write(&path, b"initial").expect("write initial");
+        assert_eq!(fs::read_to_string(&path).expect("read initial"), "initial");
+
+        // Overwrite with longer content.
+        fs::write(&path, b"overwritten content").expect("overwrite");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read overwritten"),
+            "overwritten content"
+        );
+
+        // Append additional content.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open for append");
+        file.write_all(b" + appended").expect("append write");
+        drop(file);
+        assert_eq!(
+            fs::read_to_string(&path).expect("read appended"),
+            "overwritten content + appended"
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires /dev/fuse"]
+fn fuse_mkdir_and_nested_create() {
+    with_rw_mount(|mnt| {
+        let dir = mnt.join("newdir");
+        fs::create_dir(&dir).expect("mkdir via FUSE");
+
+        let meta = fs::metadata(&dir).expect("stat newdir");
+        assert!(meta.is_dir());
+
+        // Create a file inside the new directory.
+        let nested = dir.join("inner.txt");
+        fs::write(&nested, b"nested content\n").expect("write nested file");
+
+        let content = fs::read_to_string(&nested).expect("read nested file");
+        assert_eq!(content, "nested content\n");
+    });
+}
+
+#[test]
+#[ignore = "requires /dev/fuse"]
+fn fuse_unlink_removes_file() {
+    with_rw_mount(|mnt| {
+        // hello.txt exists from create_test_image.
+        let path = mnt.join("hello.txt");
+        assert!(path.exists(), "hello.txt should exist before unlink");
+
+        fs::remove_file(&path).expect("unlink hello.txt via FUSE");
+        assert!(!path.exists(), "hello.txt should be gone after unlink");
+    });
+}
+
+#[test]
+#[ignore = "requires /dev/fuse"]
+fn fuse_rmdir_removes_empty_directory() {
+    with_rw_mount(|mnt| {
+        let dir = mnt.join("empty_dir");
+        fs::create_dir(&dir).expect("mkdir empty_dir");
+        assert!(dir.exists());
+
+        fs::remove_dir(&dir).expect("rmdir empty_dir via FUSE");
+        assert!(!dir.exists(), "empty_dir should be gone after rmdir");
+    });
+}
+
+#[test]
+#[ignore = "requires /dev/fuse"]
+fn fuse_rmdir_non_empty_fails() {
+    with_rw_mount(|mnt| {
+        let dir = mnt.join("non_empty_dir");
+        fs::create_dir(&dir).expect("mkdir non_empty_dir");
+        fs::write(dir.join("child.txt"), b"child").expect("create child in non_empty_dir");
+
+        let err = fs::remove_dir(&dir).expect_err("rmdir non-empty should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::DirectoryNotEmpty);
+        assert!(
+            dir.exists(),
+            "directory should still exist after failed rmdir"
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires /dev/fuse"]
+fn fuse_rename_file() {
+    with_rw_mount(|mnt| {
+        let old = mnt.join("hello.txt");
+        let new = mnt.join("renamed.txt");
+        assert!(old.exists());
+
+        fs::rename(&old, &new).expect("rename via FUSE");
+        assert!(!old.exists(), "old name should be gone");
+        assert!(new.exists(), "new name should exist");
+
+        let content = fs::read_to_string(&new).expect("read renamed file");
+        assert_eq!(content, "Hello from FrankenFS E2E!\n");
+    });
+}
+
+#[test]
+#[ignore = "requires /dev/fuse"]
+fn fuse_rename_across_directories() {
+    with_rw_mount(|mnt| {
+        let src = mnt.join("hello.txt");
+        let dst = mnt.join("testdir/moved.txt");
+        assert!(src.exists());
+
+        fs::rename(&src, &dst).expect("rename across dirs via FUSE");
+        assert!(!src.exists());
+
+        let content = fs::read_to_string(&dst).expect("read moved file");
+        assert_eq!(content, "Hello from FrankenFS E2E!\n");
+    });
+}
+
+#[test]
+#[ignore = "requires /dev/fuse"]
+fn fuse_hard_link() {
+    with_rw_mount(|mnt| {
+        let original = mnt.join("hello.txt");
+        let link = mnt.join("hello_link.txt");
+
+        fs::hard_link(&original, &link).expect("hard link via FUSE");
+
+        let content = fs::read_to_string(&link).expect("read through hard link");
+        assert_eq!(content, "Hello from FrankenFS E2E!\n");
+
+        // Both should share the same inode.
+        let orig_ino = fs::metadata(&original).expect("stat original").ino();
+        let link_ino = fs::metadata(&link).expect("stat link").ino();
+        assert_eq!(orig_ino, link_ino, "hard link should share inode");
+        let orig_nlink = fs::metadata(&original).expect("stat original").nlink();
+        let link_nlink = fs::metadata(&link).expect("stat link").nlink();
+        assert_eq!(orig_nlink, 2, "original should report two hard links");
+        assert_eq!(link_nlink, 2, "link should report two hard links");
+    });
+}
+
+#[test]
+#[ignore = "requires /dev/fuse"]
+fn fuse_symlink_create_and_follow() {
+    with_rw_mount(|mnt| {
+        let target = mnt.join("hello.txt");
+        let link = mnt.join("sym.txt");
+
+        std::os::unix::fs::symlink("hello.txt", &link).expect("symlink via FUSE");
+
+        // Verify readlink returns the target.
+        let read_target = fs::read_link(&link).expect("readlink via FUSE");
+        assert_eq!(read_target.to_str().unwrap(), "hello.txt");
+
+        // Following the symlink should work.
+        let content = fs::read_to_string(&link).expect("read through new symlink");
+        assert_eq!(content, "Hello from FrankenFS E2E!\n");
+
+        // Symlink metadata should differ from target.
+        let link_meta = fs::symlink_metadata(&link).expect("lstat symlink");
+        assert!(link_meta.file_type().is_symlink());
+        let _ = target; // used implicitly via symlink follow
+    });
+}
+
+#[test]
+#[ignore = "requires /dev/fuse"]
+fn fuse_setattr_truncate() {
+    with_rw_mount(|mnt| {
+        let path = mnt.join("hello.txt");
+        let original_len = fs::metadata(&path).expect("stat").len();
+        assert!(original_len > 0);
+
+        // Truncate to 5 bytes.
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open for truncate");
+        f.set_len(5).expect("truncate via FUSE");
+        drop(f);
+
+        let new_len = fs::metadata(&path).expect("stat after truncate").len();
+        assert_eq!(new_len, 5, "file should be truncated to 5 bytes");
+
+        let content = fs::read_to_string(&path).expect("read truncated file");
+        assert_eq!(content, "Hello");
+    });
+}
+
+#[test]
+#[ignore = "requires /dev/fuse"]
+fn fuse_write_large_file() {
+    with_rw_mount(|mnt| {
+        let path = mnt.join("large.bin");
+        // Write 64 KiB of patterned data (crosses multiple blocks).
+        let data: Vec<u8> = (0..65536_u32).map(|i| (i % 251) as u8).collect();
+        fs::write(&path, &data).expect("write large file via FUSE");
+
+        let readback = fs::read(&path).expect("read large file");
+        assert_eq!(readback.len(), 65536);
+        assert_eq!(readback, data, "large file content should match");
+    });
+}
+
+// ── btrfs FUSE E2E tests ────────────────────────────────────────────────────
+
+/// Check if btrfs FUSE prerequisites are met.
+fn btrfs_fuse_available() -> bool {
+    Path::new("/dev/fuse").exists()
+        && Command::new("which")
+            .arg("mkfs.btrfs")
+            .output()
+            .is_ok_and(|o| o.status.success())
+}
+
+/// Create a small btrfs image and populate it with test files.
+fn create_btrfs_test_image(dir: &Path) -> std::path::PathBuf {
+    let image = dir.join("test.btrfs");
+
+    // Create a 64 MiB sparse image (btrfs needs more space than ext4).
+    let f = fs::File::create(&image).expect("create btrfs image");
+    f.set_len(64 * 1024 * 1024).expect("set btrfs image size");
+    drop(f);
+
+    // mkfs.btrfs
+    let out = Command::new("mkfs.btrfs")
+        .args(["-f", "-L", "ffs-btrfs-e2e", image.to_str().unwrap()])
+        .output()
+        .expect("mkfs.btrfs");
+    assert!(
+        out.status.success(),
+        "mkfs.btrfs failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    image
+}
+
+/// Try to mount a btrfs image via FrankenFS FUSE (read-write).
+fn try_mount_btrfs_rw(image: &Path, mountpoint: &Path) -> Option<fuser::BackgroundSession> {
+    let cx = Cx::for_testing();
+    let opts = OpenOptions {
+        skip_validation: false,
+        ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
+    };
+    let fs = OpenFs::open_with_options(&cx, image, &opts).expect("open btrfs image");
+    let mount_opts = MountOptions {
+        read_only: false,
+        auto_unmount: false,
+        ..MountOptions::default()
+    };
+    match mount_background(Box::new(fs), mountpoint, &mount_opts) {
+        Ok(session) => {
+            thread::sleep(Duration::from_millis(300));
+            Some(session)
+        }
+        Err(e) => {
+            eprintln!("btrfs FUSE mount failed (skipping test): {e}");
+            None
+        }
+    }
+}
+
+/// Helper: create btrfs image, mount rw, run a closure.
+fn with_btrfs_rw_mount(f: impl FnOnce(&Path)) {
+    if !btrfs_fuse_available() {
+        eprintln!("btrfs FUSE prerequisites not met, skipping");
+        return;
+    }
+    let tmp = TempDir::new().expect("tmpdir");
+    let image = create_btrfs_test_image(tmp.path());
+    let mnt = tmp.path().join("mnt");
+    fs::create_dir_all(&mnt).expect("create mountpoint");
+
+    let Some(_session) = try_mount_btrfs_rw(&image, &mnt) else {
+        return;
+    };
+    f(&mnt);
+}
+
+#[test]
+#[ignore = "requires /dev/fuse"]
+fn btrfs_fuse_readdir_root() {
+    with_btrfs_rw_mount(|mnt| {
+        // Empty btrfs should at least have . and ..
+        let entries: Vec<String> = fs::read_dir(mnt)
+            .expect("readdir btrfs root via FUSE")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        // btrfs root dir exists; entries may be empty (no default subvolume files).
+        // Just verify readdir doesn't error.
+        let _ = entries;
+    });
+}
+
+#[test]
+#[ignore = "requires /dev/fuse"]
+fn btrfs_fuse_create_and_read_file() {
+    with_btrfs_rw_mount(|mnt| {
+        let path = mnt.join("hello.txt");
+        fs::write(&path, b"Hello from btrfs FUSE!\n").expect("write file on btrfs");
+
+        let content = fs::read_to_string(&path).expect("read file on btrfs");
+        assert_eq!(content, "Hello from btrfs FUSE!\n");
+    });
+}
+
+#[test]
+#[ignore = "requires /dev/fuse"]
+fn btrfs_fuse_mkdir_and_nested_file() {
+    with_btrfs_rw_mount(|mnt| {
+        let dir = mnt.join("subdir");
+        fs::create_dir(&dir).expect("mkdir on btrfs");
+
+        let nested = dir.join("nested.txt");
+        fs::write(&nested, b"nested btrfs content\n").expect("write nested on btrfs");
+
+        let content = fs::read_to_string(&nested).expect("read nested on btrfs");
+        assert_eq!(content, "nested btrfs content\n");
+    });
+}
+
+#[test]
+#[ignore = "requires /dev/fuse"]
+fn btrfs_fuse_unlink_and_rmdir() {
+    with_btrfs_rw_mount(|mnt| {
+        // Create and remove a file.
+        let path = mnt.join("temp.txt");
+        fs::write(&path, b"temporary").expect("write temp");
+        assert!(path.exists());
+        fs::remove_file(&path).expect("unlink on btrfs");
+        assert!(!path.exists());
+
+        // Create and remove a directory.
+        let dir = mnt.join("tempdir");
+        fs::create_dir(&dir).expect("mkdir tempdir");
+        assert!(dir.exists());
+        fs::remove_dir(&dir).expect("rmdir on btrfs");
+        assert!(!dir.exists());
+    });
+}
+
+#[test]
+#[ignore = "requires /dev/fuse"]
+fn btrfs_fuse_rename() {
+    with_btrfs_rw_mount(|mnt| {
+        let old = mnt.join("original.txt");
+        let new = mnt.join("renamed.txt");
+        fs::write(&old, b"rename test").expect("write for rename");
+        assert!(old.exists());
+
+        fs::rename(&old, &new).expect("rename on btrfs");
+        assert!(!old.exists());
+        assert!(new.exists());
+        assert_eq!(
+            fs::read_to_string(&new).expect("read renamed"),
+            "rename test"
+        );
+    });
 }
