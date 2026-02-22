@@ -1357,9 +1357,12 @@ impl OpenFs {
                     &alloc.persist_ctx,
                 )?;
                 Self::set_extent_root(&mut inode, &root_bytes);
-                inode.blocks = inode
-                    .blocks
-                    .saturating_sub(freed.saturating_mul(u64::from(alloc.geo.block_size / 512)));
+                let freed_sectors = if inode.is_huge_file() {
+                    freed
+                } else {
+                    freed.saturating_mul(u64::from(alloc.geo.block_size / 512))
+                };
+                inode.blocks = inode.blocks.saturating_sub(freed_sectors);
             }
 
             inode.dtime = 0;
@@ -1936,13 +1939,14 @@ impl OpenFs {
     ///
     /// The write path is:
     /// 1. Extract the transaction's write set.
-    /// 2. Commit the MVCC transaction (in-memory) to perform conflict detection.
-    /// 3. If MVCC commit succeeds, write a JBD2 transaction (descriptor + data + commit blocks)
+    /// 2. Preflight FCW/chain-pressure checks under the MVCC write lock.
+    /// 3. Write a JBD2 transaction (descriptor + data + commit blocks)
     ///    to the journal region via the attached [`Jbd2Writer`].
+    /// 4. Make the transaction visible in MVCC after journal durability succeeds.
     ///
-    /// MVCC commit must happen first because if an FCW conflict aborts the transaction,
-    /// we must not write it to the JBD2 journal. Otherwise, crash recovery would
-    /// replay the aborted writes and corrupt the filesystem state.
+    /// The same MVCC write lock is held across steps (2)-(4), preventing any
+    /// interleaving writer from invalidating the preflight decision before
+    /// visibility is applied.
     ///
     /// # Errors
     ///
@@ -1982,16 +1986,29 @@ impl OpenFs {
             .map(|(b, d)| (*b, d.clone()))
             .collect();
 
-        // Phase 1: commit to MVCC store. This performs conflict detection.
-        // If it fails, the transaction is cleanly aborted without touching the disk.
-        let commit_seq = self.mvcc_store.write().commit(txn).map_err(|e| {
+        // Hold the MVCC write lock across preflight, journal I/O, and final
+        // visibility so no other writer can invalidate this transaction in between.
+        let mut mvcc_guard = self.mvcc_store.write();
+
+        // Phase 1: preflight conflict checks. This does not make versions visible.
+        mvcc_guard.preflight_commit_fcw(&txn).map_err(|e| {
             warn!(
                 target: "ffs::journal",
                 txn_id = txn_id.0,
                 error = %e,
                 "journaled_commit_mvcc_conflict"
             );
-            FfsError::Format(format!("MVCC commit failed before journal write: {e}"))
+            match e {
+                CommitError::Conflict { block, .. }
+                | CommitError::ChainBackpressure { block, .. } => FfsError::MvccConflict {
+                    tx: txn_id.0,
+                    block: block.0,
+                },
+                CommitError::SsiConflict { pivot_block, .. } => FfsError::MvccConflict {
+                    tx: txn_id.0,
+                    block: pivot_block.0,
+                },
+            }
         })?;
 
         // Phase 2: write all pending blocks to the JBD2 journal.
@@ -2006,14 +2023,22 @@ impl OpenFs {
             match jbd2_writer.commit_transaction(cx, &block_dev, &jbd2_txn) {
                 Ok((_seq, stats)) => stats,
                 Err(e) => {
-                    panic!(
-                        "FATAL: JBD2 journal write failed after MVCC commit. \
-                         Memory state and disk state have diverged. \
-                         Aborting to prevent filesystem corruption. Error: {e}"
+                    warn!(
+                        target: "ffs::journal",
+                        txn_id = txn_id.0,
+                        error = %e,
+                        "journaled_commit_jbd2_failed_before_visibility"
                     );
+                    return Err(FfsError::Format(format!(
+                        "JBD2 journal write failed before MVCC visibility: {e}"
+                    )));
                 }
             }
         };
+
+        // Phase 3: make preflighted writes visible in MVCC.
+        let commit_seq = mvcc_guard.commit_fcw_prechecked(txn);
+        drop(mvcc_guard);
 
         info!(
             target: "ffs::journal",
@@ -2260,7 +2285,9 @@ impl OpenFs {
 
     fn btrfs_timespec(sec: u64, nsec: u32) -> SystemTime {
         let clamped_nsec = nsec.min(999_999_999);
-        UNIX_EPOCH + Duration::new(sec, clamped_nsec)
+        UNIX_EPOCH
+            .checked_add(Duration::new(sec, clamped_nsec))
+            .unwrap_or(UNIX_EPOCH)
     }
 
     fn btrfs_mode_to_file_type(mode: u32) -> FileType {
@@ -2850,7 +2877,7 @@ impl OpenFs {
                     }
 
                     // Preallocated extents have no initialized data yet.
-                    if *extent_type == BTRFS_FILE_EXTENT_PREALLOC {
+                    if *extent_type == BTRFS_FILE_EXTENT_PREALLOC || *disk_bytenr == 0 {
                         trace!(
                             inode = canonical,
                             file_offset = overlap_start,
@@ -3193,7 +3220,7 @@ impl OpenFs {
         cx: &Cx,
         inode: &Ext4Inode,
         logical_block: u32,
-    ) -> Result<Option<u64>, FfsError> {
+    ) -> Result<Option<(u64, bool)>, FfsError> {
         let (header, tree) = parse_inode_extent_tree(inode).map_err(|e| parse_to_ffs_error(&e))?;
         self.walk_extent_tree(cx, &tree, logical_block, header.depth)
     }
@@ -3204,7 +3231,7 @@ impl OpenFs {
         tree: &ExtentTree,
         logical_block: u32,
         remaining_depth: u16,
-    ) -> Result<Option<u64>, FfsError> {
+    ) -> Result<Option<(u64, bool)>, FfsError> {
         if remaining_depth > Self::MAX_EXTENT_DEPTH {
             return Err(FfsError::Corruption {
                 block: 0,
@@ -3219,7 +3246,10 @@ impl OpenFs {
                     let len = u32::from(ext.actual_len());
                     if logical_block >= start && logical_block < start.saturating_add(len) {
                         let offset_within = u64::from(logical_block - start);
-                        return Ok(Some(ext.physical_start + offset_within));
+                        return Ok(Some((
+                            ext.physical_start + offset_within,
+                            ext.is_unwritten(),
+                        )));
                     }
                 }
                 Ok(None)
@@ -3350,11 +3380,15 @@ impl OpenFs {
             let chunk_size = remaining_in_block.min(to_read - bytes_read);
 
             match self.resolve_extent(cx, inode, logical_block)? {
-                Some(phys_block) => {
-                    let block_data = self.read_block_vec(cx, BlockNumber(phys_block))?;
-                    buf[bytes_read..bytes_read + chunk_size].copy_from_slice(
-                        &block_data[offset_in_block..offset_in_block + chunk_size],
-                    );
+                Some((phys_block, unwritten)) => {
+                    if unwritten {
+                        buf[bytes_read..bytes_read + chunk_size].fill(0);
+                    } else {
+                        let block_data = self.read_block_vec(cx, BlockNumber(phys_block))?;
+                        buf[bytes_read..bytes_read + chunk_size].copy_from_slice(
+                            &block_data[offset_in_block..offset_in_block + chunk_size],
+                        );
+                    }
                 }
                 None => {
                     buf[bytes_read..bytes_read + chunk_size].fill(0);
@@ -3380,7 +3414,10 @@ impl OpenFs {
         let mut all_entries = Vec::new();
 
         for lb in 0..num_blocks {
-            if let Some(phys) = self.resolve_extent(cx, inode, lb)? {
+            if let Some((phys, unwritten)) = self.resolve_extent(cx, inode, lb)? {
+                if unwritten {
+                    continue;
+                }
                 let block_data = self.read_block_vec(cx, BlockNumber(phys))?;
                 let (entries, _tail) = parse_dir_block(&block_data, self.block_size())
                     .map_err(|e| parse_to_ffs_error(&e))?;
@@ -3404,7 +3441,10 @@ impl OpenFs {
         let num_blocks = dir_logical_block_count(dir_inode.size, bs)?;
 
         for lb in 0..num_blocks {
-            if let Some(phys) = self.resolve_extent(cx, dir_inode, lb)? {
+            if let Some((phys, unwritten)) = self.resolve_extent(cx, dir_inode, lb)? {
+                if unwritten {
+                    continue;
+                }
                 let block_data = self.read_block_vec(cx, BlockNumber(phys))?;
                 if let Some(entry) = lookup_in_dir_block(&block_data, self.block_size(), name) {
                     return Ok(Some(entry));
@@ -6028,7 +6068,37 @@ impl OpenFs {
         // For simplicity in V1, write data as an inline extent if small enough,
         // otherwise allocate a data extent and write through the device.
         let nodesize = alloc.nodesize;
-        if end <= u64::from(nodesize) - 200 && data.len() <= 2048 {
+        let mut can_be_inline = end.max(inode.size) <= u64::from(nodesize) - 200 && data.len() <= 2048;
+
+        if can_be_inline {
+            let ext_start = BtrfsKey {
+                objectid: canonical,
+                item_type: BTRFS_ITEM_EXTENT_DATA,
+                offset: 0,
+            };
+            let ext_end = BtrfsKey {
+                objectid: canonical,
+                item_type: BTRFS_ITEM_EXTENT_DATA,
+                offset: u64::MAX,
+            };
+            if let Ok(extents) = alloc.fs_tree.range(&ext_start, &ext_end) {
+                for (k, edata) in extents {
+                    if k.offset > 0 {
+                        can_be_inline = false;
+                        break;
+                    }
+                    match parse_extent_data(edata) {
+                        Ok(BtrfsExtentData::Inline { .. }) => {}
+                        _ => {
+                            can_be_inline = false;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if can_be_inline {
             // Inline extent: store data directly in the tree item.
             let extent = BtrfsExtentData::Inline {
                 compression: 0,
@@ -6075,6 +6145,8 @@ impl OpenFs {
                 item_type: BTRFS_ITEM_EXTENT_DATA,
                 offset: 0,
             };
+            let mut merged_data = None;
+
             if let Ok(existing) = alloc.fs_tree.range(&inline_key, &inline_key) {
                 if let Some((_, edata)) = existing.first() {
                     if let Ok(BtrfsExtentData::Inline {
@@ -6085,9 +6157,16 @@ impl OpenFs {
                             .fs_tree
                             .delete(&inline_key)
                             .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-                        // Persist the old inline data as a regular extent at
-                        // offset 0 so reads in [0, prev_data.len()) still work.
-                        if !prev_data.is_empty() && offset > 0 {
+                        
+                        if offset == 0 && data.len() < prev_data.len() {
+                            // Partial overwrite at offset 0: merge new data into old
+                            // inline extent to preserve the tail before converting.
+                            let mut merged = prev_data.clone();
+                            merged[..data.len()].copy_from_slice(data);
+                            merged_data = Some(merged);
+                        } else if !prev_data.is_empty() && offset > 0 {
+                            // Persist the old inline data as a regular extent at
+                            // offset 0 so reads in [0, prev_data.len()) still work.
                             let prev_alloc_size = (prev_data.len() as u64)
                                 .saturating_add(sectorsize - 1)
                                 & !(sectorsize - 1);
@@ -6117,8 +6196,11 @@ impl OpenFs {
                 }
             }
 
+            let data_to_write = merged_data.as_deref().unwrap_or(data);
+            let write_len = data_to_write.len();
+
             // Allocate a data extent and write through the device.
-            let alloc_size = (data.len() as u64).saturating_add(sectorsize - 1) & !(sectorsize - 1);
+            let alloc_size = (write_len as u64).saturating_add(sectorsize - 1) & !(sectorsize - 1);
             let allocation = alloc
                 .extent_alloc
                 .alloc_data(alloc_size)
@@ -6128,7 +6210,7 @@ impl OpenFs {
             // Write data to the allocated physical region.
             // For single-device, the logical address is the physical address
             // (the data block group we create maps 1:1).
-            self.dev.write_all_at(cx, ByteOffset(disk_bytenr), data)?;
+            self.dev.write_all_at(cx, ByteOffset(disk_bytenr), data_to_write)?;
 
             // Insert the EXTENT_DATA item.
             let extent = BtrfsExtentData::Regular {
@@ -6137,7 +6219,7 @@ impl OpenFs {
                 disk_bytenr,
                 disk_num_bytes: alloc_size,
                 extent_offset: 0,
-                num_bytes: data.len() as u64,
+                num_bytes: write_len as u64,
             };
             let extent_key = BtrfsKey {
                 objectid: canonical,
@@ -6596,14 +6678,23 @@ impl OpenFs {
                     offset: u64::MAX,
                 };
                 if let Ok(extents) = alloc.fs_tree.range(&ext_start, &ext_end) {
-                    let to_delete: Vec<BtrfsKey> = extents
-                        .into_iter()
-                        .filter(|(k, _)| k.offset >= size)
-                        .map(|(k, _)| k)
-                        .collect();
-                    for key in to_delete {
-                        if let Err(e) = alloc.fs_tree.delete(&key) {
-                            warn!("truncate: failed to delete extent key {key:?}: {e:?}");
+                    for (k, edata) in extents {
+                        if k.offset >= size {
+                            if let Ok(BtrfsExtentData::Regular {
+                                disk_bytenr,
+                                disk_num_bytes,
+                                ..
+                            }) = parse_extent_data(&edata)
+                            {
+                                if disk_bytenr > 0 {
+                                    if let Err(e) = alloc.extent_alloc.free_extent(disk_bytenr, disk_num_bytes, false) {
+                                        warn!("truncate: failed to free extent at {disk_bytenr}: {e:?}");
+                                    }
+                                }
+                            }
+                            if let Err(e) = alloc.fs_tree.delete(&k) {
+                                warn!("truncate: failed to delete extent key {k:?}: {e:?}");
+                            }
                         }
                     }
                 }
@@ -6656,8 +6747,25 @@ impl OpenFs {
         ino: InodeNumber,
         offset: u64,
         length: u64,
-        _mode: i32,
+        mode: i32,
     ) -> ffs_error::Result<()> {
+        const KEEP_SIZE: i32 = 0x01;
+        const PUNCH_HOLE: i32 = 0x02;
+
+        let keep_size = (mode & KEEP_SIZE) != 0;
+        let punch_hole = (mode & PUNCH_HOLE) != 0;
+        let unsupported_bits = mode & !(KEEP_SIZE | PUNCH_HOLE);
+        if unsupported_bits != 0 {
+            return Err(FfsError::UnsupportedFeature(format!(
+                "btrfs fallocate unsupported mode bits: 0x{unsupported_bits:08x}"
+            )));
+        }
+        if punch_hole {
+            return Err(FfsError::UnsupportedFeature(
+                "btrfs fallocate punch-hole mode is not yet supported".into(),
+            ));
+        }
+
         let alloc_mutex = self.require_btrfs_alloc_state()?;
         let canonical = self.btrfs_canonical_inode(ino)?;
 
@@ -6687,6 +6795,54 @@ impl OpenFs {
             });
 
         if !already_has_data {
+            // If there's an existing inline extent at offset 0, convert it
+            // to a regular extent because a file cannot mix inline and regular extents.
+            let inline_key = BtrfsKey {
+                objectid: canonical,
+                item_type: BTRFS_ITEM_EXTENT_DATA,
+                offset: 0,
+            };
+            if let Ok(existing) = alloc.fs_tree.range(&inline_key, &inline_key) {
+                if let Some((_, edata)) = existing.first() {
+                    if let Ok(BtrfsExtentData::Inline {
+                        data: prev_data, ..
+                    }) = parse_extent_data(edata)
+                    {
+                        alloc
+                            .fs_tree
+                            .delete(&inline_key)
+                            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                        let sectorsize = u64::from(alloc.nodesize.min(4096));
+                        if !prev_data.is_empty() {
+                            let prev_alloc_size = (prev_data.len() as u64)
+                                .saturating_add(sectorsize - 1)
+                                & !(sectorsize - 1);
+                            let prev_allocation = alloc
+                                .extent_alloc
+                                .alloc_data(prev_alloc_size)
+                                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                            self.dev.write_all_at(
+                                cx,
+                                ByteOffset(prev_allocation.bytenr),
+                                &prev_data,
+                            )?;
+                            let prev_extent = BtrfsExtentData::Regular {
+                                extent_type: BTRFS_FILE_EXTENT_REG,
+                                compression: 0,
+                                disk_bytenr: prev_allocation.bytenr,
+                                disk_num_bytes: prev_alloc_size,
+                                extent_offset: 0,
+                                num_bytes: prev_data.len() as u64,
+                            };
+                            alloc
+                                .fs_tree
+                                .insert(inline_key, &prev_extent.to_bytes())
+                                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                        }
+                    }
+                }
+            }
+
             let sectorsize = u64::from(alloc.nodesize.min(4096));
             let alloc_size = length
                 .checked_add(sectorsize - 1)
@@ -6722,7 +6878,7 @@ impl OpenFs {
         let new_end = offset
             .checked_add(length)
             .ok_or_else(|| FfsError::InvalidGeometry("offset + length overflow".into()))?;
-        if new_end > inode.size {
+        if !keep_size && new_end > inode.size {
             inode.size = new_end;
             inode.nbytes = new_end;
             let inode_key = BtrfsKey {
@@ -7188,7 +7344,21 @@ impl OpenFs {
             .range(&start, &end)
             .map_err(|e| btrfs_mutation_to_ffs(&e))?;
 
-        for (key, _) in items {
+        for (key, data) in items {
+            if key.item_type == BTRFS_ITEM_EXTENT_DATA {
+                if let Ok(BtrfsExtentData::Regular {
+                    disk_bytenr,
+                    disk_num_bytes,
+                    ..
+                }) = parse_extent_data(&data)
+                {
+                    if disk_bytenr > 0 {
+                        if let Err(e) = alloc.extent_alloc.free_extent(disk_bytenr, disk_num_bytes, false) {
+                            warn!("cleanup: failed to free extent at {disk_bytenr}: {e:?}");
+                        }
+                    }
+                }
+            }
             if let Err(e) = alloc.fs_tree.delete(&key) {
                 warn!("cleanup: failed to delete inode item {key:?}: {e:?}");
             }
@@ -9313,6 +9483,88 @@ mod tests {
         let cx = Cx::for_testing();
         let err = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap_err();
         assert!(matches!(err, FfsError::UnsupportedFeature(_)));
+    }
+
+    #[test]
+    fn journaled_commit_jbd2_failure_returns_error_without_visibility() {
+        let image = build_ext4_image(2); // 4K blocks, 128K image
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+
+        let mut fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        fs.attach_jbd2_writer(Jbd2Writer::new(
+            ffs_journal::JournalRegion {
+                start: BlockNumber(64), // outside the 32-block synthetic image
+                blocks: 8,
+            },
+            1,
+        ));
+
+        let target = BlockNumber(5);
+        let before = fs
+            .read_block_at_snapshot(&cx, target, fs.current_snapshot())
+            .expect("read before journaled commit");
+
+        let mut txn = fs.begin_transaction();
+        let block_size = usize::try_from(fs.block_size()).expect("block size fits usize");
+        txn.stage_write(target, vec![0xAB; block_size]);
+
+        let err = fs
+            .commit_transaction_journaled(&cx, txn)
+            .expect_err("journaled commit should fail when journal region is out-of-range");
+        assert!(
+            err.to_string()
+                .contains("JBD2 journal write failed before MVCC visibility"),
+            "unexpected error: {err}"
+        );
+
+        // No commit should become visible when journal durability fails.
+        assert_eq!(fs.current_snapshot().high, CommitSeq(0));
+        let after = fs
+            .read_block_at_snapshot(&cx, target, fs.current_snapshot())
+            .expect("read after failed journaled commit");
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn journaled_commit_conflict_returns_retryable_mvcc_error() {
+        let image = build_ext4_image(2); // 4K blocks, 128K image
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+
+        let mut fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        fs.attach_jbd2_writer(Jbd2Writer::new(
+            ffs_journal::JournalRegion {
+                start: BlockNumber(16), // in-range for this synthetic image
+                blocks: 8,
+            },
+            1,
+        ));
+
+        let target = BlockNumber(5);
+        let block_size = usize::try_from(fs.block_size()).expect("block size fits usize");
+
+        let mut t1 = fs.begin_transaction();
+        let mut t2 = fs.begin_transaction();
+        t1.stage_write(target, vec![0x11; block_size]);
+        t2.stage_write(target, vec![0x22; block_size]);
+        let t2_id = t2.id.0;
+
+        fs.commit_transaction(t1)
+            .expect("first transaction should commit");
+        let err = fs
+            .commit_transaction_journaled(&cx, t2)
+            .expect_err("second transaction should conflict");
+
+        assert!(
+            matches!(
+                err,
+                FfsError::MvccConflict { tx, block } if tx == t2_id && block == target.0
+            ),
+            "unexpected error variant: {err:?}"
+        );
+        assert_eq!(err.to_errno(), libc::EAGAIN);
+        assert_eq!(fs.current_snapshot().high, CommitSeq(1));
     }
 
     #[test]
@@ -14783,6 +15035,50 @@ mod tests {
         ops.fallocate(&cx, attr.ino, 0, 4096, 0).unwrap();
         let attr3 = ops.getattr(&cx, attr.ino).unwrap();
         assert_eq!(attr3.size, 4096);
+    }
+
+    #[test]
+    fn btrfs_write_fallocate_keep_size_does_not_extend_file() {
+        let (fs, cx) = open_writable_btrfs();
+        let ops: &dyn FsOps = &fs;
+
+        let attr = ops
+            .create(&cx, InodeNumber(1), OsStr::new("keep.bin"), 0o644, 0, 0)
+            .unwrap();
+        ops.write(&cx, attr.ino, 0, b"existing").unwrap();
+        let before = ops.getattr(&cx, attr.ino).unwrap();
+        assert_eq!(before.size, 8);
+
+        ops.fallocate(&cx, attr.ino, 4096, 4096, libc::FALLOC_FL_KEEP_SIZE)
+            .unwrap();
+
+        let after = ops.getattr(&cx, attr.ino).unwrap();
+        assert_eq!(after.size, 8);
+        let data = ops.read(&cx, attr.ino, 0, 4096).unwrap();
+        assert_eq!(&data[..8], b"existing");
+    }
+
+    #[test]
+    fn btrfs_write_fallocate_punch_hole_rejected() {
+        let (fs, cx) = open_writable_btrfs();
+        let ops: &dyn FsOps = &fs;
+
+        let attr = ops
+            .create(&cx, InodeNumber(1), OsStr::new("hole.bin"), 0o644, 0, 0)
+            .unwrap();
+        let err = ops
+            .fallocate(
+                &cx,
+                attr.ino,
+                0,
+                4096,
+                libc::FALLOC_FL_KEEP_SIZE | libc::FALLOC_FL_PUNCH_HOLE,
+            )
+            .expect_err("punch-hole mode should be rejected for btrfs");
+        assert!(
+            matches!(err, FfsError::UnsupportedFeature(_)),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
