@@ -207,7 +207,7 @@ pub fn remove_entry(block: &mut [u8], name: &[u8]) -> Result<bool> {
     validate_name(name)?;
 
     let mut off = 0usize;
-    let mut prev_live_off: Option<usize> = None;
+    let mut prev_off_opt: Option<usize> = None;
 
     while off + DIR_ENTRY_HEADER_LEN <= block.len() {
         let rec_len =
@@ -255,7 +255,7 @@ pub fn remove_entry(block: &mut [u8], name: &[u8]) -> Result<bool> {
         }
 
         if cur_ino != 0 && &block[off + DIR_ENTRY_HEADER_LEN..name_end] == name {
-            if let Some(prev_off) = prev_live_off {
+            if let Some(prev_off) = prev_off_opt {
                 let prev_len = usize::from(read_u16_le(block, prev_off + 4).ok_or_else(|| {
                     FfsError::Corruption {
                         block: 0,
@@ -276,9 +276,7 @@ pub fn remove_entry(block: &mut [u8], name: &[u8]) -> Result<bool> {
             return Ok(true);
         }
 
-        if cur_ino != 0 {
-            prev_live_off = Some(off);
-        }
+        prev_off_opt = Some(off);
         off = end;
     }
 
