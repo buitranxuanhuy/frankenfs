@@ -328,12 +328,14 @@ impl<K: Clone + Ord + Hash + fmt::Debug, V: Clone + fmt::Debug> RcuMap<K, V> {
 
     /// Replace the entire map atomically.
     pub fn replace(&self, new_map: BTreeMap<K, Arc<V>>) {
+        let _guard = self.write_lock.lock();
         self.inner.store(Arc::new(new_map));
         self.update_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Clear all entries (publish an empty map).
     pub fn clear(&self) {
+        let _guard = self.write_lock.lock();
         self.inner.store(Arc::new(BTreeMap::new()));
         self.update_count.fetch_add(1, Ordering::Relaxed);
     }

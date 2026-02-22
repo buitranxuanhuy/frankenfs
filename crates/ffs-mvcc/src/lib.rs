@@ -421,10 +421,10 @@ impl MvccEvidenceSink {
 
 #[derive(Debug, Clone)]
 pub struct MvccStore {
-    next_txn: u64,
-    next_commit: u64,
-    versions: BTreeMap<BlockNumber, Vec<BlockVersion>>,
-    physical_versions: BTreeMap<BlockNumber, Vec<PhysicalBlockVersion>>,
+    pub(crate) next_txn: u64,
+    pub(crate) next_commit: u64,
+    pub(crate) versions: BTreeMap<BlockNumber, Vec<BlockVersion>>,
+    pub(crate) physical_versions: BTreeMap<BlockNumber, Vec<PhysicalBlockVersion>>,
     /// Active snapshots: each entry is a `CommitSeq` from which a reader is
     /// still potentially reading.  The set uses a `BTreeMap` so that the
     /// minimum (oldest active snapshot) can be obtained in O(log n).
@@ -439,7 +439,7 @@ pub struct MvccStore {
     active_snapshots: BTreeMap<CommitSeq, u32>,
     /// Recent committed transactions retained for SSI antidependency
     /// checking.  Pruned by `prune_ssi_log`.
-    ssi_log: Vec<CommittedTxnRecord>,
+    pub(crate) ssi_log: Vec<CommittedTxnRecord>,
     /// Version chain compression policy.
     compression_policy: CompressionPolicy,
     /// Epoch-based reclaimer for retired logical block versions.
@@ -738,6 +738,27 @@ impl MvccStore {
         }
     }
 
+    /// Validate FCW + chain-pressure constraints without making versions visible.
+    ///
+    /// Callers should hold the same `MvccStore` write lock between this preflight
+    /// and a subsequent [`Self::commit_fcw_prechecked`] call.
+    pub fn preflight_commit_fcw(&mut self, txn: &Transaction) -> Result<(), CommitError> {
+        self.preflight_fcw(txn)
+    }
+
+    /// Commit a transaction that has already passed FCW preflight checks.
+    ///
+    /// This avoids a second conflict check when an external durability phase
+    /// (for example, journal I/O) must run between validation and visibility.
+    pub fn commit_fcw_prechecked(&mut self, txn: Transaction) -> CommitSeq {
+        let started = Instant::now();
+        let txn_id = txn.id().0;
+        let write_set_size = txn.pending_writes();
+        let (commit_seq, _deferred) = self.apply_fcw_commit(txn);
+        self.emit_transaction_commit(txn_id, commit_seq, write_set_size, started);
+        commit_seq
+    }
+
     /// Commit with Serializable Snapshot Isolation (SSI) enforcement.
     ///
     /// This extends FCW with rw-antidependency tracking.  A "dangerous
@@ -896,6 +917,13 @@ impl MvccStore {
         &mut self,
         txn: Transaction,
     ) -> Result<(CommitSeq, Vec<BlockNumber>), (CommitError, Transaction)> {
+        if let Err(error) = self.preflight_fcw(&txn) {
+            return Err((error, txn));
+        }
+        Ok(self.apply_fcw_commit(txn))
+    }
+
+    fn preflight_fcw(&mut self, txn: &Transaction) -> Result<(), CommitError> {
         let chain_cap = self.compression_policy.max_chain_length;
         for block in txn.writes.keys() {
             let latest = self.latest_commit_seq(*block);
@@ -909,22 +937,21 @@ impl MvccStore {
                     snapshot_commit_seq = txn.snapshot.high.0,
                     observed_commit_seq = latest.0
                 );
-                return Err((
-                    CommitError::Conflict {
-                        block: *block,
-                        snapshot: txn.snapshot.high,
-                        observed: latest,
-                    },
-                    txn,
-                ));
+                return Err(CommitError::Conflict {
+                    block: *block,
+                    snapshot: txn.snapshot.high,
+                    observed: latest,
+                });
             }
             if let Some(cap) = chain_cap {
-                if let Err(e) = self.enforce_chain_pressure(txn.id, *block, cap) {
-                    return Err((e, txn));
-                }
+                self.enforce_chain_pressure(txn.id, *block, cap)?;
             }
         }
+        Ok(())
+    }
 
+    fn apply_fcw_commit(&mut self, txn: Transaction) -> (CommitSeq, Vec<BlockNumber>) {
+        let chain_cap = self.compression_policy.max_chain_length;
         let Transaction {
             id: txn_id,
             snapshot: _,
@@ -971,7 +998,7 @@ impl MvccStore {
         }
 
         let deferred = Self::collect_cow_deferred_frees(&cow_writes, cow_orphans);
-        Ok((commit_seq, deferred))
+        (commit_seq, deferred)
     }
 
     #[allow(clippy::result_large_err)]
