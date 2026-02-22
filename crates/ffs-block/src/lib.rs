@@ -1048,17 +1048,28 @@ impl ArcState {
                 continue;
             }
             let freed_bytes = self.resident.get(&victim).map_or(0, BlockBuf::len);
-            if from_t1 {
-                self.b1.push_back(victim);
-                self.loc.insert(victim, ArcList::B1);
+            if self.evict_resident(victim) {
+                if from_t1 {
+                    self.b1.push_back(victim);
+                    self.loc.insert(victim, ArcList::B1);
+                } else {
+                    self.b2.push_back(victim);
+                    self.loc.insert(victim, ArcList::B2);
+                }
+                self.evictions = self.evictions.saturating_add(1);
+                batch.evicted_blocks = batch.evicted_blocks.saturating_add(1);
+                batch.evicted_bytes = batch.evicted_bytes.saturating_add(freed_bytes);
             } else {
-                self.b2.push_back(victim);
-                self.loc.insert(victim, ArcList::B2);
+                if from_t1 {
+                    self.t1.push_back(victim);
+                    self.loc.insert(victim, ArcList::T1);
+                } else {
+                    self.t2.push_back(victim);
+                    self.loc.insert(victim, ArcList::T2);
+                }
+                // Dirty races are tolerated; stop shrinking until flush catches up.
+                break;
             }
-            self.evictions = self.evictions.saturating_add(1);
-            self.evict_resident(victim);
-            batch.evicted_blocks = batch.evicted_blocks.saturating_add(1);
-            batch.evicted_bytes = batch.evicted_bytes.saturating_add(freed_bytes);
         }
         while self.b1.len() > self.capacity {
             if let Some(victim) = self.b1.pop_front() {
@@ -1089,7 +1100,7 @@ impl ArcState {
         false
     }
 
-    fn evict_resident(&mut self, victim: BlockNumber) {
+    fn evict_resident(&mut self, victim: BlockNumber) -> bool {
         if self.is_dirty(victim) {
             let metrics = self.snapshot_metrics();
             warn!(
@@ -1101,7 +1112,7 @@ impl ArcState {
                 oldest_dirty_age_ticks = metrics.oldest_dirty_age_ticks.unwrap_or(0),
                 "dirty block cannot be evicted before flush"
             );
-            panic!("dirty block {} cannot be evicted before flush", victim.0);
+            return false;
         }
         let _ = self.resident.remove(&victim);
         #[cfg(feature = "s3fifo")]
@@ -1110,6 +1121,7 @@ impl ArcState {
         }
         self.clear_dirty(victim);
         trace!(event = "cache_evict_clean", block = victim.0);
+        true
     }
 
     #[cfg(not(feature = "s3fifo"))]
@@ -1166,16 +1178,22 @@ impl ArcState {
         }
 
         if let Some(victim) = victim {
-            if from_t1 {
-                self.loc.insert(victim, ArcList::B1);
-                self.evict_resident(victim);
-                self.b1.push_back(victim);
+            if self.evict_resident(victim) {
+                if from_t1 {
+                    self.loc.insert(victim, ArcList::B1);
+                    self.b1.push_back(victim);
+                } else {
+                    self.loc.insert(victim, ArcList::B2);
+                    self.b2.push_back(victim);
+                }
+                self.evictions += 1;
+            } else if from_t1 {
+                self.t1.push_back(victim);
+                self.loc.insert(victim, ArcList::T1);
             } else {
-                self.loc.insert(victim, ArcList::B2);
-                self.evict_resident(victim);
-                self.b2.push_back(victim);
+                self.t2.push_back(victim);
+                self.loc.insert(victim, ArcList::T2);
             }
-            self.evictions += 1;
         }
 
         while self.b1.len() > self.capacity {
@@ -1254,9 +1272,13 @@ impl ArcState {
                     let _ = self.b1.pop_front().and_then(|v| self.loc.remove(&v));
                     self.replace(key);
                 } else if let Some(victim) = self.t1.pop_front() {
-                    let _ = self.loc.remove(&victim);
-                    self.evict_resident(victim);
-                    self.evictions += 1;
+                    if self.evict_resident(victim) {
+                        let _ = self.loc.remove(&victim);
+                        self.evictions += 1;
+                    } else {
+                        self.t1.push_front(victim);
+                        self.loc.insert(victim, ArcList::T1);
+                    }
                 }
             } else if l1_len < self.capacity && total_len >= self.capacity {
                 if total_len >= self.capacity.saturating_mul(2) {
@@ -1458,21 +1480,25 @@ impl ArcState {
                     ghost_len = self.b1.len()
                 );
             } else {
-                self.loc.insert(victim, ArcList::B1);
-                self.b1.push_back(victim);
-                self.evictions = self.evictions.saturating_add(1);
-                self.evict_resident(victim);
-                trace!(
-                    target: "ffs::block::s3fifo",
-                    event = "victim_selection",
-                    block = victim.0,
-                    from_queue = "small",
-                    to_queue = "ghost",
-                    access_count,
-                    small_len = self.t1.len(),
-                    main_len = self.t2.len(),
-                    ghost_len = self.b1.len()
-                );
+                if self.evict_resident(victim) {
+                    self.loc.insert(victim, ArcList::B1);
+                    self.b1.push_back(victim);
+                    self.evictions = self.evictions.saturating_add(1);
+                    trace!(
+                        target: "ffs::block::s3fifo",
+                        event = "victim_selection",
+                        block = victim.0,
+                        from_queue = "small",
+                        to_queue = "ghost",
+                        access_count,
+                        small_len = self.t1.len(),
+                        main_len = self.t2.len(),
+                        ghost_len = self.b1.len()
+                    );
+                } else {
+                    self.t1.push_back(victim);
+                    self.loc.insert(victim, ArcList::T1);
+                }
             }
         }
 
@@ -1509,21 +1535,25 @@ impl ArcState {
                 continue;
             }
 
-            self.loc.insert(victim, ArcList::B1);
-            self.b1.push_back(victim);
-            self.evictions = self.evictions.saturating_add(1);
-            self.evict_resident(victim);
-            trace!(
-                target: "ffs::block::s3fifo",
-                event = "victim_selection",
-                block = victim.0,
-                from_queue = "main",
-                to_queue = "ghost",
-                access_count,
-                small_len = self.t1.len(),
-                main_len = self.t2.len(),
-                ghost_len = self.b1.len()
-            );
+            if self.evict_resident(victim) {
+                self.loc.insert(victim, ArcList::B1);
+                self.b1.push_back(victim);
+                self.evictions = self.evictions.saturating_add(1);
+                trace!(
+                    target: "ffs::block::s3fifo",
+                    event = "victim_selection",
+                    block = victim.0,
+                    from_queue = "main",
+                    to_queue = "ghost",
+                    access_count,
+                    small_len = self.t1.len(),
+                    main_len = self.t2.len(),
+                    ghost_len = self.b1.len()
+                );
+            } else {
+                self.t2.push_back(victim);
+                self.loc.insert(victim, ArcList::T2);
+            }
         }
 
         while self.b1.len() > self.ghost_capacity {
@@ -1559,20 +1589,27 @@ impl ArcState {
             let Some(victim) = victim else {
                 break;
             };
-            self.loc.insert(victim, ArcList::B1);
-            self.b1.push_back(victim);
-            self.evictions = self.evictions.saturating_add(1);
-            self.evict_resident(victim);
-            trace!(
-                target: "ffs::block::s3fifo",
-                event = "pressure_fallback_evict",
-                block = victim.0,
-                from_queue = if from_t1 { "small" } else { "main" },
-                to_queue = "ghost",
-                small_len = self.t1.len(),
-                main_len = self.t2.len(),
-                ghost_len = self.b1.len()
-            );
+            if self.evict_resident(victim) {
+                self.loc.insert(victim, ArcList::B1);
+                self.b1.push_back(victim);
+                self.evictions = self.evictions.saturating_add(1);
+                trace!(
+                    target: "ffs::block::s3fifo",
+                    event = "pressure_fallback_evict",
+                    block = victim.0,
+                    from_queue = if from_t1 { "small" } else { "main" },
+                    to_queue = "ghost",
+                    small_len = self.t1.len(),
+                    main_len = self.t2.len(),
+                    ghost_len = self.b1.len()
+                );
+            } else if from_t1 {
+                self.t1.push_back(victim);
+                self.loc.insert(victim, ArcList::T1);
+            } else {
+                self.t2.push_back(victim);
+                self.loc.insert(victim, ArcList::T2);
+            }
         }
 
         if self.resident_len() > self.capacity {
@@ -1619,10 +1656,19 @@ impl ArcState {
                 if !from_t1 {
                     let _ = Self::remove_from_list(&mut self.t2, victim);
                 }
-                self.loc.insert(victim, ArcList::B1);
-                self.b1.push_back(victim);
-                self.evictions = self.evictions.saturating_add(1);
-                self.evict_resident(victim);
+                if self.evict_resident(victim) {
+                    self.loc.insert(victim, ArcList::B1);
+                    self.b1.push_back(victim);
+                    self.evictions = self.evictions.saturating_add(1);
+                } else if from_t1 {
+                    self.t1.push_back(victim);
+                    self.loc.insert(victim, ArcList::T1);
+                    break;
+                } else {
+                    self.t2.push_back(victim);
+                    self.loc.insert(victim, ArcList::T2);
+                    break;
+                }
             }
 
             if self.resident_len() > self.capacity {
@@ -2969,7 +3015,7 @@ impl<D: BlockDevice> BlockCache for ArcCache<D> {
                 oldest_dirty_age_ticks = metrics.oldest_dirty_age_ticks.unwrap_or(0),
                 "dirty block cannot be evicted before flush"
             );
-            panic!("dirty block {} cannot be evicted before flush", block.0);
+            return;
         }
 
         let mut removed = false;
@@ -4491,8 +4537,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "cannot be evicted before flush")]
-    fn arc_cache_explicit_evict_panics_for_dirty_block() {
+    fn arc_cache_explicit_evict_skips_dirty_block() {
         let cx = Cx::for_testing();
         let mem = MemoryByteDevice::new(4096 * 4);
         let dev = ByteBlockDevice::new(mem, 4096).expect("device");
@@ -4506,6 +4551,10 @@ mod tests {
         assert_eq!(cache.dirty_count(), 1);
 
         cache.evict(BlockNumber(0));
+        assert_eq!(cache.dirty_count(), 1);
+        let guard = cache.state.lock();
+        assert!(guard.resident.contains_key(&BlockNumber(0)));
+        drop(guard);
     }
 
     #[test]
