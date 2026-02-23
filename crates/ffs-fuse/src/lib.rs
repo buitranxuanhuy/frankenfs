@@ -919,8 +919,11 @@ impl Filesystem for FrankenFuse {
         reply: ReplyData,
     ) {
         let cx = Self::cx_for_request();
-        // Clamp negative offsets to 0 (shouldn't happen in practice).
-        let byte_offset = u64::try_from(offset).unwrap_or(0);
+        let Ok(byte_offset) = u64::try_from(offset) else {
+            warn!(ino, offset, "read: negative offset");
+            reply.error(libc::EINVAL);
+            return;
+        };
         match self.read_with_readahead(&cx, InodeNumber(ino), byte_offset, size) {
             Ok(data) => {
                 self.inner
@@ -951,7 +954,11 @@ impl Filesystem for FrankenFuse {
         mut reply: ReplyDirectory,
     ) {
         let cx = Self::cx_for_request();
-        let fs_offset = u64::try_from(offset).unwrap_or(0);
+        let Ok(fs_offset) = u64::try_from(offset) else {
+            warn!(ino, offset, "readdir: negative offset");
+            reply.error(libc::EINVAL);
+            return;
+        };
         match self.with_request_scope(&cx, RequestOp::Readdir, |cx| {
             self.inner.ops.readdir(cx, InodeNumber(ino), fs_offset)
         }) {
@@ -1464,7 +1471,11 @@ impl Filesystem for FrankenFuse {
             return;
         }
         let cx = Self::cx_for_request();
-        let byte_offset = u64::try_from(offset).unwrap_or(0);
+        let Ok(byte_offset) = u64::try_from(offset) else {
+            warn!(ino, offset, "write: negative offset");
+            reply.error(libc::EINVAL);
+            return;
+        };
         match self.with_request_scope(&cx, RequestOp::Write, |cx| {
             self.inner
                 .ops

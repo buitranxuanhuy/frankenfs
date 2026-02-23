@@ -234,12 +234,13 @@ pub struct FsGeometry {
 impl FsGeometry {
     /// Derive geometry from a parsed superblock.
     #[must_use]
-    #[expect(clippy::cast_possible_truncation)]
     pub fn from_superblock(sb: &Ext4Superblock) -> Self {
         let group_count = if sb.blocks_per_group > 0 {
             let full = sb.blocks_count / u64::from(sb.blocks_per_group);
             let remainder = sb.blocks_count % u64::from(sb.blocks_per_group);
-            (full + u64::from(remainder > 0)) as u32
+            let count = full + u64::from(remainder > 0);
+            // Saturate at u32::MAX; geometry validation catches oversized values.
+            u32::try_from(count).unwrap_or(u32::MAX)
         } else {
             0
         };
@@ -1006,8 +1007,11 @@ pub fn free_inode(
         block: 0,
         detail: "inode number 0 is invalid".into(),
     })?;
-    #[expect(clippy::cast_possible_truncation)]
-    let group_idx = (ino_zero / u64::from(geo.inodes_per_group)) as u32;
+    let group_idx_u64 = ino_zero / u64::from(geo.inodes_per_group);
+    let group_idx = u32::try_from(group_idx_u64).map_err(|_| FfsError::Corruption {
+        block: 0,
+        detail: format!("free_inode: group index {group_idx_u64} exceeds u32"),
+    })?;
     #[expect(clippy::cast_possible_truncation)]
     let bit_idx = (ino_zero % u64::from(geo.inodes_per_group)) as u32;
     let gidx = group_idx as usize;
@@ -1047,8 +1051,11 @@ pub fn free_inode_persist(
 ) -> Result<()> {
     free_inode(cx, dev, geo, groups, ino)?;
     let ino_zero = ino.0.saturating_sub(1);
-    #[expect(clippy::cast_possible_truncation)]
-    let group_idx = (ino_zero / u64::from(geo.inodes_per_group)) as u32;
+    let group_idx_u64 = ino_zero / u64::from(geo.inodes_per_group);
+    let group_idx = u32::try_from(group_idx_u64).map_err(|_| FfsError::Corruption {
+        block: 0,
+        detail: format!("free_inode_persist: group index {group_idx_u64} exceeds u32"),
+    })?;
     persist_group_desc(
         cx,
         dev,

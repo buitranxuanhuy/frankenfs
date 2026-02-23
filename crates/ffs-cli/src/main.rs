@@ -1,20 +1,19 @@
 #![forbid(unsafe_code)]
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use asupersync::{Budget, Cx};
 use clap::{Parser, Subcommand, ValueEnum};
 use ffs_block::{BlockDevice, ByteBlockDevice, ByteDevice, FileByteDevice};
 use ffs_core::{
-    detect_filesystem_at_path, CrashRecoveryOutcome, Ext4JournalReplayMode, FsFlavor, FsOps,
-    OpenFs, OpenOptions,
+    CrashRecoveryOutcome, Ext4JournalReplayMode, FsFlavor, FsOps, OpenFs, OpenOptions,
+    detect_filesystem_at_path,
 };
 use ffs_fuse::MountOptions;
 use ffs_harness::ParityReport;
 use ffs_ondisk::{
-    map_logical_to_physical, parse_dx_root, parse_extent_tree, parse_inode_extent_tree,
-    verify_btrfs_superblock_checksum, BtrfsChunkEntry, BtrfsSuperblock, Ext4DirEntry, Ext4Extent,
-    Ext4ExtentHeader, Ext4ExtentIndex, Ext4GroupDesc, Ext4ImageReader, Ext4Inode, Ext4Superblock,
-    ExtentTree,
+    BtrfsChunkEntry, BtrfsSuperblock, Ext4DirEntry, Ext4Extent, Ext4ExtentHeader, Ext4ExtentIndex,
+    Ext4GroupDesc, Ext4ImageReader, Ext4Inode, Ext4Superblock, ExtentTree, map_logical_to_physical,
+    parse_dx_root, parse_extent_tree, parse_inode_extent_tree, verify_btrfs_superblock_checksum,
 };
 use ffs_repair::codec::encode_group;
 use ffs_repair::evidence::{EvidenceEventType, EvidenceRecord};
@@ -23,11 +22,11 @@ use ffs_repair::scrub::{
     BlockValidator, BtrfsSuperblockValidator, BtrfsTreeBlockValidator, CompositeValidator,
     Ext4SuperblockValidator, ScrubReport, Scrubber, Severity, ZeroCheckValidator,
 };
-use ffs_repair::storage::{RepairGroupLayout, RepairGroupStorage, REPAIR_DESC_SLOT_COUNT};
+use ffs_repair::storage::{REPAIR_DESC_SLOT_COUNT, RepairGroupLayout, RepairGroupStorage};
 use ffs_repair::symbol::RepairGroupDescExt;
 use ffs_types::{
-    BlockNumber, ByteOffset, GroupNumber, InodeNumber, BTRFS_SUPER_INFO_OFFSET,
-    BTRFS_SUPER_INFO_SIZE, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE,
+    BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE, BlockNumber, ByteOffset,
+    EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, GroupNumber, InodeNumber,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -716,7 +715,7 @@ struct DumpDirOutput {
 struct DumpDirEntryOutput {
     index: usize,
     inode: u32,
-    rec_len: u16,
+    rec_len: u32,
     file_type: String,
     name: String,
 }
@@ -6133,13 +6132,13 @@ fn mkfs_cmd(
 #[cfg(test)]
 mod tests {
     use super::{
+        Cli, Command, DumpCommand, EvidenceEventType, Ext4JournalReplayMode, Ext4RepairStaleness,
+        FsckCommandOptions, FsckFlags, LogFormat, RepairCommandOptions, RepairFlags,
         btrfs_super_mirror_offsets, build_btrfs_repair_group_spec, build_ext4_group_info,
         build_fsck_output, build_repair_output, ext4_appears_clean_state, ext4_mount_replay_mode,
         load_evidence_records, merge_scrub_reports, normalize_btrfs_superblock_as_primary,
         partition_scrub_range, read_ext4_group_desc_from_path, read_ext4_inode_from_path,
-        read_file_region, repair_worker_limit, select_ext4_repair_groups, Cli, Command,
-        DumpCommand, EvidenceEventType, Ext4JournalReplayMode, Ext4RepairStaleness,
-        FsckCommandOptions, FsckFlags, LogFormat, RepairCommandOptions, RepairFlags,
+        read_file_region, repair_worker_limit, select_ext4_repair_groups,
     };
     use clap::Parser;
     use serde_json::Value;
@@ -6148,8 +6147,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tracing::{info, info_span};
-    use tracing_subscriber::fmt::MakeWriter;
     use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::fmt::MakeWriter;
 
     #[derive(Clone, Default)]
     struct SharedLogBuffer {
@@ -6328,9 +6327,11 @@ mod tests {
             let records = load_evidence_records(&path, Some("repair_failed"), None)
                 .expect("filtered evidence read should succeed");
             assert_eq!(records.len(), 2);
-            assert!(records
-                .iter()
-                .all(|record| record.event_type == EvidenceEventType::RepairFailed));
+            assert!(
+                records
+                    .iter()
+                    .all(|record| record.event_type == EvidenceEventType::RepairFailed)
+            );
             assert_eq!(records[0].block_group, 2);
             assert_eq!(records[1].block_group, 3);
         });
@@ -6801,10 +6802,12 @@ mod tests {
             .expect("checksum_scrub phase should be present");
         assert_eq!(scrub_phase.status, "skipped");
         assert!(scrub_phase.detail.contains("pass --force for full scrub"));
-        assert!(output
-            .limitations
-            .iter()
-            .any(|limitation| limitation.contains("skipped block-level scrub")));
+        assert!(
+            output
+                .limitations
+                .iter()
+                .any(|limitation| limitation.contains("skipped block-level scrub"))
+        );
     }
 
     #[test]
@@ -6829,10 +6832,12 @@ mod tests {
             .find(|phase| phase.phase == "checksum_scrub")
             .expect("checksum_scrub phase should be present");
         assert_eq!(scrub_phase.status, "ok");
-        assert!(!output
-            .limitations
-            .iter()
-            .any(|limitation| limitation.contains("skipped block-level scrub")));
+        assert!(
+            !output
+                .limitations
+                .iter()
+                .any(|limitation| limitation.contains("skipped block-level scrub"))
+        );
     }
 
     #[test]
@@ -6906,10 +6911,12 @@ mod tests {
             .expect("build repair output for verify-only rebuild request")
         });
 
-        assert!(output
-            .limitations
-            .iter()
-            .any(|limitation| limitation.contains("ignored when --verify-only")));
+        assert!(
+            output
+                .limitations
+                .iter()
+                .any(|limitation| limitation.contains("ignored when --verify-only"))
+        );
         assert!(matches!(
             output.action,
             super::RepairActionOutput::VerifyOnly
@@ -6981,10 +6988,12 @@ mod tests {
             super::RepairActionOutput::RepairRequested
         ));
         assert_eq!(parsed_primary.bytenr, primary_offset as u64);
-        assert!(output
-            .limitations
-            .iter()
-            .any(|limitation| limitation.contains("restored primary btrfs superblock")));
+        assert!(
+            output
+                .limitations
+                .iter()
+                .any(|limitation| limitation.contains("restored primary btrfs superblock"))
+        );
     }
 
     #[test]
@@ -7165,9 +7174,11 @@ mod tests {
             .find(|phase| phase.phase == "repair")
             .expect("repair phase should be present");
         assert_eq!(repair_phase.status, "ok");
-        assert!(repair_phase
-            .detail
-            .contains("restored primary btrfs superblock"));
+        assert!(
+            repair_phase
+                .detail
+                .contains("restored primary btrfs superblock")
+        );
         assert_eq!(parsed_primary.bytenr, primary_offset as u64);
         assert!(output.scrub.scanned > 0);
     }
@@ -7218,9 +7229,11 @@ mod tests {
             .find(|phase| phase.phase == "repair")
             .expect("repair phase should be present");
         assert_eq!(repair_phase.status, "ok");
-        assert!(repair_phase
-            .detail
-            .contains("restored 1 btrfs superblock mirror(s) from primary superblock"));
+        assert!(
+            repair_phase
+                .detail
+                .contains("restored 1 btrfs superblock mirror(s) from primary superblock")
+        );
         assert_eq!(parsed_backup.bytenr, backup_offset as u64);
     }
 
@@ -7266,10 +7279,11 @@ mod tests {
             super::RepairActionOutput::RepairRequested
         ));
         assert_eq!(parsed_primary.bytenr, primary_offset as u64);
-        assert!(output
-            .limitations
-            .iter()
-            .any(|limitation| limitation.contains("bootstrap restored primary btrfs superblock")));
+        assert!(
+            output.limitations.iter().any(
+                |limitation| limitation.contains("bootstrap restored primary btrfs superblock")
+            )
+        );
     }
 
     #[test]
@@ -7318,9 +7332,11 @@ mod tests {
             .find(|phase| phase.phase == "repair")
             .expect("repair phase should be present");
         assert_eq!(repair_phase.status, "ok");
-        assert!(repair_phase
-            .detail
-            .contains("bootstrap restored primary btrfs superblock"));
+        assert!(
+            repair_phase
+                .detail
+                .contains("bootstrap restored primary btrfs superblock")
+        );
         assert_eq!(parsed_primary.bytenr, primary_offset as u64);
         assert!(output.scrub.scanned > 0);
     }

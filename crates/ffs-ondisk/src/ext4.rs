@@ -827,9 +827,12 @@ impl Ext4Superblock {
         }
         let gdt_bytes = u64::from(group_count).saturating_mul(u64::from(self.group_desc_size()));
         let device_bytes = self.blocks_count.saturating_mul(u64::from(self.block_size));
-        let gdt_start = self
-            .group_desc_offset(ffs_types::GroupNumber(0))
-            .unwrap_or(u64::MAX);
+        let gdt_start =
+            self.group_desc_offset(ffs_types::GroupNumber(0))
+                .ok_or(ParseError::InvalidField {
+                    field: "s_first_data_block",
+                    reason: "group descriptor table offset overflows",
+                })?;
         if gdt_start.saturating_add(gdt_bytes) > device_bytes {
             return Err(ParseError::InvalidField {
                 field: "s_blocks_count",
@@ -1404,7 +1407,13 @@ pub fn verify_extent_block_checksum(
 
     // eh_max is at offset 4 in the 12-byte extent header
     let eh_max = usize::from(read_le_u16(extent_block, 4)?);
-    let tail_off = 12 + 12 * eh_max;
+    let tail_off = 12_usize
+        .checked_mul(eh_max)
+        .and_then(|v| v.checked_add(12))
+        .ok_or(ParseError::InvalidField {
+            field: "eh_max",
+            reason: "extent header max entries causes offset overflow",
+        })?;
     if tail_off + 4 > bs {
         return Err(ParseError::InsufficientData {
             needed: tail_off + 4,
@@ -1626,6 +1635,13 @@ impl Ext4Inode {
         ) = if bytes.len() >= 0x82 {
             let extra_isize = read_le_u16(bytes, 0x80)?;
             let extra_end = 128_usize + usize::from(extra_isize);
+            // Kernel validates: i_extra_isize <= inode_size - 128
+            if extra_end > bytes.len() {
+                return Err(ParseError::InvalidField {
+                    field: "i_extra_isize",
+                    reason: "extra_isize extends beyond inode boundary",
+                });
+            }
 
             let checksum_hi = if extra_end >= 0x84 && bytes.len() >= 0x84 {
                 u32::from(read_le_u16(bytes, 0x82)?)
@@ -2148,7 +2164,7 @@ const EXT4_FT_DIR_CSUM: u8 = 0xDE;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ext4DirEntry {
     pub inode: u32,
-    pub rec_len: u16,
+    pub rec_len: u32,
     pub name_len: u8,
     pub file_type: Ext4FileType,
     pub name: Vec<u8>,
@@ -2273,7 +2289,7 @@ pub fn parse_dir_block(
 
         entries.push(Ext4DirEntry {
             inode,
-            rec_len: rec_len_raw,
+            rec_len,
             name_len,
             file_type: Ext4FileType::from_raw(file_type_raw),
             name,
@@ -2316,7 +2332,7 @@ impl Ext4DirEntryRef<'_> {
     pub fn to_owned(&self) -> Ext4DirEntry {
         Ext4DirEntry {
             inode: self.inode,
-            rec_len: u16::try_from(self.rec_len).unwrap_or(u16::MAX),
+            rec_len: self.rec_len,
             name_len: self.name_len,
             file_type: self.file_type,
             name: self.name.to_vec(),
@@ -2955,7 +2971,7 @@ impl Ext4ImageReader {
         // Extent-mapped symlink: read via normal file data path
         let size = usize::try_from(inode.size)
             .map_err(|_| ParseError::IntegerConversion { field: "i_size" })?;
-            
+
         // Protect against malicious symlink sizes causing OOM.
         // Linux PATH_MAX is 4096.
         if size > 4096 {
@@ -3089,7 +3105,8 @@ impl Ext4ImageReader {
             // No inline xattrs present (or corrupted)
             return Ok(Vec::new());
         }
-        parse_xattr_entries(&inode.xattr_ibody[4..])
+        let entries = &inode.xattr_ibody[4..];
+        parse_xattr_entries(entries, entries)
     }
 
     /// Read xattrs from an external xattr block (pointed to by `i_file_acl`).
@@ -3118,8 +3135,11 @@ impl Ext4ImageReader {
                 actual: u64::from(magic),
             });
         }
-        // Entries start at byte 32 of the xattr block
-        parse_xattr_entries(&block_data[32..])
+        // Entries and values both start at byte 32 of the xattr block.
+        // Our write code (ffs-xattr encode_entries_region) stores value offsets
+        // relative to the entries region, not the full block.
+        let entries_region = &block_data[32..];
+        parse_xattr_entries(entries_region, entries_region)
     }
 
     /// Read all xattrs for an inode (inline + external block).
@@ -3261,7 +3281,7 @@ impl Ext4Xattr {
 ///   - padding to 4-byte boundary
 ///
 /// Entry list is terminated by a zero name_len + zero name_index.
-fn parse_xattr_entries(data: &[u8]) -> Result<Vec<Ext4Xattr>, ParseError> {
+fn parse_xattr_entries(data: &[u8], value_base: &[u8]) -> Result<Vec<Ext4Xattr>, ParseError> {
     let mut entries = Vec::new();
     let mut offset = 0_usize;
 
@@ -3305,13 +3325,13 @@ fn parse_xattr_entries(data: &[u8]) -> Result<Vec<Ext4Xattr>, ParseError> {
                 usize::try_from(value_size).map_err(|_| ParseError::IntegerConversion {
                     field: "xattr_value_size",
                 })?;
-            if v_off + v_size > data.len() {
+            if v_off + v_size > value_base.len() {
                 return Err(ParseError::InvalidField {
                     field: "xattr_value",
                     reason: "value extends past data boundary",
                 });
             }
-            data[v_off..v_off + v_size].to_vec()
+            value_base[v_off..v_off + v_size].to_vec()
         } else {
             Vec::new()
         };
@@ -3341,7 +3361,8 @@ pub fn parse_ibody_xattrs(inode: &Ext4Inode) -> Result<Vec<Ext4Xattr>, ParseErro
     if magic != EXT4_XATTR_MAGIC {
         return Ok(Vec::new());
     }
-    parse_xattr_entries(&inode.xattr_ibody[4..])
+    let entries = &inode.xattr_ibody[4..];
+    parse_xattr_entries(entries, entries)
 }
 
 /// Parse xattrs from an external xattr block (raw block data).
@@ -3362,7 +3383,8 @@ pub fn parse_xattr_block(block_data: &[u8]) -> Result<Vec<Ext4Xattr>, ParseError
             actual: u64::from(magic),
         });
     }
-    parse_xattr_entries(&block_data[32..])
+    let entries_region = &block_data[32..];
+    parse_xattr_entries(entries_region, entries_region)
 }
 
 // ── Hash-tree (htree/DX) structures and algorithms ──────────────────────────
@@ -3595,7 +3617,11 @@ fn dx_hash_tea(name: &[u8], seed: &[u32; 4], signed: bool) -> (u32, u32) {
 /// from `fs/ext4/hash.c`. Characters are packed big-endian within each u32
 /// word via `val = char + (val << 8)`. Unused slots are filled with a pad
 /// value derived from the name length.
-#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
 fn str2hashbuf(name: &[u8], buf_size: usize, signed: bool) -> Vec<u32> {
     let mut buf = vec![0_u32; buf_size];
     let len = name.len();
@@ -4728,10 +4754,54 @@ mod tests {
 
     #[test]
     fn dir_iter_empty_block() {
-        // All-zero block: every entry has inode=0, rec_len=0 → rec_len < 8 error
+        // All-zero block: inode=0, rec_len_raw=0 → rec_len_from_disk maps 0 to
+        // block_size (ext4 kernel convention: raw 0 and 0xFFFC both encode
+        // "entire block"), so the single deleted entry is silently skipped.
         let block = vec![0_u8; 4096];
         let mut iter = iter_dir_block(&block, 4096);
-        let result = iter.next().unwrap();
+        assert!(
+            iter.next().is_none(),
+            "all-zero block should yield no entries"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn dir_iter_rec_len_zero() {
+        let mut block = vec![0_u8; 1024];
+        // Entry with inode=5, rec_len_raw=0 on disk → rec_len_from_disk(0,1024) = 1024.
+        // Per the ext4 kernel convention, raw 0 encodes "entire block".
+        block[0..4].copy_from_slice(&5_u32.to_le_bytes());
+        block[4..6].copy_from_slice(&0_u16.to_le_bytes());
+        block[6] = 1; // name_len
+        block[7] = 1; // file_type (regular)
+        block[8] = b'x'; // name
+
+        let mut iter = iter_dir_block(&block, 1024);
+        let entry = iter
+            .next()
+            .expect("should yield an entry")
+            .expect("should parse ok");
+        assert_eq!(entry.inode, 5);
+        assert_eq!(entry.rec_len, 1024);
+        assert_eq!(entry.name, b"x");
+
+        // Only one entry spans the whole block, so iterator is exhausted.
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn dir_iter_rec_len_too_small() {
+        // rec_len=4 on disk → rec_len_from_disk(4, 1024) = 4, which is < 8.
+        let mut block = vec![0_u8; 1024];
+        block[0..4].copy_from_slice(&5_u32.to_le_bytes()); // inode=5
+        block[4..6].copy_from_slice(&4_u16.to_le_bytes()); // rec_len=4
+        block[6] = 1; // name_len
+        block[7] = 1; // file_type
+
+        let mut iter = iter_dir_block(&block, 1024);
+        let result = iter.next().expect("should yield an item");
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -4741,33 +4811,6 @@ mod tests {
                     field: "de_rec_len",
                     ..
                 }
-            ),
-            "expected rec_len error, got {err:?}",
-        );
-    }
-
-    #[test]
-    #[allow(clippy::cast_possible_truncation)]
-    fn dir_iter_rec_len_zero() {
-        let mut block = vec![0_u8; 1024];
-        // Entry with inode=5 but rec_len=0
-        block[0..4].copy_from_slice(&5_u32.to_le_bytes());
-        block[4..6].copy_from_slice(&0_u16.to_le_bytes());
-        block[6] = 1;
-        block[7] = 1;
-        block[8] = b'x';
-
-        let mut iter = iter_dir_block(&block, 1024);
-        let result = iter.next().unwrap();
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ParseError::InvalidField {
-                    field: "de_rec_len",
-                    reason,
-                } if reason.contains("< 8")
             ),
             "expected rec_len < 8 error, got {err:?}",
         );
@@ -6015,7 +6058,7 @@ mod tests {
         data[20] = 0; // name_len=0
         data[21] = 0; // name_index=0
 
-        let entries = super::parse_xattr_entries(&data).unwrap();
+        let entries = super::parse_xattr_entries(&data, &data).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name_index, 1);
         assert_eq!(entries[0].name, b"test");
@@ -6047,7 +6090,7 @@ mod tests {
         data[44] = 0;
         data[45] = 0;
 
-        let entries = super::parse_xattr_entries(&data).unwrap();
+        let entries = super::parse_xattr_entries(&data, &data).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].full_name(), "security.selinux");
         assert_eq!(entries[0].value, b"context");
@@ -6059,7 +6102,7 @@ mod tests {
     fn parse_xattr_entries_empty() {
         // Just a terminator
         let data = [0_u8; 4];
-        let entries = super::parse_xattr_entries(&data).unwrap();
+        let entries = super::parse_xattr_entries(&data, &data).unwrap();
         assert!(entries.is_empty());
     }
 
