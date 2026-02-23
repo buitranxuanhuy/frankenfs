@@ -1009,6 +1009,13 @@ pub fn free_inode(
     let bitmap_buf = dev.read_block(cx, gs.inode_bitmap_block)?;
     let mut bitmap = bitmap_buf.as_slice().to_vec();
 
+    if !bitmap_get(&bitmap, bit_idx) {
+        return Err(FfsError::Corruption {
+            block: 0,
+            detail: format!("double-free: inode {} already free in bitmap", ino.0),
+        });
+    }
+
     bitmap_clear(&mut bitmap, bit_idx);
     dev.write_block(cx, gs.inode_bitmap_block, &bitmap)?;
     groups[gidx].free_inodes = groups[gidx].free_inodes.saturating_add(1);
