@@ -577,6 +577,13 @@ pub fn free_blocks(
         });
     }
 
+    if rel_start.saturating_add(count) > geo.blocks_in_group(group) {
+        return Err(FfsError::Corruption {
+            block: start.0,
+            detail: "free_blocks: extent crosses block group boundary".into(),
+        });
+    }
+
     let gs = &groups[gidx];
     let bitmap_buf = dev.read_block(cx, gs.block_bitmap_block)?;
     let mut bitmap = bitmap_buf.as_slice().to_vec();
@@ -754,6 +761,13 @@ pub fn free_blocks_persist(
         return Err(FfsError::Corruption {
             block: start.0,
             detail: "free_blocks_persist: group out of range".into(),
+        });
+    }
+
+    if rel_start.saturating_add(count) > geo.blocks_in_group(group) {
+        return Err(FfsError::Corruption {
+            block: start.0,
+            detail: "free_blocks_persist: extent crosses block group boundary".into(),
         });
     }
 
