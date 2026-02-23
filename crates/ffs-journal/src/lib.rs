@@ -287,7 +287,7 @@ fn replay_jbd2_inner(
         if let Some(txn) = pending.get(&seq) {
             for (target, payload) in &txn.writes {
                 let revoked_seq = max_revoke_seq.get(target).copied().unwrap_or(0);
-                if seq < revoked_seq {
+                if seq <= revoked_seq {
                     stats.skipped_revoked_blocks = stats.skipped_revoked_blocks.saturating_add(1);
                     continue;
                 }

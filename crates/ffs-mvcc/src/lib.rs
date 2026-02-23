@@ -332,7 +332,7 @@ impl EbrVersionReclaimer {
         let passes = usize::try_from(self.stats().pending_versions().clamp(1, 8)).unwrap_or(8);
         for _ in 0..passes {
             let handle = self.collector.register();
-            handle.pin().flush();
+            handle.flush();
             if self.stats().pending_versions() == 0 {
                 break;
             }
@@ -353,7 +353,7 @@ impl EbrVersionReclaimer {
             }
 
             let handle = self.collector.register();
-            handle.pin().flush();
+            handle.flush();
             collected_any = true;
             if self.stats().pending_versions() == 0 {
                 break;

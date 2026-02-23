@@ -1462,15 +1462,20 @@ impl OpenFs {
         sb_region[0x3A..0x3C].copy_from_slice(&new_state.to_le_bytes());
         sb_region[0xE8..0xEC].copy_from_slice(&0_u32.to_le_bytes());
 
+        if let FsFlavor::Ext4(sb) = &mut self.flavor {
+            if sb.has_metadata_csum() {
+                let csum = ffs_ondisk::ext4_chksum(!0u32, &sb_region[..0x3FC]);
+                sb_region[0x3FC..0x400].copy_from_slice(&csum.to_le_bytes());
+                sb.checksum = csum;
+            }
+            sb.state = new_state;
+            sb.last_orphan = 0;
+        }
+
         let sb_offset = u64::try_from(ffs_types::EXT4_SUPERBLOCK_OFFSET)
             .map_err(|_| FfsError::Format("ext4 superblock offset does not fit u64".to_owned()))?;
         self.dev
             .write_all_at(cx, ByteOffset(sb_offset), &sb_region)?;
-
-        if let FsFlavor::Ext4(sb) = &mut self.flavor {
-            sb.state = new_state;
-            sb.last_orphan = 0;
-        }
 
         Ok(())
     }
@@ -3532,7 +3537,11 @@ impl OpenFs {
         }
         // Fast symlink: target stored inline in extent_bytes
         if let Some(target) = inode.fast_symlink_target() {
-            return Ok(target.to_vec());
+            let mut buf = target.to_vec();
+            if let Some(pos) = buf.iter().position(|&b| b == 0) {
+                buf.truncate(pos);
+            }
+            return Ok(buf);
         }
         // Slow symlink: read from data blocks
         let len = usize::try_from(inode.size).map_err(|_| FfsError::Corruption {

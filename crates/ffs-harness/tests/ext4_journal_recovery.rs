@@ -14,6 +14,8 @@ const TARGET_BLOCK: usize = 15;
 const TARGET_PREFIX_LEN: usize = 16;
 const JOURNAL_INODE: u32 = 8;
 const JOURNAL_START_BLOCK: usize = 20;
+const TARGET_BLOCK2: usize = 16;
+const TARGET2_PREFIX_LEN: usize = 16;
 
 const JBD2_MAGIC: u32 = 0xC03B_3998;
 const JBD2_BLOCKTYPE_DESCRIPTOR: u32 = 1;
@@ -429,9 +431,6 @@ fn write_jbd2_header(block: &mut [u8], block_type: u32, sequence: u32) {
     block[8..12].copy_from_slice(&sequence.to_be_bytes());
 }
 
-const TARGET_BLOCK2: usize = 16;
-const TARGET2_PREFIX_LEN: usize = 16;
-
 // ── Multi-transaction and crash recovery integration tests ──────────
 
 #[test]
@@ -689,7 +688,8 @@ fn build_multi_txn_image(commit_second: bool) -> Vec<u8> {
         let j5 = (JOURNAL_START_BLOCK + 5) * BLOCK_SIZE;
         write_jbd2_header(&mut image[j5..j5 + BLOCK_SIZE], JBD2_BLOCKTYPE_COMMIT, 2);
     }
-    // When !commit_second, journal block 25 stays zeroed → incomplete transaction.
+    // When !commit_second, the journal region ends after block 24 (5 blocks total)
+    // with no commit for seq=2 → replay detects the incomplete transaction.
 
     image
 }
