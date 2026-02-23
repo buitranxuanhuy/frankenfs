@@ -2196,11 +2196,10 @@ pub struct Ext4DirEntryTail {
 /// aligned so the low 2 bits are 0 and the formula is a no-op.
 #[must_use]
 fn rec_len_from_disk(raw: u16, block_size: u32) -> u32 {
-    if raw == 0xFFFF {
+    // Kernel: EXT4_MAX_REC_LEN = (1<<16)-4 = 0xFFFC. Both 0xFFFC and 0
+    // encode "entire block" (needed for 64K blocks where block_size > u16::MAX).
+    if raw == 0xFFFC || raw == 0 {
         return block_size;
-    }
-    if raw == 0xFFFE {
-        return block_size.saturating_sub(1);
     }
     let len = u32::from(raw);
     (len & 0xFFFC) | ((len & 0x3) << 16)

@@ -240,4 +240,55 @@ mod tests {
         let result = resolve_data_with(&chain, 0, |d| d);
         assert!(result.is_none());
     }
+
+    #[test]
+    fn resolve_mixed_chain() {
+        let chain = vec![
+            VersionData::Full(vec![1]), // 0
+            VersionData::Identical,     // 1 -> resolves to [1]
+            VersionData::Full(vec![2]), // 2
+            VersionData::Identical,     // 3 -> resolves to [2]
+            VersionData::Identical,     // 4 -> resolves to [2]
+        ];
+        assert_eq!(resolve_data_with(&chain, 0, |d| d).as_deref(), Some(&[1][..]));
+        assert_eq!(resolve_data_with(&chain, 1, |d| d).as_deref(), Some(&[1][..]));
+        assert_eq!(resolve_data_with(&chain, 2, |d| d).as_deref(), Some(&[2][..]));
+        assert_eq!(resolve_data_with(&chain, 3, |d| d).as_deref(), Some(&[2][..]));
+        assert_eq!(resolve_data_with(&chain, 4, |d| d).as_deref(), Some(&[2][..]));
+    }
+
+    #[test]
+    fn compression_stats_dedup_ratio() {
+        let stats = CompressionStats {
+            full_versions: 7,
+            identical_versions: 3,
+            bytes_saved: 300,
+            bytes_stored: 700,
+        };
+        let ratio = stats.dedup_ratio();
+        assert!((ratio - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn compression_stats_empty() {
+        let stats = CompressionStats::default();
+        assert!(stats.dedup_ratio().abs() < f64::EPSILON);
+        assert!((stats.compression_ratio() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn policy_defaults() {
+        let policy = CompressionPolicy::default();
+        assert!(policy.dedup_identical);
+        assert_eq!(policy.max_chain_length, Some(64));
+        assert_eq!(policy.algo, CompressionAlgo::None);
+    }
+
+    #[test]
+    fn policy_none() {
+        let policy = CompressionPolicy::none();
+        assert!(!policy.dedup_identical);
+        assert_eq!(policy.max_chain_length, None);
+        assert_eq!(policy.algo, CompressionAlgo::None);
+    }
 }
