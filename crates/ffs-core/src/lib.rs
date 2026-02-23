@@ -4682,7 +4682,11 @@ impl OpenFs {
         // Update inode metadata.
         let bs = alloc.geo.block_size;
         new_inode.size = u64::from(bs);
-        new_inode.blocks = u64::from(bs / 512);
+        if new_inode.is_huge_file() {
+            new_inode.blocks = 1;
+        } else {
+            new_inode.blocks = u64::from(bs / 512);
+        }
         new_inode.links_count = 2; // . and parent
         {
             let Ext4AllocState { geo, groups, .. } = &mut *alloc;
@@ -4838,7 +4842,11 @@ impl OpenFs {
         Self::set_extent_root(&mut parent_upd, &root_bytes);
 
         parent_upd.size += u64::from(alloc.geo.block_size);
-        parent_upd.blocks += u64::from(alloc.geo.block_size / 512);
+        if parent_upd.is_huge_file() {
+            parent_upd.blocks += 1;
+        } else {
+            parent_upd.blocks += u64::from(alloc.geo.block_size / 512);
+        }
         ffs_inode::touch_mtime_ctime(&mut parent_upd, tstamp_secs, tstamp_nanos);
         ffs_inode::write_inode(
             cx,
@@ -5261,9 +5269,13 @@ impl OpenFs {
                         persist_ctx,
                     )?
                 };
-                inode.blocks = inode
-                    .blocks
-                    .saturating_sub(freed_blocks.saturating_mul(sectors_per_block));
+                if inode.is_huge_file() {
+                    inode.blocks = inode.blocks.saturating_sub(freed_blocks);
+                } else {
+                    inode.blocks = inode
+                        .blocks
+                        .saturating_sub(freed_blocks.saturating_mul(sectors_per_block));
+                }
                 Self::set_extent_root(&mut inode, &root_bytes);
             }
         } else {
@@ -5340,9 +5352,13 @@ impl OpenFs {
             }
 
             if newly_allocated_blocks > 0 {
-                inode.blocks = inode
-                    .blocks
-                    .saturating_add(newly_allocated_blocks.saturating_mul(sectors_per_block));
+                if inode.is_huge_file() {
+                    inode.blocks = inode.blocks.saturating_add(newly_allocated_blocks);
+                } else {
+                    inode.blocks = inode
+                        .blocks
+                        .saturating_add(newly_allocated_blocks.saturating_mul(sectors_per_block));
+                }
                 Self::set_extent_root(&mut inode, &root_bytes);
             }
 
@@ -5466,7 +5482,11 @@ impl OpenFs {
                         )?
                     };
                     Self::set_extent_root(&mut inode, &root_bytes);
-                    inode.blocks += u64::from(block_size / 512);
+                    if inode.is_huge_file() {
+                        inode.blocks += 1;
+                    } else {
+                        inode.blocks += u64::from(block_size / 512);
+                    }
                     BlockNumber(mapping.physical_start)
                 }
             };
@@ -5819,9 +5839,13 @@ impl OpenFs {
                         )?
                     };
                     Self::set_extent_root(&mut inode, &root_bytes);
-                    inode.blocks = inode
-                        .blocks
-                        .saturating_sub(freed * u64::from(block_size / 512));
+                    if inode.is_huge_file() {
+                        inode.blocks = inode.blocks.saturating_sub(freed);
+                    } else {
+                        inode.blocks = inode
+                            .blocks
+                            .saturating_sub(freed * u64::from(block_size / 512));
+                    }
                 } else {
                     // Extend: just update size (sparse — blocks allocated on write).
                 }
@@ -5879,11 +5903,17 @@ impl OpenFs {
         let csum_seed = sb.csum_seed();
 
         let mut inode = self.read_inode(cx, ino)?;
-        let mut external_block = if inode.file_acl != 0 {
-            Some(self.read_block_vec(cx, BlockNumber(inode.file_acl))?)
-        } else {
-            None
-        };
+        let old_acl = inode.file_acl;
+        let mut external_block = None;
+        let mut old_refcount = 1;
+
+        if old_acl != 0 {
+            let buf = self.read_block_vec(cx, BlockNumber(old_acl))?;
+            if buf.len() >= 32 {
+                old_refcount = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            }
+            external_block = Some(buf);
+        }
 
         let existing = ffs_xattr::get_xattr(&inode, external_block.as_deref(), name)?;
         match mode {
@@ -5901,6 +5931,7 @@ impl OpenFs {
             has_cap_fowner: false,
             has_cap_sys_admin: false,
         };
+        
         let storage = match ffs_xattr::set_xattr(
             &mut inode,
             external_block.as_deref_mut(),
@@ -5909,7 +5940,7 @@ impl OpenFs {
             access,
         ) {
             Ok(s) => s,
-            Err(FfsError::NoSpace) if inode.file_acl == 0 => {
+            Err(FfsError::NoSpace) if old_acl == 0 => {
                 // Inline region exhausted and no external block exists yet — allocate one.
                 let mut alloc = alloc_mutex.lock();
                 let ino_group = ffs_types::inode_to_group(ino, alloc.geo.inodes_per_group);
@@ -5931,11 +5962,16 @@ impl OpenFs {
                     &hint,
                     persist_ctx,
                 )?;
-                let block_size = geo.block_size as usize;
+                let block_size = geo.block_size;
                 drop(alloc);
 
-                external_block = Some(vec![0u8; block_size]);
+                external_block = Some(vec![0u8; block_size as usize]);
                 inode.file_acl = block_alloc.start.0;
+                if inode.is_huge_file() {
+                    inode.blocks = inode.blocks.saturating_add(1);
+                } else {
+                    inode.blocks = inode.blocks.saturating_add(u64::from(block_size / 512));
+                }
 
                 ffs_xattr::set_xattr(
                     &mut inode,
@@ -5948,8 +5984,41 @@ impl OpenFs {
             Err(e) => return Err(e),
         };
 
-        if let Some(block) = external_block {
-            block_dev.write_block(cx, BlockNumber(inode.file_acl), &block)?;
+        if let Some(mut block) = external_block {
+            let mut alloc = alloc_mutex.lock();
+            if old_acl != 0 && old_refcount > 1 {
+                // Block was shared, we must allocate a new block (COW)
+                let ino_group = ffs_types::inode_to_group(ino, alloc.geo.inodes_per_group);
+                let hint = AllocHint {
+                    goal_group: Some(ino_group),
+                    goal_block: None,
+                };
+                let block_alloc = ffs_alloc::alloc_blocks_persist(
+                    cx,
+                    &block_dev,
+                    &alloc.geo,
+                    &mut alloc.groups,
+                    1,
+                    &hint,
+                    &alloc.persist_ctx,
+                )?;
+                inode.file_acl = block_alloc.start.0;
+                block[4..8].copy_from_slice(&1_u32.to_le_bytes()); // new block has refcount 1
+                block_dev.write_block(cx, block_alloc.start, &block)?;
+
+                // Decrement old block's refcount.
+                let mut old_block = self.read_block_vec(cx, BlockNumber(old_acl))?;
+                let new_refcount = old_refcount - 1;
+                old_block[4..8].copy_from_slice(&new_refcount.to_le_bytes());
+                block_dev.write_block(cx, BlockNumber(old_acl), &old_block)?;
+            } else if old_acl != 0 {
+                // Not shared, modify in place
+                block_dev.write_block(cx, BlockNumber(old_acl), &block)?;
+            } else {
+                // New block
+                block_dev.write_block(cx, BlockNumber(inode.file_acl), &block)?;
+            }
+            drop(alloc);
         }
 
         ffs_inode::touch_ctime(&mut inode, tstamp_secs, tstamp_nanos);
@@ -5992,33 +6061,82 @@ impl OpenFs {
 
         let mut inode = self.read_inode(cx, ino)?;
         let old_acl = inode.file_acl;
-        let mut external_block = if old_acl != 0 {
-            Some(self.read_block_vec(cx, BlockNumber(old_acl))?)
-        } else {
-            None
-        };
+        let mut external_block = None;
+        let mut old_refcount = 1;
+
+        if old_acl != 0 {
+            let buf = self.read_block_vec(cx, BlockNumber(old_acl))?;
+            if buf.len() >= 32 {
+                old_refcount = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            }
+            external_block = Some(buf);
+        }
 
         let access = XattrWriteAccess {
-            // The FUSE mount uses `default_permissions`, so ownership checks are
-            // expected to have already happened in-kernel.
             is_owner: true,
             has_cap_fowner: false,
             has_cap_sys_admin: false,
         };
-        let removed =
-            ffs_xattr::remove_xattr(&mut inode, external_block.as_deref_mut(), name, access)?;
+        
+        let removed = ffs_xattr::remove_xattr(&mut inode, external_block.as_deref_mut(), name, access)?;
         if !removed {
             return Ok(false);
         }
 
-        if let Some(block) = external_block {
-            // Persist any external block updates even if `file_acl` was cleared.
-            block_dev.write_block(cx, BlockNumber(old_acl), &block)?;
+        let mut alloc = alloc_mutex.lock();
+
+        if let Some(mut block) = external_block {
+            let new_acl = inode.file_acl;
+            
+            if new_acl == 0 {
+                // Block became empty. If it was shared, we just decrement its refcount.
+                if old_refcount > 1 {
+                    let mut old_block = self.read_block_vec(cx, BlockNumber(old_acl))?;
+                    let new_refcount = old_refcount - 1;
+                    old_block[4..8].copy_from_slice(&new_refcount.to_le_bytes());
+                    block_dev.write_block(cx, BlockNumber(old_acl), &old_block)?;
+                } else {
+                    ffs_alloc::free_blocks_persist(cx, &block_dev, &alloc.geo, &mut alloc.groups, BlockNumber(old_acl), 1, &alloc.persist_ctx)?;
+                }
+                
+                if inode.is_huge_file() {
+                    inode.blocks = inode.blocks.saturating_sub(1);
+                } else {
+                    inode.blocks = inode.blocks.saturating_sub(u64::from(alloc.geo.block_size / 512));
+                }
+            } else if old_refcount > 1 {
+                // Block modified but not empty, and it was shared. We must allocate a new block (COW).
+                let ino_group = ffs_types::inode_to_group(ino, alloc.geo.inodes_per_group);
+                let hint = AllocHint {
+                    goal_group: Some(ino_group),
+                    goal_block: None,
+                };
+                let block_alloc = ffs_alloc::alloc_blocks_persist(
+                    cx,
+                    &block_dev,
+                    &alloc.geo,
+                    &mut alloc.groups,
+                    1,
+                    &hint,
+                    &alloc.persist_ctx,
+                )?;
+                inode.file_acl = block_alloc.start.0;
+                block[4..8].copy_from_slice(&1_u32.to_le_bytes()); // new block has refcount 1
+                block_dev.write_block(cx, block_alloc.start, &block)?;
+
+                // Decrement old block's refcount.
+                let mut old_block = self.read_block_vec(cx, BlockNumber(old_acl))?;
+                let new_refcount = old_refcount - 1;
+                old_block[4..8].copy_from_slice(&new_refcount.to_le_bytes());
+                block_dev.write_block(cx, BlockNumber(old_acl), &old_block)?;
+            } else {
+                // Not shared, safe to modify in place.
+                block_dev.write_block(cx, BlockNumber(old_acl), &block)?;
+            }
         }
 
         ffs_inode::touch_ctime(&mut inode, tstamp_secs, tstamp_nanos);
 
-        let alloc = alloc_mutex.lock();
         ffs_inode::write_inode(
             cx,
             &block_dev,
