@@ -2781,7 +2781,9 @@ impl OpenFs {
         let mut covered_until = offset;
         for (logical_start, extent) in &extents {
             match extent {
-                BtrfsExtentData::Inline { compression, data, .. } => {
+                BtrfsExtentData::Inline {
+                    compression, data, ..
+                } => {
                     if *compression != 0 {
                         info!(
                             inode = canonical,
@@ -5625,7 +5627,7 @@ impl OpenFs {
             let mut ex_upd = existing_inode;
             if ex_upd.is_dir() {
                 ex_upd.links_count = 0;
-                
+
                 // Decrement the new parent's link count for the ".." backref from the deleted directory.
                 let mut new_par = self.read_inode(cx, new_parent)?;
                 new_par.links_count = new_par.links_count.saturating_sub(1);
@@ -5633,13 +5635,7 @@ impl OpenFs {
                 {
                     let Ext4AllocState { geo, groups, .. } = &mut *alloc;
                     ffs_inode::write_inode(
-                        cx,
-                        &block_dev,
-                        geo,
-                        groups,
-                        new_parent,
-                        &new_par,
-                        csum_seed,
+                        cx, &block_dev, geo, groups, new_parent, &new_par, csum_seed,
                     )?;
                 }
             } else {
@@ -5935,7 +5931,7 @@ impl OpenFs {
             has_cap_fowner: false,
             has_cap_sys_admin: false,
         };
-        
+
         let storage = match ffs_xattr::set_xattr(
             &mut inode,
             external_block.as_deref_mut(),
@@ -5990,7 +5986,11 @@ impl OpenFs {
 
         if let Some(mut block) = external_block {
             let mut alloc = alloc_mutex.lock();
-            let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
+            let Ext4AllocState {
+                geo,
+                groups,
+                persist_ctx,
+            } = &mut *alloc;
             if old_acl != 0 && old_refcount > 1 {
                 // Block was shared, we must allocate a new block (COW)
                 let ino_group = ffs_types::inode_to_group(ino, geo.inodes_per_group);
@@ -6052,6 +6052,82 @@ impl OpenFs {
         Ok(())
     }
 
+    /// Reconcile an external xattr block after a remove-xattr mutation.
+    ///
+    /// Handles three cases: block became empty (free or decrement refcount),
+    /// block modified but shared (COW), or block modified and unshared (in-place write).
+    fn reconcile_xattr_block_after_remove(
+        &self,
+        cx: &Cx,
+        inode: &mut Ext4Inode,
+        mut block: Vec<u8>,
+        old_acl_refcount: (u64, u32),
+        ino: InodeNumber,
+        alloc: &mut Ext4AllocState,
+    ) -> ffs_error::Result<()> {
+        let (old_acl, old_refcount) = old_acl_refcount;
+        let block_dev = self.block_device_adapter();
+        let new_acl = inode.file_acl;
+        let Ext4AllocState {
+            geo,
+            groups,
+            persist_ctx,
+        } = alloc;
+
+        if new_acl == 0 {
+            // Block became empty.
+            if old_refcount > 1 {
+                let mut old_block = self.read_block_vec(cx, BlockNumber(old_acl))?;
+                let new_refcount = old_refcount - 1;
+                old_block[4..8].copy_from_slice(&new_refcount.to_le_bytes());
+                block_dev.write_block(cx, BlockNumber(old_acl), &old_block)?;
+            } else {
+                ffs_alloc::free_blocks_persist(
+                    cx,
+                    &block_dev,
+                    geo,
+                    groups,
+                    BlockNumber(old_acl),
+                    1,
+                    persist_ctx,
+                )?;
+            }
+            if inode.is_huge_file() {
+                inode.blocks = inode.blocks.saturating_sub(1);
+            } else {
+                inode.blocks = inode.blocks.saturating_sub(u64::from(geo.block_size / 512));
+            }
+        } else if old_refcount > 1 {
+            // Block modified but shared — COW.
+            let ino_group = ffs_types::inode_to_group(ino, geo.inodes_per_group);
+            let hint = AllocHint {
+                goal_group: Some(ino_group),
+                goal_block: None,
+            };
+            let block_alloc = ffs_alloc::alloc_blocks_persist(
+                cx,
+                &block_dev,
+                geo,
+                groups,
+                1,
+                &hint,
+                persist_ctx,
+            )?;
+            inode.file_acl = block_alloc.start.0;
+            block[4..8].copy_from_slice(&1_u32.to_le_bytes());
+            block_dev.write_block(cx, block_alloc.start, &block)?;
+
+            let mut old_block = self.read_block_vec(cx, BlockNumber(old_acl))?;
+            let new_refcount = old_refcount - 1;
+            old_block[4..8].copy_from_slice(&new_refcount.to_le_bytes());
+            block_dev.write_block(cx, BlockNumber(old_acl), &old_block)?;
+        } else {
+            // Not shared, modify in place.
+            block_dev.write_block(cx, BlockNumber(old_acl), &block)?;
+        }
+        Ok(())
+    }
+
     /// Remove one ext4 xattr.
     #[allow(clippy::significant_drop_tightening)]
     fn ext4_removexattr(&self, cx: &Cx, ino: InodeNumber, name: &str) -> ffs_error::Result<bool> {
@@ -6082,63 +6158,24 @@ impl OpenFs {
             has_cap_fowner: false,
             has_cap_sys_admin: false,
         };
-        
-        let removed = ffs_xattr::remove_xattr(&mut inode, external_block.as_deref_mut(), name, access)?;
+
+        let removed =
+            ffs_xattr::remove_xattr(&mut inode, external_block.as_deref_mut(), name, access)?;
         if !removed {
             return Ok(false);
         }
 
         let mut alloc = alloc_mutex.lock();
-        let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
 
-        if let Some(mut block) = external_block {
-            let new_acl = inode.file_acl;
-
-            if new_acl == 0 {
-                // Block became empty. If it was shared, we just decrement its refcount.
-                if old_refcount > 1 {
-                    let mut old_block = self.read_block_vec(cx, BlockNumber(old_acl))?;
-                    let new_refcount = old_refcount - 1;
-                    old_block[4..8].copy_from_slice(&new_refcount.to_le_bytes());
-                    block_dev.write_block(cx, BlockNumber(old_acl), &old_block)?;
-                } else {
-                    ffs_alloc::free_blocks_persist(cx, &block_dev, geo, groups, BlockNumber(old_acl), 1, persist_ctx)?;
-                }
-
-                if inode.is_huge_file() {
-                    inode.blocks = inode.blocks.saturating_sub(1);
-                } else {
-                    inode.blocks = inode.blocks.saturating_sub(u64::from(geo.block_size / 512));
-                }
-            } else if old_refcount > 1 {
-                // Block modified but not empty, and it was shared. We must allocate a new block (COW).
-                let ino_group = ffs_types::inode_to_group(ino, geo.inodes_per_group);
-                let hint = AllocHint {
-                    goal_group: Some(ino_group),
-                    goal_block: None,
-                };
-                let block_alloc = ffs_alloc::alloc_blocks_persist(
-                    cx,
-                    &block_dev,
-                    geo,
-                    groups,
-                    1,
-                    &hint,
-                    persist_ctx,
-                )?;
-                inode.file_acl = block_alloc.start.0;
-                block[4..8].copy_from_slice(&1_u32.to_le_bytes()); // new block has refcount 1
-                block_dev.write_block(cx, block_alloc.start, &block)?;
-
-                // Decrement old block's refcount.
-                let mut old_block = self.read_block_vec(cx, BlockNumber(old_acl))?;
-                let new_refcount = old_refcount - 1;
-                old_block[4..8].copy_from_slice(&new_refcount.to_le_bytes());
-                block_dev.write_block(cx, BlockNumber(old_acl), &old_block)?;
-            } else {
-                // Not shared, safe to modify in place.
-                block_dev.write_block(cx, BlockNumber(old_acl), &block)?;
-            }
+        if let Some(block) = external_block {
+            self.reconcile_xattr_block_after_remove(
+                cx,
+                &mut inode,
+                block,
+                (old_acl, old_refcount),
+                ino,
+                &mut alloc,
+            )?;
         }
 
         ffs_inode::touch_ctime(&mut inode, tstamp_secs, tstamp_nanos);
@@ -6220,7 +6257,8 @@ impl OpenFs {
         // For simplicity in V1, write data as an inline extent if small enough,
         // otherwise allocate a data extent and write through the device.
         let nodesize = alloc.nodesize;
-        let mut can_be_inline = end.max(inode.size) <= u64::from(nodesize) - 200 && data.len() <= 2048;
+        let mut can_be_inline =
+            end.max(inode.size) <= u64::from(nodesize) - 200 && data.len() <= 2048;
 
         if can_be_inline {
             let ext_start = BtrfsKey {
@@ -6239,7 +6277,10 @@ impl OpenFs {
                         can_be_inline = false;
                         break;
                     }
-                    if !matches!(parse_extent_data(&edata), Ok(BtrfsExtentData::Inline { .. })) {
+                    if !matches!(
+                        parse_extent_data(&edata),
+                        Ok(BtrfsExtentData::Inline { .. })
+                    ) {
                         can_be_inline = false;
                         break;
                     }
@@ -6307,7 +6348,7 @@ impl OpenFs {
                             .fs_tree
                             .delete(&inline_key)
                             .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-                        
+
                         if offset == 0 && data.len() < prev_data.len() {
                             // Partial overwrite at offset 0: merge new data into old
                             // inline extent to preserve the tail before converting.
@@ -6361,7 +6402,8 @@ impl OpenFs {
             // Write data to the allocated physical region.
             // For single-device, the logical address is the physical address
             // (the data block group we create maps 1:1).
-            self.dev.write_all_at(cx, ByteOffset(disk_bytenr), data_to_write)?;
+            self.dev
+                .write_all_at(cx, ByteOffset(disk_bytenr), data_to_write)?;
 
             // Insert the EXTENT_DATA item.
             let extent = BtrfsExtentData::Regular {
@@ -6389,8 +6431,14 @@ impl OpenFs {
                     }) = parse_extent_data(edata)
                     {
                         if old_bytenr > 0 {
-                            if let Err(e) = alloc.extent_alloc.free_extent(old_bytenr, old_num_bytes, false) {
-                                warn!("btrfs_write: failed to free overwritten extent at {old_bytenr}: {e:?}");
+                            if let Err(e) =
+                                alloc
+                                    .extent_alloc
+                                    .free_extent(old_bytenr, old_num_bytes, false)
+                            {
+                                warn!(
+                                    "btrfs_write: failed to free overwritten extent at {old_bytenr}: {e:?}"
+                                );
                             }
                         }
                     }
@@ -6864,8 +6912,14 @@ impl OpenFs {
                             }) = parse_extent_data(&edata)
                             {
                                 if disk_bytenr > 0 {
-                                    if let Err(e) = alloc.extent_alloc.free_extent(disk_bytenr, disk_num_bytes, false) {
-                                        warn!("truncate: failed to free extent at {disk_bytenr}: {e:?}");
+                                    if let Err(e) = alloc.extent_alloc.free_extent(
+                                        disk_bytenr,
+                                        disk_num_bytes,
+                                        false,
+                                    ) {
+                                        warn!(
+                                            "truncate: failed to free extent at {disk_bytenr}: {e:?}"
+                                        );
                                     }
                                 }
                             }
@@ -7533,7 +7587,11 @@ impl OpenFs {
                 }) = parse_extent_data(&data)
                 {
                     if disk_bytenr > 0 {
-                        if let Err(e) = alloc.extent_alloc.free_extent(disk_bytenr, disk_num_bytes, false) {
+                        if let Err(e) =
+                            alloc
+                                .extent_alloc
+                                .free_extent(disk_bytenr, disk_num_bytes, false)
+                        {
                             warn!("cleanup: failed to free extent at {disk_bytenr}: {e:?}");
                         }
                     }
@@ -8843,7 +8901,11 @@ impl FrankenFsEngine {
     }
 
     #[must_use]
-    pub fn read(&self, block: BlockNumber, snapshot: Snapshot) -> Option<std::borrow::Cow<'_, [u8]>> {
+    pub fn read(
+        &self,
+        block: BlockNumber,
+        snapshot: Snapshot,
+    ) -> Option<std::borrow::Cow<'_, [u8]>> {
         self.store.read_visible(block, snapshot)
     }
 

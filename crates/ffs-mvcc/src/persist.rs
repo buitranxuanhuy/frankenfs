@@ -717,6 +717,64 @@ fn write_checkpoint(
     Ok(())
 }
 
+/// Read a single block version from a checkpoint stream.
+fn read_block_version(
+    reader: &mut BufReader<File>,
+    hasher: &mut Crc32cHasher,
+    file_len: u64,
+    block: BlockNumber,
+    dedup: bool,
+    versions: &[BlockVersion],
+) -> Result<BlockVersion> {
+    let mut commit_seq_bytes = [0_u8; 8];
+    reader.read_exact(&mut commit_seq_bytes)?;
+    hasher.update(&commit_seq_bytes);
+    let commit_seq = CommitSeq(u64::from_le_bytes(commit_seq_bytes));
+
+    let mut txn_id_bytes = [0_u8; 8];
+    reader.read_exact(&mut txn_id_bytes)?;
+    hasher.update(&txn_id_bytes);
+    let txn_id = ffs_types::TxnId(u64::from_le_bytes(txn_id_bytes));
+
+    let mut data_len_bytes = [0_u8; 4];
+    reader.read_exact(&mut data_len_bytes)?;
+    hasher.update(&data_len_bytes);
+    let data_len = u32::from_le_bytes(data_len_bytes) as usize;
+
+    if data_len as u64 > file_len {
+        return Err(FfsError::Corruption {
+            block: 0,
+            detail: format!("checkpoint data_len {data_len} exceeds file size"),
+        });
+    }
+
+    let mut data = vec![0_u8; data_len];
+    reader.read_exact(&mut data)?;
+    hasher.update(&data);
+
+    let version_data = if dedup && !versions.is_empty() {
+        let last_idx = versions.len() - 1;
+        let is_identical =
+            crate::compression::resolve_data_with(versions, last_idx, |v: &BlockVersion| &v.data)
+                .as_deref()
+                == Some(data.as_slice());
+        if is_identical {
+            crate::compression::VersionData::Identical
+        } else {
+            crate::compression::VersionData::Full(data)
+        }
+    } else {
+        crate::compression::VersionData::Full(data)
+    };
+
+    Ok(BlockVersion {
+        block,
+        commit_seq,
+        writer: txn_id,
+        data: version_data,
+    })
+}
+
 /// Load a checkpoint from a file into an MvccStore.
 fn load_checkpoint(path: &Path, store: &mut MvccStore) -> Result<()> {
     let file = File::open(path)?;
@@ -755,6 +813,8 @@ fn load_checkpoint(path: &Path, store: &mut MvccStore) -> Result<()> {
 
     store.advance_counters(next_commit.saturating_sub(1), next_txn.saturating_sub(1));
 
+    let dedup = store.compression_policy().dedup_identical;
+
     // Read blocks
     for _ in 0..num_blocks {
         let mut block_bytes = [0_u8; 8];
@@ -769,56 +829,14 @@ fn load_checkpoint(path: &Path, store: &mut MvccStore) -> Result<()> {
 
         let mut versions = Vec::with_capacity((num_versions as usize).min(1024));
         for _ in 0..num_versions {
-            let mut commit_seq_bytes = [0_u8; 8];
-            reader.read_exact(&mut commit_seq_bytes)?;
-            hasher.update(&commit_seq_bytes);
-            let commit_seq = CommitSeq(u64::from_le_bytes(commit_seq_bytes));
-
-            let mut txn_id_bytes = [0_u8; 8];
-            reader.read_exact(&mut txn_id_bytes)?;
-            hasher.update(&txn_id_bytes);
-            let txn_id = ffs_types::TxnId(u64::from_le_bytes(txn_id_bytes));
-
-            let mut data_len_bytes = [0_u8; 4];
-            reader.read_exact(&mut data_len_bytes)?;
-            hasher.update(&data_len_bytes);
-            let data_len = u32::from_le_bytes(data_len_bytes) as usize;
-
-            if data_len as u64 > file_len {
-                return Err(FfsError::Corruption {
-                    block: 0,
-                    detail: format!("checkpoint data_len {data_len} exceeds file size"),
-                });
-            }
-
-            let mut data = vec![0_u8; data_len];
-            reader.read_exact(&mut data)?;
-            hasher.update(&data);
-
-            let version_data = if store.compression_policy().dedup_identical {
-                let is_identical = !versions.is_empty() && {
-                    let last_idx = versions.len() - 1;
-                    crate::compression::resolve_data_with(
-                        &versions,
-                        last_idx,
-                        |v: &BlockVersion| &v.data,
-                    ).as_deref() == Some(data.as_slice())
-                };
-                if is_identical {
-                    crate::compression::VersionData::Identical
-                } else {
-                    crate::compression::VersionData::Full(data)
-                }
-            } else {
-                crate::compression::VersionData::Full(data)
-            };
-
-            versions.push(BlockVersion {
+            versions.push(read_block_version(
+                &mut reader,
+                &mut hasher,
+                file_len,
                 block,
-                commit_seq,
-                writer: txn_id,
-                data: version_data,
-            });
+                dedup,
+                &versions,
+            )?);
         }
 
         store.insert_versions(block, versions);
