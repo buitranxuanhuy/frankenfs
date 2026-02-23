@@ -286,7 +286,7 @@ impl BtrfsExtentData {
             } => {
                 let mut buf = vec![0u8; 53];
                 buf[0..8].copy_from_slice(&generation.to_le_bytes());
-                buf[8..16].copy_from_slice(&num_bytes.to_le_bytes()); // ram_bytes
+                buf[8..16].copy_from_slice(&disk_num_bytes.to_le_bytes()); // ram_bytes
                 buf[16] = *compression;
                 // encryption at 17 (zero)
                 // other_encoding at 18..20 (zero)

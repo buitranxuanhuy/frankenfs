@@ -2763,11 +2763,6 @@ impl OpenFs {
         if to_read > 1_048_576 {
             debug!(inode = canonical, length = to_read, "btrfs large_read");
         }
-        extents.sort_by_key(|(logical, ext)| match ext {
-            BtrfsExtentData::Inline { generation, .. } => (*generation, *logical),
-            BtrfsExtentData::Regular { generation, .. } => (*generation, *logical),
-        });
-
         if extents.len() > 10 {
             debug!(
                 inode = canonical,

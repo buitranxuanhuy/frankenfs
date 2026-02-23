@@ -3572,8 +3572,6 @@ fn dx_hash_half_md4(name: &[u8], seed: &[u32; 4], signed: bool) -> (u32, u32) {
 fn dx_hash_tea(name: &[u8], seed: &[u32; 4], signed: bool) -> (u32, u32) {
     let mut a = seed[0];
     let mut b = seed[1];
-    let mut c = seed[2];
-    let mut d = seed[3];
 
     let mut offset = 0;
     while offset < name.len() {
