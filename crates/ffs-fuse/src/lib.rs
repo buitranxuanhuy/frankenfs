@@ -1560,6 +1560,11 @@ impl Filesystem for FrankenFuse {
             reply.error(libc::EROFS);
             return;
         }
+        if self.should_shed(RequestOp::Fsync) {
+            warn!(ino, "backpressure: shedding fsync");
+            reply.error(libc::EBUSY);
+            return;
+        }
         let cx = Self::cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Fsync, |cx| {
             self.inner.ops.fsync(cx, InodeNumber(ino), fh, datasync)
@@ -1589,6 +1594,11 @@ impl Filesystem for FrankenFuse {
     ) {
         if self.inner.read_only {
             reply.error(libc::EROFS);
+            return;
+        }
+        if self.should_shed(RequestOp::Fsyncdir) {
+            warn!(ino, "backpressure: shedding fsyncdir");
+            reply.error(libc::EBUSY);
             return;
         }
         let cx = Self::cx_for_request();

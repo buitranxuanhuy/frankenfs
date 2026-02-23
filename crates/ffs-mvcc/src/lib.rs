@@ -1006,34 +1006,8 @@ impl MvccStore {
         &mut self,
         txn: Transaction,
     ) -> Result<(CommitSeq, Vec<BlockNumber>), (CommitError, Transaction)> {
-        let chain_cap = self.compression_policy.max_chain_length;
-        // Step 1: FCW check (write-write conflicts).
-        for block in txn.writes.keys() {
-            let latest = self.latest_commit_seq(*block);
-            if latest > txn.snapshot.high {
-                warn!(
-                    target: "ffs::mvcc::evidence",
-                    event = "txn_aborted",
-                    txn_id = txn.id.0,
-                    reason = "fcw_conflict",
-                    block = block.0,
-                    snapshot_commit_seq = txn.snapshot.high.0,
-                    observed_commit_seq = latest.0
-                );
-                return Err((
-                    CommitError::Conflict {
-                        block: *block,
-                        snapshot: txn.snapshot.high,
-                        observed: latest,
-                    },
-                    txn,
-                ));
-            }
-            if let Some(cap) = chain_cap {
-                if let Err(e) = self.enforce_chain_pressure(txn.id, *block, cap) {
-                    return Err((e, txn));
-                }
-            }
+        if let Err(error) = self.preflight_fcw(&txn) {
+            return Err((error, txn));
         }
 
         // Step 2: SSI rw-antidependency check (phantom detection).
@@ -1082,7 +1056,7 @@ impl MvccStore {
                     });
             }
 
-            if let Some(cap) = chain_cap {
+            if let Some(cap) = self.compression_policy.max_chain_length {
                 self.enforce_chain_cap(block, cap);
                 self.enforce_physical_chain_cap(block, cap);
             }
