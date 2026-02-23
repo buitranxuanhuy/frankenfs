@@ -750,7 +750,7 @@ struct BtrfsAllocState {
     /// Next available objectid for new inodes / directory entries.
     next_objectid: u64,
     /// Current transaction generation (bumped on each commit).
-    _generation: u64,
+    generation: u64,
     /// Node size in bytes (copied from superblock for convenience).
     nodesize: u32,
 }
@@ -1925,7 +1925,7 @@ impl OpenFs {
             fs_tree,
             extent_alloc,
             next_objectid: max_objectid + 1,
-            _generation: generation,
+            generation,
             nodesize,
         })
     }
@@ -2758,7 +2758,10 @@ impl OpenFs {
         if to_read > 1_048_576 {
             debug!(inode = canonical, length = to_read, "btrfs large_read");
         }
-        extents.sort_by_key(|(logical, _)| *logical);
+        extents.sort_by_key(|(logical, ext)| match ext {
+            BtrfsExtentData::Inline { generation, .. } => (*generation, *logical),
+            BtrfsExtentData::Regular { generation, .. } => (*generation, *logical),
+        });
 
         if extents.len() > 10 {
             debug!(
@@ -2778,7 +2781,7 @@ impl OpenFs {
         let mut covered_until = offset;
         for (logical_start, extent) in &extents {
             match extent {
-                BtrfsExtentData::Inline { compression, data } => {
+                BtrfsExtentData::Inline { compression, data, .. } => {
                     if *compression != 0 {
                         info!(
                             inode = canonical,
@@ -5598,6 +5601,23 @@ impl OpenFs {
             let mut ex_upd = existing_inode;
             if ex_upd.is_dir() {
                 ex_upd.links_count = 0;
+                
+                // Decrement the new parent's link count for the ".." backref from the deleted directory.
+                let mut new_par = self.read_inode(cx, new_parent)?;
+                new_par.links_count = new_par.links_count.saturating_sub(1);
+                ffs_inode::touch_mtime_ctime(&mut new_par, tstamp_secs, tstamp_nanos);
+                {
+                    let Ext4AllocState { geo, groups, .. } = &mut *alloc;
+                    ffs_inode::write_inode(
+                        cx,
+                        &block_dev,
+                        geo,
+                        groups,
+                        new_parent,
+                        &new_par,
+                        csum_seed,
+                    )?;
+                }
             } else {
                 ex_upd.links_count = ex_upd.links_count.saturating_sub(1);
             }
@@ -6109,6 +6129,7 @@ impl OpenFs {
         if can_be_inline {
             // Inline extent: store data directly in the tree item.
             let extent = BtrfsExtentData::Inline {
+                generation: alloc.generation,
                 compression: 0,
                 data: {
                     // Build the full file content up to `end`.
@@ -6188,6 +6209,7 @@ impl OpenFs {
                                 &prev_data,
                             )?;
                             let prev_extent = BtrfsExtentData::Regular {
+                                generation: alloc.generation,
                                 extent_type: BTRFS_FILE_EXTENT_REG,
                                 compression: 0,
                                 disk_bytenr: prev_allocation.bytenr,
@@ -6222,6 +6244,7 @@ impl OpenFs {
 
             // Insert the EXTENT_DATA item.
             let extent = BtrfsExtentData::Regular {
+                generation: alloc.generation,
                 extent_type: BTRFS_FILE_EXTENT_REG,
                 compression: 0,
                 disk_bytenr,
@@ -6641,6 +6664,7 @@ impl OpenFs {
 
         // Store symlink target as an inline extent.
         let extent = BtrfsExtentData::Inline {
+            generation: alloc.generation,
             compression: 0,
             data: target_bytes.to_vec(),
         };
@@ -6859,6 +6883,7 @@ impl OpenFs {
                                 &prev_data,
                             )?;
                             let prev_extent = BtrfsExtentData::Regular {
+                                generation: alloc.generation,
                                 extent_type: BTRFS_FILE_EXTENT_REG,
                                 compression: 0,
                                 disk_bytenr: prev_allocation.bytenr,
@@ -6887,6 +6912,7 @@ impl OpenFs {
                 .map_err(|e| btrfs_mutation_to_ffs(&e))?;
 
             let extent = BtrfsExtentData::Regular {
+                generation: alloc.generation,
                 extent_type: BTRFS_FILE_EXTENT_PREALLOC,
                 compression: 0,
                 disk_bytenr: allocation.bytenr,
