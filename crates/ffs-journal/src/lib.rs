@@ -292,7 +292,7 @@ fn replay_jbd2_inner(
                     stats.skipped_revoked_blocks = stats.skipped_revoked_blocks.saturating_add(1);
                     continue;
                 }
-                
+
                 final_writes.insert(*target, payload.clone());
                 stats.replayed_blocks = stats.replayed_blocks.saturating_add(1);
             }
@@ -305,8 +305,8 @@ fn replay_jbd2_inner(
         dev.write_block(cx, target, &payload)?;
     }
 
-    stats.incomplete_transactions = u64::try_from(pending.len().saturating_sub(committed_sequences.len()))
-        .unwrap_or(u64::MAX);
+    stats.incomplete_transactions =
+        u64::try_from(pending.len().saturating_sub(committed_sequences.len())).unwrap_or(u64::MAX);
 
     Ok(ReplayOutcome {
         committed_sequences: committed_sequences.into_iter().collect(),

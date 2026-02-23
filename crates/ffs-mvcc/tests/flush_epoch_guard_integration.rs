@@ -255,7 +255,9 @@ fn flush_epoch_guard_blocks_gc_until_writeback_finishes() {
         let mut store = shared_store.write();
         let _ = store.prune_safe();
         store.ebr_collect();
-        let v2_after = store.read_visible(block, snapshot_v2).map(std::borrow::Cow::into_owned);
+        let v2_after = store
+            .read_visible(block, snapshot_v2)
+            .map(std::borrow::Cow::into_owned);
         assert_ne!(
             v2_after,
             Some(payload_v2),

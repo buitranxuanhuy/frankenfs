@@ -170,7 +170,8 @@ impl ShardedMvccStore {
             let idx = versions
                 .iter()
                 .rposition(|v| v.commit_seq <= snapshot.high)?;
-            compression::resolve_data_with(versions, idx, |v| &v.data).map(std::borrow::Cow::into_owned)
+            compression::resolve_data_with(versions, idx, |v| &v.data)
+                .map(std::borrow::Cow::into_owned)
         })
     }
 

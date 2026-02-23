@@ -74,7 +74,11 @@ impl VersionData {
 ///
 /// * `chain` - Slice of `(VersionData, ...)` tuples or items with a `.data` field.
 /// * `index` - Index of the version to resolve.
-pub fn resolve_data_with<'a, T, F>(chain: &'a [T], index: usize, get_data: F) -> Option<Cow<'a, [u8]>>
+pub fn resolve_data_with<'a, T, F>(
+    chain: &'a [T],
+    index: usize,
+    get_data: F,
+) -> Option<Cow<'a, [u8]>>
 where
     F: Fn(&'a T) -> &'a VersionData,
 {
@@ -250,11 +254,26 @@ mod tests {
             VersionData::Identical,     // 3 -> resolves to [2]
             VersionData::Identical,     // 4 -> resolves to [2]
         ];
-        assert_eq!(resolve_data_with(&chain, 0, |d| d).as_deref(), Some(&[1][..]));
-        assert_eq!(resolve_data_with(&chain, 1, |d| d).as_deref(), Some(&[1][..]));
-        assert_eq!(resolve_data_with(&chain, 2, |d| d).as_deref(), Some(&[2][..]));
-        assert_eq!(resolve_data_with(&chain, 3, |d| d).as_deref(), Some(&[2][..]));
-        assert_eq!(resolve_data_with(&chain, 4, |d| d).as_deref(), Some(&[2][..]));
+        assert_eq!(
+            resolve_data_with(&chain, 0, |d| d).as_deref(),
+            Some(&[1][..])
+        );
+        assert_eq!(
+            resolve_data_with(&chain, 1, |d| d).as_deref(),
+            Some(&[1][..])
+        );
+        assert_eq!(
+            resolve_data_with(&chain, 2, |d| d).as_deref(),
+            Some(&[2][..])
+        );
+        assert_eq!(
+            resolve_data_with(&chain, 3, |d| d).as_deref(),
+            Some(&[2][..])
+        );
+        assert_eq!(
+            resolve_data_with(&chain, 4, |d| d).as_deref(),
+            Some(&[2][..])
+        );
     }
 
     #[test]

@@ -263,7 +263,11 @@ impl BtrfsExtentData {
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
-            Self::Inline { generation, compression, data } => {
+            Self::Inline {
+                generation,
+                compression,
+                data,
+            } => {
                 let mut buf = vec![0u8; 21 + data.len()];
                 buf[0..8].copy_from_slice(&generation.to_le_bytes());
                 // ram_bytes at 8..16 — set to data length
@@ -4988,7 +4992,9 @@ mod tests {
 
         let parsed = parse_extent_data(&payload).expect("parse inline extent");
         match parsed {
-            BtrfsExtentData::Inline { compression, data, .. } => {
+            BtrfsExtentData::Inline {
+                compression, data, ..
+            } => {
                 assert_eq!(compression, 0, "should be uncompressed");
                 assert_eq!(data, file_data, "inline data mismatch");
             }

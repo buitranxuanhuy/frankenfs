@@ -1495,7 +1495,11 @@ impl MvccStore {
     }
 
     #[must_use]
-    pub fn read_visible(&self, block: BlockNumber, snapshot: Snapshot) -> Option<std::borrow::Cow<'_, [u8]>> {
+    pub fn read_visible(
+        &self,
+        block: BlockNumber,
+        snapshot: Snapshot,
+    ) -> Option<std::borrow::Cow<'_, [u8]>> {
         self.versions.get(&block).and_then(|versions| {
             let idx = versions
                 .iter()
@@ -2497,7 +2501,10 @@ mod tests {
         assert_eq!(commit_seq, CommitSeq(1));
 
         let latest = store.current_snapshot();
-        assert_eq!(store.read_visible(logical, latest).unwrap().as_ref(), &[0xAB; 8]);
+        assert_eq!(
+            store.read_visible(logical, latest).unwrap().as_ref(),
+            &[0xAB; 8]
+        );
         assert_eq!(store.latest_physical_block(logical), Some(new_physical));
         assert!(allocator.freed_blocks().is_empty());
     }
@@ -2740,7 +2747,8 @@ mod tests {
             let expected_version = u8::try_from(i + 1).expect("fits u8");
             let data = store.read_visible(block, *snap).expect("should be visible");
             assert_eq!(
-                data.as_ref(), &[expected_version; 4],
+                data.as_ref(),
+                &[expected_version; 4],
                 "snapshot {i} should see version {expected_version}"
             );
         }
@@ -2820,8 +2828,14 @@ mod tests {
             .expect("t2 should succeed (disjoint block)");
 
         let snap = store.current_snapshot();
-        assert_eq!(store.read_visible(BlockNumber(1), snap).unwrap().as_ref(), &[0xAA]);
-        assert_eq!(store.read_visible(BlockNumber(2), snap).unwrap().as_ref(), &[0xBB]);
+        assert_eq!(
+            store.read_visible(BlockNumber(1), snap).unwrap().as_ref(),
+            &[0xAA]
+        );
+        assert_eq!(
+            store.read_visible(BlockNumber(2), snap).unwrap().as_ref(),
+            &[0xBB]
+        );
     }
 
     /// Invariant: no lost updates — every committed write is observable.
@@ -3219,7 +3233,11 @@ mod tests {
                 let data = store
                     .read_visible(block, snap)
                     .unwrap_or_else(|| panic!("seed {seed}: block {i} must be visible"));
-                assert_eq!(data.as_ref(), &[val; 4], "seed {seed}: block {i} data mismatch");
+                assert_eq!(
+                    data.as_ref(),
+                    &[val; 4],
+                    "seed {seed}: block {i} data mismatch"
+                );
             }
         }
     }
@@ -3262,7 +3280,8 @@ mod tests {
 
                         let data = {
                             let s = store.lock().unwrap();
-                            s.read_visible(block, reader_snap).map(std::borrow::Cow::into_owned)
+                            s.read_visible(block, reader_snap)
+                                .map(std::borrow::Cow::into_owned)
                         };
                         *reader_result.lock().unwrap() = Some(data);
                     })
@@ -3997,7 +4016,10 @@ mod tests {
         assert!(stats.compression_ratio() < 0.02);
 
         let latest = store.current_snapshot();
-        assert_eq!(store.read_visible(block, latest).expect("latest").as_ref(), payload.as_slice());
+        assert_eq!(
+            store.read_visible(block, latest).expect("latest").as_ref(),
+            payload.as_slice()
+        );
     }
 
     #[test]
@@ -5295,7 +5317,10 @@ mod tests {
         let held_snapshot = snapshots[4]; // commit 5
         store.register_snapshot(held_snapshot);
         assert_eq!(
-            store.read_visible(block, held_snapshot).expect("held read").as_ref(),
+            store
+                .read_visible(block, held_snapshot)
+                .expect("held read")
+                .as_ref(),
             &[5]
         );
 
@@ -5326,7 +5351,9 @@ mod tests {
         );
         assert_eq!(after_release.pending_versions(), 0);
 
-        let old_snapshot_value = store.read_visible(block, held_snapshot).map(std::borrow::Cow::into_owned);
+        let old_snapshot_value = store
+            .read_visible(block, held_snapshot)
+            .map(std::borrow::Cow::into_owned);
         assert_ne!(
             old_snapshot_value,
             Some(vec![5]),
@@ -5464,7 +5491,10 @@ mod tests {
             let _ = store.prune_safe();
             store.ebr_collect();
             assert_eq!(
-                store.read_visible(block, held_snapshot).expect("held read").as_ref(),
+                store
+                    .read_visible(block, held_snapshot)
+                    .expect("held read")
+                    .as_ref(),
                 &[1],
                 "held reader must keep original version visible"
             );
@@ -5485,7 +5515,9 @@ mod tests {
             version_count_after_release < version_count_during_pin,
             "release should allow aggressive reclamation"
         );
-        let old_visible = store.read_visible(block, held_snapshot).map(std::borrow::Cow::into_owned);
+        let old_visible = store
+            .read_visible(block, held_snapshot)
+            .map(std::borrow::Cow::into_owned);
         assert_ne!(
             old_visible,
             Some(vec![1]),
@@ -5647,7 +5679,10 @@ mod tests {
 
         // Latest version should also be readable.
         let snap_latest = store.current_snapshot();
-        assert_eq!(store.read_visible(block, snap_latest).unwrap().as_ref(), &[5]);
+        assert_eq!(
+            store.read_visible(block, snap_latest).unwrap().as_ref(),
+            &[5]
+        );
     }
 
     #[test]
