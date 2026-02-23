@@ -3691,14 +3691,16 @@ mod tests {
         assert_eq!(
             store
                 .read_visible(BlockNumber(31_001), snapshot)
-                .expect("dir tombstone visible"),
-            b"dir:/tmp.bin-><deleted>".to_vec()
+                .expect("dir tombstone visible")
+                .as_ref(),
+            b"dir:/tmp.bin-><deleted>"
         );
         assert_eq!(
             store
                 .read_visible(BlockNumber(31_002), snapshot)
-                .expect("inode tombstone visible"),
-            b"inode:512:<deleted>".to_vec()
+                .expect("inode tombstone visible")
+                .as_ref(),
+            b"inode:512:<deleted>"
         );
     }
 
@@ -3764,8 +3766,9 @@ mod tests {
         assert_eq!(
             store
                 .read_visible(BlockNumber(32_001), snapshot)
-                .expect("new payload visible"),
-            b"payload:new".to_vec()
+                .expect("new payload visible")
+                .as_ref(),
+            b"payload:new"
         );
     }
 
@@ -3806,20 +3809,23 @@ mod tests {
         assert_eq!(
             store
                 .read_visible(BlockNumber(33_001), snapshot)
-                .expect("old entry tombstone visible"),
-            b"dir:/old-name-><deleted>".to_vec()
+                .expect("old entry tombstone visible")
+                .as_ref(),
+            b"dir:/old-name-><deleted>"
         );
         assert_eq!(
             store
                 .read_visible(BlockNumber(33_003), snapshot)
-                .expect("new entry visible"),
-            b"dir:/new-name->900".to_vec()
+                .expect("new entry visible")
+                .as_ref(),
+            b"dir:/new-name->900"
         );
         assert_eq!(
             store
                 .read_visible(BlockNumber(33_002), snapshot)
-                .expect("inode still visible"),
-            b"inode:900:size=128".to_vec()
+                .expect("inode still visible")
+                .as_ref(),
+            b"inode:900:size=128"
         );
     }
 
@@ -4015,6 +4021,7 @@ mod tests {
     #[test]
     fn extent_data_regular_round_trip() {
         let original = BtrfsExtentData::Regular {
+            generation: 1,
             extent_type: BTRFS_FILE_EXTENT_REG,
             compression: 0,
             disk_bytenr: 0x10_0000,
@@ -4031,6 +4038,7 @@ mod tests {
     #[test]
     fn extent_data_prealloc_round_trip() {
         let original = BtrfsExtentData::Regular {
+            generation: 1,
             extent_type: BTRFS_FILE_EXTENT_PREALLOC,
             compression: 0,
             disk_bytenr: 0x20_0000,
@@ -4100,6 +4108,7 @@ mod tests {
     #[test]
     fn extent_data_inline_empty() {
         let original = BtrfsExtentData::Inline {
+            generation: 1,
             compression: 0,
             data: vec![],
         };
@@ -4457,7 +4466,7 @@ mod tests {
         let payload = store
             .read_visible(BlockNumber(1234), snapshot)
             .expect("payload visible");
-        assert_eq!(payload, b"hello-btrfs");
+        assert_eq!(payload.as_ref(), b"hello-btrfs");
 
         let tree_block =
             BtrfsTransaction::tree_root_block(BTRFS_FS_TREE_OBJECTID).expect("tree block");
@@ -4979,7 +4988,7 @@ mod tests {
 
         let parsed = parse_extent_data(&payload).expect("parse inline extent");
         match parsed {
-            BtrfsExtentData::Inline { compression, data } => {
+            BtrfsExtentData::Inline { compression, data, .. } => {
                 assert_eq!(compression, 0, "should be uncompressed");
                 assert_eq!(data, file_data, "inline data mismatch");
             }
@@ -5009,6 +5018,7 @@ mod tests {
                 disk_num_bytes,
                 extent_offset,
                 num_bytes,
+                ..
             } => {
                 assert_eq!(extent_type, BTRFS_FILE_EXTENT_REG);
                 assert_eq!(compression, 0);
@@ -5536,8 +5546,8 @@ mod tests {
             .read_visible(block, snap_after_a)
             .expect("version-A should be visible at snap_after_a");
         assert_eq!(
-            data_a,
-            b"version-A".to_vec(),
+            data_a.as_ref(),
+            b"version-A",
             "snap_after_a should see version-A"
         );
 
@@ -5546,8 +5556,8 @@ mod tests {
             .read_visible(block, snap_after_b)
             .expect("version-B should be visible at snap_after_b");
         assert_eq!(
-            data_b,
-            b"version-B".to_vec(),
+            data_b.as_ref(),
+            b"version-B",
             "snap_after_b should see version-B"
         );
     }

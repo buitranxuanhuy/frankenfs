@@ -16,7 +16,7 @@
 use asupersync::Cx;
 use criterion::{Criterion, criterion_group, criterion_main};
 use ffs_mvcc::persist::{PersistOptions, PersistentMvccStore};
-use ffs_mvcc::{CompressionPolicy, MvccStore};
+use ffs_mvcc::{CompressionAlgo, CompressionPolicy, MvccStore};
 use ffs_types::BlockNumber;
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -323,6 +323,7 @@ fn run_single_writer_steady_state() -> EbrScenarioReport {
         CompressionPolicy {
             dedup_identical: false,
             max_chain_length: Some(64),
+            algo: CompressionAlgo::None,
         },
     )));
     let attempts = 100_000_u64;
@@ -367,6 +368,7 @@ fn run_single_writer_no_gc_baseline() -> EbrScenarioReport {
         CompressionPolicy {
             dedup_identical: false,
             max_chain_length: Some(64),
+            algo: CompressionAlgo::None,
         },
     )));
     let attempts = 50_000_u64;
@@ -422,6 +424,7 @@ fn run_multi_writer_scale(writers: usize) -> EbrScenarioReport {
         CompressionPolicy {
             dedup_identical: false,
             max_chain_length: None,
+            algo: CompressionAlgo::None,
         },
     )));
     let ops_per_writer = 10_000_u64;
@@ -486,6 +489,7 @@ fn run_long_running_reader_pinning() -> EbrScenarioReport {
         CompressionPolicy {
             dedup_identical: false,
             max_chain_length: None,
+            algo: CompressionAlgo::None,
         },
     )));
     let rss_start = process_rss_bytes();
@@ -578,6 +582,7 @@ fn run_hot_key_contention() -> EbrScenarioReport {
         CompressionPolicy {
             dedup_identical: false,
             max_chain_length: Some(64),
+            algo: CompressionAlgo::None,
         },
     )));
     let writers = 16_usize;
@@ -644,6 +649,7 @@ fn run_bursty_write_pattern() -> EbrScenarioReport {
         CompressionPolicy {
             dedup_identical: false,
             max_chain_length: Some(64),
+            algo: CompressionAlgo::None,
         },
     )));
     let mut rng = 0x1234_5678_9ABC_DEF0_u64;

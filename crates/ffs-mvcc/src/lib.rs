@@ -8,7 +8,7 @@ pub mod sharded;
 pub mod wal;
 
 use asupersync::Cx;
-pub use compression::CompressionPolicy;
+pub use compression::{CompressionAlgo, CompressionPolicy};
 use compression::{CompressionStats, VersionData};
 use crossbeam_epoch as epoch;
 use ffs_block::{BlockBuf, BlockDevice, FlushPinToken, MvccFlushLifecycle};
@@ -39,10 +39,13 @@ pub struct BlockVersion {
 }
 
 impl BlockVersion {
-    /// Convenience: get inline bytes if this is a Full version, None for Identical.
+    /// Convenience: get inline bytes if this is a Full version.
     #[must_use]
     pub fn bytes_inline(&self) -> Option<&[u8]> {
-        self.data.as_bytes()
+        match &self.data {
+            VersionData::Full(bytes) => Some(bytes),
+            _ => None,
+        }
     }
 }
 
@@ -513,7 +516,9 @@ impl MvccStore {
         for versions in self.versions.values() {
             for (idx, version) in versions.iter().enumerate() {
                 match &version.data {
-                    VersionData::Full(bytes) => {
+                    VersionData::Full(bytes)
+                    | VersionData::Zstd(bytes)
+                    | VersionData::Brotli(bytes) => {
                         stats.full_versions += 1;
                         stats.bytes_stored += bytes.len();
                     }
@@ -969,7 +974,7 @@ impl MvccStore {
             let version_data = if dedup_enabled {
                 self.maybe_dedup(block, &bytes)
             } else {
-                VersionData::Full(bytes)
+                self.compress_data(&bytes)
             };
 
             self.versions.entry(block).or_default().push(BlockVersion {
@@ -1034,7 +1039,7 @@ impl MvccStore {
             let version_data = if dedup_enabled {
                 self.maybe_dedup(block, &bytes)
             } else {
-                VersionData::Full(bytes)
+                self.compress_data(&bytes)
             };
 
             self.versions.entry(block).or_default().push(BlockVersion {
@@ -1087,26 +1092,56 @@ impl MvccStore {
     }
 
     /// Check if `new_bytes` are identical to the latest version for `block`.
-    /// If so, return `VersionData::Identical` (dedup); otherwise `VersionData::Full`.
+    /// If so, return `VersionData::Identical` (dedup); otherwise `VersionData::Full` or compressed.
     pub(crate) fn maybe_dedup(&self, block: BlockNumber, new_bytes: &[u8]) -> VersionData {
         if let Some(versions) = self.versions.get(&block) {
             if !versions.is_empty() {
                 // Resolve the latest version's data (might itself be Identical).
                 if let Some(existing) =
                     compression::resolve_data_with(versions, versions.len() - 1, |v| &v.data)
-                    && existing == new_bytes
                 {
-                    trace!(
-                        block = block.0,
-                        chain_len = versions.len(),
-                        bytes_saved = new_bytes.len(),
-                        "version_dedup: identical to previous"
-                    );
-                    return VersionData::Identical;
+                    if existing.as_ref() == new_bytes {
+                        trace!(
+                            block = block.0,
+                            chain_len = versions.len(),
+                            bytes_saved = new_bytes.len(),
+                            "version_dedup: identical to previous"
+                        );
+                        return VersionData::Identical;
+                    }
                 }
             }
         }
-        VersionData::Full(new_bytes.to_vec())
+        self.compress_data(new_bytes)
+    }
+
+    pub(crate) fn compress_data(&self, new_bytes: &[u8]) -> VersionData {
+        match self.compression_policy.algo {
+            compression::CompressionAlgo::None => VersionData::Full(new_bytes.to_vec()),
+            compression::CompressionAlgo::Zstd { level } => {
+                if let Ok(compressed) = zstd::encode_all(new_bytes, level)
+                    && compressed.len() < new_bytes.len()
+                {
+                    return VersionData::Zstd(compressed);
+                }
+                VersionData::Full(new_bytes.to_vec())
+            }
+            compression::CompressionAlgo::Brotli { level } => {
+                let mut compressed = Vec::new();
+                #[allow(clippy::cast_possible_wrap)]
+                let params = brotli::enc::BrotliEncoderParams {
+                    quality: level as i32,
+                    ..Default::default()
+                };
+                let mut reader = new_bytes;
+                if brotli::BrotliCompress(&mut reader, &mut compressed, &params).is_ok()
+                    && compressed.len() < new_bytes.len()
+                {
+                    return VersionData::Brotli(compressed);
+                }
+                VersionData::Full(new_bytes.to_vec())
+            }
+        }
     }
 
     /// Advance the internal transaction and commit counters so the next
@@ -1406,7 +1441,7 @@ impl MvccStore {
             if let Some(full_data) =
                 compression::resolve_data_with(versions, keep_from, |v| &v.data)
             {
-                let full_data = full_data.to_vec();
+                let full_data = full_data.into_owned();
                 versions[keep_from].data = VersionData::Full(full_data);
             }
         }
@@ -1460,7 +1495,7 @@ impl MvccStore {
     }
 
     #[must_use]
-    pub fn read_visible(&self, block: BlockNumber, snapshot: Snapshot) -> Option<&[u8]> {
+    pub fn read_visible(&self, block: BlockNumber, snapshot: Snapshot) -> Option<std::borrow::Cow<'_, [u8]>> {
         self.versions.get(&block).and_then(|versions| {
             let idx = versions
                 .iter()
@@ -2439,7 +2474,7 @@ mod tests {
         let visible = store
             .read_visible(BlockNumber(1), snap)
             .expect("visible data at snap");
-        assert_eq!(visible, &[1]);
+        assert_eq!(visible.as_ref(), &[1]);
     }
 
     #[test]
@@ -2462,7 +2497,7 @@ mod tests {
         assert_eq!(commit_seq, CommitSeq(1));
 
         let latest = store.current_snapshot();
-        assert_eq!(store.read_visible(logical, latest).unwrap(), &[0xAB; 8]);
+        assert_eq!(store.read_visible(logical, latest).unwrap().as_ref(), &[0xAB; 8]);
         assert_eq!(store.latest_physical_block(logical), Some(new_physical));
         assert!(allocator.freed_blocks().is_empty());
     }
@@ -2490,7 +2525,7 @@ mod tests {
             .expect("cow commit");
 
         assert_eq!(
-            store.read_visible(logical, old_snapshot).unwrap(),
+            store.read_visible(logical, old_snapshot).unwrap().as_ref(),
             &[0x11; 4]
         );
         assert_eq!(
@@ -2705,7 +2740,7 @@ mod tests {
             let expected_version = u8::try_from(i + 1).expect("fits u8");
             let data = store.read_visible(block, *snap).expect("should be visible");
             assert_eq!(
-                data, &[expected_version; 4],
+                data.as_ref(), &[expected_version; 4],
                 "snapshot {i} should see version {expected_version}"
             );
         }
@@ -2785,8 +2820,8 @@ mod tests {
             .expect("t2 should succeed (disjoint block)");
 
         let snap = store.current_snapshot();
-        assert_eq!(store.read_visible(BlockNumber(1), snap).unwrap(), &[0xAA]);
-        assert_eq!(store.read_visible(BlockNumber(2), snap).unwrap(), &[0xBB]);
+        assert_eq!(store.read_visible(BlockNumber(1), snap).unwrap().as_ref(), &[0xAA]);
+        assert_eq!(store.read_visible(BlockNumber(2), snap).unwrap().as_ref(), &[0xBB]);
     }
 
     /// Invariant: no lost updates — every committed write is observable.
@@ -2809,7 +2844,7 @@ mod tests {
             let block = BlockNumber(i);
             let expected_val = u8::try_from(i % 256).expect("fits u8");
             let data = store.read_visible(block, snap).expect("must be visible");
-            assert_eq!(data, &[expected_val; 8], "block {i} data mismatch");
+            assert_eq!(data.as_ref(), &[expected_val; 8], "block {i} data mismatch");
         }
     }
 
@@ -2832,11 +2867,11 @@ mod tests {
 
         let snap = store.current_snapshot();
         assert_eq!(
-            store.read_visible(BlockNumber(100), snap).unwrap(),
+            store.read_visible(BlockNumber(100), snap).unwrap().as_ref(),
             &[1; 16]
         );
         assert_eq!(
-            store.read_visible(BlockNumber(200), snap).unwrap(),
+            store.read_visible(BlockNumber(200), snap).unwrap().as_ref(),
             &[2; 16]
         );
     }
@@ -2864,7 +2899,7 @@ mod tests {
 
         // Latest snapshot should still see version 5.
         let data = store.read_visible(block, snap).expect("still visible");
-        assert_eq!(data, &[5]);
+        assert_eq!(data.as_ref(), &[5]);
     }
 
     /// Multi-threaded stress: concurrent MvccBlockDevice writers on disjoint blocks.
@@ -2911,7 +2946,7 @@ mod tests {
             let data = guard
                 .read_visible(BlockNumber(block_num), snap)
                 .expect("block must be visible");
-            assert_eq!(data, &[expected_val; 64], "thread {i} write lost");
+            assert_eq!(data.as_ref(), &[expected_val; 64], "thread {i} write lost");
         }
         drop(guard);
     }
@@ -3184,7 +3219,7 @@ mod tests {
                 let data = store
                     .read_visible(block, snap)
                     .unwrap_or_else(|| panic!("seed {seed}: block {i} must be visible"));
-                assert_eq!(data, &[val; 4], "seed {seed}: block {i} data mismatch");
+                assert_eq!(data.as_ref(), &[val; 4], "seed {seed}: block {i} data mismatch");
             }
         }
     }
@@ -3227,7 +3262,7 @@ mod tests {
 
                         let data = {
                             let s = store.lock().unwrap();
-                            s.read_visible(block, reader_snap).map(<[u8]>::to_vec)
+                            s.read_visible(block, reader_snap).map(std::borrow::Cow::into_owned)
                         };
                         *reader_result.lock().unwrap() = Some(data);
                     })
@@ -3564,14 +3599,14 @@ mod tests {
 
         // Snapshot at commit 3 still works.
         assert_eq!(
-            store.read_visible(block, snaps[2]).unwrap(),
+            store.read_visible(block, snaps[2]).unwrap().as_ref(),
             &[3],
             "version at commit 3 should survive pruning"
         );
 
         // Latest snapshot still works.
         assert_eq!(
-            store.read_visible(block, snaps[4]).unwrap(),
+            store.read_visible(block, snaps[4]).unwrap().as_ref(),
             &[5],
             "latest version should always survive"
         );
@@ -3580,7 +3615,7 @@ mod tests {
         let snap_1 = Snapshot { high: CommitSeq(1) };
         let old_read = store.read_visible(block, snap_1);
         assert!(
-            old_read.is_none() || old_read.unwrap() == [3],
+            old_read.is_none() || old_read.unwrap().as_ref() == [3],
             "version 1 should be pruned or replaced by version 3"
         );
     }
@@ -3611,7 +3646,7 @@ mod tests {
 
         // Latest version still readable.
         let snap = store.current_snapshot();
-        assert_eq!(store.read_visible(block, snap).unwrap(), &[10]);
+        assert_eq!(store.read_visible(block, snap).unwrap().as_ref(), &[10]);
     }
 
     #[test]
@@ -3682,7 +3717,7 @@ mod tests {
         // Final state: current snapshot still readable.
         let snap = store.current_snapshot();
         let data = store.read_visible(block, snap).expect("readable");
-        assert_eq!(data, &[199_u8]);
+        assert_eq!(data.as_ref(), &[199_u8]);
     }
 
     /// Long-running simulation with multiple blocks.
@@ -3739,7 +3774,7 @@ mod tests {
             let last_round = num_rounds - num_blocks + b;
             let expected = u8::try_from(last_round % 256).unwrap();
             assert_eq!(
-                store.read_visible(block, snap).unwrap(),
+                store.read_visible(block, snap).unwrap().as_ref(),
                 &[expected],
                 "block {b} should have latest value"
             );
@@ -3790,6 +3825,7 @@ mod tests {
         let mut store = MvccStore::with_compression_policy(CompressionPolicy {
             dedup_identical: false,
             max_chain_length: Some(3),
+            algo: CompressionAlgo::None,
         });
         let block = BlockNumber(77);
         let mut snaps = Vec::new();
@@ -3813,7 +3849,8 @@ mod tests {
         assert_eq!(
             store
                 .read_visible(block, held)
-                .expect("held snapshot remains visible"),
+                .expect("held snapshot remains visible")
+                .as_ref(),
             &[4]
         );
 
@@ -3845,6 +3882,7 @@ mod tests {
         let mut store = MvccStore::with_compression_policy(CompressionPolicy {
             dedup_identical: false,
             max_chain_length: Some(8),
+            algo: CompressionAlgo::None,
         });
         let block = BlockNumber(88);
 
@@ -3871,6 +3909,7 @@ mod tests {
         let mut store = MvccStore::with_compression_policy(CompressionPolicy {
             dedup_identical: false,
             max_chain_length: Some(2),
+            algo: CompressionAlgo::None,
         });
         let block = BlockNumber(89);
 
@@ -3958,7 +3997,7 @@ mod tests {
         assert!(stats.compression_ratio() < 0.02);
 
         let latest = store.current_snapshot();
-        assert_eq!(store.read_visible(block, latest).expect("latest"), payload);
+        assert_eq!(store.read_visible(block, latest).expect("latest").as_ref(), payload.as_slice());
     }
 
     #[test]
@@ -4427,7 +4466,8 @@ mod tests {
         assert_eq!(
             store
                 .read_visible(block, latest)
-                .expect("latest block visible"),
+                .expect("latest block visible")
+                .as_ref(),
             &[2]
         );
     }
@@ -4492,13 +4532,15 @@ mod tests {
         assert_eq!(
             store
                 .read_visible(derived_a, snap_after_aborts)
-                .expect("derived_a visible"),
+                .expect("derived_a visible")
+                .as_ref(),
             &[10]
         );
         assert_eq!(
             store
                 .read_visible(derived_b, snap_after_aborts)
-                .expect("derived_b visible"),
+                .expect("derived_b visible")
+                .as_ref(),
             &[10]
         );
 
@@ -4512,7 +4554,8 @@ mod tests {
         assert_eq!(
             store
                 .read_visible(derived_a, latest)
-                .expect("retry value visible"),
+                .expect("retry value visible")
+                .as_ref(),
             &[11]
         );
     }
@@ -5237,6 +5280,7 @@ mod tests {
         let mut store = MvccStore::with_compression_policy(CompressionPolicy {
             dedup_identical: false,
             max_chain_length: Some(64),
+            algo: CompressionAlgo::None,
         });
         let block = BlockNumber(910);
         let mut snapshots = Vec::new();
@@ -5251,7 +5295,7 @@ mod tests {
         let held_snapshot = snapshots[4]; // commit 5
         store.register_snapshot(held_snapshot);
         assert_eq!(
-            store.read_visible(block, held_snapshot).expect("held read"),
+            store.read_visible(block, held_snapshot).expect("held read").as_ref(),
             &[5]
         );
 
@@ -5266,7 +5310,8 @@ mod tests {
         assert_eq!(
             store
                 .read_visible(block, held_snapshot)
-                .expect("still pinned"),
+                .expect("still pinned")
+                .as_ref(),
             &[5],
             "held snapshot must keep version 5 visible"
         );
@@ -5281,7 +5326,7 @@ mod tests {
         );
         assert_eq!(after_release.pending_versions(), 0);
 
-        let old_snapshot_value = store.read_visible(block, held_snapshot).map(<[u8]>::to_vec);
+        let old_snapshot_value = store.read_visible(block, held_snapshot).map(std::borrow::Cow::into_owned);
         assert_ne!(
             old_snapshot_value,
             Some(vec![5]),
@@ -5301,6 +5346,7 @@ mod tests {
         let mut base = MvccStore::with_compression_policy(CompressionPolicy {
             dedup_identical: false,
             max_chain_length: None,
+            algo: CompressionAlgo::None,
         });
         let mut snapshots = Vec::new();
 
@@ -5401,6 +5447,7 @@ mod tests {
         let mut store = MvccStore::with_compression_policy(CompressionPolicy {
             dedup_identical: false,
             max_chain_length: None,
+            algo: CompressionAlgo::None,
         });
         let block = BlockNumber(920);
 
@@ -5417,7 +5464,7 @@ mod tests {
             let _ = store.prune_safe();
             store.ebr_collect();
             assert_eq!(
-                store.read_visible(block, held_snapshot).expect("held read"),
+                store.read_visible(block, held_snapshot).expect("held read").as_ref(),
                 &[1],
                 "held reader must keep original version visible"
             );
@@ -5438,7 +5485,7 @@ mod tests {
             version_count_after_release < version_count_during_pin,
             "release should allow aggressive reclamation"
         );
-        let old_visible = store.read_visible(block, held_snapshot).map(<[u8]>::to_vec);
+        let old_visible = store.read_visible(block, held_snapshot).map(std::borrow::Cow::into_owned);
         assert_ne!(
             old_visible,
             Some(vec![1]),
@@ -5454,6 +5501,7 @@ mod tests {
             CompressionPolicy {
                 dedup_identical: false,
                 max_chain_length: Some(16),
+                algo: CompressionAlgo::None,
             },
         )));
 
@@ -5595,11 +5643,11 @@ mod tests {
         store.prune_versions_older_than(wm);
 
         // Version at commit 3 should still be readable.
-        assert_eq!(store.read_visible(block, snap3).unwrap(), &[3]);
+        assert_eq!(store.read_visible(block, snap3).unwrap().as_ref(), &[3]);
 
         // Latest version should also be readable.
         let snap_latest = store.current_snapshot();
-        assert_eq!(store.read_visible(block, snap_latest).unwrap(), &[5]);
+        assert_eq!(store.read_visible(block, snap_latest).unwrap().as_ref(), &[5]);
     }
 
     #[test]

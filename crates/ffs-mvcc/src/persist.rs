@@ -451,7 +451,7 @@ impl PersistentMvccStore {
         self.store
             .read()
             .read_visible(block, snapshot)
-            .map(<[u8]>::to_vec)
+            .map(std::borrow::Cow::into_owned)
     }
 
     /// Get the current snapshot (latest committed state).
@@ -697,7 +697,7 @@ fn write_checkpoint(
             // Materialize compressed data: resolve Identical markers before writing.
             let materialized =
                 crate::compression::resolve_data_with(block_versions, vi, |v| &v.data)
-                    .unwrap_or(&[]);
+                    .unwrap_or(std::borrow::Cow::Borrowed(&[]));
 
             let data_len = u32::try_from(materialized.len())
                 .map_err(|_| FfsError::Format("version data too large".to_owned()))?;
@@ -705,8 +705,8 @@ fn write_checkpoint(
             writer.write_all(&data_len_bytes)?;
             hasher.update(&data_len_bytes);
 
-            writer.write_all(materialized)?;
-            hasher.update(materialized);
+            writer.write_all(&materialized)?;
+            hasher.update(&materialized);
         }
     }
 
@@ -802,7 +802,7 @@ fn load_checkpoint(path: &Path, store: &mut MvccStore) -> Result<()> {
                         &versions,
                         last_idx,
                         |v: &BlockVersion| &v.data,
-                    ) == Some(data.as_slice())
+                    ).as_deref() == Some(data.as_slice())
                 };
                 if is_identical {
                     crate::compression::VersionData::Identical
@@ -972,7 +972,7 @@ fn apply_wal_commit(store: &mut MvccStore, commit: &WalCommit) {
         let version_data = if dedup_enabled {
             store.maybe_dedup(write.block, &write.data)
         } else {
-            crate::compression::VersionData::Full(write.data.clone())
+            store.compress_data(&write.data)
         };
         let version = BlockVersion {
             block: write.block,

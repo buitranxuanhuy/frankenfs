@@ -2195,7 +2195,13 @@ pub struct Ext4DirEntryTail {
 /// For standard 1K-4K blocks (FrankenFS v1 scope), rec_len is always 4-byte
 /// aligned so the low 2 bits are 0 and the formula is a no-op.
 #[must_use]
-fn rec_len_from_disk(raw: u16, _block_size: u32) -> u32 {
+fn rec_len_from_disk(raw: u16, block_size: u32) -> u32 {
+    if raw == 0xFFFF {
+        return block_size;
+    }
+    if raw == 0xFFFE {
+        return block_size.saturating_sub(1);
+    }
     let len = u32::from(raw);
     (len & 0xFFFC) | ((len & 0x3) << 16)
 }
@@ -3586,38 +3592,55 @@ fn dx_hash_tea(name: &[u8], seed: &[u32; 4], signed: bool) -> (u32, u32) {
 
 /// Convert a filename chunk to a u32 buffer for hashing.
 ///
-/// The kernel's `str2hashbuf` packs characters into u32 words (little-endian),
-/// with optional signed character semantics.
-#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+/// Matches the Linux kernel's `str2hashbuf_signed` / `str2hashbuf_unsigned`
+/// from `fs/ext4/hash.c`. Characters are packed big-endian within each u32
+/// word via `val = char + (val << 8)`. Unused slots are filled with a pad
+/// value derived from the name length.
+#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn str2hashbuf(name: &[u8], buf_size: usize, signed: bool) -> Vec<u32> {
     let mut buf = vec![0_u32; buf_size];
-    let mut idx = 0_usize;
-    let mut shift = 0_u32;
+    let len = name.len();
 
-    for &byte_val in name {
-        let val = if signed {
-            (byte_val as i8) as u32
+    // Pad = length byte replicated across all 4 bytes of a u32 (kernel convention).
+    let pad = {
+        let p = (len as u32) | ((len as u32) << 8);
+        p | (p << 16)
+    };
+
+    let mut val = pad;
+    let effective_len = len.min(buf_size * 4);
+    let mut num = buf_size;
+    let mut buf_idx = 0;
+
+    for (i, &byte_val) in name.iter().enumerate().take(effective_len) {
+        let ch = if signed {
+            // Sign-extend: 0xC3 → -61 → 0xFFFF_FFC3, then wrapping add
+            i32::from(byte_val as i8) as u32
         } else {
             u32::from(byte_val)
         };
-        // Clear the target byte before ORing, matching the Linux kernel's
-        // behavior which truncates sign extensions from previous bytes in the target slot.
-        buf[idx] = (buf[idx] & !(0xFF << shift)) | (val << shift);
-        shift += 8;
-        if shift >= 32 {
-            shift = 0;
-            idx += 1;
-            if idx >= buf_size {
-                break;
-            }
+        val = ch.wrapping_add(val << 8);
+        if (i % 4) == 3 {
+            buf[buf_idx] = val;
+            buf_idx += 1;
+            val = pad;
+            num -= 1;
         }
     }
 
-    // Pad with 0x80 terminator like the kernel does
-    if idx < buf_size {
-        buf[idx] = (buf[idx] & !(0xFF << shift)) | (0x80 << shift);
+    // Store remaining partial word, then fill rest with pad.
+    // Mirrors kernel: `if (--num >= 0) *buf++ = val; while (--num >= 0) *buf++ = pad;`
+    if num > 0 {
+        buf[buf_idx] = val;
+        buf_idx += 1;
+        num -= 1;
+        while num > 0 {
+            buf[buf_idx] = pad;
+            buf_idx += 1;
+            num -= 1;
+        }
     }
-    
+
     buf
 }
 
@@ -6295,22 +6318,23 @@ mod tests {
     fn str2hashbuf_basic() {
         let buf = super::str2hashbuf(b"abc", 4, false);
         assert_eq!(buf.len(), 4);
-        // "abc" packs into first word: 'a'=0x61, 'b'=0x62, 'c'=0x63
-        // plus 0x80 terminator in byte 3
-        let expected = 0x61_u32 | (0x62 << 8) | (0x63 << 16) | (0x80 << 24);
-        assert_eq!(buf[0], expected);
-        assert_eq!(buf[1], 0); // remaining words are 0
+        // Kernel packs big-endian within each word via val = char + (val << 8).
+        // pad for len=3: 0x03030303. After 3 chars: val = 0x03616263.
+        assert_eq!(buf[0], 0x0361_6263);
+        assert_eq!(buf[1], 0x0303_0303); // remaining words are pad
     }
 
     #[test]
     fn str2hashbuf_signed_chars() {
-        // 0xC3 as signed i8 is -61 (0xFFFFFFC3 as u32)
+        // 0xC3 as signed i8 is -61; sign extension affects the wrapping add
         let buf_signed = super::str2hashbuf(b"\xC3", 4, true);
         let buf_unsigned = super::str2hashbuf(b"\xC3", 4, false);
 
-        // Signed: 0xC3 sign-extended + 0x80 terminator at byte 1
-        // Unsigned: 0xC3 zero-extended + 0x80 terminator at byte 1
+        // Signed: -61 + (pad<<8) wrapping = 0x010100C3
+        // Unsigned: 195 + (pad<<8)          = 0x010101C3
         assert_ne!(buf_signed[0], buf_unsigned[0]);
+        assert_eq!(buf_signed[0], 0x0101_00C3);
+        assert_eq!(buf_unsigned[0], 0x0101_01C3);
     }
 
     // ── Feature flag decode + validation tests ──────────────────────────

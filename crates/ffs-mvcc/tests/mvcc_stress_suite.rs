@@ -2,7 +2,7 @@ use asupersync::Cx;
 use asupersync::lab::{LabConfig, LabRuntime};
 use asupersync::types::Budget;
 use ffs_mvcc::sharded::ShardedMvccStore;
-use ffs_mvcc::{CommitError, CompressionPolicy, GcBackpressureConfig, MvccStore};
+use ffs_mvcc::{CommitError, CompressionAlgo, CompressionPolicy, GcBackpressureConfig, MvccStore};
 use ffs_types::{BlockNumber, Snapshot};
 use std::collections::VecDeque;
 use std::future::Future;
@@ -404,6 +404,7 @@ fn stress_gc_under_load() {
             CompressionPolicy {
                 dedup_identical: false,
                 max_chain_length: Some(MAX_CHAIN),
+                algo: CompressionAlgo::None,
             },
         )));
         let held_snapshots: Arc<Mutex<VecDeque<Snapshot>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -544,6 +545,7 @@ fn stress_version_chain_growth() {
             CompressionPolicy {
                 dedup_identical: false,
                 max_chain_length: Some(MAX_CHAIN),
+                algo: CompressionAlgo::None,
             },
         )));
         let backpressure_events = Arc::new(AtomicU64::new(0));

@@ -21,6 +21,8 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+zstd = { workspace = true }
+brotli = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

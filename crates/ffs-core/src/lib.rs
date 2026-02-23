@@ -2096,7 +2096,7 @@ impl OpenFs {
                     duration_us,
                     "mvcc_version_hit"
                 );
-                return Ok(bytes.to_vec());
+                return Ok(bytes.into_owned());
             }
         }
 
@@ -2693,7 +2693,7 @@ impl OpenFs {
 
         // Fetch the inode and extent items from either the COW tree (when
         // writes are enabled) or the on-disk FS tree.
-        let (inode, mut extents): (BtrfsInodeItem, Vec<(u64, BtrfsExtentData)>) =
+        let (inode, extents): (BtrfsInodeItem, Vec<(u64, BtrfsExtentData)>) =
             if let Some(alloc_mutex) = self.btrfs_alloc_state.as_ref() {
                 let alloc = alloc_mutex.lock();
                 let inode = self.btrfs_read_inode_from_tree(&alloc, canonical)?;
@@ -4866,7 +4866,7 @@ impl OpenFs {
     }
 
     /// Remove a directory entry (unlink a file or rmdir).
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     fn ext4_unlink_impl(
         &self,
         cx: &Cx,
@@ -5888,7 +5888,7 @@ impl OpenFs {
     }
 
     /// Set or replace one ext4 xattr.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     fn ext4_setxattr(
         &self,
         cx: &Cx,
@@ -5990,9 +5990,10 @@ impl OpenFs {
 
         if let Some(mut block) = external_block {
             let mut alloc = alloc_mutex.lock();
+            let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
             if old_acl != 0 && old_refcount > 1 {
                 // Block was shared, we must allocate a new block (COW)
-                let ino_group = ffs_types::inode_to_group(ino, alloc.geo.inodes_per_group);
+                let ino_group = ffs_types::inode_to_group(ino, geo.inodes_per_group);
                 let hint = AllocHint {
                     goal_group: Some(ino_group),
                     goal_block: None,
@@ -6000,11 +6001,11 @@ impl OpenFs {
                 let block_alloc = ffs_alloc::alloc_blocks_persist(
                     cx,
                     &block_dev,
-                    &alloc.geo,
-                    &mut alloc.groups,
+                    geo,
+                    groups,
                     1,
                     &hint,
-                    &alloc.persist_ctx,
+                    persist_ctx,
                 )?;
                 inode.file_acl = block_alloc.start.0;
                 block[4..8].copy_from_slice(&1_u32.to_le_bytes()); // new block has refcount 1
@@ -6088,10 +6089,11 @@ impl OpenFs {
         }
 
         let mut alloc = alloc_mutex.lock();
+        let Ext4AllocState { geo, groups, persist_ctx } = &mut *alloc;
 
         if let Some(mut block) = external_block {
             let new_acl = inode.file_acl;
-            
+
             if new_acl == 0 {
                 // Block became empty. If it was shared, we just decrement its refcount.
                 if old_refcount > 1 {
@@ -6100,17 +6102,17 @@ impl OpenFs {
                     old_block[4..8].copy_from_slice(&new_refcount.to_le_bytes());
                     block_dev.write_block(cx, BlockNumber(old_acl), &old_block)?;
                 } else {
-                    ffs_alloc::free_blocks_persist(cx, &block_dev, &alloc.geo, &mut alloc.groups, BlockNumber(old_acl), 1, &alloc.persist_ctx)?;
+                    ffs_alloc::free_blocks_persist(cx, &block_dev, geo, groups, BlockNumber(old_acl), 1, persist_ctx)?;
                 }
-                
+
                 if inode.is_huge_file() {
                     inode.blocks = inode.blocks.saturating_sub(1);
                 } else {
-                    inode.blocks = inode.blocks.saturating_sub(u64::from(alloc.geo.block_size / 512));
+                    inode.blocks = inode.blocks.saturating_sub(u64::from(geo.block_size / 512));
                 }
             } else if old_refcount > 1 {
                 // Block modified but not empty, and it was shared. We must allocate a new block (COW).
-                let ino_group = ffs_types::inode_to_group(ino, alloc.geo.inodes_per_group);
+                let ino_group = ffs_types::inode_to_group(ino, geo.inodes_per_group);
                 let hint = AllocHint {
                     goal_group: Some(ino_group),
                     goal_block: None,
@@ -6118,11 +6120,11 @@ impl OpenFs {
                 let block_alloc = ffs_alloc::alloc_blocks_persist(
                     cx,
                     &block_dev,
-                    &alloc.geo,
-                    &mut alloc.groups,
+                    geo,
+                    groups,
                     1,
                     &hint,
-                    &alloc.persist_ctx,
+                    persist_ctx,
                 )?;
                 inode.file_acl = block_alloc.start.0;
                 block[4..8].copy_from_slice(&1_u32.to_le_bytes()); // new block has refcount 1
@@ -6237,12 +6239,9 @@ impl OpenFs {
                         can_be_inline = false;
                         break;
                     }
-                    match parse_extent_data(edata) {
-                        Ok(BtrfsExtentData::Inline { .. }) => {}
-                        _ => {
-                            can_be_inline = false;
-                            break;
-                        }
+                    if !matches!(parse_extent_data(&edata), Ok(BtrfsExtentData::Inline { .. })) {
+                        can_be_inline = false;
+                        break;
                     }
                 }
             }
@@ -6312,7 +6311,7 @@ impl OpenFs {
                         if offset == 0 && data.len() < prev_data.len() {
                             // Partial overwrite at offset 0: merge new data into old
                             // inline extent to preserve the tail before converting.
-                            let mut merged = prev_data.clone();
+                            let mut merged = prev_data;
                             merged[..data.len()].copy_from_slice(data);
                             merged_data = Some(merged);
                         } else if !prev_data.is_empty() && offset > 0 {
@@ -6919,9 +6918,10 @@ impl OpenFs {
     }
 
     /// Preallocate extents in a btrfs filesystem.
+    #[allow(clippy::too_many_lines)]
     fn btrfs_fallocate(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         ino: InodeNumber,
         offset: u64,
         length: u64,
@@ -8843,7 +8843,7 @@ impl FrankenFsEngine {
     }
 
     #[must_use]
-    pub fn read(&self, block: BlockNumber, snapshot: Snapshot) -> Option<&[u8]> {
+    pub fn read(&self, block: BlockNumber, snapshot: Snapshot) -> Option<std::borrow::Cow<'_, [u8]>> {
         self.store.read_visible(block, snapshot)
     }
 
@@ -10109,6 +10109,13 @@ mod tests {
             let next = chain.get(idx + 1).copied().unwrap_or(0);
             set_test_inode_dtime(&mut image, ino, next);
         }
+        // Mark orphan inodes as allocated in the inode bitmap (block 3).
+        // Inode numbering is 1-based: inode N → bit (N-1) in the bitmap.
+        let ibm = 3 * 4096;
+        for &ino in chain {
+            let bit = (ino - 1) as usize;
+            image[ibm + bit / 8] |= 1 << (bit % 8);
+        }
         image
     }
 
@@ -10393,7 +10400,7 @@ mod tests {
 
         let inode = fs.read_inode(&cx, InodeNumber(11)).unwrap();
         let phys = fs.resolve_extent(&cx, &inode, 0).unwrap();
-        assert_eq!(phys, Some(13));
+        assert_eq!(phys, Some((13, false)));
     }
 
     #[test]
@@ -10418,7 +10425,7 @@ mod tests {
 
         let inode = fs.read_inode(&cx, InodeNumber(12)).unwrap();
         let phys = fs.resolve_extent(&cx, &inode, 0).unwrap();
-        assert_eq!(phys, Some(15));
+        assert_eq!(phys, Some((15, false)));
     }
 
     #[test]

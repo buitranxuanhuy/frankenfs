@@ -188,6 +188,7 @@ pub fn replay_jbd2_segments(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn replay_jbd2_inner(
     cx: &Cx,
     dev: &dyn BlockDevice,

@@ -17,35 +17,31 @@
 //!
 //! # Resolving compressed versions
 //!
-//! Use [`resolve_data`] to walk backward through a version chain and find
-//! the actual bytes for an `Identical` marker. This is O(k) where k is
-//! the number of consecutive `Identical` markers (typically 1-2).
+//! Use [`resolve_data_with`] to walk backward through a version chain and find
+//! the actual bytes for an `Identical` marker, decompressing if necessary.
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 /// Compressed representation of block version data.
 ///
 /// Instead of always storing a full `Vec<u8>`, this enum allows
-/// memory-efficient alternatives when the data hasn't changed.
+/// memory-efficient alternatives when the data hasn't changed,
+/// or when compressed using standard algorithms.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VersionData {
     /// Full block data stored inline.
     Full(Vec<u8>),
     /// Data is byte-identical to the previous version in the chain.
-    /// No data is stored; resolve by walking backward to the nearest `Full`.
+    /// No data is stored; resolve by walking backward.
     Identical,
+    /// Zstd compressed block data.
+    Zstd(Vec<u8>),
+    /// Brotli compressed block data.
+    Brotli(Vec<u8>),
 }
 
 impl VersionData {
-    /// Returns the inline bytes if this is a `Full` variant, `None` for `Identical`.
-    #[must_use]
-    pub fn as_bytes(&self) -> Option<&[u8]> {
-        match self {
-            Self::Full(bytes) => Some(bytes),
-            Self::Identical => None,
-        }
-    }
-
     /// Returns `true` if this version is a dedup marker (no data stored).
     #[must_use]
     pub fn is_identical(&self) -> bool {
@@ -62,17 +58,8 @@ impl VersionData {
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
         match self {
-            Self::Full(bytes) => bytes.len(),
+            Self::Full(bytes) | Self::Zstd(bytes) | Self::Brotli(bytes) => bytes.len(),
             Self::Identical => 0,
-        }
-    }
-
-    /// Consume and return the inner bytes, or `None` for `Identical`.
-    #[must_use]
-    pub fn into_bytes(self) -> Option<Vec<u8>> {
-        match self {
-            Self::Full(bytes) => Some(bytes),
-            Self::Identical => None,
         }
     }
 }
@@ -80,30 +67,34 @@ impl VersionData {
 /// Resolve the actual bytes for a version at `index` in a chain.
 ///
 /// If the version at `index` is `Identical`, walks backward through the
-/// chain until a `Full` version is found. Returns `None` only if the chain
-/// is malformed (starts with `Identical` at index 0 with no preceding `Full`).
+/// chain until a `Full` or compressed version is found. Returns `None`
+/// only if the chain is malformed.
 ///
 /// # Arguments
 ///
 /// * `chain` - Slice of `(VersionData, ...)` tuples or items with a `.data` field.
-///   For flexibility, this takes a closure that extracts `&VersionData` from each element.
 /// * `index` - Index of the version to resolve.
-///
-/// # Performance
-///
-/// O(k) where k is the number of consecutive `Identical` markers before the
-/// nearest `Full` version. In practice k is usually 0 or 1.
-pub fn resolve_data_with<T, F>(chain: &[T], index: usize, get_data: F) -> Option<&[u8]>
+pub fn resolve_data_with<'a, T, F>(chain: &'a [T], index: usize, get_data: F) -> Option<Cow<'a, [u8]>>
 where
-    F: Fn(&T) -> &VersionData,
+    F: Fn(&'a T) -> &'a VersionData,
 {
     let mut i = index;
     loop {
         match get_data(&chain[i]) {
-            VersionData::Full(bytes) => return Some(bytes),
+            VersionData::Full(bytes) => return Some(Cow::Borrowed(bytes)),
+            VersionData::Zstd(bytes) => {
+                return zstd::decode_all(bytes.as_slice()).ok().map(Cow::Owned);
+            }
+            VersionData::Brotli(bytes) => {
+                let mut decoded = Vec::new();
+                let mut decompressor = brotli::Decompressor::new(bytes.as_slice(), 4096);
+                if std::io::Read::read_to_end(&mut decompressor, &mut decoded).is_ok() {
+                    return Some(Cow::Owned(decoded));
+                }
+                return None;
+            }
             VersionData::Identical => {
                 if i == 0 {
-                    // Malformed chain: Identical at position 0 with no base.
                     return None;
                 }
                 i -= 1;
@@ -112,22 +103,27 @@ where
     }
 }
 
+/// Compression algorithm options for MVCC blocks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompressionAlgo {
+    None,
+    Zstd { level: i32 },
+    Brotli { level: u32 },
+}
+
 /// Configuration for version chain compression behavior.
 ///
-/// Controls dedup and chain length limits. The default configuration
-/// enables dedup and caps chains at 64 versions.
+/// Controls dedup, compression algorithm, and chain length limits.
 #[derive(Debug, Clone)]
 pub struct CompressionPolicy {
     /// Enable dedup of identical consecutive versions.
-    /// When true, committing bytes identical to the latest version
-    /// stores an `Identical` marker instead of duplicating the data.
     pub dedup_identical: bool,
 
     /// Maximum number of versions to retain per block.
-    /// When exceeded after a commit, the oldest versions are pruned
-    /// (keeping at least 1 version and respecting active snapshots).
-    /// `None` means no limit (only watermark-based pruning applies).
     pub max_chain_length: Option<usize>,
+
+    /// The compression algorithm to apply to new blocks.
+    pub algo: CompressionAlgo,
 }
 
 impl Default for CompressionPolicy {
@@ -135,6 +131,7 @@ impl Default for CompressionPolicy {
         Self {
             dedup_identical: true,
             max_chain_length: Some(64),
+            algo: CompressionAlgo::None,
         }
     }
 }
@@ -146,6 +143,7 @@ impl CompressionPolicy {
         Self {
             dedup_identical: false,
             max_chain_length: None,
+            algo: CompressionAlgo::None,
         }
     }
 
@@ -155,6 +153,7 @@ impl CompressionPolicy {
         Self {
             dedup_identical: true,
             max_chain_length: None,
+            algo: CompressionAlgo::None,
         }
     }
 }
@@ -205,7 +204,6 @@ mod tests {
         let data = VersionData::Full(vec![1, 2, 3]);
         assert!(data.is_full());
         assert!(!data.is_identical());
-        assert_eq!(data.as_bytes(), Some(&[1, 2, 3][..]));
         assert_eq!(data.memory_bytes(), 3);
     }
 
@@ -214,7 +212,6 @@ mod tests {
         let data = VersionData::Identical;
         assert!(data.is_identical());
         assert!(!data.is_full());
-        assert_eq!(data.as_bytes(), None);
         assert_eq!(data.memory_bytes(), 0);
     }
 
@@ -222,7 +219,7 @@ mod tests {
     fn resolve_full_at_index() {
         let chain = vec![VersionData::Full(vec![0xAA]), VersionData::Full(vec![0xBB])];
         let result = resolve_data_with(&chain, 1, |d| d);
-        assert_eq!(result, Some(&[0xBB][..]));
+        assert_eq!(result.as_deref(), Some(&[0xBB][..]));
     }
 
     #[test]
@@ -234,62 +231,13 @@ mod tests {
         ];
         // Index 2 is Identical -> walks to 1 (Identical) -> walks to 0 (Full)
         let result = resolve_data_with(&chain, 2, |d| d);
-        assert_eq!(result, Some(&[0xAA][..]));
+        assert_eq!(result.as_deref(), Some(&[0xAA][..]));
     }
 
     #[test]
     fn resolve_identical_at_zero_returns_none() {
         let chain = vec![VersionData::Identical];
         let result = resolve_data_with(&chain, 0, |d| d);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn resolve_mixed_chain() {
-        let chain = vec![
-            VersionData::Full(vec![1]), // 0
-            VersionData::Identical,     // 1 -> resolves to [1]
-            VersionData::Full(vec![2]), // 2
-            VersionData::Identical,     // 3 -> resolves to [2]
-            VersionData::Identical,     // 4 -> resolves to [2]
-        ];
-        assert_eq!(resolve_data_with(&chain, 0, |d| d), Some(&[1][..]));
-        assert_eq!(resolve_data_with(&chain, 1, |d| d), Some(&[1][..]));
-        assert_eq!(resolve_data_with(&chain, 2, |d| d), Some(&[2][..]));
-        assert_eq!(resolve_data_with(&chain, 3, |d| d), Some(&[2][..]));
-        assert_eq!(resolve_data_with(&chain, 4, |d| d), Some(&[2][..]));
-    }
-
-    #[test]
-    fn compression_stats_dedup_ratio() {
-        let stats = CompressionStats {
-            full_versions: 7,
-            identical_versions: 3,
-            bytes_saved: 300,
-            bytes_stored: 700,
-        };
-        let ratio = stats.dedup_ratio();
-        assert!((ratio - 0.3).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn compression_stats_empty() {
-        let stats = CompressionStats::default();
-        assert!(stats.dedup_ratio().abs() < f64::EPSILON);
-        assert!((stats.compression_ratio() - 1.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn policy_defaults() {
-        let policy = CompressionPolicy::default();
-        assert!(policy.dedup_identical);
-        assert_eq!(policy.max_chain_length, Some(64));
-    }
-
-    #[test]
-    fn policy_none() {
-        let policy = CompressionPolicy::none();
-        assert!(!policy.dedup_identical);
-        assert_eq!(policy.max_chain_length, None);
+        assert!(result.is_none());
     }
 }

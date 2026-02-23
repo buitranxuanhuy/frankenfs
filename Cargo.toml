@@ -71,6 +71,8 @@ tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 fuser = "0.16.0"
+zstd = "0.13"
+brotli = "6.0"
 
 # Sibling project dependencies (crates.io; local path overrides via [patch] if needed)
 asupersync = "0.2.5"

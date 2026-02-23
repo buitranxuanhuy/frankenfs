@@ -5712,7 +5712,7 @@ fn load_evidence_records(
         if line.is_empty() {
             continue;
         }
-        let Ok(record) = serde_json::from_str::<EvidenceRecord>(&line) else {
+        let Ok(record) = serde_json::from_str::<EvidenceRecord>(line) else {
             // Preserve torn-write behavior: skip malformed lines.
             continue;
         };

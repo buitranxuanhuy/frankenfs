@@ -159,7 +159,8 @@ fn flush_epoch_guard_blocks_gc_until_writeback_finishes() {
     assert_eq!(
         seed_store
             .read_visible(block, snapshot_v2)
-            .expect("version 2 visible"),
+            .expect("version 2 visible")
+            .as_ref(),
         payload_v2.as_slice()
     );
 
@@ -213,7 +214,8 @@ fn flush_epoch_guard_blocks_gc_until_writeback_finishes() {
         assert_eq!(
             store
                 .read_visible(block, snapshot_v2)
-                .expect("version 2 pinned during flush"),
+                .expect("version 2 pinned during flush")
+                .as_ref(),
             payload_v2.as_slice(),
             "GC must not reclaim the flush-referenced version while guard is held"
         );
@@ -225,7 +227,8 @@ fn flush_epoch_guard_blocks_gc_until_writeback_finishes() {
         assert_eq!(
             store
                 .read_visible(block, Snapshot { high: CommitSeq(3) })
-                .expect("latest version visible"),
+                .expect("latest version visible")
+                .as_ref(),
             payload_v3.as_slice()
         );
         drop(store);
@@ -252,7 +255,7 @@ fn flush_epoch_guard_blocks_gc_until_writeback_finishes() {
         let mut store = shared_store.write();
         let _ = store.prune_safe();
         store.ebr_collect();
-        let v2_after = store.read_visible(block, snapshot_v2).map(<[u8]>::to_vec);
+        let v2_after = store.read_visible(block, snapshot_v2).map(std::borrow::Cow::into_owned);
         assert_ne!(
             v2_after,
             Some(payload_v2),
@@ -261,7 +264,8 @@ fn flush_epoch_guard_blocks_gc_until_writeback_finishes() {
         assert_eq!(
             store
                 .read_visible(block, Snapshot { high: CommitSeq(3) })
-                .expect("latest survives"),
+                .expect("latest survives")
+                .as_ref(),
             payload_v3.as_slice()
         );
         drop(store);

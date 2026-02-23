@@ -526,20 +526,13 @@ pub fn parse_leaf_items(block: &[u8]) -> Result<(BtrfsHeader, Vec<BtrfsItem>), P
             item_type: block[base + 8],
             offset: read_le_u64(block, base + 9)?,
         };
-        // btrfs leaf item offsets are relative to the end of the header (BTRFS_HEADER_SIZE).
+        // btrfs leaf item offsets are absolute within the leaf block.
         let data_offset = read_le_u32(block, base + 17)?;
         let data_size = read_le_u32(block, base + 21)?;
 
-        let data_start = usize::try_from(data_offset)
+        let data_end = usize::try_from(data_offset)
             .ok()
-            .and_then(|off| off.checked_add(BTRFS_HEADER_SIZE))
-            .ok_or(ParseError::InvalidField {
-                field: "item_offset",
-                reason: "overflow",
-            })?;
-
-        let data_end = data_start
-            .checked_add(usize::try_from(data_size).unwrap_or(usize::MAX))
+            .and_then(|off| off.checked_add(usize::try_from(data_size).ok()?))
             .ok_or(ParseError::InvalidField {
                 field: "item_offset",
                 reason: "overflow",
@@ -554,7 +547,7 @@ pub fn parse_leaf_items(block: &[u8]) -> Result<(BtrfsHeader, Vec<BtrfsItem>), P
 
         items.push(BtrfsItem {
             key,
-            data_offset: u32::try_from(data_start).unwrap_or(u32::MAX),
+            data_offset,
             data_size,
         });
     }
