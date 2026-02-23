@@ -202,7 +202,7 @@ fn replay_jbd2_inner(
 
     let mut stats = ReplayStats::default();
     let mut pending: BTreeMap<u32, PendingTxn> = BTreeMap::new();
-    let mut committed_sequences = Vec::new();
+    let mut committed_sequences = BTreeSet::new();
 
     let mut idx = 0_u64;
     while idx < total_blocks {
@@ -263,20 +263,7 @@ fn replay_jbd2_inner(
             }
             JBD2_BLOCKTYPE_COMMIT => {
                 stats.commit_blocks = stats.commit_blocks.saturating_add(1);
-                if let Some(txn) = pending.remove(&header.sequence) {
-                    for (target, payload) in txn.writes {
-                        if txn.revoked.contains(&target) {
-                            stats.skipped_revoked_blocks =
-                                stats.skipped_revoked_blocks.saturating_add(1);
-                            continue;
-                        }
-                        dev.write_block(cx, target, &payload)?;
-                        stats.replayed_blocks = stats.replayed_blocks.saturating_add(1);
-                    }
-                    committed_sequences.push(header.sequence);
-                } else {
-                    stats.orphaned_commit_blocks = stats.orphaned_commit_blocks.saturating_add(1);
-                }
+                committed_sequences.insert(header.sequence);
                 idx = idx.saturating_add(1);
             }
             _ => {
@@ -285,11 +272,43 @@ fn replay_jbd2_inner(
         }
     }
 
-    stats.incomplete_transactions = u64::try_from(pending.len())
-        .map_err(|_| FfsError::Format("pending transaction count overflow".to_owned()))?;
+    let mut max_revoke_seq: BTreeMap<BlockNumber, u32> = BTreeMap::new();
+    for &seq in &committed_sequences {
+        if let Some(txn) = pending.get(&seq) {
+            for &revoked_block in &txn.revoked {
+                max_revoke_seq.insert(revoked_block, seq);
+            }
+        }
+    }
+
+    let mut final_writes: BTreeMap<BlockNumber, Vec<u8>> = BTreeMap::new();
+
+    for &seq in &committed_sequences {
+        if let Some(txn) = pending.get(&seq) {
+            for (target, payload) in &txn.writes {
+                let revoked_seq = max_revoke_seq.get(target).copied().unwrap_or(0);
+                if seq < revoked_seq {
+                    stats.skipped_revoked_blocks = stats.skipped_revoked_blocks.saturating_add(1);
+                    continue;
+                }
+                
+                final_writes.insert(*target, payload.clone());
+                stats.replayed_blocks = stats.replayed_blocks.saturating_add(1);
+            }
+        } else {
+            stats.orphaned_commit_blocks = stats.orphaned_commit_blocks.saturating_add(1);
+        }
+    }
+
+    for (target, payload) in final_writes {
+        dev.write_block(cx, target, &payload)?;
+    }
+
+    stats.incomplete_transactions = u64::try_from(pending.len().saturating_sub(committed_sequences.len()))
+        .unwrap_or(u64::MAX);
 
     Ok(ReplayOutcome {
-        committed_sequences,
+        committed_sequences: committed_sequences.into_iter().collect(),
         stats,
     })
 }

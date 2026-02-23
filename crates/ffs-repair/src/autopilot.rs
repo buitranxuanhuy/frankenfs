@@ -268,6 +268,9 @@ fn beta_binomial_tail(alpha: f64, beta: f64, draws: u32, cutoff: u32) -> f64 {
 
 #[must_use]
 fn log_add_exp(lhs: f64, rhs: f64) -> f64 {
+    if lhs == f64::NEG_INFINITY && rhs == f64::NEG_INFINITY {
+        return f64::NEG_INFINITY;
+    }
     if !lhs.is_finite() {
         return rhs;
     }
